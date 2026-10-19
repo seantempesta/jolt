@@ -211,7 +211,25 @@ static double pre_main_ms(void) {
 #endif
 }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+#include <pthread.h>
+/* A fork()ed child runs on a copy of the forking thread, and XNU gives that
+   copy the thread's MAP_JIT view (pthread_jit_write_protect_np) as the kernel
+   last saved it at a context switch, not its live value. Chez enables code
+   writes for the length of a collection; a thread descheduled inside one that
+   re-protected afterwards without another switch forks a child whose code
+   pages are writable and not executable, and the child's first instruction
+   back in Scheme faults (SIGBUS, "invalid memory reference"). The child
+   re-protects before it returns to Scheme. chez-patches/0006 does the same in
+   the kernel; this covers a stock Chez. */
+static void jolt_fork_child_reprotect_code(void) { pthread_jit_write_protect_np(1); }
+#define JOLT_FORK_REPROTECT() pthread_atfork(NULL, NULL, jolt_fork_child_reprotect_code)
+#else
+#define JOLT_FORK_REPROTECT() ((void)0)
+#endif
+
 int main(int argc, char *argv[]) {
+  JOLT_FORK_REPROTECT();
   int startup_profile = getenv("JOLT_STARTUP_PROFILE") != NULL;
   double startup_started = startup_profile ? monotonic_ms() : 0.0;
   double startup_last = startup_started;
