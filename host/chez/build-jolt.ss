@@ -987,7 +987,8 @@
       "#include \"stdlib_fasls_data.h\"\n"
       "#include \"source_blob_data.h\"\n"
       (bld-boot-prefetch-defn)
-      "int main(int argc, char *argv[]) {\n"
+      "#if defined(__APPLE__) && defined(__aarch64__)\n#include <pthread.h>\n/* fork: the child re-protects MAP_JIT code (see stub/launcher.c) */\nstatic void jolt_fork_child_reprotect_code(void) { pthread_jit_write_protect_np(1); }\n#define JOLT_FORK_REPROTECT() pthread_atfork(NULL, NULL, jolt_fork_child_reprotect_code)\n#else\n#define JOLT_FORK_REPROTECT() ((void)0)\n#endif\n"
+      "int main(int argc, char *argv[]) {\n  JOLT_FORK_REPROTECT();\n"
       ;; before Sscheme_init: the 18MB boot's readahead then overlaps kernel
       ;; init and the runtime image top levels instead of stalling behind them.
       (bld-boot-prefetch-call)

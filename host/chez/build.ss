@@ -3903,7 +3903,8 @@
       (string-append
         "#include \"scheme.h\"\n#include \"jolt_zlib.h\"\n#include \"boot_data.h\"\n"
         (bld-boot-prefetch-defn)
-        "int main(int argc, char *argv[]) {\n"
+        "#if defined(__APPLE__) && defined(__aarch64__)\n#include <pthread.h>\n/* fork: the child re-protects MAP_JIT code (see stub/launcher.c) */\nstatic void jolt_fork_child_reprotect_code(void) { pthread_jit_write_protect_np(1); }\n#define JOLT_FORK_REPROTECT() pthread_atfork(NULL, NULL, jolt_fork_child_reprotect_code)\n#else\n#define JOLT_FORK_REPROTECT() ((void)0)\n#endif\n"
+        "int main(int argc, char *argv[]) {\n  JOLT_FORK_REPROTECT();\n"
         (bld-boot-prefetch-call)
         "  Sscheme_init(0);\n"
         "  Sregister_boot_file_bytes(\"jolt\", (void *)jolt_boot, jolt_boot_len);\n"
