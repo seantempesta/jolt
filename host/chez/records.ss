@@ -111,11 +111,21 @@
              (case i
                ,@(map (lambda (i) `((,i) (,(mut k i) r v))) (range 0 (- k 1)))
                (else (error 'jrec-field-set! "index out of range" i)))))
+         ;; dispatch on the descriptor's field count, as jrec-field-ref does: the
+         ;; predicate chain this replaced tested jrec1? .. jrecK? in turn on every
+         ;; set!, so a deftype's (set! field v) paid K record-type tests.
+         (define (set-case k)
+           `((,k)
+             (case i
+               ,@(map (lambda (i) `((,i) (,(mut k i) r v))) (range 0 (- k 1)))
+               (else (error 'jrec-field-set! "index out of range" i)))))
          (define fieldset-def
            `(define (jrec-field-set! r i v)
-              (cond ,@(map set-branch (range 1 mn))
-                    ((jrec*? r) (vector-set! (jrec*-vals r) i v))
-                    (else (error 'jrec-field-set! "not a fielded record" r)))))
+              (let ((n (jrdesc-nfields (jrec-desc r))))
+                (case n
+                  ,@(map set-case (range 1 mn))
+                  (else (if (jrec*? r) (vector-set! (jrec*-vals r) i v)
+                            (error 'jrec-field-set! "not a fielded record" r)))))))
          (define (fieldat-branch k)
            `((,(pred k) r)
              (case i
@@ -669,11 +679,30 @@
 ;; mutate a deftype's mutable field in place: fields are mutable slots, so
 ;; jrec-field-set! updates the field. (set! field v) inside a method lowers to
 ;; this; returns v, as set! does.
+;; The ^double flags of INST's type, or #f when it declares none, memoized per
+;; descriptor (eq?): the string-keyed chez-record-dbl-tbl read this replaced hashed
+;; the whole type tag on every set!, which was most of a deftype field write.
+(define jrec-dbl-flags-tbl (make-weak-eq-hashtable))
+(define jrec-dbl-flags-mu (make-mutex))
+(define (jrec-dbl-flags inst)
+  (let* ((d (jrec-desc inst))
+         (f (hashtable-ref jrec-dbl-flags-tbl d 'none)))
+    (if (eq? f 'none)
+        (let* ((raw (hashtable-ref chez-record-dbl-tbl (jrec-tag inst) #f))
+               (f (and raw
+                       (let loop ((i 0))
+                         (cond ((fx=? i (vector-length raw)) #f)
+                               ((vector-ref raw i) raw)
+                               (else (loop (fx+ i 1))))))))
+          (jolt-with-mutex jrec-dbl-flags-mu (hashtable-set! jrec-dbl-flags-tbl d f))
+          f)
+        f)))
 (define (jolt-set-field! inst k v)
   (if (jrec? inst)
-      (let ((i (let ((k2 (and (keyword-t? k) (jrec-member-field inst k))))
-                 (and k2 (jrec-field-index inst k2)))))
-        (if i (let* ((flags (hashtable-ref chez-record-dbl-tbl (jrec-tag inst) #f))
+      (let ((i (or (and (keyword-t? k) (jrec-field-index inst k))
+                   (let ((k2 (and (keyword-t? k) (jrec-member-field inst k))))
+                     (and k2 (jrec-field-index inst k2))))))
+        (if i (let* ((flags (jrec-dbl-flags inst))
                      ;; a ^double field stays a flonum across set!, like the ctor —
                      ;; keeps a later field read sound to unbox.
                      (v2 (if (and flags (fx< i (vector-length flags)) (vector-ref flags i)
