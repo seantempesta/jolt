@@ -189,7 +189,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost recordshadow emittedheads adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotcachesourcepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
   systemstreams closedstdout stderrsplit userdirpaths utf8decode \
-  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest monitorescape windescape threadsafety maskedacquire ioerrno cas flow
+  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest monitorescape windescape threadsafety maskedacquire ioerrno cas flow remotechan
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -978,6 +978,13 @@ continuations:
 # run on fibers, so 200 of them do not need 200 threads.
 flow:
 	@bin/jolt run test/chez/flow-test.clj
+
+# jolt.async.remote: a channel whose other end is another OS process, over a
+# socketpair. FIFO, back-pressure with nothing lost, peer death as close, alts! over
+# local and remote channels, FD_CLOFORK at fork, SCM_RIGHTS passing, and Flow wired
+# across a forked child (jolt.async.remote.flow), from a single-threaded fork server.
+remotechan:
+	@bin/jolt run test/chez/remote-chan-test.clj
 
 # Sorted colls: the lazy tree walk behind seq/rseq/keys/vals/subseq, and hash/=
 # answered from the tree. Values pinned to the JVM; scaling pinned as allocation.

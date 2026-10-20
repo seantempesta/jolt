@@ -100,15 +100,17 @@
                   control-mult (async/mult control-chan)
                   report-chan (async/chan (async/sliding-buffer 100))
                   error-chan (async/chan (async/sliding-buffer 100))
-                  make-chan (fn [[[pid cid]{:keys [buf-or-n xform]}]]
-                              (if xform
+                  ;; jolt: an in-port whose chan-opts name a :chan is that channel,
+                  ;; one the flow did not make (a remote channel's out-half)
+                  make-chan (fn [[[pid cid]{:keys [chan buf-or-n xform]}]]
+                              (if chan chan (if xform
                                 (async/chan
                                  buf-or-n xform
                                  (fn [ex]
                                    (async/put! error-chan
                                                #::flow{:ex ex, :pid pid, :cid cid, :xform xform})
                                    nil))
-                                (async/chan (or buf-or-n 10))))
+                                (async/chan (or buf-or-n 10)))))
                   in-chans (zipmap (keys inopts) (map make-chan inopts))
                   needs-mult? (fn [out ins]
                                 (or (< 1 (count ins))

@@ -55,6 +55,8 @@ grenadine.repo
 grenadine.runtime
 grenadine.source
 grenadine.tree
+jolt.async.remote
+jolt.async.remote.flow
 jolt.cli
 jolt.completions
 jolt.continuations
