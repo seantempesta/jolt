@@ -2760,16 +2760,50 @@
 ;; every call, which this pays per printed value. The cell is stable — def-var!
 ;; mutates the root in place — so caching it is sound under redefinition.
 (define pm-cell #f)
+(define (user-print-method-full mf x)
+  (let ((tbl (jolt-multifn-methods mf)))
+    (or (hashtable-ref tbl (jolt-type x) #f)
+        (and (pm-class-keys? tbl)
+             (let ((c (jolt-class-name x)))
+               (and (string? c)
+                    (hashtable-ref tbl (jolt-class-for c) #f)))))))
+;; The answer above is asked of EVERY value printed, nested ones included, and
+;; costs two lookups in the method table (keyed by jolt=, so a hash and an equality
+;; walk each) plus a class-name lookup by string once any class-keyed method
+;; exists — 72% of pr-str of a small vector of datoms (pf1). For a value whose
+;; (class x) is on the fast path (class-fast-name: scalars, collections, seqs,
+;; records, plain reifies) and which carries no metadata and no :jolt/type tag,
+;; both lookups are a function of that class: its type tag is the kind's own and
+;; its class is the fast name. So the answer is memoized per fast class name (one
+;; string object per class), and the memo is dropped when any multimethod changes
+;; (jolt-mm-epoch), print-method is rebound, or a type arm is added.
+(define pm-memo (make-weak-eq-hashtable))
+(define pm-memo-mu (make-mutex))
+(define pm-memo-mf #f)
+(define pm-memo-epoch -1)
+(define pm-memo-arms #f)
+(define (pm-memo-key x)
+  (and (jolt-nil? (jolt-meta x))
+       (not (and (pmap? x) (not (jolt-nil? (jolt-get x ty-kw-jtype jolt-nil)))))
+       (class-fast-name x)))
 (define (user-print-method x)
   (unless pm-cell (set! pm-cell (jolt-var "clojure.core" "print-method")))
   (let ((mf (var-cell-deref pm-cell)))
     (and (jolt-multifn? mf)
-         (let ((tbl (jolt-multifn-methods mf)))
-           (or (hashtable-ref tbl (jolt-type x) #f)
-               (and (pm-class-keys? tbl)
-                    (let ((c (jolt-class-name x)))
-                      (and (string? c)
-                           (hashtable-ref tbl (jolt-class-for c) #f)))))))))
+         (let ((k (pm-memo-key x)))
+           (if (not k)
+               (user-print-method-full mf x)
+               (begin
+                 (unless (and (eq? pm-memo-mf mf) (fx= pm-memo-epoch jolt-mm-epoch) (eq? pm-memo-arms jolt-type-arms))
+                   (jolt-with-mutex pm-memo-mu
+                     (set! pm-memo (make-weak-eq-hashtable))
+                     (set! pm-memo-mf mf) (set! pm-memo-epoch jolt-mm-epoch) (set! pm-memo-arms jolt-type-arms)))
+                 (let* ((memo pm-memo) (hit (hashtable-ref memo k 'none)))
+                   (if (eq? hit 'none)
+                       (let ((r (user-print-method-full mf x)))
+                         (jolt-with-mutex pm-memo-mu (hashtable-set! memo k r))
+                         r)
+                       hit))))))))
 (set-pr-user-method-render!
   (lambda (x)
     (let ((m (user-print-method x)))
