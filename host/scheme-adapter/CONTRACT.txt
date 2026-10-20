@@ -142,7 +142,8 @@ system
 # leaves os.version out of the system properties; sa-real-time-ms may use any monotonic ms clock but never
 # a constant (callers stamp temp files with it); sa-total-memory-bytes may
 # approximate — callers only display it or subtract sa-bytes-allocated from
-# it; sa-max-memory-bytes is the heap's high-water mark since the last
+# it; sa-static-bytes may answer 0 where the collector has no never-collected
+# generation; sa-max-memory-bytes is the heap's high-water mark since the last
 # sa-reset-max-memory-bytes! and may answer the current total (a target that
 # keeps no peak answers "now"), in which case sa-reset-max-memory-bytes! may
 # no-op; sa-gc-reserve-ratio! may be ignored by a target that sizes its own
@@ -172,6 +173,7 @@ sa-os-release
 sa-gc-collect
 sa-gc-max-generation
 sa-bytes-allocated
+sa-static-bytes
 sa-total-memory-bytes
 sa-max-memory-bytes
 sa-real-time-ms

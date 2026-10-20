@@ -936,8 +936,8 @@
 ;;     it the nursery halves back.
 ;;   JOLT_MAX_HEAP_FREE_RATIO=P (-XX:MaxHeapFreeRatio, default 50): at most P% of
 ;;     the heap may be nursery headroom over the live data -- the heap live after
-;;     the last full collection -- so the nursery grows to live*P/(100-P), 1x the
-;;     live set by default. This is the footprint bound: a nursery is memory held
+;;     the last full collection, less the static generation (gc-collectable) --
+;;     so the nursery grows to live*P/(100-P), 1x the live set by default. This is the footprint bound: a nursery is memory held
 ;;     on top of the program's data, and without it a loop with 40MB live ran in
 ;;     1.4GB for a 1.4x speedup (the JVM, which bounds its young generation by
 ;;     pause time instead, ran the same loop in 4.1GB).
@@ -1005,11 +1005,12 @@
         (max gc-room-min (quotient (max 0 (- c (sa-bytes-allocated))) 4))
         gc-trip-cap)))
 (define (gc-max-trip) (min gc-trip-cap (gc-room-cap)))
-;; The footprint bound: live * P/(100-P), within [floor, cap].
+;; The footprint bound: live * P/(100-P), within [floor, cap], where live is the
+;; heap the collector can collect (gc-collectable).
 (define (gc-trip-limit)
   (min (gc-max-trip)
        (max gc-trip-floor
-            (quotient (* gc-live-after-full gc-free-ratio) (- 100 gc-free-ratio)))))
+            (quotient (* (gc-collectable gc-live-after-full) gc-free-ratio) (- 100 gc-free-ratio)))))
 ;; Growth past the bound is a bet that a bigger window lets more die young, and
 ;; it does not always pay: a program whose working set spans the window copies
 ;; more the bigger it is (writ's prover: 10.6ms a young collection at 256MB, 105ms
@@ -1096,9 +1097,9 @@
 ;; live passed 12GB allocated between collections. It happened at the fixed 16MB
 ;; too, only slower -- writ's examples ran at 7.7GB resident for ~100MB of data.
 ;; So the old generations are also collected by HEAP GROWTH, the rule Go's GOGC
-;; and the JVM's occupancy trigger use: once the heap is more than twice what was
-;; live after the last full collection (and 64MB past it, so a tiny heap does not
-;; collect constantly), collect everything and measure again. The footprint is
+;; and the JVM's occupancy trigger use: once the collectable heap is more than
+;; twice what was live after the last full collection (and 64MB past it, so a tiny
+;; heap does not collect constantly), collect everything and measure again. The footprint is
 ;; then bounded by the program's own live data, whatever the nursery.
 ;;
 ;; "Twice" is where it starts, not a constant. A full collection copies all the
@@ -1110,6 +1111,18 @@
 ;; the allowance grows by half, up to 8x live, and below a quarter of it shrinks
 ;; back toward 2x. A program with little churn keeps the tight bound.
 (define gc-live-after-full 0)
+;; The nursery bound and the growth allowance are headroom for garbage, so they
+;; are sized from the heap the collector can collect: the live bytes less the
+;; static generation (sa-static-bytes), which is never collected or copied. It
+;; holds the boot image in every process (~70MB of a hello world's 73MB) and
+;; whatever a program made static itself; a server that moves its preloaded data
+;; there before forking (~430MB of 432MB live) grew a 400MB nursery for 30MB of
+;; collectable data, and its growth allowance did not fire until 870MB. Static
+;; data only grows, by promoting what was live, so subtracting today's figure
+;; from a live set measured earlier is right whichever came first. The heap
+;; ceiling still bounds the total, static included: that is memory the process
+;; holds.
+(define (gc-collectable live) (max 0 (- live (sa-static-bytes))))
 (define gc-live-measured? #f)
 (define gc-full-this-time #f)
 (define gc-full-ms-this-time 0)
@@ -1127,10 +1140,11 @@
 ;; raise the footprint by up to this (jolt.host/gc-old-growth-bytes).
 (define (gc-old-growth-limit live)
   (max (exact (floor (* gc-old-factor live))) (+ live (* 64 1024 1024))))
-(define (gc-old-growth-bytes) (- (gc-old-growth-limit gc-live-after-full) gc-live-after-full))
+(define (gc-old-growth-bytes)
+  (let ((live (gc-collectable gc-live-after-full))) (- (gc-old-growth-limit live) live)))
 (define (gc-collect-old-when-grown! collect-full!)
   (let ((live gc-live-after-full))
-    (when (> (sa-bytes-allocated) (gc-old-growth-limit live))
+    (when (> (gc-collectable (sa-bytes-allocated)) (gc-old-growth-limit (gc-collectable live)))
       (let ((t0 (sa-real-time-ms)))
         ;; tight (in place) when a second copy of the live data would not fit
         ;; under a heap ceiling, as for the ceiling's own collections

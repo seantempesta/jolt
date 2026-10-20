@@ -98,6 +98,12 @@
   (guard (e (#t 0))
     (##bytes-allocated)))
 
+;; (sa-static-bytes) -> exact integer
+;; The part of sa-bytes-allocated the collector never collects. Contract: never
+;; more than sa-bytes-allocated. Degradation: 0, Gambit's collector has no
+;; static generation the policy needs to leave out.
+(define (sa-static-bytes) 0)
+
 ;; (sa-total-memory-bytes) -> exact integer
 ;; Total process heap bytes — what the collector has reserved from the OS
 ;; (the JVM's totalMemory; Runtime.freeMemory is the difference against
