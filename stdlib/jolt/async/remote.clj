@@ -178,7 +178,12 @@
 ;; A frame is [u32 length, little-endian][body]; length END is an end frame.
 ;; rd: long-array [buf cap lo hi] over foreign memory, grown to the largest frame.
 
-(defn- rd-new [] (long-array [(ffi/address (ffi/alloc 65536)) 65536 0 0]))
+;; An end's buffers start small and grow to the largest frame (rd-room!, the writer's
+;; room!): a process holding a thousand mostly idle ends (a root of agents) pays 4 KB each,
+;; not 64 KB.
+(def ^:private start-bytes 4096)
+
+(defn- rd-new [] (long-array [(ffi/address (ffi/alloc start-bytes)) start-bytes 0 0]))
 
 (defn- rd-room!
   "Compact the buffer, then grow it until `need` bytes fit from its start."
@@ -274,7 +279,7 @@
       (finally (ffi/free (aget st 0)) (finish! end)))))
 
 (defn- writer [{:keys [fd out encode pump] :as end}]
-  (let [scratch (volatile! [(ffi/address (ffi/alloc batch-bytes)) batch-bytes])
+  (let [scratch (volatile! [(ffi/address (ffi/alloc start-bytes)) start-bytes])
         room! (fn [need]
                 (let [[p cap] @scratch]
                   (if (<= need cap)
