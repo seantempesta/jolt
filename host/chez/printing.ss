@@ -162,13 +162,123 @@
 (define (pr-user-meta x)
   (if (or (var-cell? x) (procedure? x)) jolt-nil (jolt-meta x)))
 
-(define (jolt-pr-readable x)
+;; ---- the readable printer writes to one port ----------------------------------
+;; A value prints by writing into ONE string port, threaded through the recursion:
+;; no level builds a string of its own for the level above to copy, a string is
+;; escaped by writing the runs between its escapable characters, map entries and
+;; set elements are written as they are walked, and a user print-method writes
+;; through a char-writer over the same port. jolt-pr-readable-base and
+;; jolt-pr-readable-dispatch above return strings for the callers that want one;
+;; the print family (pr-str, pr, print-method's default) comes through here.
+(define pr-user-method-write #f)    ; (x port) -> #t when a user print-method wrote x
+(define (set-pr-user-method-write! f) (set! pr-user-method-write f))
+
+(define (pr-put-escaped s port)
+  (let ((n (string-length s)))
+    (let loop ((i 0) (start 0))
+      (if (fx= i n)
+          (when (fx< start n) (put-string port s start (fx- n start)))
+          (let ((esc (case (string-ref s i)
+                       ((#\") "\\\"") ((#\\) "\\\\") ((#\newline) "\\n") ((#\tab) "\\t")
+                       ((#\return) "\\r") ((#\backspace) "\\b") ((#\page) "\\f")
+                       (else #f))))
+            (if esc
+                (begin (when (fx< start i) (put-string port s start (fx- i start)))
+                       (put-string port esc)
+                       (loop (fx+ i 1) (fx+ i 1)))
+                (loop (fx+ i 1) start)))))))
+
+;; elements of a list, " "-separated (or sep), honoring *print-length*
+(define (pr-write-list-elems xs port sep write-one)
+  (let ((lim (jolt-print-length)))
+    (let loop ((xs xs) (i 0))
+      (unless (null? xs)
+        (unless (fx= i 0) (put-string port sep))
+        (if (and lim (fx>=? i lim))
+            (put-string port "...")
+            (begin (write-one (car xs)) (loop (cdr xs) (fx+ i 1))))))))
+
+(define (jolt-pr-base-to x port)
+  (cond
+    ((string? x)
+     (if (jolt-pr-readable?)
+         (begin (put-string port "\"") (pr-put-escaped x port) (put-string port "\""))
+         (put-string port x)))
+    ((keyword? x)
+     (let ((ns (keyword-t-ns x)))
+       (put-string port ":")
+       (when ns (put-string port ns) (put-string port "/"))
+       (put-string port (keyword-t-name x))))
+    ((pvec? x)
+     (if (jolt-print-hash?) (put-string port "#")
+         (with-deeper-print
+           (put-string port "[")
+           (let ((len (pvec-count x)) (lim (jolt-print-length)))
+             (let loop ((i 0))
+               (when (fx<? i len)
+                 (unless (fx= i 0) (put-string port " "))
+                 (if (and lim (fx>=? i lim))
+                     (put-string port "...")
+                     (begin (jolt-pr-readable-to (pvec-nth-d x i jolt-nil) port) (loop (fx+ i 1)))))))
+           (put-string port "]"))))
+    ((pmap? x)
+     (if (jolt-print-hash?) (put-string port "#")
+         (with-deeper-print
+           (let* ((pairs (pmap-fold x (lambda (k v a) (cons (cons k v) a)) '()))
+                  (ns (pr-ns-maps-shared-ns pairs)))
+             (if ns
+                 (begin (put-string port "#:") (put-string port ns) (put-string port "{")
+                        (pr-write-list-elems pairs port ", "
+                          (lambda (pr) (jolt-pr-readable-to (pr-strip-ns (car pr)) port)
+                                       (put-string port " ") (jolt-pr-readable-to (cdr pr) port))))
+                 (begin (put-string port "{")
+                        (pr-write-list-elems pairs port ", "
+                          (lambda (pr) (jolt-pr-readable-to (car pr) port)
+                                       (put-string port " ") (jolt-pr-readable-to (cdr pr) port)))))
+             (put-string port "}")))))
+    ((pset? x)
+     (if (jolt-print-hash?) (put-string port "#")
+         (with-deeper-print
+           (put-string port "#{")
+           (pr-write-list-elems (pset-fold x (lambda (e a) (cons e a)) '()) port " "
+                                (lambda (e) (jolt-pr-readable-to e port)))
+           (put-string port "}"))))
+    ((cseq? x)
+     (if (jolt-print-hash?) (put-string port "#")
+         (with-deeper-print
+           (put-string port "(")
+           (let ((lim (jolt-print-length)))
+             (let loop ((s x) (i 0))
+               (unless (jolt-nil? s)
+                 (unless (fx= i 0) (put-string port " "))
+                 (if (and lim (fx>=? i lim))
+                     (put-string port "...")
+                     (begin (jolt-pr-readable-to (seq-first s) port)
+                            (loop (jolt-seq (seq-more s)) (fx+ i 1)))))))
+           (put-string port ")"))))
+    ;; everything else renders as jolt-pr-readable-base does, as a string
+    (else (put-string port (jolt-pr-readable-base x)))))
+
+(define (jolt-pr-dispatch-to x port)
+  (cond ((and pr-user-method-write (pr-user-method-write x port)) (if #f #f))
+        ((pr-fast-type? x) (jolt-pr-base-to x port))
+        (else (let loop ((as jolt-pr-readable-arms))
+                (cond ((null? as) (jolt-pr-base-to x port))
+                      (((caar as) x) (put-string port ((cdar as) x)))
+                      (else (loop (cdr as))))))))
+
+(define (jolt-pr-readable-to x port)
   (if (pr-print-meta?)
       (let ((m (pr-user-meta x)))
-        (if (jolt-nil? m)
-            (jolt-pr-readable-dispatch x)
-            (string-append "^" (jolt-pr-readable-dispatch m) " " (jolt-pr-readable-dispatch x))))
-      (jolt-pr-readable-dispatch x)))
+        (unless (jolt-nil? m)
+          (put-string port "^") (jolt-pr-dispatch-to m port) (put-string port " "))
+        (jolt-pr-dispatch-to x port))
+      (jolt-pr-dispatch-to x port)))
+
+(define (jolt-pr-readable x)
+  (let ((port (open-output-string)))
+    (jolt-pr-readable-to x port)
+    (get-output-string port)))
 
 ;; __pr-str1: render ONE value readably (the overlay's pr-str joins these).
 (define (jolt-pr-str1 x) (jolt-pr-readable x))
