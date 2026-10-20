@@ -987,7 +987,9 @@
       "#include \"stdlib_fasls_data.h\"\n"
       "#include \"source_blob_data.h\"\n"
       (bld-boot-prefetch-defn)
+      (bld-fork-reprotect-defn)
       "int main(int argc, char *argv[]) {\n"
+      (bld-fork-reprotect-call)
       ;; before Sscheme_init: the 18MB boot's readahead then overlaps kernel
       ;; init and the runtime image top levels instead of stalling behind them.
       (bld-boot-prefetch-call)

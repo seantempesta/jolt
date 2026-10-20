@@ -211,7 +211,22 @@ static double pre_main_ms(void) {
 #endif
 }
 
+/* A fork()ed child on macOS arm64 re-protects its MAP_JIT code before it runs
+   any (build.ss bld-fork-reprotect-defn says why; chez-patches/0006 does the
+   same in the kernel, this covers a stock Chez). */
+#if defined(__APPLE__) && defined(__aarch64__)
+#include <TargetConditionals.h>
+#endif
+#if defined(__APPLE__) && defined(__aarch64__) && TARGET_OS_OSX
+#include <pthread.h>
+static void jolt_fork_child_reprotect(void) { pthread_jit_write_protect_np(1); }
+#define JOLT_FORK_REPROTECT() pthread_atfork(NULL, NULL, jolt_fork_child_reprotect)
+#else
+#define JOLT_FORK_REPROTECT() ((void)0)
+#endif
+
 int main(int argc, char *argv[]) {
+  JOLT_FORK_REPROTECT();
   int startup_profile = getenv("JOLT_STARTUP_PROFILE") != NULL;
   double startup_started = startup_profile ? monotonic_ms() : 0.0;
   double startup_last = startup_started;

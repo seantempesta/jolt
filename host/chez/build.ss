@@ -3903,7 +3903,9 @@
       (string-append
         "#include \"scheme.h\"\n#include \"jolt_zlib.h\"\n#include \"boot_data.h\"\n"
         (bld-boot-prefetch-defn)
+        (bld-fork-reprotect-defn)
         "int main(int argc, char *argv[]) {\n"
+        (bld-fork-reprotect-call)
         (bld-boot-prefetch-call)
         "  Sscheme_init(0);\n"
         "  Sregister_boot_file_bytes(\"jolt\", (void *)jolt_boot, jolt_boot_len);\n"
@@ -4076,6 +4078,34 @@
 ;; already in flight for everything that follows it.
 (define (bld-boot-prefetch-call)
   "  jolt_prefetch_boot(jolt_boot, (size_t)jolt_boot_len);\n")
+;; A fork()ed child on macOS arm64 re-protects its MAP_JIT code before it runs
+;; any. The child runs on a copy of the forking thread, and XNU gives that copy
+;; the thread's pthread_jit_write_protect_np state as the kernel last saved it,
+;; at a context switch, not its live one. Chez enables code writes for the
+;; length of a collection, so a thread descheduled inside one, which then
+;; re-protected without another switch, forks a child whose code pages are
+;; writable and not executable: its first instruction back in Scheme faults
+;; (SIGBUS, "invalid memory reference"). Every Scheme thread runs with writes
+;; off, so the handler restores what the child must have.
+;; chez-patches/0006 registers the same handler in the kernel; this covers a
+;; jolt built against a stock Chez. It is not in the --library stub: there the
+;; host owns the process and its forks, and 0006 covers it.
+(define (bld-fork-reprotect-defn)
+  (string-append
+    "#if defined(__APPLE__) && defined(__aarch64__)\n"
+    "#include <TargetConditionals.h>\n"
+    "#endif\n"
+    "#if defined(__APPLE__) && defined(__aarch64__) && TARGET_OS_OSX\n"
+    "#include <pthread.h>\n"
+    "static void jolt_fork_child_reprotect(void) { pthread_jit_write_protect_np(1); }\n"
+    "#define JOLT_FORK_REPROTECT() pthread_atfork(NULL, NULL, jolt_fork_child_reprotect)\n"
+    "#else\n"
+    "#define JOLT_FORK_REPROTECT() ((void)0)\n"
+    "#endif\n"))
+
+;; The registration: the first statement of main, before Chez runs any code.
+(define (bld-fork-reprotect-call)
+  "  JOLT_FORK_REPROTECT();\n")
 
 ;; --- legacy cc link (dev bin/jolt): fresh Chez compile + xxd + cc ------------
 (define (build-with-cc entry-ns out-path mode builddir units boot boot-h main-c native-link petite-only?)
