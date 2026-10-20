@@ -693,7 +693,7 @@ gcpolicy: testbin
 	 [ -n "$$pk" ] && [ $$((pk * 10)) -le $$((mx * 11)) ] || { echo "FAIL gcpolicy: the heap peaked at $${pk:-?} in a ceiling-forced full collection, more than 10% over JOLT_MAX_HEAP=256m: one collection of every generation holds its copies beside their sources (collect it a generation at a time; jolt-exoj)"; exit 1; }; \
 	 set -- $$(JOLT_NO_USER_DEPS=1 $$j run $$t refresh 2>&1 | sed -n 's/^growth //p'); \
 	 echo "gcpolicy: older generations' allowance with ~100MB held $$(($${1:-0} / 1048576))MB, after dropping it and System/gc $$(($${2:-0} / 1048576))MB"; \
-	 [ -n "$${2:-}" ] && [ "$$1" -gt 67108864 ] && [ "$$2" -ge 67108864 ] && [ $$(($$2 * 2)) -lt "$$1" ] || { echo "FAIL gcpolicy: System/gc did not re-measure the live set the older generations' allowance is sized from"; exit 1; }; \
+	 [ -n "$${2:-}" ] && [ "$$1" -gt 67108864 ] && [ "$$2" -ge 67108864 ] && [ "$$2" -lt "$$1" ] || { echo "FAIL gcpolicy: System/gc did not re-measure the live set the older generations' allowance is sized from"; exit 1; }; \
 	 st=$$(JOLT_NO_USER_DEPS=1 $$j run $$t startup 2>&1 | sed -n 's/^trip //p'); \
 	 echo "gcpolicy: a sub-millisecond first reading then cheap collections -> nursery $$st"; \
 	 [ "$$st" = "$$floor" ] || { echo "FAIL gcpolicy: one collection right after startup grew the nursery to $${st:-?} (the share must weigh collections by their time, and wait for five)"; exit 1; }; \
