@@ -189,7 +189,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost recordshadow emittedheads adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotcachesourcepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
   systemstreams closedstdout stderrsplit userdirpaths utf8decode \
-  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest monitorescape windescape threadsafety maskedacquire ioerrno cas flow
+  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest monitorescape windescape threadsafety maskedacquire staticcodeshare ioerrno cas flow
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -1044,6 +1044,12 @@ threadsafety:
 # of the whole process, so the script runs the gate under an outside deadline.
 maskedacquire:
 	@sh host/chez/masked-acquire-gate.sh $(CHEZ)
+
+# A fork()ed child shares its parent's static code copy-on-write on macOS arm64
+# when CHEZ_SHARE_STATIC_CODE=1 (chez-patches/0007); skipped elsewhere, where
+# fork already shares it.
+staticcodeshare:
+	@sh test/chez/static-code-share-test.sh "$(CHEZ)"
 
 # A read or write the OS refuses is an IOException carrying the errno's text
 # ("Invalid argument"), as on the JDK, not Chez's rendering with the port in it.
