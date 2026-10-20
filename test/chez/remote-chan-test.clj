@@ -4,7 +4,7 @@
 ;; Run: bin/jolt run test/chez/remote-chan-test.clj   (prints REMOTE-CHAN-TEST OK)
 ;;
 ;; Children come from a fork server: a single-threaded process forked from this one
-;; before anything here starts a thread, as Seon's agents come from theirs. Each
+;; before anything here starts a thread, as a supervisor's workers usually do. Each
 ;; child's descriptors reach the server by SCM_RIGHTS (send-fd!), so passing an end to
 ;; another process is proven on every spawn. Why a server: Chez's parallel collector
 ;; keeps sweeper threads, made the first time a collection finds other threads waiting;

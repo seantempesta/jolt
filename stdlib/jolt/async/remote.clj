@@ -43,7 +43,7 @@
 ;; collection finds other threads waiting, and keeps them; a child of a process that
 ;; has them hangs in its first such collection). A single-threaded fork server, forked
 ;; before anything starts a thread, is that process. A child forked from a threaded
-;; process (a test child of an agent) can still use the descriptors it inherited raw,
+;; process (a test child of a worker) can still use the descriptors it inherited raw,
 ;; with no pump.
 ;;
 ;; The codec is a seam: {:encode (fn [v] byte-array) :decode (fn [byte-array] v)}.
