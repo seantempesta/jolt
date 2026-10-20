@@ -68,6 +68,13 @@
 ;;                      binary read 0.29 to 0.53 across nursery sizes, and CI
 ;;                      runners 0.81 and 0.87 against the 0.8 ceiling.
 ;;
+;;   arraycopy-object   System/arraycopy between two Object[] stepped through
+;;                      ja-ref/ja-set! one slot at a time, ~7.7 ns a slot,
+;;                      though both backings are plain vectors and every other
+;;                      same-backing pair was already one block move. The
+;;                      reference arm is aclone of the same array, a block copy
+;;                      into a fresh vector (4.2 -> 0.33).
+;;
 ;;   substring-scan     str-index-of is the widest-reach scan in the string
 ;;                      layer: indexOf, contains, literal split and both literal
 ;;                      replaces all run it once per character. It called
@@ -456,6 +463,13 @@
   ;; ...and a char array must take half the heap of a long array of the same
   ;; length, because its backing is half as wide and is never traced.
   (judge-bytes! "char-alloc" #(long-array 65536) #(char-array 65536) 0.8)
+
+  ;; Copying between two Object[] must cost about what cloning one costs.
+  (let [src (object-array (range 4096)) dst (object-array 4096)]
+    (judge! "arraycopy-object"
+            #(dotimes [_ 200] (aclone src))
+            #(dotimes [_ 200] (System/arraycopy src 0 dst 0 4096))
+            1.5 2.2))
 
   ;; Searching for a multi-character needle must cost about what searching for a
   ;; single CHARACTER costs — the reference arm takes str-char-index, which never
