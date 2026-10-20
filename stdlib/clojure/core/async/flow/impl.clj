@@ -98,22 +98,6 @@
 
 (defn- set-diff [a b] (into #{} (remove b) a))
 
-(defn- plan-diff
-  "What an update must do, as data: pids to stop, start, keep; in-chans to drop and make."
-  [old-plans new-plans]
-  (let [old-pids (set (keys old-plans)) new-pids (set (keys new-plans))
-        both (into #{} (filter old-pids) new-pids)
-        kept (into #{} (filter #(= (:fingerprint (old-plans %)) (:fingerprint (new-plans %)))) both)
-        changed (set-diff both kept)
-        old-ins (into {} (mapcat :ins) (vals old-plans))
-        new-ins (into {} (mapcat :ins) (vals new-plans))
-        same-in? (fn [coord] (and (contains? old-ins coord) (contains? new-ins coord) (= (old-ins coord) (new-ins coord))))]
-    {:stop (into (set-diff old-pids new-pids) changed)
-     :start (into (set-diff new-pids old-pids) changed)
-     :kept kept
-     :drop-ins (into #{} (remove same-in?) (keys old-ins))
-     :make-ins (into #{} (remove same-in?) (keys new-ins))}))
-
 (defn- make-chan [error-chan [[pid cid] {:keys [buf-or-n xform]}]]
   (if xform
     (async/chan buf-or-n xform
@@ -220,12 +204,36 @@
         apply! (fn [{:keys [procs conns]}]
                  (let [t0 (System/nanoTime)
                        old @rt
-                       ;; a proc whose definition is the identical value keeps its plan
-                       plans (into {} (map (fn [[pid d]] [pid (if (identical? d (get-in old [:defs pid])) (get-in old [:plans pid]) (proc-plan pid d))]))
-                                   procs)
-                       cmap (conn-map plans conns)
-                       {:keys [stop start drop-ins make-ins kept]} (plan-diff (:plans old) plans)
-                       new-ins (into {} (mapcat :ins) (vals plans))
+                       old-defs (:defs old {})
+                       old-plans (:plans old {})
+                       ;; only definitions that are not the identical value are planned again:
+                       ;; an update costs what changed, not the graph's size
+                       touched (-> #{}
+                                   (into (remove #(identical? (old-defs %) (procs %))) (keys procs))
+                                   (into (remove #(contains? procs %)) (keys old-defs)))
+                       fresh (into {} (keep (fn [pid] (when-let [d (procs pid)] [pid (proc-plan pid d)]))) touched)
+                       kept? (fn [pid] (and (fresh pid) (old-plans pid)
+                                            (= (:fingerprint (old-plans pid)) (:fingerprint (fresh pid)))))
+                       stop (into #{} (filter #(and (old-plans %) (not (kept? %)))) touched)
+                       start (into #{} (filter #(and (fresh %) (not (kept? %)))) touched)
+                       plans (reduce (fn [m pid] (cond (kept? pid) m
+                                                       (fresh pid) (assoc m pid (fresh pid))
+                                                       :else (dissoc m pid)))
+                                     old-plans touched)
+                       ;; in-chans survive by coord and options
+                       old-ins (into {} (mapcat :ins) (keep old-plans stop))
+                       new-ins (into {} (mapcat :ins) (keep plans start))
+                       same-in? (fn [c] (and (contains? old-ins c) (contains? new-ins c) (= (old-ins c) (new-ins c))))
+                       drop-ins (into #{} (remove same-in?) (keys old-ins))
+                       make-ins (into #{} (remove same-in?) (keys new-ins))
+                       ;; routes change only when the conns do, or a connected proc changed
+                       same-conns? (and (:cmap old) (identical? conns (:conns old)))
+                       conn-pids (if same-conns?
+                                   (:conn-pids old)
+                                   (into #{} (mapcat (fn [[out in]] [(first out) (first in)])) conns))
+                       rewire? (or (not same-conns?) (some conn-pids touched))
+                       cmap (if rewire? (conn-map plans conns) (:cmap old))
+                       kept (- (count plans) (count start))
                        ;; 1. the new in-chans (and castees)
                        in-chans (-> (apply dissoc (:in-chans old) drop-ins)
                                     (into (map (fn [k] [k (make-chan (:error old) [k (new-ins k)])])) make-ins))
@@ -234,11 +242,14 @@
                                                               :chan (async/chan (async/sliding-buffer 100))}]))
                                          start))
                        ;; 2. routes and mults: a producer's next send goes the new way
-                       new-outs (into {} (mapcat :outs) (vals plans))
-                       live-mults (into {} (filter (comp #(contains? new-outs %) key)) (:mults old))
-                       [rts mults] (routes-for in-chans cmap live-mults)
-                       mults (retap! mults cmap in-chans)]
-                   (swap! rt assoc :plans plans :defs procs :in-chans in-chans :castees castees :routes rts :mults mults)
+                       [rts mults] (if rewire?
+                                     (let [new-outs (into {} (mapcat :outs) (vals plans))
+                                           live-mults (into {} (filter (comp #(contains? new-outs %) key)) (:mults old))
+                                           [rts mults] (routes-for in-chans cmap live-mults)]
+                                       [rts (retap! mults cmap in-chans)])
+                                     [(:routes old) (:mults old)])]
+                   (swap! rt assoc :plans plans :defs procs :conns conns :conn-pids conn-pids :cmap cmap
+                          :in-chans in-chans :castees castees :routes rts :mults mults)
                    ;; 3. stop removed and changed procs, awaiting each exit; one that missed
                    ;; its bound is never started twice (every later update retries it)
                    (let [pending (:pending-exit old #{})
@@ -252,7 +263,7 @@
                          lost (into {} (map (fn [k] [k (drain! (get-in old [:in-chans k]))])) drop-ins)
                          ;; 6. start added and changed procs
                          _ (doseq [pid start] (start-proc! rt execs (plans pid)))]
-                     {:stopped stop :started start :kept (count kept)
+                     {:stopped stop :started start :kept kept
                       :lost (into {} (filter (comp pos? val)) lost)
                       :missed-exit missed
                       :ms (/ (- (System/nanoTime) t0) 1e6)})))]
