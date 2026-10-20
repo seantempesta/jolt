@@ -248,7 +248,16 @@
                            #t)
                       (and (jch-isa? tag "java.util.Set") #t)))
             ;; slot 13: jrec-dash-field-index's answers, "-name" -> slot or #f
-            (make-weak-eq-hashtable))))
+            (make-weak-eq-hashtable)
+            ;; slot 14: which fields are ^double (records.ss jrec-dbl-flags), the
+            ;; vector chez-record-dbl-tbl holds for the tag, or #f when the type
+            ;; declares none. Read on every set! of a deftype field.
+            (let ((raw (hashtable-ref chez-record-dbl-tbl tag #f)))
+              (and raw
+                   (let loop ((i 0))
+                     (cond ((fx=? i (vector-length raw)) #f)
+                           ((vector-ref raw i) raw)
+                           (else (loop (fx+ i 1))))))))))
 (define (jrdesc-ifc-of x)
   (let* ((d (jrec-desc x))
          (c (jrdesc-ifc d)))

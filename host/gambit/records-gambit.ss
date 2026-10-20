@@ -152,69 +152,72 @@
            (error 'jrec-field-ref "not a fielded record" r))))))
 
 (define (jrec-field-set! r i v)
-  (cond
-    ((jrec1? r)
-     (case i
-       ((0) (jrec1-f0-set! r v))
-       (else (error 'jrec-field-set! "index out of range" i))))
-    ((jrec2? r)
-     (case i
-       ((0) (jrec2-f0-set! r v))
-       ((1) (jrec2-f1-set! r v))
-       (else (error 'jrec-field-set! "index out of range" i))))
-    ((jrec3? r)
-     (case i
-       ((0) (jrec3-f0-set! r v))
-       ((1) (jrec3-f1-set! r v))
-       ((2) (jrec3-f2-set! r v))
-       (else (error 'jrec-field-set! "index out of range" i))))
-    ((jrec4? r)
-     (case i
-       ((0) (jrec4-f0-set! r v))
-       ((1) (jrec4-f1-set! r v))
-       ((2) (jrec4-f2-set! r v))
-       ((3) (jrec4-f3-set! r v))
-       (else (error 'jrec-field-set! "index out of range" i))))
-    ((jrec5? r)
-     (case i
-       ((0) (jrec5-f0-set! r v))
-       ((1) (jrec5-f1-set! r v))
-       ((2) (jrec5-f2-set! r v))
-       ((3) (jrec5-f3-set! r v))
-       ((4) (jrec5-f4-set! r v))
-       (else (error 'jrec-field-set! "index out of range" i))))
-    ((jrec6? r)
-     (case i
-       ((0) (jrec6-f0-set! r v))
-       ((1) (jrec6-f1-set! r v))
-       ((2) (jrec6-f2-set! r v))
-       ((3) (jrec6-f3-set! r v))
-       ((4) (jrec6-f4-set! r v))
-       ((5) (jrec6-f5-set! r v))
-       (else (error 'jrec-field-set! "index out of range" i))))
-    ((jrec7? r)
-     (case i
-       ((0) (jrec7-f0-set! r v))
-       ((1) (jrec7-f1-set! r v))
-       ((2) (jrec7-f2-set! r v))
-       ((3) (jrec7-f3-set! r v))
-       ((4) (jrec7-f4-set! r v))
-       ((5) (jrec7-f5-set! r v))
-       ((6) (jrec7-f6-set! r v))
-       (else (error 'jrec-field-set! "index out of range" i))))
-    ((jrec8? r)
-     (case i
-       ((0) (jrec8-f0-set! r v))
-       ((1) (jrec8-f1-set! r v))
-       ((2) (jrec8-f2-set! r v))
-       ((3) (jrec8-f3-set! r v))
-       ((4) (jrec8-f4-set! r v))
-       ((5) (jrec8-f5-set! r v))
-       ((6) (jrec8-f6-set! r v))
-       ((7) (jrec8-f7-set! r v))
-       (else (error 'jrec-field-set! "index out of range" i))))
-    ((jrec*? r) (vector-set! (jrec*-vals r) i v))
-    (else (error 'jrec-field-set! "not a fielded record" r))))
+  (let ((n (jrdesc-nfields (jrec-desc r))))
+    (case n
+      ((1)
+       (case i
+         ((0) (jrec1-f0-set! r v))
+         (else (error 'jrec-field-set! "index out of range" i))))
+      ((2)
+       (case i
+         ((0) (jrec2-f0-set! r v))
+         ((1) (jrec2-f1-set! r v))
+         (else (error 'jrec-field-set! "index out of range" i))))
+      ((3)
+       (case i
+         ((0) (jrec3-f0-set! r v))
+         ((1) (jrec3-f1-set! r v))
+         ((2) (jrec3-f2-set! r v))
+         (else (error 'jrec-field-set! "index out of range" i))))
+      ((4)
+       (case i
+         ((0) (jrec4-f0-set! r v))
+         ((1) (jrec4-f1-set! r v))
+         ((2) (jrec4-f2-set! r v))
+         ((3) (jrec4-f3-set! r v))
+         (else (error 'jrec-field-set! "index out of range" i))))
+      ((5)
+       (case i
+         ((0) (jrec5-f0-set! r v))
+         ((1) (jrec5-f1-set! r v))
+         ((2) (jrec5-f2-set! r v))
+         ((3) (jrec5-f3-set! r v))
+         ((4) (jrec5-f4-set! r v))
+         (else (error 'jrec-field-set! "index out of range" i))))
+      ((6)
+       (case i
+         ((0) (jrec6-f0-set! r v))
+         ((1) (jrec6-f1-set! r v))
+         ((2) (jrec6-f2-set! r v))
+         ((3) (jrec6-f3-set! r v))
+         ((4) (jrec6-f4-set! r v))
+         ((5) (jrec6-f5-set! r v))
+         (else (error 'jrec-field-set! "index out of range" i))))
+      ((7)
+       (case i
+         ((0) (jrec7-f0-set! r v))
+         ((1) (jrec7-f1-set! r v))
+         ((2) (jrec7-f2-set! r v))
+         ((3) (jrec7-f3-set! r v))
+         ((4) (jrec7-f4-set! r v))
+         ((5) (jrec7-f5-set! r v))
+         ((6) (jrec7-f6-set! r v))
+         (else (error 'jrec-field-set! "index out of range" i))))
+      ((8)
+       (case i
+         ((0) (jrec8-f0-set! r v))
+         ((1) (jrec8-f1-set! r v))
+         ((2) (jrec8-f2-set! r v))
+         ((3) (jrec8-f3-set! r v))
+         ((4) (jrec8-f4-set! r v))
+         ((5) (jrec8-f5-set! r v))
+         ((6) (jrec8-f6-set! r v))
+         ((7) (jrec8-f7-set! r v))
+         (else (error 'jrec-field-set! "index out of range" i))))
+      (else
+       (if (jrec*? r)
+           (vector-set! (jrec*-vals r) i v)
+           (error 'jrec-field-set! "not a fielded record" r))))))
 
 (define (jrec-field-at r i k)
   (cond
@@ -718,16 +721,17 @@
 
 (def-var! "clojure.core" "__deftype-field" jrec-field)
 
+(define (jrec-dbl-flags inst)
+  (vector-ref (jrdesc-ifc-of inst) 14))
+
 (define (jolt-set-field! inst k v)
   (if (jrec? inst)
-      (let ((i (let ((k2 (and (keyword-t? k)
-                              (jrec-member-field inst k))))
-                 (and k2 (jrec-field-index inst k2)))))
+      (let ((i (or (and (keyword-t? k) (jrec-field-index inst k))
+                   (let ((k2 (and (keyword-t? k)
+                                  (jrec-member-field inst k))))
+                     (and k2 (jrec-field-index inst k2))))))
         (if i
-            (let* ((flags (hashtable-ref
-                            chez-record-dbl-tbl
-                            (jrec-tag inst)
-                            #f))
+            (let* ((flags (jrec-dbl-flags inst))
                    (v2 (if (and flags
                                 (fx< i (vector-length flags))
                                 (vector-ref flags i)
@@ -1018,7 +1022,14 @@
                    (jch-isa? tag "clojure.lang.MapEquivalence"))
                #t)
           (and (jch-isa? tag "java.util.Set") #t)))
-      (make-weak-eq-hashtable))))
+      (make-weak-eq-hashtable)
+      (let ((raw (hashtable-ref chez-record-dbl-tbl tag #f)))
+        (and raw
+             (let loop ((i 0))
+               (cond
+                 ((fx=? i (vector-length raw)) #f)
+                 ((vector-ref raw i) raw)
+                 (else (loop (fx+ i 1))))))))))
 
 (define (jrdesc-ifc-of x)
   (let* ((d (jrec-desc x)) (c (jrdesc-ifc d)))
