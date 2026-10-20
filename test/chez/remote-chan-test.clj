@@ -128,11 +128,13 @@
 
 (defn spawn!
   "Run body k in a fresh child of the fork server with descriptors fds (closed here
-  once handed over). Answers the child's pid."
+  once the server has answered). Answers the child's pid."
   [k & fds]
   (write-bytes! ctl (byte-array [(count fds) (.indexOf ^java.util.List body-keys k)]))
-  (doseq [fd fds] (r/send-fd! ctl fd) (r/close-fd! fd))
+  (doseq [fd fds] (r/send-fd! ctl fd))
   (let [b (read-bytes! ctl 4)]
+    ;; close our copies only once the server has them: see send-fd!
+    (run! r/close-fd! fds)
     (reduce + (map-indexed (fn [i x] (bit-shift-left (bit-and x 0xff) (* 8 i))) b))))
 
 ;; ---- 1. FIFO per direction, in one process and across a fork ----------------------
@@ -189,6 +191,19 @@
       (check "SIGKILL of the peer: a pending take answers nil" (and (nil? v) (< ms 2000)) {:v v :ms ms})
       (println "   death seen as close after" ms "ms")))
   (check "after the peer's death a put answers false" (false? (a/>!! (:out e) 1))))
+
+;; close! of several ends, then at once a new child whose descriptor is in flight to
+;; the fork server (SCM_RIGHTS): the new child must still connect. close! used to
+;; shutdown(SHUT_RD) its socket, and on macOS that broke the socket in flight (its
+;; child read EOF at once), about one batch in two.
+(let [ok (for [_ (range 6)]
+           (let [ends (vec (for [_ (range 3)] (let [[e fd] (r/remote-pair)] (spawn! :echo-inc fd) e)))]
+             (doseq [e ends] (a/>!! (:out e) 1))
+             (let [firsts (mapv #(take-within 5000 (:in %)) ends)]
+               (doseq [e ends] (r/close! e))
+               firsts)))]
+  (check "six batches: close! three ends, spawn the next three at once; every child answers"
+         (every? #(= [2 2 2] %) ok) (vec ok)))
 
 ;; a value put before the peer's end frame still arrives, then nil (graceful close)
 (let [[e fd] (r/remote-pair)]

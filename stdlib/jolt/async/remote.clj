@@ -138,8 +138,11 @@
 
 (defn send-fd!
   "Hand descriptor fd to the process at the other end of unix socket s (SCM_RIGHTS),
-  with one byte of data. The receiver gets its own descriptor for the same socket;
-  close this one after. Answers true, or the errno."
+  with one byte of data. The receiver gets its own descriptor for the same socket.
+  Close this one only after the receiver has answered that it holds it: on macOS a
+  socket whose only reference is in flight was measured to be discarded (its
+  receiver reads EOF at once) when other unix sockets of the process close
+  meanwhile. Answers true, or the errno."
   [s fd]
   (let [m (ffi/alloc (+ 48 16 8 cmsg-space))
         iov (+ (ffi/address m) 48) one (+ iov 16) ctl (+ one 8)]
@@ -241,8 +244,13 @@
   "One pump is done; the second to finish closes the descriptor. Under the end's
   lock, with close!: once closed, the number may belong to a new socket, so nothing
   may touch it after this."
-  [{:keys [fd ::lock ::live]}]
-  (locking lock (when (zero? (vswap! live dec)) (close-fd! fd))))
+  [{:keys [fd pump ::lock ::live]}]
+  (locking lock
+    (when (zero? (vswap! live dec))
+      ;; the poller keeps per-number state (a ready mark, a cancel): drop it, or the
+      ;; next socket given this number inherits it
+      (when (= pump :fiber) (poller/forget! fd))
+      (close-fd! fd))))
 
 (defn- dead!
   "The peer is gone: both halves close locally (a take drains :in, then nil)."
@@ -330,7 +338,8 @@
 (defn remote-pair
   "[end fd]: an end in this process, and the raw descriptor of the other end for the
   peer process: a child forked next inherits it (then close it here with close-fd!),
-  or send-fd! hands it to a running process. The peer calls (open fd opts).
+  or send-fd! hands it to a running process (close it here once that process has
+  answered). The peer calls (open fd opts).
   opts: open's, plus :sock-buf (socketpair's)."
   ([] (remote-pair {}))
   ([opts]
