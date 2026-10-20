@@ -53,7 +53,11 @@
                            "clojure.core.async.impl.protocols/ReadPort"}
                          class-name)
               (clojure.core.async/chan? val))
-     true)))
+     true))
+ ;; the claim: it answers only for these names, so instance? of any other class
+ ;; never calls it and its verdict stays memoized
+ {:classes #{"clojure.core.async.impl.protocols.ReadPort"
+             "clojure.core.async.impl.protocols/ReadPort"}})
 
 ;; The method body is load-bearing, not decoration: extend-type with no methods
 ;; registers no impl at all, and satisfies? stays false.

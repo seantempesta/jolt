@@ -118,6 +118,10 @@
 (define (make-class-obj name) (make-jhost "class" (vector name)))
 (define (jclass? x) (and (jhost? x) (string=? (jhost-tag x) "class")))
 (define (jclass-name x) (vector-ref (jhost-state x) 0))
+;; two distinct Class tokens, for the eq and hash registries' fast-path probes
+;; (values.ss): jolt=2 and jolt-hash answer Class tokens ahead of the arm walk
+(define jclass-fast-type-probes
+  (cons (make-class-obj "jolt.lang.FastProbeA") (make-class-obj "jolt.lang.FastProbeB")))
 ;; The name a class token PRESENTS — .getName, toString, print: the JVM spelling.
 ;; A deftype's registered name is its namespace as written (rf.def-two.R3); the
 ;; JVM munges the dash (rf.def_two.R3), and that is the spelling a record literal
@@ -198,9 +202,11 @@
 ;; = compares jclass values by name (stable interning makes this eq?-level);
 ;; strings are no longer = to a jclass — class-key survives for internal
 ;; dispatch boundaries only (multimethod tables, catch dispatch, isa?).
-(register-eq-arm! (lambda (a b) (and (jclass? a) (jclass? b)))
-                  (lambda (a b) (let ((ka (class-key a)) (kb (class-key b)))
-                                  (and ka kb (string=? ka kb) #t))))
+;; Two Class tokens are answered by jolt=2 itself (values.ss), ahead of the arm
+;; walk, with this comparison; the pair is in eq-fast-probes.
+(define (jclass=? a b)
+  (let ((ka (class-key a)) (kb (class-key b)))
+    (and ka kb (string=? ka kb) #t)))
 ;; A deftype/defrecord TYPE TOKEN and (class inst) are the same Class object on
 ;; the JVM — identical?, not merely =. jolt spells them differently (the token is
 ;; the ctor procedure, so it stays callable) and they compared unequal, so
@@ -215,7 +221,7 @@
                         (and (jclass? b) (procedure? a) (deftype-ctor-tag a) #t)))
                   (lambda (a b) (let ((ka (class-key a)) (kb (class-key b)))
                                   (and ka kb (string=? ka kb) #t))))
-(register-hash-arm! jclass? (lambda (x) (jolt-hash (jclass-name x))))
+;; a Class token hashes by its name: jolt-hash / jolt-hasheq answer it ahead of the walk
 ;; The nine primitive classes. jolt names them exactly as the JVM does — the
 ;; class `long` is spelled "long" — and they are in no class graph row, so this
 ;; literal set is what tells them from a reference class.

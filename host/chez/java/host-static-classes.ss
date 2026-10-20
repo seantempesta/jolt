@@ -2266,17 +2266,21 @@
   (lambda (type-sym val)
     (let ((tname (symbol-t-name type-sym)))
       (let loop ((fs user-instance-checks))
-        (if (null? fs)
-            'pass
-            (let ((r (seam-invoke2 (car fs) tname val)))
-              (if (jolt-nil? r) (loop (cdr fs)) (if (jolt-truthy? r) #t #f))))))))
+        (cond ((null? fs) 'pass)
+              ;; an entry is (fn . claim): an arm is not asked what its claim excludes
+              ((not (instance-claim-covers? (cdar fs) tname val)) (loop (cdr fs)))
+              (else
+               (let ((r (seam-invoke2 (caar fs) tname val)))
+                 (if (jolt-nil? r) (loop (cdr fs)) (if (jolt-truthy? r) #t #f)))))))))
 ;; the bump retires every instance? answer cached while no library arm existed
 ;; (records-interop.ss jolt-instance-site) — the arm may claim any of them now
 (def-var! "clojure.core" "__register-instance-check!"
-  (lambda (f)
-    (set! user-instance-checks (append user-instance-checks (list f)))
-    (set! instance-arms-epoch (fx+ instance-arms-epoch 1))
-    jolt-nil))
+  (case-lambda
+    ((f) ((var-deref "clojure.core" "__register-instance-check!") f jolt-nil))
+    ((f opts)
+     (set! user-instance-checks (append user-instance-checks (list (cons f (seam-instance-claim opts)))))
+     (set! instance-arms-epoch (fx+ instance-arms-epoch 1))
+     jolt-nil)))
 
 ;; ---- value-semantics seams -------------------------------------------------
 ;; A seam fn is jolt code the HOST calls, from inside =/hash/str/compare/class of
@@ -2302,31 +2306,66 @@
 ;; eq, an integer for hash/compare, a string for str/pr). pred should be cheap
 ;; and return false for values it doesn't own — it runs on the slow path of every
 ;; =/hash/compare/print.
+;;
+;; Each takes an optional last argument, the arm's CLAIM, as data: {:kind :table}
+;; says the arm only ever owns host tables (jolt.host/table?, the representation
+;; jolt-lang/time and jolt-lang/crypto build their values from). The runtime then
+;; tests the kind itself, in Scheme, and never calls the Clojure predicate for a
+;; value of another kind: a UUID compare, a record's instance? check or a class
+;; token's hash stops paying every library's predicate. An arm without a claim
+;; may own anything and is asked for every value, as before. An instance? arm may
+;; also say {:classes #{"a.B" ...}}: it only answers for those class names.
+(define seam-kw-kind (keyword #f "kind"))
+(define seam-kw-table (keyword #f "table"))
+(define seam-kw-classes (keyword #f "classes"))
+(define (seam-claims-tables? opts)
+  (and (pmap? opts) (eq? (jolt-get opts seam-kw-kind jolt-nil) seam-kw-table)))
+;; an instance? arm's claim: #f (none) or (tables-only? . class-names|#f), where
+;; {:classes #{"a.B" ...}} says the arm only answers for those class names
+(define (seam-instance-claim opts)
+  (and (pmap? opts)
+       (let ((cs (jolt-get opts seam-kw-classes jolt-nil)))
+         (cons (seam-claims-tables? opts)
+               (and (not (jolt-nil? cs)) (jt-jolt-strs->list cs))))))
+(define (seam-pred1 pred opts)
+  (if (seam-claims-tables? opts)
+      (lambda (x) (and (htable? x) (jolt-truthy? (seam-invoke1 pred x))))
+      (lambda (x) (jolt-truthy? (seam-invoke1 pred x)))))
+(define (seam-pred2 pred opts)
+  (if (seam-claims-tables? opts)
+      (lambda (a b) (and (or (htable? a) (htable? b)) (jolt-truthy? (seam-invoke2 pred a b))))
+      (lambda (a b) (jolt-truthy? (seam-invoke2 pred a b)))))
 (def-var! "clojure.core" "__register-eq!"
-  (lambda (pred handler)
-    (register-eq-arm! (lambda (a b) (jolt-truthy? (seam-invoke2 pred a b)))
-                      (lambda (a b) (jolt-truthy? (seam-invoke2 handler a b))))
-    jolt-nil))
+  (case-lambda
+    ((pred handler) ((var-deref "clojure.core" "__register-eq!") pred handler jolt-nil))
+    ((pred handler opts)
+     (register-eq-arm! (seam-pred2 pred opts)
+                       (lambda (a b) (jolt-truthy? (seam-invoke2 handler a b))))
+     jolt-nil)))
 (def-var! "clojure.core" "__register-hash!"
-  (lambda (pred handler)
-    (register-hash-arm! (lambda (x) (jolt-truthy? (seam-invoke1 pred x)))
-                        (lambda (x) (seam-invoke1 handler x)))
-    jolt-nil))
+  (case-lambda
+    ((pred handler) ((var-deref "clojure.core" "__register-hash!") pred handler jolt-nil))
+    ((pred handler opts)
+     (register-hash-arm! (seam-pred1 pred opts) (lambda (x) (seam-invoke1 handler x)))
+     jolt-nil)))
 (def-var! "clojure.core" "__register-str!"
-  (lambda (pred render)
-    (register-str-render! (lambda (x) (jolt-truthy? (seam-invoke1 pred x)))
-                          (lambda (x) (seam-invoke1 render x)))
-    jolt-nil))
+  (case-lambda
+    ((pred render) ((var-deref "clojure.core" "__register-str!") pred render jolt-nil))
+    ((pred render opts)
+     (register-str-render! (seam-pred1 pred opts) (lambda (x) (seam-invoke1 render x)))
+     jolt-nil)))
 (def-var! "clojure.core" "__register-pr!"
-  (lambda (pred render)
-    (register-pr-arm! (lambda (x) (jolt-truthy? (seam-invoke1 pred x)))
-                      (lambda (x) (seam-invoke1 render x)))
-    jolt-nil))
+  (case-lambda
+    ((pred render) ((var-deref "clojure.core" "__register-pr!") pred render jolt-nil))
+    ((pred render opts)
+     (register-pr-arm! (seam-pred1 pred opts) (lambda (x) (seam-invoke1 render x)))
+     jolt-nil)))
 (def-var! "clojure.core" "__register-compare!"
-  (lambda (pred handler)
-    (register-compare-arm! (lambda (a b) (jolt-truthy? (seam-invoke2 pred a b)))
-                           (lambda (a b) (seam-invoke2 handler a b)))
-    jolt-nil))
+  (case-lambda
+    ((pred handler) ((var-deref "clojure.core" "__register-compare!") pred handler jolt-nil))
+    ((pred handler opts)
+     (register-compare-arm! (seam-pred2 pred opts) (lambda (a b) (seam-invoke2 handler a b)))
+     jolt-nil)))
 
 ;; __register-class! makes a library's own host values answer (class x)/(type x)
 ;; AND dispatch protocols extended to their class. class-fn returns the class name;
@@ -2345,13 +2384,15 @@
   (let loop ((s (jolt-seq v)) (acc '()))
     (if (jolt-nil? s) (reverse acc) (loop (jolt-seq (jolt-rest s)) (cons (jolt-first s) acc)))))
 (def-var! "clojure.core" "__register-class!"
-  (lambda (pred class-fn tags-fn)
-    (let ((p (lambda (x) (jolt-truthy? (seam-invoke1 pred x)))))
+  (case-lambda
+   ((pred class-fn tags-fn) ((var-deref "clojure.core" "__register-class!") pred class-fn tags-fn jolt-nil))
+   ((pred class-fn tags-fn opts)
+    (let ((p (seam-pred1 pred opts)))
       (register-class-arm-checked! p (lambda (x) (seam-invoke1 class-fn x)))
       (set! jt-user-value-tags-arms
             (append jt-user-value-tags-arms
                     (list (cons p (lambda (x) (jt-jolt-strs->list (seam-invoke1 tags-fn x))))))))
-    jolt-nil))
+    jolt-nil)))
 
 ;; values that carry metadata (mirrors jolt-with-meta's set in natives-meta.ss).
 (define (hsc-imeta? x)
