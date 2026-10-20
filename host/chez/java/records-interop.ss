@@ -295,14 +295,27 @@
                             (before (vector-ref e 1)))
                        (cond ((not (eq? before 'pass)) (if before #t #f))
                              ((user-instance-checks-empty?) (if (vector-ref e 2) #t #f))
-                             (else 'uncached)))))))
+                             ;; the library arm must be asked live; ask it here, once,
+                             ;; with the verdict memo already in hand, instead of
+                             ;; answering 'uncached and repeating the whole check
+                             ;; (instance-check -> instance-check-kind: the same
+                             ;; entry, the same arm), which asked the arm twice per miss
+                             (else (cons 'live
+                                         (let ((r (if instance-check-user-arm (instance-check-user-arm ts val) 'pass)))
+                                           (if (eq? r 'pass) (if (vector-ref e 2) #t #f) (if r #t #f)))))))))))
     ;; each entry is published behind a release: on a weakly ordered machine
     ;; (ARM64) another thread could otherwise see the new entry before its slots
-    (if (eq? ans 'uncached)
+    (cond
+      ((eq? ans 'uncached)
         (begin
           (unless same-t (memory-order-release) (vector-set! site 0 (vector t ts tname #f #f -1)))
-          (if (instance-check ts val) #t #f))
-        (begin (memory-order-release) (vector-set! site 0 (vector t ts tname k ans epoch)) ans))))
+          (if (instance-check ts val) #t #f)))
+      ((pair? ans)
+        (begin
+          (unless same-t (memory-order-release) (vector-set! site 0 (vector t ts tname #f #f -1)))
+          (cdr ans)))
+      (else
+        (begin (memory-order-release) (vector-set! site 0 (vector t ts tname k ans epoch)) ans)))))
 
 ;; The plain walk, which the memo must always agree with (the dispatch-caches
 ;; unit rows compare the two).
