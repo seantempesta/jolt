@@ -1593,10 +1593,14 @@
   (guard (e (#t (lambda (r) #f)))
     (record-accessor sa-winder-rtd 0)))
 
-;; (jolt-try-catch raw body handler): a jolt try/catch (backend emit-try on
-;; Chez). Evaluates body; if anything is raised inside it, the stack unwinds to
-;; here (every dynamic-wind after-thunk on the way runs) and handler is
-;; evaluated, in tail position, with raw bound to the raised object.
+;; A jolt try/catch on Chez (backend emit-try) is
+;;
+;;   (call-with-values (lambda () (jolt-try-body body)) (jolt-try-handler raw handler))
+;;
+;; It evaluates body; if anything is raised inside it, the stack unwinds to here
+;; (every dynamic-wind after-thunk on the way runs) and handler is evaluated, in
+;; tail position, with raw bound to the raised object. Body values pass through
+;; as they come, any number of them.
 ;;
 ;; This is R6RS `guard` with an else clause, minus what guard costs on the path
 ;; that does not throw. Chez's $guard (s/exceptions.ss) takes a MULTI-SHOT
@@ -1631,37 +1635,45 @@
 ;; restores its own saved value on the way out, whatever is above it. The
 ;; one-shot k survives a fiber park for the reason continuations.ss gives (the
 ;; park captures and restores the whole segment chain, k's frame included).
-;; Body values pass through as they come, any number of them.
+;;
+;; WHY TWO MACROS and the call-with-values in the emitted text: the frame the
+;; enclosing fn keeps while body runs is the return point of the call/1cc, and a
+;; backtrace reads that fn's line off the source of that call. Chez gives a
+;; macro's OUTERMOST output form the source of the macro use, so jolt-try-body
+;; expands to the call/1cc itself and the emitted (jolt-try-body ...) carries the
+;; try's position. One macro with the call/1cc nested inside its output left the
+;; frame with no source, and the trace fell back to the fn's definition line.
 (define jolt-try-caught (string->uninterned-symbol "jolt-try-caught"))
-(define-syntax jolt-try-catch
+(define-syntax jolt-try-body
   (syntax-rules ()
-    ((_ raw body handler)
-     (call-with-values
-       (lambda ()
-         (call/1cc
-          (lambda (k)
-            (let ((oh (#%$current-handler-stack))
-                  (ow (#%$current-winders)))
-              (letrec ((h (case-lambda
-                            ((c) (k jolt-try-caught c))
-                            (() (let ((cur (#%$current-handler-stack)))
-                                  (#%$current-handler-stack
-                                   (if (and (pair? cur) (eq? (car cur) h))
-                                       (cdr cur)
-                                       (cons h cur))))))))
-                (#%$current-winders
-                 (cons (#%$record sa-winder-rtd h h (#%$current-attachments)) ow))
-                (#%$current-handler-stack (cons h oh))
-                (call-with-values
-                  (lambda () body)
-                  (case-lambda
-                    ((v) (#%$current-handler-stack oh) (#%$current-winders ow) v)
-                    (vs (#%$current-handler-stack oh) (#%$current-winders ow)
-                        (apply values vs)))))))))
-       (case-lambda
-         ((v) v)
-         ((tag raw) (if (eq? tag jolt-try-caught) handler (values tag raw)))
-         (vs (apply values vs)))))))
+    ((_ body)
+     (call/1cc
+      (lambda (k)
+        (let ((oh (#%$current-handler-stack))
+              (ow (#%$current-winders)))
+          (letrec ((h (case-lambda
+                        ((c) (k jolt-try-caught c))
+                        (() (let ((cur (#%$current-handler-stack)))
+                              (#%$current-handler-stack
+                               (if (and (pair? cur) (eq? (car cur) h))
+                                   (cdr cur)
+                                   (cons h cur))))))))
+            (#%$current-winders
+             (cons (#%$record sa-winder-rtd h h (#%$current-attachments)) ow))
+            (#%$current-handler-stack (cons h oh))
+            (call-with-values
+              (lambda () body)
+              (case-lambda
+                ((v) (#%$current-handler-stack oh) (#%$current-winders ow) v)
+                (vs (#%$current-handler-stack oh) (#%$current-winders ow)
+                    (apply values vs)))))))))))
+(define-syntax jolt-try-handler
+  (syntax-rules ()
+    ((_ raw handler)
+     (case-lambda
+       ((v) v)
+       ((tag raw) (if (eq? tag jolt-try-caught) handler (values tag raw)))
+       (vs (apply values vs))))))
 
 
 ;; (sa-current-winders) -> the chain, innermost first.

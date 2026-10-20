@@ -1230,9 +1230,10 @@
 (def ^:private tail-transparent-ops #{:if :do :let :loop :invoke :throw :host-call :try})
 ;; A try is tail-transparent too. With neither a catch nor a finally, emit-try
 ;; emits it as its body and nothing else, so a tail call inside one is a real tail
-;; call. With a catch or a finally the body runs inside a jolt-try-catch (guard on
-;; Gambit) or dynamic-wind, so its last call is not a Chez tail call — but the
-;; try form itself is, and it
+;; call. On Chez a catch's body with no finally is emitted non-tail (emit-try):
+;; the fn's frame stays live under jolt-try-body, so nothing is erased. Otherwise (a finally's
+;; dynamic-wind, Gambit's guard) the body's last call is not a Chez tail call —
+;; but the wind or guard itself is, and it
 ;; erases the enclosing fn's frame all the same. The body's last call is then the
 ;; fn's exit: storing its site and registering it as a tail edge is what lets a
 ;; trace, or Thread.getStackTrace, name the fn the try sat in. Treating the try
@@ -3779,8 +3780,8 @@
 
 ;; try/catch/finally. throw raises a Chez condition wrapping the jolt value
 ;; (jolt-throw = Scheme `raise` of a &jolt-throw condition); catch lowers to
-;; jolt-try-catch on Chez (scheme-adapter-runtime.ss: guard's semantics on a
-;; one-shot escape) and to `guard` on Gambit. The raw binding is unwrapped via
+;; jolt-try-body / jolt-try-handler on Chez (scheme-adapter-runtime.ss: guard's
+;; semantics on a one-shot escape) and to `guard` on Gambit. The raw binding is unwrapped via
 ;; jolt-unwrap-throw so the catch var
 ;; receives the jolt value (preserving ex-data/ex-message and the backtrace
 ;; identity tag). finally lowers to `dynamic-wind`'s after-thunk, and runs on
@@ -3834,12 +3835,26 @@
                                   "(jolt-catch-complete!) r)"
                                   (if cl ")" "")
                                   ")")]
-                 ;; Chez: jolt-try-catch (scheme-adapter-runtime.ss), a one-shot
-                 ;; escape and a hand-pushed handler — 160 B and ~8 ns per entry
-                 ;; against guard's 297 B and ~18 ns. Gambit keeps R7RS guard.
+                 ;; Chez: jolt-try-body / jolt-try-handler (scheme-adapter-runtime.ss),
+                 ;; a one-shot escape and a hand-pushed handler — 160 B and ~8 ns per
+                 ;; entry against guard's 297 B and ~18 ns. Gambit keeps R7RS guard.
                  (if (= :gambit (target))
                    (str "(guard (" raw " (else " handler ")) " (emit (:body node)) ")")
-                   (str "(jolt-try-catch " raw " " (emit (:body node)) " " handler ")")))
+                   ;; Without a finally the body is emitted NON-tail: the enclosing
+                   ;; fn's frame stays live under the call/1cc (guard's tail call
+                   ;; erased it), so the body's last call is an ordinary call from
+                   ;; that frame, registered as the fn's callee at its line like any
+                   ;; other. Under a finally the dynamic-wind still erases the fn's
+                   ;; frame, so the body keeps the tail position the wind gives it.
+                   ;; The line marker goes IN FRONT: that live frame is stopped at
+                   ;; the (jolt-try-body ...) call, before any marker the body emits,
+                   ;; so without one there it would read as the fn's definition line.
+                   ;; The body's line where it has one (where the JVM's frame points),
+                   ;; else the try's.
+                   (with-site (if (and (map? (:body node)) (node-line (:body node))) (:body node) node)
+                     (str "(call-with-values (lambda () (jolt-try-body "
+                          (binding [*tail?* (and *tail?* (some? (:finally node)))] (emit (:body node))) ")) "
+                          "(jolt-try-handler " raw " " handler "))"))))
                (emit (:body node)))]
     (if-let [fin (:finally node)]
       ;; The edges are masked against an interrupt's escape. run-interruptible
