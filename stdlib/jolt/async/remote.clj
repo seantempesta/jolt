@@ -238,9 +238,11 @@
   65536)
 
 (defn- finish!
-  "One pump is done; the second to finish closes the descriptor."
-  [{:keys [fd done]}]
-  (when (= 2 (swap! done inc)) (close-fd! fd)))
+  "One pump is done; the second to finish closes the descriptor. Under the end's
+  lock, with close!: once closed, the number may belong to a new socket, so nothing
+  may touch it after this."
+  [{:keys [fd ::lock ::live]}]
+  (locking lock (when (zero? (vswap! live dec)) (close-fd! fd))))
 
 (defn- dead!
   "The peer is gone: both halves close locally (a take drains :in, then nil)."
@@ -300,8 +302,9 @@
 
 (defn open
   "Make an end over connected stream socket fd, which this end then owns: it becomes
-  close-on-fork, and it is closed once both directions are done. Answers
-  {:in ch :out ch :fd fd}.
+  close-on-fork, and it is closed once both directions are done (:fd is then no
+  longer this end's to touch). Answers {:in ch :out ch :fd fd} (plus private keys
+  close! uses).
 
   opts:
     :buf      buffer of :in and of :out (default 16); :in-buf and :out-buf set one
@@ -319,10 +322,10 @@
               :out (a/chan (or out-buf buf))
               :close-in? close-in?
               :encode (:encode codec) :decode (:decode codec)
-              :pump pump :done (atom 0)}]
+              :pump pump ::lock (Object.) ::live (volatile! 2)}]
      (spawn pump #(reader end))
      (spawn pump #(writer end))
-     (select-keys end [:in :out :fd]))))
+     (select-keys end [:in :out :fd ::lock ::live]))))
 
 (defn remote-pair
   "[end fd]: an end in this process, and the raw descriptor of the other end for the
@@ -337,8 +340,9 @@
 (defn close!
   "Close both halves of an end: an end frame follows what was put on :out, and :in
   stops taking from the peer."
-  [{:keys [in out fd]}]
+  [{:keys [in out fd ::lock ::live]}]
+  ;; wake the reader while the descriptor is still this end's (see finish!)
+  (locking lock (when (pos? @live) (c-shutdown fd native/shut-rd)))
   (a/close! out)
   (a/close! in)
-  (c-shutdown fd native/shut-rd)
   nil)

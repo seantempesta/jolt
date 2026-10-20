@@ -151,6 +151,19 @@
     (check "FIFO across a fork (the descriptor passed by SCM_RIGHTS): 10,000 values out and back, in order, then the child's end frame"
            (= (range 1 (inc n)) got) {:count (count got) :head (take 5 got)})))
 
+;; close! after both directions ended must not touch the descriptor number: by then it
+;; may be a new socket's (the bug: close! shut down whatever socket had reused it)
+(let [[x fd] (r/remote-pair) y (r/open fd)]
+  (a/close! (:out y)) (a/close! (:out x))
+  (check "both directions ended: both :in channels close" (and (nil? (take-within 5000 (:in x))) (nil? (take-within 5000 (:in y)))))
+  (await-until 2000 #(neg? (c-fcntl (:fd x) 1 0)))        ; the pumps closed x's descriptor
+  (let [[p pfd] (r/remote-pair) q (r/open pfd)]
+    (r/close! x) (r/close! y)                               ; late closes of the old ends
+    (a/>!! (:out p) :still-open)
+    (check "a late close! leaves a new socket that reused the number alone"
+           (= :still-open (take-within 5000 (:in q))) {:old (:fd x) :new [(:fd p) (:fd q)]})
+    (r/close! p) (r/close! q)))
+
 ;; ---- 2. back-pressure: nothing lost, and the sender really waits -------------------
 (let [[e fd] (r/remote-pair {:buf 4 :sock-buf 8192}) y (r/open fd {:buf 4})
       n 20000 sent (atom 0)
