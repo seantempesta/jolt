@@ -8,7 +8,8 @@
   (:require [clojure.core.async :as async]
             [clojure.core.async.flow :as flow]
             [clojure.core.async.impl.dispatch :as dispatch]
-            [jolt.fibers :as fib])
+            [jolt.fibers :as fib]
+            [jolt.scheme])
   (:import [java.util.concurrent Executor ExecutorService Future FutureTask
             Executors TimeUnit ExecutionException]))
 
@@ -201,6 +202,55 @@
             (do (await-until 20000 #(= n (count @reached))) (count @reached))
             n)
   (flow/stop big))
+
+;; --- lifecycle: stop frees what start made, and awaits actual exit -----------
+;; A go block is an OS thread on jolt, so a mult's go-loop parked on a channel
+;; that is never closed is a thread held for the life of the process. Upstream
+;; leaves the control chan and every fan-out source open after stop (free on the
+;; JVM, where a parked go block is garbage); each start/stop cycle leaked one
+;; thread per mult. The bound is the thread count across 300 cycles of a graph
+;; with a fan-out, against the count before them.
+(def chez-threads (jolt.scheme/eval-string "(lambda () (length (#%$thread-list)))"))
+(defn lc-echo ([] {:ins {:in ""} :outs {:out ""} :workload :io}) ([a] a) ([s _] s) ([s _ m] [s {:out [m]}]))
+(defn lc-sink ([] {:ins {:in ""} :workload :io}) ([a] a) ([s _] s) ([s _ m] (deliver (:p m) true) [s nil]))
+(def lc-exited (atom 0))
+(defn lc-stuck ([] {:ins {:in ""} :workload :io}) ([a] a)
+  ([s tr] (when (= tr ::flow/stop) (swap! lc-exited inc)) s)
+  ([s _ m] (Thread/sleep 400) [s nil]))
+(defn lc-graph []
+  (flow/create-flow {:procs {:e {:proc (flow/process #'lc-echo)} :s1 {:proc (flow/process #'lc-sink)}
+                             :s2 {:proc (flow/process #'lc-sink)}}
+                     :conns [[[:e :out] [:s1 :in]] [[:e :out] [:s2 :in]]]}))
+(let [g0 (lc-graph)] (flow/start g0) (flow/resume g0) (flow/stop g0)) ; warm carriers
+(let [before (chez-threads)
+      stops (atom #{})]
+  (dotimes [_ 300]
+    (let [g (lc-graph) p (promise)]
+      (flow/start g) (flow/resume g)
+      (flow/inject g [:e :in] [{:p p}])
+      (deref p 5000 nil)
+      (swap! stops conj (flow/stop g))))
+  (check-eq "stop answers true once every proc exited" @stops #{true})
+  (check-eq "300 start/stop cycles of a fan-out graph hold no thread (within 2)"
+            (await-until 2000 #(<= (- (chez-threads) before) 2)) true))
+;; pings queued behind a stuck step, answered late, then the graph stops:
+;; take's go-loop must end (the reply chan is closed after the wait in any case).
+;; stop answers after the stuck step finished and the proc's stop transition ran.
+(let [g (flow/create-flow {:procs {:x {:proc (flow/process #'lc-stuck)}}})
+      before (chez-threads)]
+  (flow/start g) (flow/resume g)
+  (flow/inject g [:x :in] [1]) (Thread/sleep 20)
+  (dotimes [_ 5] (flow/ping g 5))
+  (reset! lc-exited 0)
+  (check-eq "stop answers true after the stuck step" (flow/stop g) true)
+  (check-eq "the proc's stop transition ran before stop answered" @lc-exited 1)
+  (check-eq "unanswered pings and a stopped graph hold no thread (within 2)"
+            (await-until 2000 #(<= (- (chez-threads) before) 2)) true))
+;; a proc stuck past the stop bound is named, not called stopped
+(let [g (flow/create-flow {:procs {:x {:proc (flow/process #'lc-stuck)}} :stop-timeout-ms 50})]
+  (flow/start g) (flow/resume g)
+  (flow/inject g [:x :in] [1]) (Thread/sleep 50)
+  (check-eq "stop past its bound names the running proc" (flow/stop g) {::flow/running #{:x}}))
 
 (if (empty? @failures)
   (do (println "FLOW-TEST OK") (flush) (System/exit 0))

@@ -26,6 +26,14 @@
     clojure.lang.Var (symbol x)
     (datafy/datafy x)))
 
+;; jolt: a go block runs on an OS thread unless *go-backend* is :fiber. Flow's own
+;; plumbing (the control mult, fan-out mults, ping's take) is nothing but channel ops,
+;; which park on a fiber, so it runs on fibers: a live graph then costs no OS thread
+;; of its own (1,000 live graphs: 21 OS threads, against 1,021). A proc's own code is
+;; untouched: it runs on the executor its workload names.
+(defmacro ^:private fiber-go [& body]
+  `(binding [async/*go-backend* :fiber] ~@body))
+
 (defn futurize [f {:keys [exec]}]
   (fn [& args]
     (let [^Executor e (if (instance? Executor exec)
@@ -49,7 +57,7 @@
 
 (defn create-flow
   "see lib ns for docs"
-  [{:keys [procs conns mixed-exec io-exec compute-exec]}]
+  [{:keys [procs conns mixed-exec io-exec compute-exec stop-timeout-ms] :or {stop-timeout-ms 10000}}]
   (let [lock (ReentrantLock.)
         chans (atom nil)
         execs {:mixed mixed-exec :io io-exec :compute compute-exec}
@@ -75,14 +83,17 @@
                        ([command to] (sc #::flow{:command command :to to})))
         handle-ping (fn [to timeout-ms]
                       (let [reply-chan (async/chan (count procs))
-                            ret-chan (async/take (if (= to ::flow/all) (count procs) 1) reply-chan)
+                            ret-chan (fiber-go (async/take (if (= to ::flow/all) (count procs) 1) reply-chan))
                             timeout (async/timeout timeout-ms)
                             _ (send-command #::flow{:command ::flow/ping, :to to, :reply-chan reply-chan})
                             ret (loop [ret nil]
                                   (let [[{::flow/keys [pid] :as m} c] (async/alts!! [ret-chan timeout])]
                                     (if (some? m)
                                       (recur (assoc ret pid m))
-                                      ret)))]
+                                      ret)))
+                            ;; jolt: a go block is a thread; take's go-loop ends only when
+                            ;; reply-chan closes, so close it (a late pong is dropped)
+                            _ (async/close! reply-chan)]
                         (if (= to ::flow/all) ret (-> ret vals first))))]
     (reify
       clojure.core.protocols/Datafiable
@@ -97,7 +108,7 @@
           (if-let [{:keys [report error]} @chans]
             {:report-chan report :error-chan error :already-running true}
             (let [control-chan (async/chan 10)
-                  control-mult (async/mult control-chan)
+                  control-mult (fiber-go (async/mult control-chan))
                   report-chan (async/chan (async/sliding-buffer 100))
                   error-chan (async/chan (async/sliding-buffer 100))
                   make-chan (fn [[[pid cid]{:keys [buf-or-n xform]}]]
@@ -136,7 +147,7 @@
                   ;;mults
                   _  (doseq [[out ins] conn-map]
                        (when (needs-mult? out ins)
-                         (let [m (async/mult (out-chans out))]
+                         (let [m (fiber-go (async/mult (out-chans out)))]
                            (doseq [in ins]
                              (async/tap m (in-chans in))))))
                   write-chan #(if-let [[_ c] (or (find in-chans %) (find out-chans %))]
@@ -163,23 +174,40 @@
                       (catch Throwable ex
                         (async/>!! control-chan #::flow{:command ::flow/stop :to ::flow/all})
                         (throw ex))))]
-              (doseq [p (vals pdescs)]
-                (start-proc p))
+              (let [futs (into {} (map (fn [p] [(:pid p) (start-proc p)])) (vals pdescs))]
               ;;the only connection to a running flow is via channels
               (reset! chans {:control control-chan :resolver resolver :cast cast
+                             ;; jolt: what stop awaits and closes
+                             :futs futs
+                             :mult-srcs (into [] (keep (fn [[out ins]] (when (needs-mult? out ins) (out-chans out)))) conn-map)
                              :report report-chan, :error error-chan
                              :ins in-chans, :outs out-chans})
-              {:report-chan report-chan :error-chan error-chan}))
+              {:report-chan report-chan :error-chan error-chan})))
           (finally (.unlock lock))))
       (stop [_]
         (.lock lock)
         (try
-          (when-let [{:keys [report error]} @chans]
+          (when-let [{:keys [report error control futs mult-srcs]} @chans]
             (send-command ::flow/stop ::flow/all)
-            (async/close! error)
-            (async/close! report)
-            (reset! chans nil)
-            true)
+            ;; jolt: stop answers after every proc's loop has exited (its ::flow/stop
+            ;; transition has run), bounded by :stop-timeout-ms; a proc still running
+            ;; at the bound is named, not called stopped.
+            (let [deadline (+ (System/currentTimeMillis) stop-timeout-ms)
+                  running (into #{} (keep (fn [[pid ^Future f]]
+                                            (when-not (try (.get f (max 1 (- deadline (System/currentTimeMillis))) TimeUnit/MILLISECONDS) true
+                                                           (catch Throwable _ (.isDone f)))
+                                              pid)))
+                                futs)]
+              ;; jolt: a go block is a thread, so a mult's go-loop parked on an open
+              ;; source is a thread held forever. Close every mult source once the
+              ;; procs reading its taps are gone.
+              (when (empty? running)
+                (async/close! control)
+                (run! async/close! mult-srcs))
+              (async/close! error)
+              (async/close! report)
+              (reset! chans nil)
+              (if (empty? running) true {::flow/running running})))
           (finally (.unlock lock))))
       (pause [_] (send-command ::flow/pause ::flow/all))
       (resume [_] (send-command ::flow/resume ::flow/all))
