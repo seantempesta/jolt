@@ -1297,6 +1297,14 @@
       (and thead (> (count thead) 1) (= \. (first thead)))
       {:op :set-field :obj (analyze ctx (nth ti 1) env)
        :field (if (field-head? thead) (subs thead 2) (subs thead 1)) :val val-node}
+      ;; (set! (__deftype-mslot inst :f i dbl?) v): a deftype method's mutable
+      ;; field read, as the deftype macro rewrote it, under a set! a macro built
+      ;; from the field's name (tools.reader's (update! pos inc)). The write to
+      ;; the same slot.
+      (and (= thead "__deftype-mslot") (= 5 (count ti)))
+      (invoke (var-ref "clojure.core" "__deftype-slot-set!")
+              [(analyze ctx (nth ti 1) env) (analyze ctx (nth ti 2) env)
+               (analyze ctx (nth ti 3) env) val-node (analyze ctx (nth ti 4) env)])
       ;; (set! (. Class member) val) — a host static-field set. clojure.spec.alpha
       ;; toggles clojure.lang.RT/checkSpecAsserts this way. Lowered to a runtime
       ;; jolt.host/set-static-field! call (the read side is a :host-static ref).

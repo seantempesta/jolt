@@ -133,6 +133,14 @@
    ;; on every entry. Cheaper than get too — straight to the slot, no type
    ;; cascade. (records.ss jrec-field / clojure.core/__deftype-field.)
    "__deftype-field" {:call "jrec-field" :arity #(= % 2) :pure? true}
+   ;; The same slot reads with the declared position the deftype macro knows:
+   ;; (__deftype-slot this :f i) checks the slot at i holds :f (one eq?) and reads
+   ;; it straight, falling back to jrec-field. -mslot is the mutable-field read
+   ;; (not pure: a set! between two reads must be observed), -slot-set! the
+   ;; write, with a constant flag for a ^double field. (records.ss jrec-slot.)
+   "__deftype-slot"      {:call "jrec-slot" :arity #(= % 3) :pure? true}
+   "__deftype-mslot"     {:call "jrec-mslot" :arity #(= % 4)}
+   "__deftype-slot-set!" {:call "jrec-slot-set!" :arity #(= % 5)}
    "nth"         {:call "jolt-nth"     :arity #(or (= % 2) (= % 3))}
    "count"       {:call "jolt-count"   :arity #(= % 1) :num-result? true}
    "assoc"       {:call "jolt-assoc"   :arity #(and (>= % 3) (odd? %))

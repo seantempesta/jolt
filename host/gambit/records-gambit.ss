@@ -721,6 +721,39 @@
 
 (def-var! "clojure.core" "__deftype-field" jrec-field)
 
+(define (jrec-slot-at? r k i)
+  (and (jrec? r)
+       (let ((fk (jrdesc-fkeys (jrec-desc r))))
+         (and (fx<? i (vector-length fk))
+              (eq? (vector-ref fk i) k)))))
+
+(define (jrec-slot r k i)
+  (cond
+    ((jrec-slot-at? r k i) (jrec-field-ref r i))
+    ((jrec? r) (jrec-field r k))
+    (else
+     (record-method-dispatch
+       r
+       (string-append "-" (keyword-t-name k))
+       (jolt-vector)))))
+
+(define (jrec-slot-set! r k i v dbl?)
+  (let ((v (if dbl? (jolt-rec-dbl v) v)))
+    (if (jrec-slot-at? r k i)
+        (begin (jrec-field-set! r i v) v)
+        (jolt-set-field! r k v))))
+
+(def-var! "clojure.core" "__deftype-slot" jrec-slot)
+
+(define (jrec-mslot r k i dbl?) (jrec-slot r k i))
+
+(def-var! "clojure.core" "__deftype-mslot" jrec-mslot)
+
+(def-var!
+  "clojure.core"
+  "__deftype-slot-set!"
+  jrec-slot-set!)
+
 (define (jrec-dbl-flags inst)
   (vector-ref (jrdesc-ifc-of inst) 14))
 

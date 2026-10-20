@@ -513,6 +513,10 @@
         ;; in-place field write the analyzer compiles to jolt-set-field!.
         mutable-syms (map first (filter second (map vector fields field-muts)))
         mutable? (fn [s] (boolean (some (fn [m] (= m s)) mutable-syms)))
+        ;; each field's declared slot index and ^double flag, for the positional
+        ;; slot ops the method bodies lower to (records.ss jrec-slot).
+        field-idx (zipmap (map name fields) (range))
+        field-dbl (zipmap (map name fields) (map (fn [t] (= t "double")) field-tags))
         ;; rewrite a method body: (set! mut-field v) -> an in-place (.-field inst)
         ;; write, and a READ of a mutable field -> (.-field inst) so it observes the
         ;; live value after a set! (the double-checked-locking idiom re-reads a field
@@ -526,8 +530,10 @@
                  (= "set!" (name (first form)))
                  (symbol? (second form)) (mutable? (second form))
                  (not (contains? shadowed (second form))))
-            (list 'set! (list (symbol (str ".-" (name (second form)))) inst)
-                  (rw inst shadowed (nth form 2)))
+            (list 'clojure.core/__deftype-slot-set! inst (keyword (name (second form)))
+                  (get field-idx (name (second form)))
+                  (rw inst shadowed (nth form 2))
+                  (get field-dbl (name (second form))))
             ;; let/loop-style vector-binding forms: rewrite inits, then shadow the
             ;; bound names in the body.
             (and (seq? form) (seq form) (symbol? (first form))
@@ -578,7 +584,8 @@
                         (map (fn [x] (rw inst shadowed x)) (rest (nth form 2)))))
             ;; a bare read of a mutable field -> live field access
             (and (symbol? form) (mutable? form) (not (contains? shadowed form)))
-            (list (symbol (str ".-" (name form))) inst)
+            (list 'clojure.core/__deftype-mslot inst (keyword (name form)) (get field-idx (name form))
+                  (get field-dbl (name form)))
             (seq? form) (map (fn [x] (rw inst shadowed x)) form)
             (vector? form) (mapv (fn [x] (rw inst shadowed x)) form)
             :else form))
@@ -613,8 +620,8 @@
                           ;; that valAt on every method entry — including valAt's
                           ;; own — and never come back. It is also the cheaper read
                           ;; (straight to the slot, no type cascade).
-                          binds (vec (mapcat (fn [f] [f (list (symbol "clojure.core" "__deftype-field")
-                                                              inst (keyword (name f)))])
+                          binds (vec (mapcat (fn [f] [f (list (symbol "clojure.core" "__deftype-slot")
+                                                              inst (keyword (name f)) (get field-idx (name f)))])
                                              (filter (fn [f] (and (not (mutable? f))
                                                                   (not (contains? pnames (name f)))))
                                                      fields)))

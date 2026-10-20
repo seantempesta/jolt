@@ -200,6 +200,16 @@
   ;; only the no-argument form is a field read: (.-name x args*) calls the member
   ;; named "-name" (a dashed protocol method), and a declared slot with an
   ;; argument attached is a method miss rather than a field read that drops it
+  ;; A deftype method reads and writes its fields by declared slot
+  ;; (records.ss jrec-slot / jrec-slot-set!): a set! returns the new value and a
+  ;; later read in the same body sees it, a ^double field stays a flonum, a set!
+  ;; a macro builds from the field's name (tools.reader's update!) still writes
+  ;; the field, and a shadowing local is not the field.
+  {:suite "deftype-slot" :expr "(do (defprotocol Pds (ds-step [this])) (deftype Tds [^:unsynchronized-mutable n k] Pds (ds-step [_] [(set! n (+ n k)) n])) (let [t (->Tds 1 10)] [(ds-step t) (ds-step t)]))" :expected "[[11 11] [21 21]]"}
+  {:suite "deftype-slot" :expr "(do (defprotocol Pdd (dd-set [this v]) (dd-get [this])) (deftype Tdd [^double ^:unsynchronized-mutable d] Pdd (dd-set [_ v] (set! d v)) (dd-get [_] d)) (let [t (->Tdd 1)] [(dd-get t) (dd-set t 2) (dd-get t)]))" :expected "[1.0 2.0 2.0]"}
+  {:suite "deftype-slot" :expr "(do (defmacro ds-update! [f g] (list 'set! f (list g f))) (defprotocol Pdu (du-bump [this])) (deftype Tdu [^:unsynchronized-mutable pos] Pdu (du-bump [_] (ds-update! pos inc) pos)) (let [t (->Tdu 0)] (du-bump t) (du-bump t)))" :expected "2"}
+  {:suite "deftype-slot" :expr "(do (defprotocol Pdl (dl-f [this])) (deftype Tdl [^:unsynchronized-mutable a b] Pdl (dl-f [_] (let [a 100 b 200] (+ a b)))) (dl-f (->Tdl 1 2)))" :expected "300"}
+  {:suite "deftype-slot" :expr "(do (defprotocol Pdv (dv-f [this])) (deftype Tdv [^:volatile-mutable a b c] Pdv (dv-f [_] (set! a (+ a b c)) [a b c])) (dv-f (->Tdv 1 2 3)))" :expected "[6 2 3]"}
   {:suite "dotform" :expr "(do (defprotocol Pdm (-go [_ x])) (deftype Tdm [fld] Pdm (-go [_ x] (str \"got \" x))) [(.-go (->Tdm 1) 42) (. (->Tdm 1) -go 42) (.-fld (->Tdm 7))])" :expected "[\"got 42\" \"got 42\" 7]"}
   {:suite "dotform" :expr "(do (deftype Tdf [fld]) (try (.-fld (->Tdf 7) 1) (catch IllegalArgumentException e (.getMessage e))))" :expected "\"No matching method _fld found taking 1 args for class user.Tdf\""}
   {:suite "dotform" :expr "(do (deftype Tdq [a]) (try (.-nope? (->Tdq 1)) (catch IllegalArgumentException e (.getMessage e))))" :expected "\"No matching field found: nope_QMARK_ for class user.Tdq\""}

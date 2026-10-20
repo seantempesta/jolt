@@ -139,6 +139,15 @@
 ;;                      vectors, and a small map keyed on records scans with =.
 ;;                      The reference is = on two equal vectors (6.8 -> 1.36).
 ;;
+;;   deftype-fields     a deftype method's (set! field v) hashed the whole type
+;;                      tag per write to find the type's ^double flags, looked
+;;                      the field index up twice and tested jrec1? .. jrecK? in
+;;                      turn, and each field read was a keyword lookup. Method
+;;                      bodies now read and write by declared slot (records.ss
+;;                      jrec-slot). The arm is eight set!s of four mutable
+;;                      fields per call, the reference a call that reads one
+;;                      (14.7 -> 6.0).
+;;
 ;;   top-level-fn       a fn built in a bare top-level form — every deftype and
 ;;                      defrecord method, every extend-type impl and defmethod —
 ;;                      got no constant pool, so each keyword literal in it
@@ -366,6 +375,13 @@
   (reify DP1 (dp1 [_] 1) DP2 (dp2 [_] 2) DP3 (dp3 [_] 3)
          DP4 (dp4 [_] 4) DP5 (dp5 [_] 5) DP6 (dp6 [_] 6)))
 (deftype DispatchT [a] DP1 (dp1 [_] a) DP2 (dp2 [_] a))
+;; four mutable fields, written eight times a call (deftype-fields)
+(deftype FieldsT [^:unsynchronized-mutable a ^:unsynchronized-mutable b
+                  ^:unsynchronized-mutable c ^:unsynchronized-mutable d]
+  DP1 (dp1 [_] (set! a (inc a)) (set! b (inc b)) (set! c (inc c)) (set! d (inc d))
+               (set! a (+ a b)) (set! b (+ b c)) (set! c (+ c d)) (set! d 0) a)
+  DP2 (dp2 [_] a))
+(def ^:private fields-t (FieldsT. 0 0 0 0))
 (def ^:private dispatch-t (DispatchT. 1))
 (def ^:private dispatch-n 100000)
 (defprotocol DP7 (dp7 [x] [x y]))
@@ -478,6 +494,13 @@
           #(dotimes [_ dispatch-n] (dp6 dispatch-reify))
           #(dotimes [_ dispatch-n] (instance? fastpath_ratio_test.DP6 dispatch-reify))
           4.0 20.0)
+  ;; Writing a deftype's mutable fields from its own method must not cost wildly
+  ;; more than a method call that reads one.
+  (judge! "deftype-fields"
+          #(dotimes [_ dispatch-n] (dp2 fields-t))
+          #(dotimes [_ dispatch-n] (dp1 fields-t))
+          8.0 11.0)
+
   (judge! "deftype-instance"
           #(dotimes [_ dispatch-n] (dp1 dispatch-t))
           #(dotimes [_ dispatch-n] (instance? fastpath_ratio_test.DP2 dispatch-t))
