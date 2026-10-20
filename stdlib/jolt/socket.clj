@@ -1327,7 +1327,8 @@
                             (and (= tag :inet-address)
                                  (let [c (jolt.host/ref-get val :class)]
                                    (or (= cn c) (= cn (subs c (count "java.net."))))))))
-            true))))
+            true)))
+      {:kind :table})
 
     ;; = and hash on an InetAddress or InetSocketAddress are by value, as
     ;; their equals/hashCode are.
@@ -1336,18 +1337,21 @@
                     (contains? #{:inet-address :inet-socket-address} (jolt.host/ref-get b :jolt/type))))
       (fn [a b]
         (let [ta (jolt.host/ref-get a :jolt/type)]
-          (if (= ta :inet-address) (inet-address= a b) (isa= a b)))))
+          (if (= ta :inet-address) (inet-address= a b) (isa= a b))))
+      {:kind :table})
     (clojure.core/__register-hash!
       (fn [x] (contains? #{:inet-address :inet-socket-address} (jolt.host/ref-get x :jolt/type)))
       (fn [x]
         (if (= :inet-address (jolt.host/ref-get x :jolt/type))
           (inet-address-hash x)
-          (isa-hash x))))
+          (isa-hash x)))
+      {:kind :table})
 
     ;; (str sock) renders through toString like Java; pred is two cheap lookups.
     (clojure.core/__register-str!
       (fn [x] (contains? tag->render (jolt.host/ref-get x :jolt/type)))
-      (fn [x] ((tag->render (jolt.host/ref-get x :jolt/type)) x)))
+      (fn [x] ((tag->render (jolt.host/ref-get x :jolt/type)) x))
+      {:kind :table})
     true))
 
 (register-all!)

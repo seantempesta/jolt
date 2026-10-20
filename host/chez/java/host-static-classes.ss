@@ -2267,8 +2267,8 @@
     (let ((tname (symbol-t-name type-sym)))
       (let loop ((fs user-instance-checks))
         (cond ((null? fs) 'pass)
-              ;; an entry is (fn . tables-only?): a table-only arm is not asked about other values
-              ((and (cdar fs) (not (htable? val))) (loop (cdr fs)))
+              ;; an entry is (fn . claim): an arm is not asked what its claim excludes
+              ((not (instance-claim-covers? (cdar fs) tname val)) (loop (cdr fs)))
               (else
                (let ((r (seam-invoke2 (caar fs) tname val)))
                  (if (jolt-nil? r) (loop (cdr fs)) (if (jolt-truthy? r) #t #f)))))))))
@@ -2278,7 +2278,7 @@
   (case-lambda
     ((f) ((var-deref "clojure.core" "__register-instance-check!") f jolt-nil))
     ((f opts)
-     (set! user-instance-checks (append user-instance-checks (list (cons f (seam-claims-tables? opts)))))
+     (set! user-instance-checks (append user-instance-checks (list (cons f (seam-instance-claim opts)))))
      (set! instance-arms-epoch (fx+ instance-arms-epoch 1))
      jolt-nil)))
 
@@ -2313,11 +2313,20 @@
 ;; tests the kind itself, in Scheme, and never calls the Clojure predicate for a
 ;; value of another kind: a UUID compare, a record's instance? check or a class
 ;; token's hash stops paying every library's predicate. An arm without a claim
-;; may own anything and is asked for every value, as before.
+;; may own anything and is asked for every value, as before. An instance? arm may
+;; also say {:classes #{"a.B" ...}}: it only answers for those class names.
 (define seam-kw-kind (keyword #f "kind"))
 (define seam-kw-table (keyword #f "table"))
+(define seam-kw-classes (keyword #f "classes"))
 (define (seam-claims-tables? opts)
   (and (pmap? opts) (eq? (jolt-get opts seam-kw-kind jolt-nil) seam-kw-table)))
+;; an instance? arm's claim: #f (none) or (tables-only? . class-names|#f), where
+;; {:classes #{"a.B" ...}} says the arm only answers for those class names
+(define (seam-instance-claim opts)
+  (and (pmap? opts)
+       (let ((cs (jolt-get opts seam-kw-classes jolt-nil)))
+         (cons (seam-claims-tables? opts)
+               (and (not (jolt-nil? cs)) (jt-jolt-strs->list cs))))))
 (define (seam-pred1 pred opts)
   (if (seam-claims-tables? opts)
       (lambda (x) (and (htable? x) (jolt-truthy? (seam-invoke1 pred x))))

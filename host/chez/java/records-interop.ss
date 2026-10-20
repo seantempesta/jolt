@@ -49,16 +49,22 @@
 ;; that file (host-vars.ss) after the seed prelude, and an instance? miss while
 ;; the prelude loads -- clojure.pprint compiling a format with a numeric param
 ;; -- died on the unbound name and silently dropped the def.
-(define user-instance-checks '())   ; ((fn . tables-only?) ...)
+(define user-instance-checks '())   ; ((fn . claim) ...), claim #f or (tables-only? . class-names|#f)
 (define (user-instance-checks-empty?) (null? user-instance-checks))
-;; Can a registered library arm answer for VAL? Only an arm without a claim, or a
-;; table-only arm when VAL is a host table (__register-instance-check!'s
-;; {:kind :table}). When none can, the library arm's answer for VAL is 'pass by
-;; declaration, so the verdict is the builtin arms' and the memo may keep it.
-(define (user-instance-checks-may-claim? val)
+;; May an arm with CLAIM answer (instance? TNAME VAL)? An arm without a claim may
+;; answer anything. A claim (__register-instance-check!'s {:kind :table} and/or
+;; {:classes #{...}}) limits it to host tables and/or to those class names.
+(define (instance-claim-covers? claim tname val)
+  (or (not claim)
+      (and (or (not (car claim)) (htable? val))
+           (or (not (cdr claim)) (and tname (member tname (cdr claim)) #t)))))
+;; Can any registered library arm answer (instance? TNAME VAL)? When none can, its
+;; answer is 'pass by declaration, so the verdict is the builtin arms' and the
+;; memo may keep it.
+(define (user-instance-checks-may-claim? tname val)
   (let loop ((fs user-instance-checks))
     (and (pair? fs)
-         (or (not (cdar fs)) (htable? val) (loop (cdr fs))))))
+         (or (instance-claim-covers? (cdar fs) tname val) (loop (cdr fs))))))
 
 ;; Object / java.lang.Object is the root of the type hierarchy: every non-nil
 ;; value is an instance of Object; nil is not an instance of anything. This is
@@ -245,7 +251,7 @@
          (before (vector-ref e 1)))
     (if (not (eq? before 'pass))
         before
-        (let ((r (if (and instance-check-user-arm (user-instance-checks-may-claim? val))
+        (let ((r (if (and instance-check-user-arm (user-instance-checks-may-claim? tname val))
                      (instance-check-user-arm ts val)
                      'pass)))
           (if (eq? r 'pass) (vector-ref e 2) r)))))
@@ -307,7 +313,7 @@
                      (let* ((e (instance-kind-entry k tname ts val))
                             (before (vector-ref e 1)))
                        (cond ((not (eq? before 'pass)) (if before #t #f))
-                             ((not (user-instance-checks-may-claim? val)) (if (vector-ref e 2) #t #f))
+                             ((not (user-instance-checks-may-claim? tname val)) (if (vector-ref e 2) #t #f))
                              (else 'uncached)))))))
     ;; each entry is published behind a release: on a weakly ordered machine
     ;; (ARM64) another thread could otherwise see the new entry before its slots
