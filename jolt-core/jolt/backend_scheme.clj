@@ -1230,8 +1230,9 @@
 (def ^:private tail-transparent-ops #{:if :do :let :loop :invoke :throw :host-call :try})
 ;; A try is tail-transparent too. With neither a catch nor a finally, emit-try
 ;; emits it as its body and nothing else, so a tail call inside one is a real tail
-;; call. With a catch or a finally the body runs inside a guard or dynamic-wind,
-;; so its last call is not a Chez tail call — but the guard itself is, and it
+;; call. With a catch or a finally the body runs inside a jolt-try-catch (guard on
+;; Gambit) or dynamic-wind, so its last call is not a Chez tail call — but the
+;; try form itself is, and it
 ;; erases the enclosing fn's frame all the same. The body's last call is then the
 ;; fn's exit: storing its site and registering it as a tail edge is what lets a
 ;; trace, or Thread.getStackTrace, name the fn the try sat in. Treating the try
@@ -3778,7 +3779,9 @@
 
 ;; try/catch/finally. throw raises a Chez condition wrapping the jolt value
 ;; (jolt-throw = Scheme `raise` of a &jolt-throw condition); catch lowers to
-;; `guard`, whose raw binding is unwrapped via jolt-unwrap-throw so the catch var
+;; jolt-try-catch on Chez (scheme-adapter-runtime.ss: guard's semantics on a
+;; one-shot escape) and to `guard` on Gambit. The raw binding is unwrapped via
+;; jolt-unwrap-throw so the catch var
 ;; receives the jolt value (preserving ex-data/ex-message and the backtrace
 ;; identity tag). finally lowers to `dynamic-wind`'s after-thunk, and runs on
 ;; success, on catch and on a real escape, but NOT while a fiber park is
@@ -3823,16 +3826,20 @@
                      ;; handler that runs later. Only under tracing — with it off
                      ;; there are no line stores to snapshot.
                      cl (when (trace-frames?) (fresh-label "_cl$"))
-                     body (str "(guard (" raw " (else (let ((" (munge-name cs) " (jolt-unwrap-throw " raw "))) "
-                               (if cl (str "(let ((" cl " (jolt-catch-enter!))) ") "")
-                               "(let ((r " (binding [*array-vecs* (dissoc *array-vecs* (munge-name cs) raw)]
-                                            (emit (:catch-body node))) ")) "
-                               (if cl (str "(jolt-catch-leave! " cl ") ") "")
-                               "(jolt-catch-complete!) r)"
-                               (if cl ")" "")
-                               "))) "
-                               (emit (:body node)) ")")]
-                 body)
+                     handler (str "(let ((" (munge-name cs) " (jolt-unwrap-throw " raw "))) "
+                                  (if cl (str "(let ((" cl " (jolt-catch-enter!))) ") "")
+                                  "(let ((r " (binding [*array-vecs* (dissoc *array-vecs* (munge-name cs) raw)]
+                                               (emit (:catch-body node))) ")) "
+                                  (if cl (str "(jolt-catch-leave! " cl ") ") "")
+                                  "(jolt-catch-complete!) r)"
+                                  (if cl ")" "")
+                                  ")")]
+                 ;; Chez: jolt-try-catch (scheme-adapter-runtime.ss), a one-shot
+                 ;; escape and a hand-pushed handler — 160 B and ~8 ns per entry
+                 ;; against guard's 297 B and ~18 ns. Gambit keeps R7RS guard.
+                 (if (= :gambit (target))
+                   (str "(guard (" raw " (else " handler ")) " (emit (:body node)) ")")
+                   (str "(jolt-try-catch " raw " " (emit (:body node)) " " handler ")")))
                (emit (:body node)))]
     (if-let [fin (:finally node)]
       ;; The edges are masked against an interrupt's escape. run-interruptible

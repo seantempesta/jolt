@@ -1593,6 +1593,76 @@
   (guard (e (#t (lambda (r) #f)))
     (record-accessor sa-winder-rtd 0)))
 
+;; (jolt-try-catch raw body handler): a jolt try/catch (backend emit-try on
+;; Chez). Evaluates body; if anything is raised inside it, the stack unwinds to
+;; here (every dynamic-wind after-thunk on the way runs) and handler is
+;; evaluated, in tail position, with raw bound to the raised object.
+;;
+;; This is R6RS `guard` with an else clause, minus what guard costs on the path
+;; that does not throw. Chez's $guard (s/exceptions.ss) takes a MULTI-SHOT
+;; call/cc, reads the continuation marks, and installs its handler through
+;; with-exception-handler, which is a parameterize: a swap closure, a box, a
+;; critical winder, and dynamic-wind's body thunk and values consumer. Measured
+;; at optimize-level 3: guard 18 ns and 297 B per entry over a bare call. And a
+;; multi-shot capture inside a one-shot frame (a letcc, a fiber) promotes that
+;; frame, so every later return through it copies the stack segment.
+;;
+;; Here the escape point is a ONE-SHOT continuation (64 B), and the handler is
+;; pushed onto Chez's handler stack by hand, with a plain winder that pops it on
+;; any escape and pushes it back on a re-entry. Per entry: the continuation, the
+;; call/1cc lambda's closure (its free variables), one closure h (holding only
+;; k), the handler-stack pair, the winder record and its chain pair:
+;; 64 + 16·n + 16 + 16 + 32 + 16 B, and no procedure call between the two pushes,
+;; nor between the two pops, so no interrupt can land between them.
+;;
+;; h is all three of the handler and the winder's in and out thunks (its arity
+;; tells them apart: raise calls it with the object, the winder with nothing):
+;;   (h c)  escape to k with the object, under a private marker. raise calls it
+;;          with the handler stack parameterized to the rest (a critical
+;;          winder); unwinding to k undoes that, then our winder below pops h.
+;;   (h)    on the way OUT (an escape past this try, a fiber park) h is the top
+;;          of the stack, so pop it; on the way back IN (a parked fiber resumed)
+;;          it is not, so push it onto whatever the resumed context has.
+;; The normal return pops both by hand, from the values saved in this frame.
+;;
+;; Why it is sound to bypass with-exception-handler: Chez reads the handler
+;; stack only through $current-handler-stack, and every other writer of it
+;; (with-exception-handler, raise, guard) goes through a winder, so each
+;; restores its own saved value on the way out, whatever is above it. The
+;; one-shot k survives a fiber park for the reason continuations.ss gives (the
+;; park captures and restores the whole segment chain, k's frame included).
+;; Body values pass through as they come, any number of them.
+(define jolt-try-caught (string->uninterned-symbol "jolt-try-caught"))
+(define-syntax jolt-try-catch
+  (syntax-rules ()
+    ((_ raw body handler)
+     (call-with-values
+       (lambda ()
+         (call/1cc
+          (lambda (k)
+            (let ((oh (#%$current-handler-stack))
+                  (ow (#%$current-winders)))
+              (letrec ((h (case-lambda
+                            ((c) (k jolt-try-caught c))
+                            (() (let ((cur (#%$current-handler-stack)))
+                                  (#%$current-handler-stack
+                                   (if (and (pair? cur) (eq? (car cur) h))
+                                       (cdr cur)
+                                       (cons h cur))))))))
+                (#%$current-winders
+                 (cons (#%$record sa-winder-rtd h h (#%$current-attachments)) ow))
+                (#%$current-handler-stack (cons h oh))
+                (call-with-values
+                  (lambda () body)
+                  (case-lambda
+                    ((v) (#%$current-handler-stack oh) (#%$current-winders ow) v)
+                    (vs (#%$current-handler-stack oh) (#%$current-winders ow)
+                        (apply values vs)))))))))
+       (case-lambda
+         ((v) v)
+         ((tag raw) (if (eq? tag jolt-try-caught) handler (values tag raw)))
+         (vs (apply values vs)))))))
+
 
 ;; (sa-current-winders) -> the chain, innermost first.
 ;; (sa-current-winders-set! w) -> void. Replaces it wholesale.
