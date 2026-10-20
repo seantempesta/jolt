@@ -2777,6 +2777,11 @@
            (let ((port (open-output-string)))
              (jolt-invoke m x (make-char-writer port))
              (get-output-string port))))))
+;; the same method, writing through a char-writer over the printer's own port
+(set-pr-user-method-write!
+  (lambda (x port)
+    (let ((m (user-print-method x)))
+      (and m (begin (jolt-invoke m x (make-char-writer port)) #t)))))
 
 ;; --- piped streams ----------------------------------------------------------
 ;; A PipedOutputStream and its PipedInputStream share one buffer: the reader
