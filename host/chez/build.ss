@@ -2916,6 +2916,23 @@
 ;; and written once, rather than writing the file, reading it back to hash it, and
 ;; appending. Same bytes, same fingerprint, one pass over a multi-megabyte file
 ;; instead of three.
+;; The Chez boots this runtime runs on are part of what it is: a unit compiled or
+;; vfasl-converted by one Chez build is wrong code under another with the same
+;; version string (a vfasl fix changed how negative bignum constants convert, and
+;; the build cache, keyed only on the runtime source, kept serving the old
+;; images). So the fingerprint also hashes petite.boot and scheme.boot, as bytes:
+;; about 4 MB once per runtime build.
+(define (bld-file-bytes-hash path)
+  (let* ((bv (call-with-port (open-file-input-port path) get-bytevector-all))
+         (n (bytevector-length bv)))
+    (let loop ((i 0) (h 2166136261))
+      (if (fx=? i n)
+          (string-append (number->string n 16) "." (number->string h 16))
+          (loop (fx+ i 1)
+                (fxlogand (fx* (fxlogxor h (bytevector-u8-ref bv i)) 16777619) #xFFFFFFFF))))))
+(define (bld-boot-identity)
+  (string-append (bld-file-bytes-hash (string-append (bld-csv-dir) "/petite.boot")) "."
+                 (bld-file-bytes-hash (string-append (bld-csv-dir) "/scheme.boot"))))
 (define (bld-prepend-prologue! flat-ss)
   (let* ((prologue (bld-kernel-prologue flat-ss))
          (src (string-append
@@ -2923,7 +2940,8 @@
                 prologue
                 (read-file-string flat-ss)))
          (fp (string-append (number->string (string-length src) 16) "-"
-                            (number->string (aot-content-hash src) 16)))
+                            (number->string (aot-content-hash src) 16) "-"
+                            (bld-boot-identity)))
          (out (open-output-file flat-ss 'replace)))
     (put-string out src)
     (put-string out (string-append

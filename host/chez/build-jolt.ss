@@ -658,8 +658,11 @@
 ;; part of what it hashes. Nothing reads it at load time (aot-cache-subdir asks
 ;; for it on the first cached require), so the position doesn't matter.
 (let* ((src (read-file-string jb-flat-ss))
+       ;; and the Chez boots it embeds (build.ss bld-boot-identity): same source on
+       ;; another Chez build is another runtime
        (fp (string-append (number->string (string-length src) 16) "-"
-                          (number->string (aot-content-hash src) 16)))
+                          (number->string (aot-content-hash src) 16) "-"
+                          (bld-boot-identity)))
        (out (open-output-file jb-flat-ss 'append)))
   (put-string out (string-append
                     "\n;; === runtime fingerprint (AOT cache key) ===\n"
