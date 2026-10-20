@@ -123,9 +123,15 @@
 (define kw-op-conj (keyword #f "conj"))
 (define kw-op-disj (keyword #f "disj"))
 
-(define (htable-sorted-map? x) (and (htable? x) (jolt=2 (jolt-ref-get x kw-jtype) kw-sorted-map)))
-(define (htable-sorted-set? x) (and (htable? x) (jolt=2 (jolt-ref-get x kw-jtype) kw-sorted-set)))
-(define (htable-sorted? x) (or (htable-sorted-map? x) (htable-sorted-set? x)))
+;; A table's tag, read under the key kw->key gives :jolt/type, without building that
+;; key: jolt-ref-get string-appends a namespaced keyword's key on every read, and
+;; these predicates run inside jolt-map? and the dot-form arm for every host table.
+;; Keywords are interned, so a tag is the sorted tag exactly when it is eq? to it.
+(define (htable-tag x) (hashtable-ref (htable-h x) "jolt/type" jolt-nil))
+(define (htable-sorted-map? x) (and (htable? x) (eq? (htable-tag x) kw-sorted-map)))
+(define (htable-sorted-set? x) (and (htable? x) (eq? (htable-tag x) kw-sorted-set)))
+(define (htable-sorted? x)
+  (and (htable? x) (let ((t (htable-tag x))) (or (eq? t kw-sorted-map) (eq? t kw-sorted-set)))))
 ;; the op fn for `op-kw` from the value's attached :ops map, then invoke it on sc.
 (define (sc-op sc op-kw) (jolt-get (jolt-ref-get sc kw-ops) op-kw jolt-nil))
 (define (sc-call sc op-kw . args) (apply jolt-invoke (sc-op sc op-kw) sc args))
