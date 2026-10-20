@@ -99,11 +99,15 @@
 
 (defn- set-diff [a b] (into #{} (remove b) a))
 
-(defn- make-chan [error-chan [[pid cid] {:keys [buf-or-n xform]}]]
-  (if xform
-    (async/chan buf-or-n xform
-                (fn [ex] (async/put! error-chan #::flow{:ex ex :pid pid :cid cid :xform xform}) nil))
-    (async/chan (or buf-or-n 10))))
+;; jolt: an in-port whose chan-opts name a :chan is that channel (one the flow did not
+;; make: a remote channel's out-half, a channel another system writes into). The flow
+;; closes it when the in-port is dropped, as it closes the ones it makes.
+(defn- make-chan [error-chan [[pid cid] {:keys [chan buf-or-n xform]}]]
+  (cond
+    chan chan
+    xform (async/chan buf-or-n xform
+                      (fn [ex] (async/put! error-chan #::flow{:ex ex :pid pid :cid cid :xform xform}) nil))
+    :else (async/chan (or buf-or-n 10))))
 
 (defn- drain!
   "Close c and take what is left in it (buffered, or parked puts); answers how many."
@@ -144,11 +148,17 @@
 (defn- proc-resolver [rt pid execs]
   (reify spi/Resolver
     (get-write-chan [_ coord]
-      (let [{:keys [routes in-chans plans]} @rt]
+      (let [{:keys [routes in-chans plans report]} @rt]
         (if (vector? coord)
           (if-let [[_ c] (or (find routes coord) (find in-chans coord))]
             c
-            (throw (ex-info "can't resolve channel with io-id" {:io-id coord})))
+            ;; jolt: an output addressed to a proc that is not in the plan (it left, or
+            ;; never was) is dropped and reported as data; it does not kill the sender's
+            ;; step. A coord naming a port the proc does not have is still a defect.
+            (if (contains? plans (first coord))
+              (throw (ex-info "can't resolve channel with io-id" {:io-id coord}))
+              (do (when report (async/put! report #::flow{:undeliverable coord :pid pid}))
+                  nil)))
           ;; the bare cid send-outputs passes for an output not in :outs
           (let [k [pid coord]]
             (if-let [[_ c] (find routes k)]

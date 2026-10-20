@@ -1,0 +1,344 @@
+;; jolt.async.remote — a core.async channel whose other end is in another OS process.
+;;
+;; An end is two ORDINARY channels and one AF_UNIX stream socket:
+;;
+;;   {:in  ch   ; values the peer put, in its order: take!, <!, <!!, poll!, alts!
+;;    :out ch   ; values for the peer: put!, >!, >!!, offer!, alts! puts, close!
+;;    :fd  n}
+;;
+;; Two pumps move values between the channels and the socket: a writer takes from
+;; :out, encodes and writes frames; a reader reads frames, decodes and puts on :in.
+;; Because both halves are the runtime's own channels, every channel op, alts! over
+;; any mix of local and remote channels, mult/pipe/Flow, and fiber parking work
+;; unchanged; nothing in the channel core knows a socket exists.
+;;
+;; Semantics:
+;;   - FIFO per direction (one stream socket).
+;;   - Back-pressure end to end: a full :in stops the reader, the socket's receive
+;;     and send buffers fill, the writer blocks, :out fills, and a put parks. Nothing
+;;     is dropped. In flight at most: :out's buffer + the kernel buffers + :in's buffer.
+;;   - (close! (:out end)) sends an end frame after the values already put; the peer
+;;     takes them, then nil. The peer's :out stays usable (a half close).
+;;   - Peer death (EOF before an end frame, or EPIPE/ECONNRESET on write) closes both
+;;     halves: a pending or later take answers nil once :in is drained, a put answers false.
+;;   - alts!: both halves are local channels, so alts! is the runtime's own. The limit
+;;     is stated plainly: a put to :out commits when the value enters :out's buffer,
+;;     not when the peer takes it. There is no two-phase protocol across processes.
+;;   - Fork: this process's end of the socket is FD_CLOFORK (macOS), so a child forked
+;;     later (a test child, a clone) never holds it: it cannot read this end's frames,
+;;     write into its stream, or keep the peer from seeing this process die.
+;;   - A raw descriptor (the second value of remote-pair) is inherited by a child that
+;;     is forked next, or handed to any process with send-fd!; that process calls open.
+;;
+;; Pumps (the :pump option):
+;;   :thread (default) — one OS thread each, blocking in recv(2) / on the channel: the
+;;     kernel wakes the reader itself, the shortest path for one busy end.
+;;   :fiber — fibers over a non-blocking socket, parked on jolt.io-poller's one
+;;     readiness thread: thousands of ends cost no thread each.
+;;
+;; Forking and threads. fork(2) copies only the calling thread. A child that opens
+;; an end runs pump threads, so it must come from a process that is safe to fork
+;; and then run threads in: one with a single active Chez thread at the fork and no
+;; parallel-collector sweeper threads yet (Chez makes those the first time a
+;; collection finds other threads waiting, and keeps them; a child of a process that
+;; has them hangs in its first such collection). A single-threaded fork server, forked
+;; before anything starts a thread, is that process. A child forked from a threaded
+;; process (a test child of an agent) can still use the descriptors it inherited raw,
+;; with no pump.
+;;
+;; The codec is a seam: {:encode (fn [v] byte-array) :decode (fn [byte-array] v)}.
+;; The default is EDN (edn-codec); a faster binary codec plugs in with :codec. A
+;; value the codec cannot encode or decode is a defect: the pump that met it closes
+;; both halves and rethrows on its own thread.
+(ns jolt.async.remote
+  (:require [clojure.core.async :as a]
+            [clojure.edn :as edn]
+            [jolt.ffi :as ffi]
+            [jolt.io-poller :as poller]
+            [jolt.socket.native :as native]
+            [clojure.string :as str]
+            [jolt.fibers]))
+
+(ffi/load-library)
+
+(def ^:private macos? (str/includes? (str/lower-case (or (System/getProperty "os.name") "")) "mac"))
+
+(ffi/defcfn ^:private c-socketpair "socketpair" [:int :int :int :pointer] :int {:capture-native-error true})
+(ffi/defcfn ^:private c-shutdown "shutdown" [:int :int] :int)
+(ffi/defcfn ^:private c-sendmsg "sendmsg" [:int :pointer :int] :ssize_t {:blocking true :capture-native-error true})
+(ffi/defcfn ^:private c-recvmsg "recvmsg" [:int :pointer :int] :ssize_t {:blocking true :capture-native-error true})
+
+(def ^:private AF-UNIX 1)
+(def ^:private SOCK-STREAM 1)
+(def ^:private SO-SNDBUF (if macos? 0x1001 7))
+(def ^:private SO-RCVBUF (if macos? 0x1002 8))
+(def ^:private F-GETFD 1)
+(def ^:private F-SETFD 2)
+(def ^:private F-GETFL 3)
+(def ^:private F-SETFL 4)
+(def ^:private O-NONBLOCK (if macos? 0x4 0x800))
+;; macOS's close-on-fork. Linux has no such flag: there a child must close the
+;; descriptors it inherited itself (forget! below).
+(def ^:private FD-CLOFORK (when macos? 2))
+(def ^:private SCM-RIGHTS 1)
+(def ^:private END 0xFFFFFFFF)          ; the length word of an end frame
+
+;; ---- the codec seam -----------------------------------------------------------
+
+(def edn-codec
+  "Values as UTF-8 EDN: readable by anything, and the slowest choice."
+  {:encode (fn [v] (.getBytes ^String (pr-str v) "UTF-8"))
+   :decode (fn [^bytes b] (edn/read-string (String. b "UTF-8")))})
+
+;; ---- descriptors --------------------------------------------------------------
+
+(defn- fcntl [fd cmd arg] (first (native/c-fcntl fd cmd arg)))
+
+(defn clofork!
+  "Mark fd close-on-fork: no child forked from now on inherits it. Answers fd."
+  [fd]
+  (when FD-CLOFORK (fcntl fd F-SETFD (bit-or FD-CLOFORK (fcntl fd F-GETFD 0))))
+  fd)
+
+(defn clofork?
+  "Is fd close-on-fork? (nil where the platform has no such flag.)"
+  [fd]
+  (when FD-CLOFORK (pos? (bit-and FD-CLOFORK (fcntl fd F-GETFD 0)))))
+
+(defn- set-int-opt! [fd opt v]
+  (let [b (ffi/alloc 4)]
+    (try (ffi/write b :int v) (first (native/c-setsockopt fd native/sol-socket opt b 4))
+         (finally (ffi/free b)))))
+
+(defn socketpair
+  "[a b]: a connected AF_UNIX stream pair, raw descriptors. A write to a dead peer
+  answers EPIPE, never a signal. opts: :sock-buf, bytes of each socket's send and
+  receive buffer (nil keeps the system's default)."
+  ([] (socketpair {}))
+  ([{:keys [sock-buf]}]
+   (let [sv (ffi/alloc 8)]
+     (try
+       (let [[r e] (c-socketpair AF-UNIX SOCK-STREAM 0 sv)]
+         (when-not (zero? r) (throw (ex-info "socketpair failed" {:errno e})))
+         (let [fds [(ffi/read sv :int 0) (ffi/read sv :int 4)]]
+           (doseq [fd fds]
+             (when native/so-nosigpipe (set-int-opt! fd native/so-nosigpipe 1))
+             (when sock-buf (set-int-opt! fd SO-SNDBUF sock-buf) (set-int-opt! fd SO-RCVBUF sock-buf)))
+           fds))
+       (finally (ffi/free sv))))))
+
+(defn close-fd! "Close a raw descriptor (one handed on to another process)." [fd] (first (native/c-close fd)))
+
+;; struct msghdr (LP64): name @0, namelen @8, iov @16, iovlen @24, control @32,
+;; controllen @40, flags @44 (48 bytes); iovec: base @0, len @8; one cmsghdr with one
+;; int: len @0, level @4, type @8, fd @12 (CMSG_SPACE(4) = 16 on both platforms'
+;; LP64 ABIs: darwin aligns to 4, glibc to 8 with a 16-byte header — see cmsg-*).
+(def ^:private cmsg-hdr (if macos? 12 16))
+(def ^:private cmsg-space (if macos? 16 24))
+
+(defn send-fd!
+  "Hand descriptor fd to the process at the other end of unix socket s (SCM_RIGHTS),
+  with one byte of data. The receiver gets its own descriptor for the same socket;
+  close this one after. Answers true, or the errno."
+  [s fd]
+  (let [m (ffi/alloc (+ 48 16 8 cmsg-space))
+        iov (+ (ffi/address m) 48) one (+ iov 16) ctl (+ one 8)]
+    (try
+      (dotimes [i (+ 48 16 8 cmsg-space)] (ffi/write m :uint8 0 i))
+      (ffi/write one :uint8 33)
+      (ffi/write iov :uint64 one 0) (ffi/write iov :uint64 1 8)
+      (if macos? (ffi/write ctl :uint32 (+ cmsg-hdr 4) 0) (ffi/write ctl :uint64 (+ cmsg-hdr 4) 0))
+      (ffi/write ctl :int native/sol-socket (- cmsg-hdr 8)) (ffi/write ctl :int SCM-RIGHTS (- cmsg-hdr 4))
+      (ffi/write ctl :int fd cmsg-hdr)
+      (ffi/write m :uint64 iov 16) (ffi/write m :int 1 24)
+      (ffi/write m :uint64 ctl 32) (if macos? (ffi/write m :uint32 cmsg-space 40) (ffi/write m :uint64 cmsg-space 40))
+      (let [[r e] (c-sendmsg s m 0)] (if (pos? r) true e))
+      (finally (ffi/free m)))))
+
+(defn recv-fd!
+  "Receive one descriptor sent with send-fd! on unix socket s (blocking): the new fd,
+  or nil when s reached EOF or carried no descriptor."
+  [s]
+  (let [m (ffi/alloc (+ 48 16 8 cmsg-space))
+        iov (+ (ffi/address m) 48) one (+ iov 16) ctl (+ one 8)]
+    (try
+      (dotimes [i (+ 48 16 8 cmsg-space)] (ffi/write m :uint8 0 i))
+      (ffi/write iov :uint64 one 0) (ffi/write iov :uint64 1 8)
+      (ffi/write m :uint64 iov 16) (ffi/write m :int 1 24)
+      (ffi/write m :uint64 ctl 32) (if macos? (ffi/write m :uint32 cmsg-space 40) (ffi/write m :uint64 cmsg-space 40))
+      (let [[r _] (loop [] (let [[r e] (c-recvmsg s m 0)] (if (and (neg? r) (native/eintr? e)) (recur) [r e])))]
+        (when (and (pos? r) (= SCM-RIGHTS (ffi/read ctl :int (- cmsg-hdr 4))))
+          (ffi/read ctl :int cmsg-hdr)))
+      (finally (ffi/free m)))))
+
+;; ---- the socket, as a buffered frame reader and a frame writer ----------------
+;; A frame is [u32 length, little-endian][body]; length END is an end frame.
+;; rd: long-array [buf cap lo hi] over foreign memory, grown to the largest frame.
+
+(defn- rd-new [] (long-array [(ffi/address (ffi/alloc 65536)) 65536 0 0]))
+
+(defn- rd-room!
+  "Compact the buffer, then grow it until `need` bytes fit from its start."
+  [^longs st need]
+  (let [buf (aget st 0) cap (aget st 1) lo (aget st 2) live (- (aget st 3) lo)]
+    (when (pos? lo)
+      (when (pos? live) (ffi/copy (+ buf lo) buf live))
+      (aset st 2 0) (aset st 3 live))
+    (when (> need cap)
+      (let [ncap (loop [c cap] (if (< c need) (recur (* 2 c)) c))
+            nb (ffi/address (ffi/alloc ncap))]
+        (when (pos? live) (ffi/copy buf nb live))
+        (ffi/free buf)
+        (aset st 0 nb) (aset st 1 ncap)))))
+
+(defn- rd-frame
+  "The next whole frame in the buffer: a byte-array, ::end, or nil (not all there)."
+  [^longs st]
+  (let [lo (aget st 2) avail (- (aget st 3) lo)]
+    (when (>= avail 4)
+      (let [buf (aget st 0) n (ffi/read (+ buf lo) :uint32)]
+        (cond
+          (= n END) (do (aset st 2 (+ lo 4)) ::end)
+          (>= avail (+ 4 n)) (let [b (ffi/read-array (+ buf lo 4) n)] (aset st 2 (+ lo 4 n)) b))))))
+
+(defn- rd-fill!
+  "One recv into the buffer: bytes read (> 0), or :eof (EOF or a terminal error).
+  :thread blocks in recv; :fiber parks on the poller while the socket is empty."
+  [fd ^longs st pump]
+  (let [lo (aget st 2) avail (- (aget st 3) lo)
+        need (if (< avail 4) 4 (let [n (ffi/read (+ (aget st 0) lo) :uint32)] (if (= n END) 4 (+ 4 n))))]
+    (when (or (> (+ lo need) (aget st 1)) (= (aget st 3) (aget st 1))) (rd-room! st need))
+    (loop []
+      (let [hi (aget st 3)
+            [r e] (native/c-recv fd (+ (aget st 0) hi) (- (aget st 1) hi) 0)]
+        (cond
+          (pos? r) (do (aset st 3 (+ hi r)) r)
+          (zero? r) :eof
+          (native/eintr? e) (recur)
+          (and (= pump :fiber) (native/eagain? e)) (do (poller/wait-ready fd :read) (recur))
+          :else :eof)))))
+
+(defn- write-all!
+  "Write n bytes at p. Answers true, or :dead (the peer is gone)."
+  [fd p n pump]
+  (loop [off 0]
+    (if (= off n)
+      true
+      (let [[r e] (native/c-send fd (+ p off) (- n off) native/msg-nosignal)]
+        (cond
+          (pos? r) (recur (+ off r))
+          (and (neg? r) (native/eintr? e)) (recur off)
+          (and (neg? r) (= pump :fiber) (native/eagain? e)) (do (poller/wait-ready fd :write) (recur off))
+          :else :dead)))))
+
+;; ---- an end -------------------------------------------------------------------
+
+(def ^:private batch-bytes
+  "The writer gathers values already queued on :out into one write up to this size."
+  65536)
+
+(defn- finish!
+  "One pump is done; the second to finish closes the descriptor."
+  [{:keys [fd done]}]
+  (when (= 2 (swap! done inc)) (close-fd! fd)))
+
+(defn- dead!
+  "The peer is gone: both halves close locally (a take drains :in, then nil)."
+  [{:keys [in out close-in?]}]
+  (when close-in? (a/close! in))
+  (a/close! out))
+
+(defn- reader [{:keys [fd in decode pump close-in?] :as end}]
+  (let [st (rd-new)]
+    (try
+      (loop []
+        (let [f (rd-frame st)]
+          (cond
+            (identical? f ::end) (when close-in? (a/close! in))
+            ;; a put to an :in its consumer closed answers false: the value is dropped
+            (some? f) (do (a/>!! in (decode f)) (recur))
+            :else (if (= :eof (rd-fill! fd st pump))
+                    (dead! end)       ; a partial frame at EOF is discarded with the peer
+                    (recur)))))
+      (catch Throwable t (dead! end) (throw t))
+      (finally (ffi/free (aget st 0)) (finish! end)))))
+
+(defn- writer [{:keys [fd out encode pump] :as end}]
+  (let [scratch (volatile! [(ffi/address (ffi/alloc batch-bytes)) batch-bytes])
+        room! (fn [need]
+                (let [[p cap] @scratch]
+                  (if (<= need cap)
+                    p
+                    (let [nc (loop [c cap] (if (< c need) (recur (* 2 c)) c)) np (ffi/address (ffi/alloc nc))]
+                      (ffi/copy p np cap) (ffi/free p) (vreset! scratch [np nc]) np))))]
+    (try
+      (loop []
+        (let [v (a/<!! out)]
+          (if (nil? v)
+            ;; :out closed here: the end frame follows every value put before the close
+            (let [p (room! 4)] (ffi/write p :uint32 END 0) (write-all! fd p 4 pump))
+            ;; this value, then whatever else is already queued, as one write
+            (let [n (loop [v v off 0]
+                      (let [^bytes b (encode v) len (alength b)
+                            p (room! (+ off 4 len))]
+                        (ffi/write p :uint32 len off)
+                        (ffi/write-array (+ p off 4) b 0 len)
+                        (let [off (+ off 4 len)]
+                          (if (< off batch-bytes)
+                            (let [nv (a/poll! out)] (if (some? nv) (recur nv off) off))
+                            off))))]
+              (if (true? (write-all! fd (first @scratch) n pump))
+                (recur)
+                (dead! end))))))
+      (catch Throwable t (dead! end) (throw t))
+      (finally (ffi/free (first @scratch)) (finish! end)))))
+
+(defn- spawn [pump f]
+  (if (= pump :fiber)
+    (jolt.fibers/spawn f)
+    (doto (Thread. ^Runnable f) (.setDaemon true) (.start))))
+
+(defn open
+  "Make an end over connected stream socket fd, which this end then owns: it becomes
+  close-on-fork, and it is closed once both directions are done. Answers
+  {:in ch :out ch :fd fd}.
+
+  opts:
+    :buf      buffer of :in and of :out (default 16); :in-buf and :out-buf set one
+    :in       a channel to deliver into instead of a new one (a Flow in-chan, a shared
+              fan-in); with :close-in? false, the peer's end and death leave it open
+    :codec    {:encode :decode} over byte-arrays (default edn-codec)
+    :pump     :thread (default) or :fiber"
+  ([fd] (open fd {}))
+  ([fd {:keys [buf in-buf out-buf in close-in? codec pump]
+        :or {buf 16 close-in? true codec edn-codec pump :thread}}]
+   (clofork! fd)
+   (when (= pump :fiber) (fcntl fd F-SETFL (bit-or O-NONBLOCK (fcntl fd F-GETFL 0))))
+   (let [end {:fd fd
+              :in (or in (a/chan (or in-buf buf)))
+              :out (a/chan (or out-buf buf))
+              :close-in? close-in?
+              :encode (:encode codec) :decode (:decode codec)
+              :pump pump :done (atom 0)}]
+     (spawn pump #(reader end))
+     (spawn pump #(writer end))
+     (select-keys end [:in :out :fd]))))
+
+(defn remote-pair
+  "[end fd]: an end in this process, and the raw descriptor of the other end for the
+  peer process: a child forked next inherits it (then close it here with close-fd!),
+  or send-fd! hands it to a running process. The peer calls (open fd opts).
+  opts: open's, plus :sock-buf (socketpair's)."
+  ([] (remote-pair {}))
+  ([opts]
+   (let [[a b] (socketpair opts)]
+     [(open a opts) b])))
+
+(defn close!
+  "Close both halves of an end: an end frame follows what was put on :out, and :in
+  stops taking from the peer."
+  [{:keys [in out fd]}]
+  (a/close! out)
+  (a/close! in)
+  (c-shutdown fd native/shut-rd)
+  nil)
