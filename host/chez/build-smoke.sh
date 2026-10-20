@@ -1171,6 +1171,24 @@ if [ "$got_um_bin" != "$umwant" ]; then
   echo "  FAIL: top-level (set! *unchecked-math* …) in a built binary — want \`$umwant\`, got \`$got_um_bin\`"; exit 1
 fi
 
+# Literal integers past the fixnum range come back exactly in a built binary,
+# negative ones included (a vfasl conversion once flipped them to the
+# two's-complement magnitude: -4658895280553007687 became -13787848793156543929).
+blapp="$root/test/chez/bignum-literal-app"
+blwant="BIGNUM-LITERALS [-4658895280553007687 4658895280553007687 -9223372036854775808 -123456789012345678901234567890N -1/123456789012345678901234567890] -5120899773137696113"
+got_bl_src="$(cd "$blapp" && JOLT_PWD="$blapp" "$joltabs" run -m blapp.main 2>&1 | tail -1)"
+if [ "$got_bl_src" != "$blwant" ]; then
+  echo "  FAIL: bignum literals from source — want \`$blwant\`, got \`$got_bl_src\`"; exit 1
+fi
+blout="$(dirname "$out")/bignum-literal-bin"
+if ! JOLT_PWD="$blapp" "$jolt" build -m blapp.main -o "$blout" >/dev/null 2>&1; then
+  echo "  FAIL: jolt build of the bignum-literal app exited non-zero"; exit 1
+fi
+got_bl_bin="$(cd / && "$blout" 2>&1 | tail -1)"
+if [ "$got_bl_bin" != "$blwant" ]; then
+  echo "  FAIL: bignum literals in a built binary — want \`$blwant\`, got \`$got_bl_bin\`"; exit 1
+fi
+
 # -main is user code after the load, so both the CLI's `run -m` and a built
 # binary's launcher run it under clojure.main's compiler-flag frame: a set! in
 # -main is legal and reads back. Before the fix both threw "Can't
