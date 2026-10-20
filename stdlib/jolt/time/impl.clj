@@ -117,42 +117,49 @@
    :jolt.time/clock "java.time.Clock"})
 
 (defn- install-seams! []
-  (__register-eq!
-   (fn [a b] (or (jt? a) (jt? b)))
-   (fn [a b] (boolean (and (same-type? a b) ((:eq (spec-of a)) a b)))))
-  (__register-hash! jt? (fn [v] ((:hash (spec-of v)) v)))
-  ;; java.time values have no reader literal, so pr renders the same as str
-  ;; (time-literals layers #time/… readable printing on top separately).
-  (__register-str! jt? (fn [v] ((:str (spec-of v)) v)))
-  (__register-pr!  jt? (fn [v] ((:str (spec-of v)) v)))
-  (__register-compare!
-   (fn [a b] (or (jt? a) (jt? b)))
-   (fn [a b]
-     ;; compareTo's cast refuses a value of another type, and a type with no
-     ;; order is not Comparable at all: both are ClassCastExceptions on the JVM
-     (let [cmp (:cmp (spec-of a))]
-       (when-not (and cmp (same-type? a b))
-         (throw (jolt.host/throwable "java.lang.ClassCastException"
-                                     (str (pr-str a) " cannot be compared to " (pr-str b)))))
-       (cmp a b))))
-  ;; java.lang.Object is answered here too, not just by the host's root rule: an
-  ;; arm returns a DEFINITIVE false for any class the value's set does not list,
-  ;; and a host whose root rule is consulted after the arms would otherwise read
-  ;; that false and make (instance? Object v) — and (.cast Object v), which every
-  ;; SCI interop argument goes through — fail (#985). Both spellings: Class.cast
-  ;; passes "java.lang.Object", (instance? Object x) passes "Object".
-  (__register-instance-check!
-   (fn [class-name v]
-     (when (jt? v)
-       (boolean (or (contains? (:classes (spec-of v)) class-name)
-                    (contains? #{"java.io.Serializable" "Serializable"
-                                 "java.lang.Object" "Object"} class-name))))))
-  ;; (class x)/(type x) and — crucially — protocol dispatch on these values, which
-  ;; keys on value-host-tags. Without this a value's class is :object and
-  ;; (extend-protocol P java.time.X …) never fires (tick extends its protocols this way).
-  (__register-class!
-   jt?
-   (fn [x] (get type->class (type-of x) "java.lang.Object"))
-   (fn [x] (conj (vec (:classes (spec-of x))) "java.io.Serializable" "Serializable"))))
+  ;; every java.time value is a host table (type-of), so each arm claims tables
+  ;; only: the runtime then never calls jt? for a value of another kind
+  (let [claim {:kind :table}]
+    (__register-eq!
+     (fn [a b] (or (jt? a) (jt? b)))
+     (fn [a b] (boolean (and (same-type? a b) ((:eq (spec-of a)) a b))))
+     claim)
+    (__register-hash! jt? (fn [v] ((:hash (spec-of v)) v)) claim)
+    ;; java.time values have no reader literal, so pr renders the same as str
+    ;; (time-literals layers #time/… readable printing on top separately).
+    (__register-str! jt? (fn [v] ((:str (spec-of v)) v)) claim)
+    (__register-pr!  jt? (fn [v] ((:str (spec-of v)) v)) claim)
+    (__register-compare!
+     (fn [a b] (or (jt? a) (jt? b)))
+     (fn [a b]
+       ;; compareTo's cast refuses a value of another type, and a type with no
+       ;; order is not Comparable at all: both are ClassCastExceptions on the JVM
+       (let [cmp (:cmp (spec-of a))]
+         (when-not (and cmp (same-type? a b))
+           (throw (jolt.host/throwable "java.lang.ClassCastException"
+                                       (str (pr-str a) " cannot be compared to " (pr-str b)))))
+         (cmp a b)))
+     claim)
+    ;; java.lang.Object is answered here too, not just by the host's root rule: an
+    ;; arm returns a DEFINITIVE false for any class the value's set does not list,
+    ;; and a host whose root rule is consulted after the arms would otherwise read
+    ;; that false and make (instance? Object v) — and (.cast Object v), which every
+    ;; SCI interop argument goes through — fail (#985). Both spellings: Class.cast
+    ;; passes "java.lang.Object", (instance? Object x) passes "Object".
+    (__register-instance-check!
+     (fn [class-name v]
+       (when (jt? v)
+         (boolean (or (contains? (:classes (spec-of v)) class-name)
+                      (contains? #{"java.io.Serializable" "Serializable"
+                                   "java.lang.Object" "Object"} class-name)))))
+     claim)
+    ;; (class x)/(type x) and — crucially — protocol dispatch on these values, which
+    ;; keys on value-host-tags. Without this a value's class is :object and
+    ;; (extend-protocol P java.time.X …) never fires (tick extends its protocols this way).
+    (__register-class!
+     jt?
+     (fn [x] (get type->class (type-of x) "java.lang.Object"))
+     (fn [x] (conj (vec (:classes (spec-of x))) "java.io.Serializable" "Serializable"))
+     claim)))
 
 (defonce ^:private installed (install-seams!))

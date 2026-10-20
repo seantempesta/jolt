@@ -515,7 +515,11 @@
    ;; two jrecs (jolt=2's jrec-pair=? clause). records.ss builds the probe after
    ;; the earliest arms register; those are checked by the dispatch-caches unit
    ;; row after boot instead (probe-if-available).
-   (probe-if-available (lambda () (cons jrec-fast-type-probe jrec-fast-type-probe)))))
+   (probe-if-available (lambda () (cons jrec-fast-type-probe jrec-fast-type-probe)))
+   ;; two UUIDs and two Class tokens (jolt=2's clauses after the jrec one)
+   ;; (natives-misc.ss and java/class-model.ss build them, after the earliest arms)
+   (probe-if-available (lambda () juuid-fast-type-probes))
+   (probe-if-available (lambda () jclass-fast-type-probes))))
 (define (eq-arm-reject-fast-type! who pred)
   (reject-fast-type-claim! who
                            (lambda (probe) (pred (car probe) (cdr probe)))
@@ -615,6 +619,16 @@
         ;; ahead of the walk it sat at the end of (records-coll.ss jrec-equiv=?,
         ;; loads later — runtime forward ref). The pair is in eq-fast-probes.
         ((and (jrec? a) (jrec? b)) (jrec-equiv=? a b))
+        ;; Two UUIDs, and two Class tokens, answer here too. Neither kind's
+        ;; equality has an extension point on the JVM (UUID.equals compares the
+        ;; bits, Class equality is identity), and both used to reach their own
+        ;; arms only after every library arm had been asked: a UUID compare paid
+        ;; jolt-lang/time's and jolt-lang/crypto's predicates per call, and Class
+        ;; tokens are what a multimethod table (print-method) compares keys with.
+        ;; Both pairs are in eq-fast-probes, so the registry refuses an arm that
+        ;; would claim one. (juuid/jhost load later: runtime forward refs, as jrec.)
+        ((and (juuid? a) (juuid? b)) (string=? (juuid-s a) (juuid-s b)))
+        ((and (jhost? a) (jhost? b) (jclass? a) (jclass? b)) (jclass=? a b))
         ;; nil is equal only to nil (the eq? clause above answered that pair),
         ;; and two base scalars of different kinds are never equal. Both used to
         ;; reach jolt=2-base only AFTER every registered arm had been asked —
@@ -669,7 +683,10 @@
    ;; a jrec answers via its hasheq slot ahead of the walk. records.ss loads
    ;; after several arm registrants, and a probe that cannot be built is one
    ;; those registrations are not checked against (probe-if-available).
-   (probe-if-available (lambda () jrec-fast-type-probe))))
+   (probe-if-available (lambda () jrec-fast-type-probe))
+   ;; UUIDs and Class tokens hash ahead of the walk too (jolt-hash, jolt-hasheq)
+   (probe-if-available (lambda () (car juuid-fast-type-probes)))
+   (probe-if-available (lambda () (car jclass-fast-type-probes)))))
 (define (hash-arm-reject-fast-type! who pred)
   (reject-fast-type-claim! who pred (hash-fast-probes) "the jolt-hash fast path"))
 (define jolt-hash-arms '())
@@ -709,6 +726,10 @@
         ;; jrec: hasheq slot read, slow-path dispatch on 0 (records-coll.ss,
         ;; loads later — runtime forward ref like the collection clauses).
         ((jrec? x) (jrec-hasheq-fast x))
+        ;; UUID.hashCode and a Class token's name hash, ahead of the arm walk for
+        ;; the reason jolt=2 answers them early (both in hash-fast-probes)
+        ((juuid? x) (uuid-hashcode x))
+        ((and (jhost? x) (jclass? x)) (jolt-hash (jclass-name x)))
         (else (let loop ((as jolt-hash-arms))
                 (cond ((null? as) (jolt-hash-base x))
                       (((caar as) x) ((cdar as) x))

@@ -7,7 +7,13 @@
 ;; --- UUID --------------------------------------------------------------------
 ;; A uuid is a record wrapping its canonical 36-char lowercase string. str -> the
 ;; bare string; pr-str -> #uuid "…"; not map?/coll?.
-(define-record-type juuid (fields s) (nongenerative chez-juuid-v1))
+;; A UUID holds its canonical string and its two 64-bit halves (unsigned), read
+;; once when it is made: compare and hashCode use the halves, which they used to
+;; re-parse from the hex text on every call.
+(define-record-type juuid
+  (fields s msb lsb)
+  (protocol (lambda (new) (lambda (s) (new s (uuid-half-u s 0) (uuid-half-u s 16)))))
+  (nongenerative chez-juuid-v2))
 (define (jolt-uuid-pred? x) (juuid? x))
 
 (define hexd "0123456789abcdef")
@@ -82,8 +88,13 @@
     (if (fx=? j (fx+ start 16))
         acc
         (loop (fx+ j 1) (+ (* acc 16) (uuid-hexv (string-ref s (uuid-hex-pos j))))))))
-(define (uuid-msb-u u) (uuid-half-u (juuid-s u) 0))
-(define (uuid-lsb-u u) (uuid-half-u (juuid-s u) 16))
+(define (uuid-msb-u u) (juuid-msb u))
+(define (uuid-lsb-u u) (juuid-lsb u))
+;; two distinct uuids: jolt=2 and jolt-hash answer uuids ahead of the arm walk, so
+;; the eq and hash registries refuse an arm claiming one (values.ss probes)
+(define juuid-fast-type-probes
+  (cons (make-juuid "00000000-0000-4000-8000-000000000001")
+        (make-juuid "00000000-0000-4000-8000-000000000002")))
 (define (uuid-u64->s64 n) (if (>= n #x8000000000000000) (- n #x10000000000000000) n))
 (define (uuid-cmp a b)
   (let ((ma (uuid-u64->s64 (uuid-msb-u a))) (mb (uuid-u64->s64 (uuid-msb-u b))))
@@ -98,9 +109,8 @@
 (register-str-render! juuid? juuid-s)
 (define (juuid-pr u) (string-append "#uuid \"" (juuid-s u) "\""))
 (register-pr-arm! juuid? juuid-pr)
-;; two uuids are = iff same string.
-(register-eq-arm! (lambda (a b) (or (juuid? a) (juuid? b)))
-                  (lambda (a b) (and (juuid? a) (juuid? b) (string=? (juuid-s a) (juuid-s b)))))
+;; two uuids are = iff same string: jolt=2 answers the pair ahead of the arm walk
+;; (values.ss); a uuid against any other kind is not = (no arm claims the pair).
 ;; and hash as UUID.hashCode, which is what Util.hasheq answers for one: the
 ;; equal-hash fallback gave every uuid the same hash (#1313).
 (define (uuid-hashcode u)
@@ -108,7 +118,7 @@
          (x (bitwise-xor (bitwise-arithmetic-shift-right hilo 32)
                          (bitwise-and hilo #xFFFFFFFF))))
     (if (>= x #x80000000) (- x #x100000000) x)))
-(register-hash-arm! juuid? uuid-hashcode)
+;; jolt-hash / jolt-hasheq answer a uuid with uuid-hashcode ahead of the arm walk.
 
 ;; --- bigint / biginteger -----------------------------------------------------
 ;; JVM bigint/biginteger coerce: string → parsed integer, double/float →

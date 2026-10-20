@@ -49,8 +49,16 @@
 ;; that file (host-vars.ss) after the seed prelude, and an instance? miss while
 ;; the prelude loads -- clojure.pprint compiling a format with a numeric param
 ;; -- died on the unbound name and silently dropped the def.
-(define user-instance-checks '())
+(define user-instance-checks '())   ; ((fn . tables-only?) ...)
 (define (user-instance-checks-empty?) (null? user-instance-checks))
+;; Can a registered library arm answer for VAL? Only an arm without a claim, or a
+;; table-only arm when VAL is a host table (__register-instance-check!'s
+;; {:kind :table}). When none can, the library arm's answer for VAL is 'pass by
+;; declaration, so the verdict is the builtin arms' and the memo may keep it.
+(define (user-instance-checks-may-claim? val)
+  (let loop ((fs user-instance-checks))
+    (and (pair? fs)
+         (or (not (cdar fs)) (htable? val) (loop (cdr fs))))))
 
 ;; Object / java.lang.Object is the root of the type hierarchy: every non-nil
 ;; value is an instance of Object; nil is not an instance of anything. This is
@@ -237,7 +245,9 @@
          (before (vector-ref e 1)))
     (if (not (eq? before 'pass))
         before
-        (let ((r (if instance-check-user-arm (instance-check-user-arm ts val) 'pass)))
+        (let ((r (if (and instance-check-user-arm (user-instance-checks-may-claim? val))
+                     (instance-check-user-arm ts val)
+                     'pass)))
           (if (eq? r 'pass) (vector-ref e 2) r)))))
 
 ;; ---- the (instance? T x) call site's inline cache -----------------------------
@@ -280,7 +290,10 @@
   (let ((st (vector-ref site 0))
         (k (instance-kind-key val)))
     (if (and st k (eq? k (vector-ref st 3)) (instance-site-same-t? t (vector-ref st 0))
-             (fx= (vector-ref st 5) (instance-kind-epoch)))
+             (fx= (vector-ref st 5) (instance-kind-epoch))
+             ;; an answer cached because no library arm could claim the value it
+             ;; was computed for must not serve a host table, which one may
+             (not (and (htable? val) (pair? user-instance-checks))))
         (vector-ref st 4)
         (instance-site-miss site st t val k))))
 (define (instance-site-miss site st t val k)
@@ -294,7 +307,7 @@
                      (let* ((e (instance-kind-entry k tname ts val))
                             (before (vector-ref e 1)))
                        (cond ((not (eq? before 'pass)) (if before #t #f))
-                             ((user-instance-checks-empty?) (if (vector-ref e 2) #t #f))
+                             ((not (user-instance-checks-may-claim? val)) (if (vector-ref e 2) #t #f))
                              (else 'uncached)))))))
     ;; each entry is published behind a release: on a weakly ordered machine
     ;; (ARM64) another thread could otherwise see the new entry before its slots

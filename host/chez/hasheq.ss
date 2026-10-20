@@ -790,6 +790,10 @@
     ;; Ahead of the arm walk, like keywords/symbols/collections: a procedure is
     ;; in hash-fast-probes, so no arm may claim one (values.ss guard).
     ((procedure? x) (procedure-hasheq x))
+    ;; UUIDs and Class tokens: the values their former hash arms answered,
+    ;; ahead of the walk (both in hash-fast-probes, values.ss)
+    ((juuid? x) (i32 (uuid-hashcode x)))
+    ((and (jhost? x) (jclass? x)) (i32 (jolt-hash (jclass-name x))))
     (else
      ;; New hasheq arms (jrec via records.ss, etc.)
      (let loop ((as jolt-hasheq-arms))
