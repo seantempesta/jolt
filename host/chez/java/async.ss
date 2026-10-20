@@ -943,10 +943,16 @@
 ;; spawns the body on the R4 fiber carrier. Read at SPAWN time — a runtime
 ;; call, not a macroexpansion — so (binding [*go-backend* :fiber] …) covers
 ;; every go that runs inside the scope, including ones in functions it calls.
-;; The default stays :thread for the whole epic; R6 decides whether it flips.
+;; The default is :fiber on this line. Measured (L1, release): a :thread go forks an
+;; OS thread per block, 8 us and 87 KB to spawn and 13 us to a first value; a :fiber
+;; go spawns in 2.2 us and 6 KB. A park costs the same on either. On a fiber,
+;; <!!/>!!/alts!! park rather than block, so a blocking op inside a go body cannot
+;; exhaust the carrier pool; a blocking foreign call (one not routed through the IO
+;; poller) still pins its carrier for its duration. (binding [*go-backend* :thread]
+;; ...) restores an OS thread per go.
 (define jolt-go-backend-thread (keyword #f "thread"))
 (define jolt-go-backend-fiber (keyword #f "fiber"))
-(def-dynvar! "clojure.core.async" "*go-backend*" jolt-go-backend-thread)
+(def-dynvar! "clojure.core.async" "*go-backend*" jolt-go-backend-fiber)
 ;; R5: the fiber carrier-pool size (fibers.ss reads this root; jolt-nil = the
 ;; machine's processor count, a positive fixnum pins the pool — set it BEFORE
 ;; the first :fiber go, or between a jolt-fiber-pool-reset! and the next go).
@@ -975,7 +981,7 @@
     (if (and cell (var-cell-defined? cell))
         (let ((bv (dyn-binding-value cell)))
           (if (eq? bv dyn-no-binding) (var-cell-root cell) bv))
-        jolt-go-backend-thread)))
+        jolt-go-backend-fiber)))
 
 ;; The R4 dispatcher: go/go-loop/go-spawn go through here and honor the var.
 ;; Nothing else does — thread is always an OS thread and io-thread is always a
