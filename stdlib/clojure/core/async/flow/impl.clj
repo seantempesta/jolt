@@ -81,7 +81,8 @@
   "One proc's plan: its launcher, describe, in/out coords with their chan opts, fingerprint."
   [pid {:keys [proc args chan-opts] :or {chan-opts {}}}]
   (let [desc (spi/describe proc)
-        step (:step (datafy/datafy proc))
+        ;; jolt: the step Var from the launcher's metadata (datafy's postwalk cost ~120 KB)
+        step (or (::step (meta proc)) (:step (datafy/datafy proc)))
         coords (fn [k] (into {} (map (fn [cid] [[pid cid] (get chan-opts cid)])) (keys (k desc))))]
     {:pid pid :proc proc :args args :desc desc :signal-select (:signal-select desc)
      :ins (coords :ins) :outs (coords :outs)
@@ -409,6 +410,8 @@
   (let [{:keys [params ins ping-map-fn] :or {ping-map-fn identity} :as desc} (step)
         workload (or workload (:workload desc) :mixed)]
     ;;(assert (or (not params) init) "must have :init if :params")
+    ;; jolt: the step travels as metadata, for update!'s fingerprint
+    (with-meta
     (reify
       clojure.core.protocols/Datafiable
       (datafy [_]
@@ -483,4 +486,5 @@
                            [status state count read-ins]))]
                    (when-not (= nstatus :exit) ;;fall out
                      (recur nstatus nstate (long count) read-ins))))]
-          ((futurize run {:exec exs})))))))
+          ((futurize run {:exec exs})))))
+      {::step step})))
