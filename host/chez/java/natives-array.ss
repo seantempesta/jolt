@@ -516,8 +516,20 @@
 ;; A byte array's elements are signed-byte-folded by na-list->backing, the same
 ;; coercion aset applies through na-elem-of — so (into-array Byte/TYPE …) stores
 ;; bytes rather than whatever magnitude it was handed.
+;; An array of the same kind is copied backing to backing: its elements already
+;; obey the kind's rule (narrowed bytes, the flvector/fxvector choice or the boxed
+;; fallback), so (byte-array a-byte-array) is one block copy, not a seq of boxed
+;; elements, a list and a refill (1 us and 7 KB for 64 bytes, every konserve key).
+(define (na-backing-copy v)
+  (cond ((bytevector? v) (bytevector-copy v))
+        ((fxvector? v) (fxvector-copy v))
+        ((flvector? v) (flvector-copy v))
+        ((string? v) (string-copy v))
+        (else (vector-copy v))))
 (define (na-from-seq x kind)
-  (make-jolt-array (na-list->backing (seq->list (jolt-seq x)) kind) kind))
+  (if (and (jolt-array? x) (eq? (jolt-array-kind x) kind))
+      (make-jolt-array (na-backing-copy (jolt-array-vec x)) kind)
+      (make-jolt-array (na-list->backing (seq->list (jolt-seq x)) kind) kind)))
 
 ;; (T-array size init) has TWO forms on the JVM, and Numbers.T_array picks between
 ;; them with an instanceof: an init that is the element's own scalar type fills
