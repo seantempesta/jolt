@@ -794,19 +794,41 @@
                (if (eq? r 'pass) (loop (cdr as)) r))))))
       (record-method-dispatch obj name (apply jolt-vector argl))))
 ;; Any receiver but a jhost goes to record-method-dispatch exactly as an
-;; uncached site did, so a map's .get or a vector's .count pays one type test.
+;; uncached site did, except the clojure.lang read surface on a jolt map, vector
+;; or set: (.valAt ^Associative m k nf), (.count v), (.nth v i), which malli's map
+;; validator calls once per key per value. Those walked every arm to the dot-form
+;; arm and dot-coll-method's string=? chain, which calls the same jolt-get,
+;; jolt-count and jolt-nth this calls directly. The arms ahead of the dot-form
+;; arm (getClass, the monitor methods, strings, regexes) never answer these names
+;; on a collection; a library's override (jolt.host/extend-class!) can, and its
+;; arm at the head of the list turns the shortcut off, as it does
+;; record-method-dispatch's own.
+(define-syntax native-coll-site?
+  (syntax-rules ()
+    ((_ obj) (and (or (pmap? obj) (pvec? obj) (pset? obj))
+                  (not (fx=? (caar method-dispatch-arms) arm-priority-user-override))))))
 (define (jolt-host-site-call0 site obj name)
-  (if (jhost? obj)
-      (let ((f (host-site-hit site obj))) (if f (f obj) (host-site-miss site obj name '())))
-      (record-method-dispatch obj name (jolt-vector))))
+  (cond ((jhost? obj)
+         (let ((f (host-site-hit site obj))) (if f (f obj) (host-site-miss site obj name '()))))
+        ((and (native-coll-site? obj) (or (string=? name "count") (string=? name "size")))
+         (jolt-count obj))
+        (else (record-method-dispatch obj name (jolt-vector)))))
 (define (jolt-host-site-call1 site obj name a)
-  (if (jhost? obj)
-      (let ((f (host-site-hit site obj))) (if f (f obj a) (host-site-miss site obj name (list a))))
-      (record-method-dispatch obj name (jolt-vector a))))
+  (cond ((jhost? obj)
+         (let ((f (host-site-hit site obj))) (if f (f obj a) (host-site-miss site obj name (list a)))))
+        ((and (native-coll-site? obj) (or (string=? name "valAt") (string=? name "get")))
+         (jolt-get obj a))
+        ((and (native-coll-site? obj) (pvec? obj) (string=? name "nth"))
+         (jolt-nth obj a))
+        (else (record-method-dispatch obj name (jolt-vector a)))))
 (define (jolt-host-site-call2 site obj name a b)
-  (if (jhost? obj)
-      (let ((f (host-site-hit site obj))) (if f (f obj a b) (host-site-miss site obj name (list a b))))
-      (record-method-dispatch obj name (jolt-vector a b))))
+  (cond ((jhost? obj)
+         (let ((f (host-site-hit site obj))) (if f (f obj a b) (host-site-miss site obj name (list a b)))))
+        ((and (native-coll-site? obj) (or (string=? name "valAt") (string=? name "get")))
+         (jolt-get obj a b))
+        ((and (native-coll-site? obj) (pvec? obj) (string=? name "nth"))
+         (jolt-nth obj a b))
+        (else (record-method-dispatch obj name (jolt-vector a b)))))
 (define (jolt-host-site-call3 site obj name a b c)
   (if (jhost? obj)
       (let ((f (host-site-hit site obj))) (if f (f obj a b c) (host-site-miss site obj name (list a b c))))

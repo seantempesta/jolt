@@ -78,5 +78,66 @@
 (printf "bytes per cached (.size q): ~a\n" size-bytes)
 (ok "a cached 0-arg call allocates nothing beyond the method" (= size-bytes 0))
 
+(printf "\n== a jolt collection's read surface answers what dispatch answers ==\n")
+;; A site answers count/size/valAt/get/nth on a jolt map, vector or set itself
+;; (host-static.ss native-coll-site?), without the walk to dot-coll-method.
+;; Every receiver, method and argument shape must answer what the walk answers,
+;; a value or the same exception message.
+(define (outcome thunk)
+  (guard (e (#t (list 'threw (record-method-dispatch (jolt-unwrap-throw e) "getMessage" jolt-nil))))
+    (list 'value (thunk))))
+(define (same? a b)
+  (and (eq? (car a) (car b))
+       (if (eq? (car a) 'value) (jolt-truthy? (jolt= (cadr a) (cadr b))) (equal? (cadr a) (cadr b)))))
+(define kw-a (keyword #f "a"))
+(define kw-z (keyword #f "z"))
+(define big-map (jolt-hash-map-build (let loop ((i 0) (acc '())) (if (= i 40) acc (loop (+ i 1) (cons i (cons (keyword #f (number->string i)) acc)))))))
+(define receivers
+  (list (cons "array map" (jolt-array-map kw-a 1 (keyword #f "b") 2))
+        (cons "hash map" big-map)
+        (cons "empty map" (jolt-array-map))
+        (cons "vector" (jolt-vector 10 20 30))
+        (cons "empty vector" (jolt-vector))
+        (cons "map entry" (make-map-entry kw-a 1))
+        (cons "set" (jolt-hash-set kw-a 2))
+        (cons "empty set" (jolt-hash-set))))
+(define calls
+  (list (list "count") (list "size")
+        (list "valAt" kw-a) (list "valAt" kw-z) (list "valAt" kw-z 'nf) (list "valAt" 1) (list "valAt" 1 'nf)
+        (list "get" kw-a) (list "get" kw-z 'nf) (list "get" 0) (list "get" 7) (list "get" 2 'nf)
+        (list "nth" 0) (list "nth" 2) (list "nth" 3) (list "nth" -1) (list "nth" 5 'nf) (list "nth" 1 'nf)))
+(for-each
+  (lambda (r)
+    (for-each
+      (lambda (c)
+        (let* ((name (car c)) (args (cdr c)) (site (jolt-host-site-make))
+               (got (outcome (lambda ()
+                               (case (length args)
+                                 ((0) (jolt-host-site-call0 site (cdr r) name))
+                                 ((1) (jolt-host-site-call1 site (cdr r) name (car args)))
+                                 (else (jolt-host-site-call2 site (cdr r) name (car args) (cadr args)))))))
+               (want (outcome (lambda () (record-method-dispatch (cdr r) name (apply jolt-vector args))))))
+          (ok (format "~a: (.~a~{ ~s~}) answers ~s, dispatch ~s" (car r) name args got want) (same? got want))))
+      calls))
+  receivers)
+
+(printf "\n== ...without the walk ==\n")
+;; The walk allocates the argument vector and list; the direct answer allocates nothing.
+(define coll-map (jolt-array-map kw-a 1))
+(define coll-vec (jolt-vector 1 2 3))
+(define s-valat (jolt-host-site-make))
+(define s-count (jolt-host-site-make))
+(define s-nth (jolt-host-site-make))
+(define valat-bytes (bytes-per (lambda () (jolt-host-site-call2 s-valat coll-map "valAt" kw-a jolt-nil))))
+(define count-bytes (bytes-per (lambda () (jolt-host-site-call0 s-count coll-vec "count"))))
+(define nth-bytes (bytes-per (lambda () (jolt-host-site-call1 s-nth coll-vec "nth" 1))))
+(printf "bytes per (.valAt m k nf): ~a, (.count v): ~a, (.nth v i): ~a\n" valat-bytes count-bytes nth-bytes)
+(ok "(.valAt m k nf) on a jolt map allocates nothing" (= valat-bytes 0))
+(ok "(.count v) on a jolt vector allocates nothing" (= count-bytes 0))
+(ok "(.nth v i) on a jolt vector allocates nothing" (= nth-bytes 0))
+(register-method-arm! arm-priority-user-override (lambda (obj name rest) (if (and (pvec? obj) (string=? name "count")) 'overridden 'pass)))
+(ok "a library override (extend-class!'s tier) still answers first"
+    (eq? 'overridden (jolt-host-site-call0 (jolt-host-site-make) coll-vec "count")))
+
 (printf "\n~a checks, ~a failed\n" total fails)
 (exit (if (zero? fails) 0 1))

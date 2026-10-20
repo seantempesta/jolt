@@ -145,6 +145,15 @@
 ;;                      re-interned on every call. The reference is the same fn
 ;;                      built under a def, which always had one (2.38 -> 1.02).
 ;;
+;;   coll-method-site   (.valAt ^Associative m k nf) on a jolt map — malli's map
+;;                      validator calls it once per key per value — walked the
+;;                      method-dispatch arms to the dot-form arm and then
+;;                      dot-coll-method's string=? chain, only to call the
+;;                      jolt-get that (get m k nf) calls directly. A method site
+;;                      now answers count/size/valAt/get/nth on a jolt map,
+;;                      vector or set itself. The reference is (get m k nf)
+;;                      (12.6 -> 2.0).
+;;
 ;;   pipe-read          a child's stdout pipe copied each chunk out of its foreign
 ;;   pipe-write         read buffer into the port's bytevector one byte at a time
 ;;                      through sa-foreign-ref (and stdin the same way in), ~30 ns
@@ -527,6 +536,13 @@
           #(dotimes [_ dispatch-n] (= eq-vec-a eq-vec-b))
           #(dotimes [_ dispatch-n] (= eq-rec-a eq-rec-b))
           2.5 4.0)
+
+  ;; A hinted read method on a jolt map must cost about what the core fn costs.
+  (let [m {:a 1 :b 2 :c 3}]
+    (judge! "coll-method-site"
+            #(dotimes [_ dispatch-n] (get m :b nil))
+            #(dotimes [_ dispatch-n] (.valAt ^clojure.lang.Associative m :b nil))
+            4.0 6.0))
 
   ;; The same fn body costs the same whether a def or a bare form built it.
   (judge! "top-level-fn"
