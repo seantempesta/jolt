@@ -39,6 +39,9 @@
 ;; minimum: building the held data can cross the old-generation limit, and a
 ;; full collection the policy runs then may raise its growth factor. Before,
 ;; System/gc left the policy's figure where its last own full collection put it.
+;; The allowance is sized from the collectable heap (the static boot image left
+;; out), so with ~100MB held it is about that, and dropped it falls to the 64MB
+;; minimum: the gate asks only that it shrank, since a stale figure would not.
 (defn- refresh []
   (reset! held (vec (map (fn [i] {:i i :s (str "held-" i)}) (range 600000))))
   (System/gc)
