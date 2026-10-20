@@ -94,6 +94,16 @@
 (define (sa-bytes-allocated)
   (bytes-allocated))
 
+;; (sa-static-bytes) -> exact integer
+;; The part of sa-bytes-allocated the collector never collects: Chez's static
+;; generation, which holds the runtime's boot image (~70MB in every process) and
+;; whatever a program moved there with (collect max 'static). It is never
+;; copied and never freed, so it needs no collection headroom. Contract: bytes
+;; in that generation, never more than sa-bytes-allocated. Degradation: 0 for a
+;; collector with no such generation.
+(define (sa-static-bytes)
+  (bytes-allocated 'static))
+
 ;; (sa-total-memory-bytes) -> exact integer
 ;; Total process heap bytes — what the collector has reserved from the OS
 ;; (the JVM's totalMemory; Runtime.freeMemory is the difference against

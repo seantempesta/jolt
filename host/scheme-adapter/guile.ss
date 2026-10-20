@@ -81,6 +81,7 @@
 ;;   sa-gc-collect          UNIMPLEMENTED  Guile: (gc) — may no-op (contract allows).
 ;;   sa-gc-max-generation   UNIMPLEMENTED  ?? Guile uses Boehm GC — no generations.
 ;;   sa-bytes-allocated     UNIMPLEMENTED  ?? (gc-stats) candidate; must verify field/shape.
+;;   sa-static-bytes        UNIMPLEMENTED  0 permitted by contract (Boehm GC has no static generation).
 ;;   sa-total-memory-bytes  UNIMPLEMENTED  ?? (gc-stats) candidate; must verify.
 ;;   sa-max-memory-bytes    UNIMPLEMENTED  The current total permitted by contract.
 ;;   sa-reset-max-memory-bytes! UNIMPLEMENTED  No-op permitted when the above answers "now".
