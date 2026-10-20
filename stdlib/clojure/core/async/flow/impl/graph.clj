@@ -26,3 +26,7 @@
   
   (inject [g [pid io-id] msgs] "synchronously puts the messages on the channel 
                          corresponding to the input or output of the process"))
+
+;; jolt: change a running flow in place (see clojure.core.async.flow/update!)
+(defprotocol Update
+  (update-flow [g new-config] "diff :procs and :conns against the running flow and apply the difference"))

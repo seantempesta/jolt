@@ -138,6 +138,17 @@
   and report channels. The flow can be started again"
   [g] (g/stop g))
 
+(defn update!
+  "jolt: change a running (or stopped) flow to new-config {:procs :conns} in place.
+  Procs whose :proc, :args and :chan-opts are unchanged keep running, with their
+  channels and the messages queued in them. Removed procs are stopped, their exit
+  awaited; added (or changed) procs are started, paused, then resumed. A connection
+  whose consumers changed gets a new route: an output with one consumer writes straight
+  into that consumer's channel, several share a mult; only a replaced mult's own buffer
+  can lose messages. Returns {:added #{pids} :removed #{pids} :rewired #{out-coords}
+  :running true|{::flow/running #{pids}}}."
+  [g new-config] (g/update-flow g new-config))
+
 (defn pause
   "pauses a running flow"
   [g] (g/pause g))

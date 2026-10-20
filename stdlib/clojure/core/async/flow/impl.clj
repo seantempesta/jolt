@@ -55,174 +55,294 @@
                       {:pid pid :ins (keys inopts) :outs (keys outopts)})))
     (assoc ret pid {:pid pid :proc proc :ins inopts :outs outopts :args args :signal-select signal-select})))
 
+;; ---- jolt: a graph that update! can change in place (lane F2, after V1's JVM design,
+;; notes/option3-V1-jvm-flow-update.md §3 and §5) -------------------------------------
+;;
+;; 1. A proc's data outputs are not handed to it at start: it gets only ::flow/error and
+;;    ::flow/report in :outs, so every data output falls through send-outputs to
+;;    spi/get-write-chan on a resolver of its own (one per pid: send-outputs passes the
+;;    bare cid). The resolver reads the graph's route table at send time, so rewiring an
+;;    output is a table swap, never a producer restart.
+;; 2. A route is nil (an unconnected output, dropped), the consumer's in-chan (1:1), or a
+;;    mult's source (fan-out). Taps are close? false. A mult, once made, stays for its
+;;    output's life (collapsing it to a direct put could reorder that producer's messages).
+;; 3. No control mult: each proc has its own control chan, and every command is put on its
+;;    targets' chans under the graph lock, in issue order. A dead proc's full chan cannot
+;;    wedge anyone else's commands; a per-proc stop is O(1).
+;; 4. update! diffs proc fingerprints (step, describe without fns, args, chan-opts):
+;;    unchanged procs keep their loop, state, in-chans and queued messages; removed and
+;;    changed procs are stopped and their exit awaited (one never starts twice); in-chans
+;;    survive by coord and options, a dropped one is closed and drained, its losses reported.
+;; 5. stop sends stop to every proc and awaits every exit (bounded), as before.
+
+(defn- describe-data [desc] (into {} (remove (comp fn? val)) desc))
+
+(defn- proc-plan
+  "One proc's plan: its launcher, describe, in/out coords with their chan opts, fingerprint."
+  [pid {:keys [proc args chan-opts] :or {chan-opts {}}}]
+  (let [desc (spi/describe proc)
+        step (:step (datafy/datafy proc))
+        coords (fn [k] (into {} (map (fn [cid] [[pid cid] (get chan-opts cid)])) (keys (k desc))))]
+    {:pid pid :proc proc :args args :desc desc :signal-select (:signal-select desc)
+     :ins (coords :ins) :outs (coords :outs)
+     :fingerprint [(or step proc) (describe-data desc) args chan-opts]}))
+
+(defn- conn-map [plans conns]
+  (let [ins (into {} (mapcat :ins) (vals plans))
+        outs (into {} (mapcat :outs) (vals plans))]
+    (reduce (fn [m [out in :as c]]
+              (if (and (contains? outs out) (contains? ins in))
+                (update m out (fnil conj #{}) in)
+                (throw (ex-info "invalid connection" {:conn c}))))
+            {} conns)))
+
+(defn- set-diff [a b] (into #{} (remove b) a))
+
+(defn- plan-diff
+  "What an update must do, as data: pids to stop, start, keep; in-chans to drop and make."
+  [old-plans new-plans]
+  (let [old-pids (set (keys old-plans)) new-pids (set (keys new-plans))
+        both (into #{} (filter old-pids) new-pids)
+        kept (into #{} (filter #(= (:fingerprint (old-plans %)) (:fingerprint (new-plans %)))) both)
+        changed (set-diff both kept)
+        old-ins (into {} (mapcat :ins) (vals old-plans))
+        new-ins (into {} (mapcat :ins) (vals new-plans))
+        same-in? (fn [coord] (and (contains? old-ins coord) (contains? new-ins coord) (= (old-ins coord) (new-ins coord))))]
+    {:stop (into (set-diff old-pids new-pids) changed)
+     :start (into (set-diff new-pids old-pids) changed)
+     :kept kept
+     :drop-ins (into #{} (remove same-in?) (keys old-ins))
+     :make-ins (into #{} (remove same-in?) (keys new-ins))}))
+
+(defn- make-chan [error-chan [[pid cid] {:keys [buf-or-n xform]}]]
+  (if xform
+    (async/chan buf-or-n xform
+                (fn [ex] (async/put! error-chan #::flow{:ex ex :pid pid :cid cid :xform xform}) nil))
+    (async/chan (or buf-or-n 10))))
+
+(defn- drain!
+  "Close c and take what is left in it (buffered, or parked puts); answers how many."
+  [c]
+  (async/close! c)
+  (loop [n 0] (if (some? (async/poll! c)) (recur (inc n)) n)))
+
+(defn- routes-for
+  "out coord -> route, given the in-chans, the conn map and the mults that exist.
+  Answers [routes mults], with a mult for every new fan-out (or self-feeding output)."
+  [in-chans cmap mults]
+  (reduce-kv
+    (fn [[rs ms] out ins]
+      (if (or (contains? ms out) (< 1 (count ins)) (= (first out) (ffirst ins)))
+        (let [{:keys [src] :as m} (or (ms out)
+                                      (let [src (async/chan 10)] {:src src :mult (fiber-go (async/mult src)) :taps {}}))]
+          [(assoc rs out src) (assoc ms out m)])
+        [(assoc rs out (in-chans (first ins))) ms]))
+    [{} mults] cmap))
+
+(defn- retap!
+  "Make each mult's taps exactly its conns' current in-chans (by identity)."
+  [mults cmap in-chans]
+  (reduce-kv (fn [ms out {:keys [mult taps] :as m}]
+               (let [want (into {} (map (fn [in] [in (in-chans in)])) (get cmap out #{}))]
+                 (doseq [[in c] taps :when (not (identical? c (want in)))] (async/untap mult c))
+                 (doseq [[in c] want :when (not (identical? c (taps in)))] (async/tap mult c false))
+                 (assoc ms out (assoc m :taps want))))
+             {} mults))
+
+(defn- send-control!
+  "Put cmd on each pid's own control chan, in order (called under the graph lock)."
+  [rt pids cmd]
+  (doseq [pid pids]
+    (when-let [c (get-in @rt [:running pid :control])]
+      (async/>!! c (assoc cmd ::flow/to pid)))))
+
+(defn- proc-resolver [rt pid execs]
+  (reify spi/Resolver
+    (get-write-chan [_ coord]
+      (let [{:keys [routes in-chans plans]} @rt]
+        (if (vector? coord)
+          (if-let [[_ c] (or (find routes coord) (find in-chans coord))]
+            c
+            (throw (ex-info "can't resolve channel with io-id" {:io-id coord})))
+          ;; the bare cid send-outputs passes for an output not in :outs
+          (let [k [pid coord]]
+            (if-let [[_ c] (find routes k)]
+              c
+              ;; nil drops: an unconnected output, or a proc no longer in the plan
+              (when (and (contains? plans pid) (not (contains? (get-in plans [pid :outs]) k)))
+                (throw (ex-info "can't resolve channel with io-id" {:io-id k}))))))))
+    (get-exec [_ context] (or (execs context) (disp/executor-for context)))))
+
+(defn- start-proc! [rt execs {:keys [pid proc args ins]}]
+  (let [{:keys [in-chans error report castees cast status]} @rt
+        control (async/chan 10)
+        fut (spi/start proc {:pid pid :args (assoc args ::flow/pid pid)
+                             :resolver (proc-resolver rt pid execs) :cast cast
+                             :ins (assoc (into {} (map (fn [[[_ cid :as k] _]] [cid (in-chans k)])) ins)
+                                         ::flow/control control
+                                         ::flow/casts (get-in castees [pid :chan]))
+                             :outs {::flow/error error ::flow/report report}})]
+    (swap! rt assoc-in [:running pid] {:future fut :control control})
+    (when (= :running status)
+      (async/>!! control #::flow{:command ::flow/resume :to pid}))))
+
+(defn- await-exits
+  "Await each future up to the deadline; answers the pids still running."
+  [running stop-timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) stop-timeout-ms)]
+    (into #{} (keep (fn [[pid {:keys [^Future future]}]]
+                      (when-not (try (.get future (max 1 (- deadline (System/currentTimeMillis))) TimeUnit/MILLISECONDS) true
+                                     (catch Throwable _ (.isDone future)))
+                        pid)))
+          running)))
+
+(defn- stop-proc!
+  "Stop one proc and await its exit. Answers nil, or the pid when it missed the bound."
+  [rt pid stop-timeout-ms]
+  (when-let [{:keys [control] :as r} (get-in @rt [:running pid])]
+    (async/>!! control #::flow{:command ::flow/stop :to pid})
+    (if (seq (await-exits {pid r} stop-timeout-ms))
+      pid
+      (do (async/close! control) (swap! rt update :running dissoc pid) nil))))
+
 (defn create-flow
-  "see lib ns for docs"
-  [{:keys [procs conns mixed-exec io-exec compute-exec stop-timeout-ms] :or {stop-timeout-ms 10000}}]
+  "see lib ns for docs (jolt: update! changes a running flow in place, above)"
+  [{:keys [procs conns mixed-exec io-exec compute-exec stop-timeout-ms] :or {stop-timeout-ms 10000} :as definition}]
   (let [lock (ReentrantLock.)
-        chans (atom nil)
         execs {:mixed mixed-exec :io io-exec :compute compute-exec}
         _ (assert (every? #(or (nil? %) (instance? Executor %)) (vals execs))
                   "mixed-exe, io-exec and compute-exec must be Executors")
-        pdescs (reduce-kv prep-proc {} procs)
-        allopts (fn [iok] (into {} (mapcat #(map (fn [[k opts]] [[(:pid %) k] opts]) (iok %)) (vals pdescs))))
-        inopts (allopts :ins)
-        outopts (allopts :outs)
-        set-conj (fnil conj #{})
-        ;;out-coord->#{in-coords}
-        conn-map (reduce (fn [ret [out in :as conn]]
-                           (if (and (contains? outopts out)
-                                    (contains? inopts in))
-                             (update ret out set-conj in)
-                             (throw (ex-info "invalid connection" {:conn conn}))))
-                         {} conns)
-        running-chans #(or (deref chans) (throw (Exception. "flow not running")))
-        send-command (fn sc
-                       ([cmap]
-                        (let [{:keys [control]} (running-chans)]
-                          (async/>!! control cmap)))
-                       ([command to] (sc #::flow{:command command :to to})))
-        handle-ping (fn [to timeout-ms]
-                      (let [reply-chan (async/chan (count procs))
-                            ret-chan (fiber-go (async/take (if (= to ::flow/all) (count procs) 1) reply-chan))
-                            timeout (async/timeout timeout-ms)
-                            _ (send-command #::flow{:command ::flow/ping, :to to, :reply-chan reply-chan})
-                            ret (loop [ret nil]
-                                  (let [[{::flow/keys [pid] :as m} c] (async/alts!! [ret-chan timeout])]
-                                    (if (some? m)
-                                      (recur (assoc ret pid m))
-                                      ret)))
-                            ;; jolt: a go block is a thread; take's go-loop ends only when
-                            ;; reply-chan closes, so close it (a late pong is dropped)
-                            _ (async/close! reply-chan)]
-                        (if (= to ::flow/all) ret (-> ret vals first))))]
+        ;; the definition update! last applied (start starts from it)
+        current (atom (select-keys definition [:procs :conns]))
+        _ (conn-map (into {} (map (fn [[pid d]] [pid (proc-plan pid d)])) procs) conns)
+        rt (atom nil)
+        locked (fn [f] (.lock lock) (try (f) (finally (.unlock lock))))
+        apply! (fn [{:keys [procs conns]}]
+                 (let [t0 (System/nanoTime)
+                       old @rt
+                       ;; a proc whose definition is the identical value keeps its plan
+                       plans (into {} (map (fn [[pid d]] [pid (if (identical? d (get-in old [:defs pid])) (get-in old [:plans pid]) (proc-plan pid d))]))
+                                   procs)
+                       cmap (conn-map plans conns)
+                       {:keys [stop start drop-ins make-ins kept]} (plan-diff (:plans old) plans)
+                       new-ins (into {} (mapcat :ins) (vals plans))
+                       ;; 1. the new in-chans (and castees)
+                       in-chans (-> (apply dissoc (:in-chans old) drop-ins)
+                                    (into (map (fn [k] [k (make-chan (:error old) [k (new-ins k)])])) make-ins))
+                       castees (-> (apply dissoc (:castees old) stop)
+                                   (into (map (fn [pid] [pid {:select (:signal-select (plans pid))
+                                                              :chan (async/chan (async/sliding-buffer 100))}]))
+                                         start))
+                       ;; 2. routes and mults: a producer's next send goes the new way
+                       new-outs (into {} (mapcat :outs) (vals plans))
+                       live-mults (into {} (filter (comp #(contains? new-outs %) key)) (:mults old))
+                       [rts mults] (routes-for in-chans cmap live-mults)
+                       mults (retap! mults cmap in-chans)]
+                   (swap! rt assoc :plans plans :defs procs :in-chans in-chans :castees castees :routes rts :mults mults)
+                   ;; 3. stop removed and changed procs, awaiting each exit; one that missed
+                   ;; its bound is never started twice (every later update retries it)
+                   (let [pending (:pending-exit old #{})
+                         missed (into #{} (keep #(stop-proc! rt % stop-timeout-ms)) (into pending stop))
+                         start (-> start (into (filter #(contains? plans %)) (remove missed pending)) (set-diff missed))
+                         _ (swap! rt assoc :pending-exit missed)
+                         ;; 4. a removed output's mult closes (its taps are close? false)
+                         _ (doseq [[out m] (:mults old) :when (not (contains? mults out))]
+                             (async/untap-all (:mult m)) (async/close! (:src m)))
+                         ;; 5. dropped in-chans: closed and drained, losses counted
+                         lost (into {} (map (fn [k] [k (drain! (get-in old [:in-chans k]))])) drop-ins)
+                         ;; 6. start added and changed procs
+                         _ (doseq [pid start] (start-proc! rt execs (plans pid)))]
+                     {:stopped stop :started start :kept (count kept)
+                      :lost (into {} (filter (comp pos? val)) lost)
+                      :missed-exit missed
+                      :ms (/ (- (System/nanoTime) t0) 1e6)})))]
     (reify
       clojure.core.protocols/Datafiable
       (datafy [_]
-        (walk/postwalk datafy {:procs procs, :conns conns, :execs execs
-                               :chans (select-keys @chans [:ins :outs :error :report])}))
+        (walk/postwalk datafy (assoc @current :execs execs :chans (select-keys @rt [:in-chans :routes :error :report]))))
 
       clojure.core.async.flow.impl.graph.Graph
       (start [_]
-        (.lock lock)
-        (try
-          (if-let [{:keys [report error]} @chans]
-            {:report-chan report :error-chan error :already-running true}
-            (let [control-chan (async/chan 10)
-                  control-mult (fiber-go (async/mult control-chan))
-                  report-chan (async/chan (async/sliding-buffer 100))
-                  error-chan (async/chan (async/sliding-buffer 100))
-                  make-chan (fn [[[pid cid]{:keys [buf-or-n xform]}]]
-                              (if xform
-                                (async/chan
-                                 buf-or-n xform
-                                 (fn [ex]
-                                   (async/put! error-chan
-                                               #::flow{:ex ex, :pid pid, :cid cid, :xform xform})
-                                   nil))
-                                (async/chan (or buf-or-n 10))))
-                  in-chans (zipmap (keys inopts) (map make-chan inopts))
-                  needs-mult? (fn [out ins]
-                                (or (< 1 (count ins))
-                                    (= (first out) (ffirst ins))))
-                  out-chans (zipmap (keys outopts)
-                                    (map (fn [[coord opts :as co]]
-                                           (let [conns (conn-map coord)]
-                                             (cond
-                                               (empty? conns) nil
-                                               (needs-mult? coord conns) (make-chan co)
-                                               ;;direct connect 1:1
-                                               :else (in-chans (first conns))))) 
-                                         outopts))                 
-                  ;;pid->{:select :chan}
-                  castees (reduce (fn [ret {:keys [pid signal-select]}]
-                                    (assoc ret pid
-                                           {:select signal-select
-                                            :chan (async/chan (async/sliding-buffer 100))}))
-                                     {} (vals pdescs))
-                  cast (fn [sigid msgs]
-                         (doseq [{:keys [select chan]} (vals castees)]
-                           (when (and select (select sigid))
-                             (doseq [m msgs]
-                               (async/>!! chan [sigid m])))))
-                  ;;mults
-                  _  (doseq [[out ins] conn-map]
-                       (when (needs-mult? out ins)
-                         (let [m (fiber-go (async/mult (out-chans out)))]
-                           (doseq [in ins]
-                             (async/tap m (in-chans in))))))
-                  write-chan #(if-let [[_ c] (or (find in-chans %) (find out-chans %))]
-                                c
-                                (throw (ex-info "can't resolve channel with io-id" {:io-id %})))
-                  resolver (reify spi/Resolver
-                             (get-write-chan [_ coord]
-                               (write-chan coord))
-                             (get-exec [_ context] (or (execs context) (disp/executor-for context))))
-                  start-proc
-                  (fn [{:keys [pid proc args ins outs]}]
-                    (try
-                      (let [chan-map (fn [ks coll] (zipmap (keys ks) (map #(coll [pid %]) (keys ks))))
-                            control-tap (async/chan 10)]
-                        (async/tap control-mult control-tap)
-                        (spi/start proc {:pid pid :args (assoc args ::flow/pid pid)
-                                         :resolver resolver :cast cast
-                                         :ins (assoc (chan-map ins in-chans)
-                                                     ::flow/control control-tap
-                                                     ::flow/casts (-> pid castees :chan))
-                                         :outs (assoc (chan-map outs out-chans)
-                                                      ::flow/error error-chan
-                                                      ::flow/report report-chan)}))
-                      (catch Throwable ex
-                        (async/>!! control-chan #::flow{:command ::flow/stop :to ::flow/all})
-                        (throw ex))))]
-              (let [futs (into {} (map (fn [p] [(:pid p) (start-proc p)])) (vals pdescs))]
-              ;;the only connection to a running flow is via channels
-              (reset! chans {:control control-chan :resolver resolver :cast cast
-                             ;; jolt: what stop awaits and closes
-                             :futs futs
-                             :mult-srcs (into [] (keep (fn [[out ins]] (when (needs-mult? out ins) (out-chans out)))) conn-map)
-                             :report report-chan, :error error-chan
-                             :ins in-chans, :outs out-chans})
-              {:report-chan report-chan :error-chan error-chan})))
-          (finally (.unlock lock))))
+        (locked
+          (fn []
+            (if-let [{:keys [report error]} @rt]
+              {:report-chan report :error-chan error :already-running true}
+              (let [report (async/chan (async/sliding-buffer 100))
+                    error (async/chan (async/sliding-buffer 100))
+                    cast (fn [sigid msgs]
+                           (doseq [{:keys [select chan]} (vals (:castees @rt))]
+                             (when (and select (select sigid))
+                               (doseq [m msgs] (async/>!! chan [sigid m])))))]
+                (reset! rt {:status :paused :report report :error error :cast cast
+                            :plans {} :in-chans {} :routes {} :mults {} :castees {} :running {}})
+                (apply! @current)
+                {:report-chan report :error-chan error})))))
       (stop [_]
-        (.lock lock)
-        (try
-          (when-let [{:keys [report error control futs mult-srcs]} @chans]
-            (send-command ::flow/stop ::flow/all)
-            ;; jolt: stop answers after every proc's loop has exited (its ::flow/stop
-            ;; transition has run), bounded by :stop-timeout-ms; a proc still running
-            ;; at the bound is named, not called stopped.
-            (let [deadline (+ (System/currentTimeMillis) stop-timeout-ms)
-                  running (into #{} (keep (fn [[pid ^Future f]]
-                                            (when-not (try (.get f (max 1 (- deadline (System/currentTimeMillis))) TimeUnit/MILLISECONDS) true
-                                                           (catch Throwable _ (.isDone f)))
-                                              pid)))
-                                futs)]
-              ;; jolt: a go block is a thread, so a mult's go-loop parked on an open
-              ;; source is a thread held forever. Close every mult source once the
-              ;; procs reading its taps are gone.
-              (when (empty? running)
-                (async/close! control)
-                (run! async/close! mult-srcs))
-              (async/close! error)
-              (async/close! report)
-              (reset! chans nil)
-              (if (empty? running) true {::flow/running running})))
-          (finally (.unlock lock))))
-      (pause [_] (send-command ::flow/pause ::flow/all))
-      (resume [_] (send-command ::flow/resume ::flow/all))
-      (ping [_ timeout-ms] (handle-ping ::flow/all timeout-ms))
-      (pause-proc [_ pid] (send-command ::flow/pause pid))
-      (resume-proc [_ pid] (send-command ::flow/resume pid))
-      (ping-proc [_ pid timeout-ms] (handle-ping pid timeout-ms))         
+        (locked
+          (fn []
+            (when-let [{:keys [report error running mults]} @rt]
+              (send-control! rt (keys running) #::flow{:command ::flow/stop})
+              ;; jolt: stop answers after every proc's loop has exited (its ::flow/stop
+              ;; transition ran), bounded by :stop-timeout-ms; a proc still running is named
+              (let [still (await-exits running stop-timeout-ms)]
+                (doseq [[_ {:keys [control]}] running] (async/close! control))
+                ;; jolt: a mult's go-loop parked on an open source holds a fiber: close them
+                (doseq [[_ m] mults] (async/close! (:src m)))
+                (async/close! error) (async/close! report)
+                (reset! rt nil)
+                (if (empty? still) true {::flow/running still}))))))
+      (pause [_] (locked #(do (swap! rt assoc :status :paused)
+                              (send-control! rt (keys (:running @rt)) #::flow{:command ::flow/pause}))))
+      (resume [_] (locked #(do (swap! rt assoc :status :running)
+                               (send-control! rt (keys (:running @rt)) #::flow{:command ::flow/resume}))))
+      (ping [_ timeout-ms]
+        (let [timeout (async/timeout timeout-ms)
+              [n reply] (locked #(let [pids (keys (:running @rt))
+                                       reply (async/chan (max 1 (count pids)))]
+                                   (send-control! rt pids #::flow{:command ::flow/ping :reply-chan reply})
+                                   [(count pids) reply]))
+              ret-chan (fiber-go (async/take n reply))
+              ret (loop [ret nil]
+                    (let [[m _] (async/alts!! [ret-chan timeout])]
+                      (if (some? m) (recur (assoc ret (::flow/pid m) m)) ret)))]
+          ;; jolt: take's go-loop ends only when reply closes (a late pong is dropped)
+          (async/close! reply)
+          ret))
+      (pause-proc [_ pid] (locked #(send-control! rt [pid] #::flow{:command ::flow/pause})))
+      (resume-proc [_ pid] (locked #(send-control! rt [pid] #::flow{:command ::flow/resume})))
+      (ping-proc [_ pid timeout-ms]
+        (let [reply (async/chan 1)]
+          (locked #(send-control! rt [pid] #::flow{:command ::flow/ping :reply-chan reply}))
+          (let [[m _] (async/alts!! [reply (async/timeout timeout-ms)])]
+            (async/close! reply)
+            m)))
       (inject [_ [target id :as coord] msgs]
-        (let [{:keys [resolver cast]} (running-chans)
+        (let [{:keys [cast]} (or @rt (throw (Exception. "flow not running")))
               do-io (if (= target ::flow/cast)
                       #(cast id msgs)
-                      (let [chan (spi/get-write-chan resolver coord)]
-                        #(doseq [m msgs]
-                           (async/>!! chan m))))]
-          ((futurize do-io {:exec :io})))))))
+                      (let [c (or (get-in @rt [:in-chans coord]) (get-in @rt [:routes coord])
+                                  (throw (ex-info "can't resolve channel with io-id" {:io-id coord})))]
+                        #(doseq [m msgs] (async/>!! c m))))]
+          ((futurize do-io {:exec :io}))))
+
+      clojure.core.async.flow.impl.graph.Update
+      (update-flow [_ d]
+        (locked (fn []
+                  (reset! current (select-keys d [:procs :conns]))
+                  (if @rt (apply! d) {:running false})))))))
+
+(defn- finish-outputs!
+  "jolt (V1's one change to the proc loop): a stop that arrives while a step's outputs are
+  being sent delivers the rest of them, each put bounded by stop-output-ms, instead of
+  dropping them; one that misses its bound is reported."
+  [outputs outs resolver cast stop-output-ms report]
+  (doseq [[output msgs] outputs]
+    (if (and (vector? output) (= (first output) ::flow/cast))
+      (cast (second output) msgs)
+      (when-let [outc (or (outs output) (spi/get-write-chan resolver output))]
+        (doseq [m msgs]
+          (let [[v _] (async/alts!! [[outc m] (async/timeout stop-output-ms)])]
+            (when-not v (async/put! report {::flow/dropped-on-stop output}))))))))
 
 (defn handle-command
   [pid pong status cmd]
@@ -247,7 +367,9 @@
 (defn send-outputs [status state outputs outs resolver control handle-command transition cast]
   (loop [nstatus status, nstate state, outputs (seq outputs)]
     (if (or (nil? outputs) (= nstatus :exit))
-      [nstatus nstate]
+      (do (when (and outputs (= nstatus :exit))
+            (finish-outputs! outputs outs resolver cast 1000 (outs ::flow/report)))
+          [nstatus nstate])
       (let [[output msgs] (first outputs)]
         (if (and (vector? output) (= (first output) ::flow/cast))
           (do (cast (second output) msgs)
@@ -256,7 +378,9 @@
             (let [[nstatus nstate]
                   (loop [nstatus nstatus, nstate nstate, msgs (seq msgs)]
                     (if (or (nil? msgs) (= nstatus :exit))
-                      [nstatus nstate]
+                      (do (when (and msgs (= nstatus :exit))
+                            (finish-outputs! [[output msgs]] outs resolver cast 1000 (outs ::flow/report)))
+                          [nstatus nstate])
                       (let [[v c] (async/alts!!
                                    [control [outc (first msgs)]]
                                    :priority true)]
