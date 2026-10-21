@@ -253,26 +253,29 @@
     (else x)))
 
 ;; read+merge one data_readers file: a literal {tag-sym reader-sym …} map.
+;; Returns the map merged, or #f.
 (define (merge-data-readers-file path)
   (let* ((src (read-file-string path)))
     (let-values (((m j) (rdr-read-form src 0 (string-length src))))
-    (when (and (not (rdr-eof? m)) (pmap? m))
+    (and (not (rdr-eof? m)) (pmap? m)
       (let ((cur (data-readers-table)))
         (def-dynvar! "clojure.core" "*data-readers*"
           (apply jolt-assoc (if (pmap? cur) cur empty-pmap)
-                 (pmap-fold m (lambda (k v a) (cons k (cons v a))) '()))))
-      (set! data-readers-active #t)
-      (set! aot-readers-digest-memo 'unset)
-      ;; eagerly load each reader fn's namespace so the rewritten call resolves.
-      ;; Tolerant — a data_readers entry must not kill the project load — but a
-      ;; failure is reported in full (ldr-warn-reader-ns-failed!), or the miss
-      ;; surfaces later as an unrelated unresolved-var error at first #tag read.
-      (pmap-fold m (lambda (k v a)
-                     (when (and (symbol-t? v) (symbol-t-ns v) (not (jolt-nil? (symbol-t-ns v))))
-                       (guard (e (#t (ldr-warn-reader-ns-failed! (symbol-t-ns v) e m)))
-                         (load-namespace (symbol-t-ns v))))
-                     a)
-                 #f)))))
+                 (pmap-fold m (lambda (k v a) (cons k (cons v a))) '())))
+        (set! data-readers-active #t)
+        (set! aot-readers-digest-memo 'unset)
+        m)))))
+;; eagerly load each reader fn's namespace of a merged map M so the rewritten
+;; call resolves. Tolerant — a data_readers entry must not kill the project load
+;; — but a failure is reported in full (ldr-warn-reader-ns-failed!), or the miss
+;; surfaces later as an unrelated unresolved-var error at first #tag read.
+(define (load-data-reader-namespaces! m)
+  (pmap-fold m (lambda (k v a)
+                 (when (and (symbol-t? v) (symbol-t-ns v) (not (jolt-nil? (symbol-t-ns v))))
+                   (guard (e (#t (ldr-warn-reader-ns-failed! (symbol-t-ns v) e m)))
+                     (load-namespace (symbol-t-ns v))))
+                 a)
+             #f))
 
 ;; The warning (under JOLT_WARNINGS, rt.ss jolt-warnings?) for a data_readers
 ;; namespace that failed to load — everything the reader needs to act on it: which namespace, why, WHERE it failed (the throw's
@@ -303,14 +306,20 @@
   ;; one settle point for the whole scan: see aot-call-with-readers-batch
   (aot-call-with-readers-batch
    (lambda ()
-    (for-each
-    (lambda (root)
-      ;; data_readers.{jolt,clj,cljc}, in the same precedence as a namespace's
-      ;; source (ldr-source-exts below) — first one found on this root wins,
-      ;; inside a jar root as on disk.
-      (let ((f (ldr-root-source root "data_readers")))
-        (when f (merge-data-readers-file f))))
-    source-roots))))
+    ;; Every root's table is merged before any reader namespace loads, as
+    ;; Clojure reads every data_readers file at startup: each key folds the
+    ;; readers digest, so one computed while a later root's tags were still
+    ;; missing is one no later run reproduces.
+    (for-each load-data-reader-namespaces!
+      (reverse
+        (fold-left (lambda (acc root)
+                     ;; data_readers.{jolt,clj,cljc}, in the same precedence as a
+                     ;; namespace's source (ldr-source-exts below) — first one
+                     ;; found on this root wins, inside a jar root as on disk.
+                     (let* ((f (ldr-root-source root "data_readers"))
+                            (m (and f (merge-data-readers-file f))))
+                       (if m (cons m acc) acc)))
+                   '() source-roots))))))
 
 ;; --- namespace -> file path -------------------------------------------------
 ;; "app.commonmark-test" -> "app/commonmark_test": split on '.', munge '-'->'_'

@@ -206,7 +206,6 @@
   ([resolved] (apply-project! resolved true))
   ([{:keys [roots immutable-roots natives provides replaces features project-dir]} strict?]
    (jolt.host/add-immutable-roots! immutable-roots)
-   (jolt.host/set-source-roots! (vec (distinct (concat roots (jolt.host/source-roots)))))
    ;; Before the providers: those matter at the first class REFERENCE, this one
    ;; at the first form read, and reading comes first.
    (register-reader-features! features)
@@ -218,7 +217,11 @@
    (register-ns-replacements! replaces)
    ;; project-dir is absent from a cpcache entry written by an older jolt; JOLT_PWD
    ;; is where the user invoked us, which is the same directory in the common case.
-   (load-natives! natives strict? (or project-dir (jolt.host/getenv "JOLT_PWD")))))
+   (load-natives! natives strict? (or project-dir (jolt.host/getenv "JOLT_PWD")))
+   ;; The roots go in LAST: setting them scans the data_readers files and loads
+   ;; each reader's namespace, the project's first compile, which reads forms,
+   ;; names classes and calls natives like any other.
+   (jolt.host/set-source-roots! (vec (distinct (concat roots (jolt.host/source-roots)))))))
 
 ;; Aliases selected by a leading -A:… — bound around the re-dispatch so every
 ;; command that resolves the project (run/path/build/repl/nrepl/task, and a

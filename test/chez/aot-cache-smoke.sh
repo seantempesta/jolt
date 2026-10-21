@@ -1026,6 +1026,37 @@ for ac2_order in a z; do
   fi
   rm -rf "$cache_ac2"
 done
+# ...and a project whose data readers come from two libraries, the first one's
+# reader namespace naming a class the project's :jolt/provides supplies. Its
+# readers loaded while the table held only its own file's tags, so what they
+# compiled folded a digest no later run reproduces; and they loaded before the
+# providers were registered, so the class was missing and the load failed.
+ac3="$tmp/ac3"; mkdir -p "$ac3/src/app" "$ac3/ra/src/ra" "$ac3/rb/src/rb"
+printf '{:paths ["src"] :deps {local/ra {:local/root "ra"} local/rb {:local/root "rb"}}}\n' > "$ac3/deps.edn"
+printf '(ns app.core)\n(defn -main [& _] (println (str "app " #ra/t 1 " " #rb/t 2)))\n' > "$ac3/src/app/core.clj"
+printf '{:paths ["src"] :jolt/provides {ra.install ["com.example.Stamp"]}}\n' > "$ac3/ra/deps.edn"
+printf '{ra/t ra.readers/read-t}\n' > "$ac3/ra/src/data_readers.clj"
+printf '(ns ra.install)\n(__register-class-statics! "com.example.Stamp" {"label" (fn [x] (str "a" x))})\n' > "$ac3/ra/src/ra/install.clj"
+printf '(ns ra.util)\n(def prefix (com.example.Stamp/label ""))\n(defn label [x] (str prefix x))\n' > "$ac3/ra/src/ra/util.clj"
+printf '(ns ra.readers (:require [ra.util :as u]))\n(defn read-t [x] (u/label x))\n' > "$ac3/ra/src/ra/readers.clj"
+printf '{:paths ["src"]}\n' > "$ac3/rb/deps.edn"
+printf '{rb/t rb.readers/read-t}\n' > "$ac3/rb/src/data_readers.clj"
+printf '(ns rb.readers)\n(defn read-t [x] (str "b" x))\n' > "$ac3/rb/src/rb/readers.clj"
+cache_ac3="$(mktemp -d)"
+ac3run() {
+  JOLT_PWD="$ac3" JOLT_NO_USER_DEPS=1 JOLT_DEBUG=1 JOLT_WARNINGS=1 JOLT_AOT_CACHE=1 JOLT_AOT_ASYNC=0 \
+    JOLT_CACHE_DIR="$cache_ac3" JOLT_QUIET=1 "$jolt" run -m app.core 2>&1
+}
+ac3run >/dev/null
+ac3_warm="$(ac3run)"
+if echo "$ac3_warm" | grep -q '^app a1 b2$' && ! echo "$ac3_warm" | grep -q 'miss \|failed to load' \
+   && [ "$(echo "$ac3_warm" | grep -cE 'hit (ra|rb|app)\.' || true)" -eq 5 ]; then
+  echo "PASS: (ac3) data readers from two libraries, one using a provided class, hit on the second run"; pass=$((pass+1))
+else
+  echo "FAIL: (ac3) second run: $(echo "$ac3_warm" | grep -E '^app|hit |miss |failed to load' | tr '\n' ' ')"
+  fails=$((fails+1))
+fi
+rm -rf "$cache_ac3"
 
 # --- (ae) a recovery recompile does not see the failed load's later defs ------
 # recover! recompiles in the process the damaged artifact already ran in. That
