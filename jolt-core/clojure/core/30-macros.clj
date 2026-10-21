@@ -671,9 +671,9 @@
 ;;               prints it.
 ;;   :method-map {kw kw} over the method names, identity on both halves (the JVM
 ;;               does not munge either side: :foo-bar maps to :foo-bar).
-;;   :var        the protocol's own var, assoc'd AFTER the def below — it does not
-;;               exist while make-protocol runs. SCI reads this one (sci.core,
-;;               sci.impl.deftype).
+;;   :var        the protocol's own var, assoc'd onto make-protocol's value in the
+;;               def's own init (analyzing the def interns the var). SCI reads
+;;               this one (sci.core, sci.impl.deftype).
 ;;
 ;; :on / :on-interface / :method-builders are the JVM's generated-interface keys
 ;; and are deliberately absent here: jolt generates no interface, dispatching on
@@ -724,14 +724,14 @@
         ;; registration all key on one string.
         pkey (str *ns* "/" (name pname))]
     `(do
+       ;; :var is the protocol's own var: analyzing the def interns it, so (var P)
+       ;; in its own init names it, and the value is whole when it is defined (one
+       ;; definition, no root written after it).
        (def ~(if pdoc (with-meta pname (assoc (meta pname) :doc pdoc)) pname)
          ;; :sigs is nil, not {}, for a protocol with no methods — the JVM's
          ;; (when sigs ..) leaves the key present with a nil value.
-         (make-protocol ~pkey ~methods (quote ~(when (seq sigs) sigs-map)) ~pdoc ~method-map))
-       ;; :var is the protocol's own var, so it can only be attached once the def
-       ;; above has made one. alter-var-root, not a second def: a re-def would
-       ;; drop the metadata just written.
-       (alter-var-root (var ~pname) assoc :var (var ~pname))
+         (assoc (make-protocol ~pkey ~methods (quote ~(when (seq sigs) sigs-map)) ~pdoc ~method-map)
+                :var (var ~pname)))
        ;; register method var-keys for devirtualization; the inference
        ;; reads this (via infer-unit!) to resolve a protocol call on a known record
        (register-protocol-methods! ~pkey [~@(map (fn [s] (name (first s))) sigs)])

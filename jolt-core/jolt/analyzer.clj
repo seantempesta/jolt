@@ -118,6 +118,17 @@
 ;; Stored like the position box, and for the same reason: written per expansion,
 ;; read only when something throws.
 (def ^:dynamic *expansion-box* nil)
+;; The unit tap: a fn of [form node], or nil (the default: no call). The runtime
+;; compile spine (host/chez/compile-eval.ss, jolt-analyze-emit-form) calls it with
+;; every top-level unit it analyzes, after analysis and before the unit runs: the
+;; form as read and its analyzed node. A unit is what Clojure's compilation-unit
+;; rule makes one: each child of a top-level (do ...), and of a macro call that
+;; expands to one, is its own unit. While a unit RUNS the tap is bound to nil, so
+;; code the unit evaluates on its own account (a require loading a file, an eval)
+;; is not reported as the caller's units. A tool binds it around an eval to learn
+;; exactly what the compiler saw (the definitions, the resolved references) with no
+;; second analysis and no text matching; nothing in jolt reads it.
+(def ^:dynamic *unit-tap* nil)
 
 ;; The macro whose expander is RUNNING, as [qualified-symbol head-as-written
 ;; form], or nil between runs. Distinct from the expansion box, which covers analysis of what

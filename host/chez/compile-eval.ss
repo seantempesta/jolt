@@ -503,10 +503,26 @@
 ;; `ns` is the compile namespace unqualified symbols resolve against. No require
 ;; pre-scan here (ce-scan-requires! is for the walks that never run the form):
 ;; the aliases in force are the ones earlier forms registered by RUNNING.
+;; --- the unit tap (jolt.analyzer/*unit-tap*) ---------------------------------
+;; A tool binds jolt.analyzer/*unit-tap* to a fn of [form node] around an eval to be
+;; given every top-level unit the spine analyzes (see the var's comment). Read per
+;; unit through var-deref, so a thread binding is what counts; the unit's run is
+;; scoped with the tap bound to nil (jolt-run-unit), so code the run itself compiles
+;; (a require's file, an eval) is not reported as the caller's.
+(define jolt-unit-tap-cell (jolt-var "jolt.analyzer" "*unit-tap*"))
+(define (jolt-unit-tap)
+  (let ((t (var-deref "jolt.analyzer" "*unit-tap*")))
+    (and (not (jolt-nil? t)) (procedure? t) t)))
+(define (jolt-run-unit thunk)
+  (if (jolt-unit-tap)
+      (dyn-with-frame (list (cons jolt-unit-tap-cell jolt-nil)) thunk)
+      (thunk)))
+
 (define (jolt-analyze-emit-form form ns)
   (let* ((ctx (make-analyze-ctx ns))
          (node (jolt-ce-analyze ctx form)))
     (jolt-lint-node! node)
+    (let ((tap (jolt-unit-tap))) (when tap (tap form node)))
     (if (hc-compiler-direct-linking?)
         (jolt-direct-link-emit node ctx)
         (jolt-ce-emit (jolt-ce-run-passes node ctx)))))
@@ -766,9 +782,11 @@
        ;; the run is a root as much as the compile was: expanding the form ran
        ;; macros, whose tail sites would otherwise be what a throw here reports.
        (jolt-site-reset!)
-       (if (jolt-ce-trace-frames?)
-           (jolt-eval-with-source scm)
-           (eval (read (open-input-string scm)) (interaction-environment)))))))
+       (jolt-run-unit
+         (lambda ()
+           (if (jolt-ce-trace-frames?)
+               (jolt-eval-with-source scm)
+               (eval (read (open-input-string scm)) (interaction-environment)))))))))
 
 ;; Source string -> value (read one form, compile + eval on Chez, in the
 ;; top-level environment where rt.ss's runtime procedures live).
