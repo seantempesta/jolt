@@ -275,23 +275,36 @@
 ;; the fasl index: written once by the launcher before scheme-start, read
 ;; afterwards by single-key hashtable-ref.
 ;;
-;; Empty in every path that carries no such array — dev bin/jolt, devcache, and
-;; `jolt build` app binaries, which register their own embeds eagerly — so the
-;; fetch returning #f is a normal answer there, not a failure. Written once while
-;; the heap is built, single-threaded, and read afterwards by single-key
-;; hashtable-ref, which is the same discipline the fasl index above keeps.
+;; A `jolt build` app that keeps the compiler carries the same blob, built from
+;; this jolt's install sources (build.ss bld-emit-install-sources), so a namespace
+;; it did not compile in loads as it does under jolt itself, wherever the binary
+;; runs. An app has no C array to link it into (the self-contained path appends a
+;; boot to a prebuilt stub), so its blob is ONE bytevector constant in the boot,
+;; attached by jolt-source-blob-attach-bytes!: one compressed object rather than
+;; a string per file, read off the boot with the rest of the heap.
+;;
+;; Empty in every path that carries neither — dev bin/jolt, devcache, and an app
+;; built without the compiler — so the fetch returning #f is a normal answer
+;; there, not a failure. Written once while the heap is built, single-threaded,
+;; and read afterwards by single-key hashtable-ref, which is the same discipline
+;; the fasl index above keeps.
 (define embedded-source-index (make-hashtable equal-hash equal?))
+(define embedded-source-bytes #f)
 (define (jolt-source-blob-attach! index)
   (for-each (lambda (entry)
               (hashtable-set! embedded-source-index (car entry)
                               (cons (cadr entry) (caddr entry))))
             index))
+(define (jolt-source-blob-attach-bytes! bv index)
+  (set! embedded-source-bytes bv)
+  (jolt-source-blob-attach! index))
 (define (jolt-source-blob-fetch offset length)
   (guard (e (else #f))
-    (let* ((base (sa-foreign-entry-address "jolt_source_blob"))
-           (bv (make-bytevector length))
-           (memcpy (sa-foreign-procedure "memcpy" (u8* uptr uptr) void*)))
-      (memcpy bv (+ base offset) length)
+    (let ((bv (make-bytevector length)))
+      (if embedded-source-bytes
+          (bytevector-copy! embedded-source-bytes offset bv 0 length)
+          ((sa-foreign-procedure "memcpy" (u8* uptr uptr) void*)
+           bv (+ (sa-foreign-entry-address "jolt_source_blob") offset) length))
       ;; Each slice is one bytevector-compress frame. Compressing pays here in a
       ;; way it does not for the boot image: the boot is read start to finish on
       ;; every single start, where unpacking outruns readahead and serializes a

@@ -41,6 +41,12 @@
   (when (= (first args) "--argv")
     (println "boot-args:" (pr-str boot-args))
     (println "main-args:" (pr-str *command-line-args*)))
+  ;; --require NS: a namespace the build did not compile in, required at runtime —
+  ;; jolt's own stdlib resolves from the binary, wherever it runs (build-smoke).
+  (when (= (first args) "--require")
+    (let [ns (symbol (second args))]
+      (require ns)
+      (println "required:" ns (count (ns-publics ns)) "publics")))
   ;; --boom: throw through a two-deep call chain so build-smoke can assert the
   ;; native stack trace. Off the normal path, so default output is unchanged.
   (when (= (first args) "--boom")

@@ -880,6 +880,64 @@
     bld-runtime-manifest)
   (set! bld-segment-out #f))
 
+;; --- jolt's install sources, carried by an app that keeps the compiler -------
+;; An app that can compile at runtime can require a namespace it did not compile
+;; in, and jolt's own (jolt-core, stdlib, the vendored libraries) are where the
+;; loader looks first: an embedded key outranks every root (resolve-on-roots), and
+;; bld-dep-resources leaves a dependency's copy of one out because jolt supplies
+;; it. So the app carries them, keyed as jolt itself carries them, and resolves
+;; them the same way wherever it runs — never by a path into the build machine
+;; (#1232) or one relative to the binary's working directory.
+;;
+;; ((name . bytes) ...) sorted by name: what this jolt carries in its source blob
+;; (a release jolt), else what its install roots hold on disk (source mode),
+;; first root first, as resolve-on-roots would find them.
+(define (bld-install-sources)
+  (let ((seen (make-hashtable string-hash string=?)) (acc '()))
+    (define (add! name bytes)
+      (unless (hashtable-ref seen name #f)
+        (hashtable-set! seen name #t)
+        (set! acc (cons (cons name (bytes)) acc))))
+    (vector-for-each
+      (lambda (k)
+        (when (and (string? k) (ldr-source-path? k))
+          (add! k (lambda () (embedded-resource-ref k)))))
+      (hashtable-keys embedded-source-index))
+    (for-each
+      (lambda (root)
+        (when (file-directory? root)
+          (for-each (lambda (rp)
+                      (when (ldr-source-path? (car rp))
+                        (add! (car rp) (lambda () (read-file-bytes-on-disk (cdr rp))))))
+                    (reverse (bld-walk-files root "" '())))))
+      ldr-install-roots)
+    (sort (lambda (a b) (string<? (car a) (car b))) acc)))
+
+;; Emit the install sources as one blob, each file its own gzip frame as in
+;; build-jolt.ss's jb-blob-add!, attached with its index (java/io.ss
+;; jolt-source-blob-attach-bytes!). The bytes are read only when a namespace
+;; loads from source.
+(define (bld-emit-install-sources out)
+  (let-values (((port extract) (open-bytevector-output-port)))
+    (let loop ((es (bld-install-sources)) (offset 0) (index '()))
+      (if (null? es)
+          (put-string out
+            (string-append
+              "\n;; === jolt install sources (read when a namespace loads from source) ===\n"
+              "(jolt-source-blob-attach-bytes! "
+              (with-output-to-string (lambda () (write (extract))))
+              " '("
+              (apply string-append
+                     (map (lambda (e)
+                            (string-append "(" (ei-str-lit (car e)) " " (number->string (cadr e))
+                                           " " (number->string (caddr e)) ")"))
+                          (reverse index)))
+              "))\n"))
+          (let ((bv (parameterize ((compress-format 'gzip)) (bytevector-compress (cdar es)))))
+            (put-bytevector port bv)
+            (loop (cdr es) (+ offset (bytevector-length bv))
+                  (cons (list (caar es) offset (bytevector-length bv)) index)))))))
+
 ;; --- app emission -----------------------------------------------------------
 ;; Re-emit one app namespace to a list of Scheme strings: run-passes (const-fold +
 ;; numeric-annotate in every mode; inference also in release/optimized; inline +
@@ -2623,11 +2681,14 @@
             ;; release, --opt and --dev share a single cache entry.
             (put-string out ";; jolt runtime half\n")
             (bld-emit-runtime out drop-compiler? core-strs)
+            (unless drop-compiler? (bld-emit-install-sources out))
             (close-port out)))
         (let ((out (open-output-file flat-ss 'replace)))
           (if split?
               (put-string out ";; app half — the runtime half is compiled separately (runtime.ss)\n")
-              (bld-emit-runtime out drop-compiler? core-strs))
+              (begin
+                (bld-emit-runtime out drop-compiler? core-strs)
+                (unless drop-compiler? (bld-emit-install-sources out))))
           ;; Load native libs, bake embedded resources, and point source roots at
           ;; the build-time app roots — all BEFORE the app forms. The app's
           ;; top-level forms run at binary startup (Sbuild_heap), and they include

@@ -73,6 +73,20 @@ if [ "$got" != "$want" ]; then
   exit 1
 fi
 
+# A namespace the build did not compile in, required at runtime from a neutral
+# cwd: an app that keeps the compiler carries jolt's install sources (build.ss
+# bld-emit-install-sources), so jolt's stdlib resolves from the binary as it
+# does under jolt itself — before, it was looked up on install roots relative
+# to the binary's cwd and found nowhere.
+got="$(cd / && "$out" --require clojure.core.rrb-vector 2>&1 | grep '^required:')"
+case "$got" in
+  "required: clojure.core.rrb-vector "*" publics") ;;
+  *) echo "  FAIL: a stdlib namespace the app did not compile is not required at runtime"
+     echo "  got: $got"; (cd / && "$out" --require clojure.core.rrb-vector 2>&1 | tail -3); exit 1 ;;
+esac
+grep -q 'jolt-source-blob-attach-bytes!' "$out.build/runtime.ss" ||
+  { echo "  FAIL: the app's runtime unit carries no install sources"; exit 1; }
+
 # The compiler verdict is taken by EVERY build now, not only a shaken one
 # (dce-needs-compiler?): this app reads images back (jolt.image/read-image
 # restores fn sources by compiling them), so its default build keeps the
@@ -2062,4 +2076,4 @@ for dl in "" "--direct-link"; do
 done
 rm -rf "$sh_d"
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + split-provider-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + unit-cache + boot-modes + compiler-verdict + gzip-round-trip + signable + include + dep-resources + emitted-head-defs)"
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + split-provider-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + unit-cache + boot-modes + compiler-verdict + gzip-round-trip + signable + include + dep-resources + emitted-head-defs + install-sources)"
