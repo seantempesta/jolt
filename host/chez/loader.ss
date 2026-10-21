@@ -702,6 +702,20 @@
 (define (load-jolt-file path)
   (load-jolt-file* path (ldr-read-source path)))
 
+;; jolt.host/*load-form*: nil (the default), or a fn of [path form text] that a
+;; source load (require, :reload, load-file, load) calls with each top-level form
+;; it reads from the file at path, and the form's exact text, in place of compiling
+;; and evaluating it; the fn evaluates it (clojure.core/eval is what the loader
+;; does). Everything else stays the loader's: the read, *file*, the current ns and
+;; its restore, and an error's position. A REPL binds it so a file it loads is
+;; evaluated as if typed at it. Read per form, so a thread binding is what counts.
+(def-var-with-meta! "jolt.host" "*load-form*" jolt-nil
+  (jolt-hash-map (keyword #f "dynamic") #t
+                 (keyword #f "doc") "nil, or a fn of [path form text] a source load calls with each top-level form it reads from the file at path, and the form's exact text, in place of evaluating it; the fn evaluates it (clojure.core/eval is what the loader does). The read, *file*, the current namespace and its restore, and an error's position stay the loader's."))
+(define (ldr-load-form-hook)
+  (let ((f (var-deref "jolt.host" "*load-form*")))
+    (and (not (jolt-nil? f)) (procedure? f) f)))
+
 ;; load-jolt-file* — the read/compile/eval loop over a PRE-READ source string.
 ;; Split out so the AOT cache (below) reads source once for both keying and the
 ;; capture load, instead of re-reading inside the loop.
@@ -786,8 +800,11 @@
                             (parameterize ((jolt-load-frames
                                              (cons (make-load-frame path ord (chez-current-ns))
                                                    (jolt-load-frames))))
-                              (jolt-compile-eval-form (if data-readers-active (ldr-apply-readers form) form)
-                                                      (chez-current-ns)))
+                              (let ((form (if data-readers-active (ldr-apply-readers form) form))
+                                    (hook (ldr-load-form-hook)))
+                                (if hook
+                                    (hook path form (substring src (rdr-skip-ws src i end) j))
+                                    (jolt-compile-eval-form form (chez-current-ns)))))
                             (loop j (fx+ ord 1)))))))))))))))
 
 ;; --- AOT / compile cache for required namespaces ----------------------------
