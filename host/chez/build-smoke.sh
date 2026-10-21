@@ -281,6 +281,20 @@ done
 
 check_fnid "$out" "the direct-linked release build"
 
+# A built binary's argv reaches its namespaces' top-level forms (bound as
+# *command-line-args* while app init loads them, as clojure.main binds it for a -m
+# run) and -main's *command-line-args*: an app that reads its config once, at load,
+# can take command-line overrides. Before, top-level code saw nil.
+got_av="$(cd / && "$out" --argv x "y z" 2>&1)"
+for line in 'boot-args: ("--argv" "x" "y z")' \
+            'main-args: ("--argv" "x" "y z")'; do
+  if ! printf '%s\n' "$got_av" | grep -qxF "$line"; then
+    echo "  FAIL: argv in top-level forms and -main — want '$line'"
+    echo "--- got ----"; echo "$got_av"
+    exit 1
+  fi
+done
+
 # The heap ceiling, in a BUILT binary. jolt bounds its heap at 25% of RAM by
 # default, the share the JVM's MaxRAMPercentage uses, because Chez has no -Xmx
 # and an unbounded heap means the kernel kills the process with no diagnostic at

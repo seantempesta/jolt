@@ -30,7 +30,17 @@
                    (.start (Thread. (fn [] (deliver p :ran))))
                    (deref p 5000 :TIMED-OUT)))
 
+;; The command line as the namespace's top-level forms see it, and as -main sees it: a
+;; built binary binds *command-line-args* while its namespaces load and while -main runs,
+;; as clojure.main does for a -m run (an app reading its config once at load can honour
+;; command-line overrides). See --argv in -main.
+(def boot-args *command-line-args*)
+
 (defn -main [& args]
+  ;; --argv: the args the top-level forms saw, and -main's *command-line-args*
+  (when (= (first args) "--argv")
+    (println "boot-args:" (pr-str boot-args))
+    (println "main-args:" (pr-str *command-line-args*)))
   ;; --boom: throw through a two-deep call chain so build-smoke can assert the
   ;; native stack trace. Off the normal path, so default output is unchanged.
   (when (= (first args) "--boom")
