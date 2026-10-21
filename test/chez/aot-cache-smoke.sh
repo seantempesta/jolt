@@ -1107,6 +1107,8 @@ done
 # after B's file changed.
 # (ah) the same app at two paths: B hits A's artifact
 # (ai) editing a read file in B misses in B only; A still hits its own
+# (al) a file added to the listed project root (a .res names it ".") misses in
+#      that checkout only
 # (aj) a file added to a directory the compile LISTED moves the key
 sh_mk() {
   mkdir -p "$1/src/app" "$1/schemas"
@@ -1118,7 +1120,8 @@ sh_mk() {
   (str/join "," (for [f (sort-by #(.getName %) (file-seq (io/file (System/getProperty "user.dir") "schemas")))
                       :when (.isFile f)]
                   (str (.getName f) "=" (slurp f)))))
-(defn -main [& _] (println (schemas)))
+(defmacro root-entries [] (count (.list (io/file (System/getProperty "user.dir")))))
+(defn -main [& _] (println (str (schemas) " root=" (root-entries))))
 CLJ
 }
 sh_a="$tmp/share/a"; sh_b="$tmp/share/b"; sh_mk "$sh_a"; sh_mk "$sh_b"
@@ -1131,7 +1134,7 @@ sh_out() { echo "$1" | grep -E '^a\.edn=' | tail -1; }
 sh_show() { echo "$1" | grep -E '^a\.edn|hit app|miss app' | tr '\n' ' '; }
 shrun "$sh_a" >/dev/null
 sh_1="$(shrun "$sh_b")"
-if [ "$(sh_out "$sh_1")" = "a.edn=1" ] && echo "$sh_1" | grep -q 'hit app\.core' && ! echo "$sh_1" | grep -q 'miss app\.core'; then
+if [ "$(sh_out "$sh_1")" = "a.edn=1 root=3" ] && echo "$sh_1" | grep -q 'hit app\.core' && ! echo "$sh_1" | grep -q 'miss app\.core'; then
   echo "PASS: (ah) a second checkout of the app hits the first one's artifact"; pass=$((pass+1))
 else
   echo "FAIL: (ah) second checkout: $(sh_show "$sh_1")"; fails=$((fails+1))
@@ -1139,15 +1142,24 @@ fi
 printf '2' > "$sh_b/schemas/a.edn"
 sh_2="$(shrun "$sh_b")"
 sh_3="$(shrun "$sh_a")"
-if [ "$(sh_out "$sh_2")" = "a.edn=2" ] && echo "$sh_2" | grep -q 'miss app\.core' \
-   && [ "$(sh_out "$sh_3")" = "a.edn=1" ] && echo "$sh_3" | grep -q 'hit app\.core' && ! echo "$sh_3" | grep -q 'miss app\.core'; then
+if [ "$(sh_out "$sh_2")" = "a.edn=2 root=3" ] && echo "$sh_2" | grep -q 'miss app\.core' \
+   && [ "$(sh_out "$sh_3")" = "a.edn=1 root=3" ] && echo "$sh_3" | grep -q 'hit app\.core' && ! echo "$sh_3" | grep -q 'miss app\.core'; then
   echo "PASS: (ai) an edited read file misses in its own checkout only"; pass=$((pass+1))
 else
   echo "FAIL: (ai) B after its edit: $(sh_show "$sh_2") / A after: $(sh_show "$sh_3")"; fails=$((fails+1))
 fi
+printf 'x' > "$sh_b/README"
+sh_5="$(shrun "$sh_b")"
+sh_6="$(shrun "$sh_a")"
+if [ "$(sh_out "$sh_5")" = "a.edn=2 root=4" ] && echo "$sh_5" | grep -q 'miss app\.core' \
+   && [ "$(sh_out "$sh_6")" = "a.edn=1 root=3" ] && ! echo "$sh_6" | grep -q 'miss app\.core'; then
+  echo "PASS: (al) a file added to the listed project root misses in its checkout only"; pass=$((pass+1))
+else
+  echo "FAIL: (al) B after adding README: $(sh_show "$sh_5") / A after: $(sh_show "$sh_6")"; fails=$((fails+1))
+fi
 printf '3' > "$sh_a/schemas/b.edn"
 sh_4="$(shrun "$sh_a")"
-if [ "$(sh_out "$sh_4")" = "a.edn=1,b.edn=3" ] && echo "$sh_4" | grep -q 'miss app\.core'; then
+if [ "$(sh_out "$sh_4")" = "a.edn=1,b.edn=3 root=3" ] && echo "$sh_4" | grep -q 'miss app\.core'; then
   echo "PASS: (aj) a file added to a listed directory moves the key"; pass=$((pass+1))
 else
   echo "FAIL: (aj) after adding schemas/b.edn: $(sh_show "$sh_4")"; fails=$((fails+1))

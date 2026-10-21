@@ -1421,8 +1421,12 @@
 ;; worktree sharing JOLT_CACHE_DIR) then reads the same names and hashes ITS OWN
 ;; files. With absolute names it hashed the first checkout's files, and was served
 ;; that checkout's artifact after its own file changed. A read outside the root
-;; keeps its absolute name. A jar entry under the root is named the same way
-;; inside its jar: URL.
+;; keeps its absolute name; the root itself is ".". A jar entry under the root
+;; is named the same way inside its jar: URL.
+;; One sidecar holds the LAST compile's names (ccache's manifest holds several),
+;; so two checkouts that read different SETS of files (one added a schema) take
+;; turns: each misses once after the other compiled, and never loads the other's
+;; artifact.
 (define aot-jar-file-prefix "jar:file:")
 (define (aot-prefix-rest prefix s)   ; S after PREFIX, or #f
   (let ((n (string-length prefix)))
@@ -1438,6 +1442,8 @@
   (let ((root (aot-res-root)))
     (cond ((not root) path)
           ((aot-prefix-rest root path) => (lambda (rel) rel))
+          ;; the root itself, listed
+          ((string=? path (substring root 0 (fx- (string-length root) 1))) ".")
           ((aot-prefix-rest (string-append aot-jar-file-prefix root) path)
            => (lambda (rel) (string-append aot-jar-file-prefix rel)))
           (else path))))
