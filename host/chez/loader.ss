@@ -906,8 +906,12 @@
                  "-" (aot-runtime-fingerprint) (aot-trace-tag)))
 ;; Generations are kept by LAST USE, not by age: a marker file refreshed once per
 ;; process is the only evidence a generation is still someone's, since a run that
-;; hits on everything never writes to it.
-(define aot-generations-kept 3)
+;; hits on everything never writes to it. How many is a setting
+;; (JOLT_CACHE_GENERATIONS, default 3, at least 1): a cache shared by checkouts
+;; on several runtimes keeps one generation for each, or they evict each other.
+(define (aot-generations-kept)
+  (let ((n (let ((v (getenv "JOLT_CACHE_GENERATIONS"))) (and v (string->number v)))))
+    (if (and (fixnum? n) (fx>=? n 1)) n 3)))
 (define aot-prune-grace-seconds 60)
 (define (aot-used-marker gen) (string-append gen "/.used"))
 (define (aot-touch-used! gen)
@@ -951,8 +955,9 @@
                               (if (file-directory? root) (directory-list root) '()))))
            ;; newest first; the current generation holds one of the kept slots
            (ordered (sort (lambda (a b) (> (car a) (car b))) gens))
-           (doomed (if (fx>? (length ordered) (fx- aot-generations-kept 1))
-                       (list-tail ordered (fx- aot-generations-kept 1))
+           (kept (fx- (aot-generations-kept) 1))
+           (doomed (if (fx>? (length ordered) kept)
+                       (list-tail ordered kept)
                        '())))
       (for-each (lambda (p)
                   (aot-info (string-append "pruning superseded generation " (cdr p)))
@@ -1088,10 +1093,8 @@
       (fold-left (lambda (h n) (aot-hash-mix h (aot-content-hash n))) 19 names)
       16)))
 (define (aot-write-ct! base relevant? surface)
-  (guard (e (else #f))
-    (let ((out (open-output-file (aot-ct-sidecar base) 'replace)))
-      (put-string out (if relevant? "1\n" (string-append "0 " surface "\n")))
-      (close-port out))))
+  (aot-write-sidecar! (aot-ct-sidecar base)
+    (lambda (out) (put-string out (if relevant? "1\n" (string-append "0 " surface "\n"))))))
 ;; The compile-time state of a namespace, keyed by its CURRENT source hash:
 ;;   a string — inert: its artifact says it defines nothing a consumer's compile
 ;;              bakes in beyond its var names; the string is their digest
@@ -1132,13 +1135,12 @@
 ;; sidecars.
 (define (aot-cti-sidecar base) (string-append base ".cti"))
 (define (aot-write-cti! base pairs)
-  (guard (e (else #f))
-    (let ((out (open-output-file (aot-cti-sidecar base) 'replace)))
+  (aot-write-sidecar! (aot-cti-sidecar base)
+    (lambda (out)
       (for-each (lambda (pr)
                   (put-string out (car pr)) (put-string out " ")
                   (put-string out (cdr pr)) (put-string out "\n"))
-                (sort (lambda (a b) (string<? (car a) (car b))) pairs))
-      (close-port out))))
+                (sort (lambda (a b) (string<? (car a) (car b))) pairs)))))
 ;; The recorded .cti as an alist dep → surface.
 (define aot-assumed-memo (make-hashtable string-hash string=?))
 (define (aot-assumed-inert name own)
@@ -1370,11 +1372,20 @@
       (vector-set! sink 0 (cons name (vector-ref sink 0))))))
 
 (define (aot-dep-sidecar base) (string-append base ".deps"))
-(define (aot-write-dep-list! path names)
+;; Every sidecar is published like the artifact: written to a temporary beside
+;; it, then renamed over it, so a process reading it (another checkout sharing
+;; the cache, or a concurrent build) sees the old sidecar or the new one, never
+;; half of one. Best effort like every cache write.
+(define (aot-write-sidecar! path write!)
   (guard (e (else #f))
-    (let ((out (open-output-file path 'replace)))
-      (for-each (lambda (n) (put-string out n) (put-string out "\n")) names)
-      (close-port out))))
+    (let* ((tmp (string-append path ".tmp" (number->string (get-process-id))))
+           (out (open-output-file tmp 'replace)))
+      (write! out)
+      (close-port out)
+      (rename-replace! tmp path))))
+(define (aot-write-dep-list! path names)
+  (aot-write-sidecar! path
+    (lambda (out) (for-each (lambda (n) (put-string out n) (put-string out "\n")) names))))
 (define (aot-read-dep-list path)
   (if (file-exists? path)
       (guard (e (else '()))
@@ -1403,17 +1414,63 @@
   (if (null? paths)
       (guard (e (else #f)) (delete-file path #f))
       (aot-write-dep-list! path paths)))
+;; The sidecar is named by the own key alone, which is free of paths, so it names
+;; what the compile read free of paths too: relative to the project root
+;; (user.dir), as a source's own name is relative to its classpath root
+;; (ldr-source-name). A checkout of the same project at another path (a
+;; worktree sharing JOLT_CACHE_DIR) then reads the same names and hashes ITS OWN
+;; files. With absolute names it hashed the first checkout's files, and was served
+;; that checkout's artifact after its own file changed. A read outside the root
+;; keeps its absolute name. A jar entry under the root is named the same way
+;; inside its jar: URL.
+(define aot-jar-file-prefix "jar:file:")
+(define (aot-prefix-rest prefix s)   ; S after PREFIX, or #f
+  (let ((n (string-length prefix)))
+    (and (fx>=? (string-length s) n)
+         (string=? (substring s 0 n) prefix)
+         (substring s n (string-length s)))))
+(define (aot-res-root)   ; "<user.dir>/", or #f when user.dir is not absolute
+  (let ((d (jolt-user-dir)))
+    (and (jfile-path-absolute? d)
+         (let ((n (string-length d)))
+           (if (char=? (string-ref d (fx- n 1)) #\/) d (string-append d "/"))))))
+(define (aot-res-name path)
+  (let ((root (aot-res-root)))
+    (cond ((not root) path)
+          ((aot-prefix-rest root path) => (lambda (rel) rel))
+          ((aot-prefix-rest (string-append aot-jar-file-prefix root) path)
+           => (lambda (rel) (string-append aot-jar-file-prefix rel)))
+          (else path))))
+(define (aot-res-path name)
+  (let ((root (aot-res-root)))
+    (cond ((not root) name)
+          ((aot-prefix-rest aot-jar-file-prefix name)
+           => (lambda (rest) (if (jfile-path-absolute? rest)
+                                 name
+                                 (string-append aot-jar-file-prefix root rest))))
+          ((jfile-path-absolute? name) name)
+          (else (string-append root name)))))
 ;; What one recorded file contributes: its length and content, or 0 when it isn't
 ;; there. ABSENT has to be a value of its own rather than "no contribution":
 ;; (io/resource "003.sql") answering nil is a compile-time answer, and adding the
 ;; file has to move the key. An empty file hashes to something else (the fold of a
 ;; zero length with FNV's basis), so the two never collide.
+;; A DIRECTORY was listed (file-seq, .listFiles, Files/newDirectoryStream): what
+;; the compile saw is its sorted names, so a file added to or removed from it
+;; moves the key, as an edit to a file it read does (a macro that reads every
+;; schema in a directory bakes in the new one).
 (define (aot-file-digest path)
   (guard (e (else 0))
-    (if (if (jar-path? path) (jar-path-exists? path) (file-exists? path))
-        (let ((lh (aot-content-of path)))
-          (aot-hash-mix (car lh) (cdr lh)))
-        0)))
+    (cond ((jar-path? path)
+           (if (jar-path-exists? path)
+               (let ((lh (aot-content-of path))) (aot-hash-mix (car lh) (cdr lh)))
+               0))
+          ((file-directory? path)
+           (fold-left (lambda (h n) (aot-hash-mix h (aot-content-hash n)))
+                      23 (sort string<? (directory-list path))))
+          ((file-exists? path)
+           (let ((lh (aot-content-of path))) (aot-hash-mix (car lh) (cdr lh))))
+          (else 0))))
 ;; PATH's (length . FNV-1a hash), from the release-jar store when PATH is an
 ;; entry of one (below), else from reading it.
 (define (aot-content-of path)
@@ -1510,13 +1567,13 @@
                     ks vs))
                 (close-port out)
                 (rename-replace! tmp path)))))))))
-;; The PATH is folded alongside its content, so gaining or losing an entry moves
+;; The NAME is folded alongside its content, so gaining or losing an entry moves
 ;; the digest even when the contents happen to coincide. Sorted, like the deps, so
 ;; the result doesn't depend on the order the reads happened to be recorded in.
-(define (aot-res-fold paths)
-  (fold-left (lambda (h p)
-               (aot-hash-mix (aot-hash-mix h (aot-content-hash p)) (aot-file-digest p)))
-             17 (sort string<? paths)))
+(define (aot-res-fold names)
+  (fold-left (lambda (h n)
+               (aot-hash-mix (aot-hash-mix h (aot-content-hash n)) (aot-file-digest (aot-res-path n))))
+             17 (sort string<? names)))
 ;; A dependency's recorded reads, for the transitive fold. Memoized per process
 ;; like the dep digest — a namespace required from several places is hashed once.
 (define aot-res-digest-memo (make-hashtable string-hash string=?))
@@ -1931,7 +1988,7 @@
                           (aot-capture-load file src))))
           (if (and (string? captured) (fx>? (string-length captured) 0))
               (let* ((deps (filter aot-cacheable-file (vector-ref sink 0)))
-                     (res (vector-ref res-sink 0))
+                     (res (map aot-res-name (vector-ref res-sink 0)))
                      (obase (aot-base-for-own name own)))
                 (aot-write-sidecars! name own obase deps res)
                 (aot-publish-when-readers-settle!

@@ -739,6 +739,7 @@
                          (else
                           (let ((anc (if ino (cons ino ancestors) ancestors)))
                             (when (< depth md)
+                              (io-note-file-read! fp)
                               (let loop ((names (sort string<? (directory-list fp))))
                                 (unless (null? names)
                                   (let ((cr (walk (make-nio-path (nio-path-join (nio-path-str path-obj) (car names)))
@@ -760,7 +761,8 @@
          (_ (cond ((not (file-exists? fp)) (nio-no-such-file base))
                   ((not (file-directory? fp))
                    (nio-fs-throw "java.nio.file.NotDirectoryException" base))))
-         (names (sort string<? (nio-fs-call fp (lambda () (directory-list fp)) base)))
+         (names (begin (io-note-file-read! fp)
+                        (sort string<? (nio-fs-call fp (lambda () (directory-list fp)) base))))
          (arg (and (pair? rest) (car rest)))
          (paths (map (lambda (nm) (make-nio-path (nio-path-join base nm))) names)))
     (make-dir-stream

@@ -1097,6 +1097,90 @@ for ae_mode in truncate unmark; do
   rm -rf "$cache_ae"
 done
 
+# --- Phase 9: one cache shared by checkouts of one project ---------------------
+# Two checkouts of one project (worktrees, CI workspaces) sharing JOLT_CACHE_DIR
+# share every artifact whose inputs are equal, and never one whose inputs differ.
+# The .res sidecar is named by the own key alone, so it names what a compile
+# read relative to the project root (as a source's own name is relative to its
+# classpath root), and a checkout reading another's sidecar hashes its OWN
+# files. With absolute names B hashed A's files, and was served A's artifact
+# after B's file changed.
+# (ah) the same app at two paths: B hits A's artifact
+# (ai) editing a read file in B misses in B only; A still hits its own
+# (aj) a file added to a directory the compile LISTED moves the key
+sh_mk() {
+  mkdir -p "$1/src/app" "$1/schemas"
+  printf '{:paths ["src"]}\n' > "$1/deps.edn"
+  printf '1' > "$1/schemas/a.edn"
+  cat > "$1/src/app/core.clj" <<'CLJ'
+(ns app.core (:require [clojure.java.io :as io] [clojure.string :as str]))
+(defmacro schemas []
+  (str/join "," (for [f (sort-by #(.getName %) (file-seq (io/file (System/getProperty "user.dir") "schemas")))
+                      :when (.isFile f)]
+                  (str (.getName f) "=" (slurp f)))))
+(defn -main [& _] (println (schemas)))
+CLJ
+}
+sh_a="$tmp/share/a"; sh_b="$tmp/share/b"; sh_mk "$sh_a"; sh_mk "$sh_b"
+cache_sh="$(mktemp -d)"
+shrun() {
+  JOLT_PWD="$1" JOLT_NO_USER_DEPS=1 JOLT_DEBUG=1 JOLT_AOT_CACHE=1 JOLT_AOT_ASYNC=0 \
+    JOLT_CACHE_DIR="$cache_sh" JOLT_QUIET=1 "$jolt" run -m app.core 2>&1
+}
+sh_out() { echo "$1" | grep -E '^a\.edn=' | tail -1; }
+sh_show() { echo "$1" | grep -E '^a\.edn|hit app|miss app' | tr '\n' ' '; }
+shrun "$sh_a" >/dev/null
+sh_1="$(shrun "$sh_b")"
+if [ "$(sh_out "$sh_1")" = "a.edn=1" ] && echo "$sh_1" | grep -q 'hit app\.core' && ! echo "$sh_1" | grep -q 'miss app\.core'; then
+  echo "PASS: (ah) a second checkout of the app hits the first one's artifact"; pass=$((pass+1))
+else
+  echo "FAIL: (ah) second checkout: $(sh_show "$sh_1")"; fails=$((fails+1))
+fi
+printf '2' > "$sh_b/schemas/a.edn"
+sh_2="$(shrun "$sh_b")"
+sh_3="$(shrun "$sh_a")"
+if [ "$(sh_out "$sh_2")" = "a.edn=2" ] && echo "$sh_2" | grep -q 'miss app\.core' \
+   && [ "$(sh_out "$sh_3")" = "a.edn=1" ] && echo "$sh_3" | grep -q 'hit app\.core' && ! echo "$sh_3" | grep -q 'miss app\.core'; then
+  echo "PASS: (ai) an edited read file misses in its own checkout only"; pass=$((pass+1))
+else
+  echo "FAIL: (ai) B after its edit: $(sh_show "$sh_2") / A after: $(sh_show "$sh_3")"; fails=$((fails+1))
+fi
+printf '3' > "$sh_a/schemas/b.edn"
+sh_4="$(shrun "$sh_a")"
+if [ "$(sh_out "$sh_4")" = "a.edn=1,b.edn=3" ] && echo "$sh_4" | grep -q 'miss app\.core'; then
+  echo "PASS: (aj) a file added to a listed directory moves the key"; pass=$((pass+1))
+else
+  echo "FAIL: (aj) after adding schemas/b.edn: $(sh_show "$sh_4")"; fails=$((fails+1))
+fi
+if find "$cache_sh" -name '*.tmp*' | grep -q .; then
+  echo "FAIL: (aj) temporary files left in the cache: $(find "$cache_sh" -name '*.tmp*' | head -3 | tr '\n' ' ')"; fails=$((fails+1))
+fi
+rm -rf "$cache_sh"
+
+# (ak) how many generations are kept is a setting (JOLT_CACHE_GENERATIONS,
+# default 3): a cache shared by checkouts on several runtimes keeps each one's.
+cache_ak="$(mktemp -d)"
+ak="$tmp/ak"; mkdir -p "$ak/src/mylib"
+printf '(ns mylib.core)\n(defn answer [] 42)\n' > "$ak/src/mylib/core.clj"
+i=1
+while [ "$i" -le 6 ]; do
+  mkdir -p "$cache_ak/stale-gen-$i/v1"
+  : > "$cache_ak/stale-gen-$i/.used"
+  touch -t "2020010100$(printf '%02d' "$i")" "$cache_ak/stale-gen-$i/.used"
+  i=$((i+1))
+done
+JOLT_CACHE_GENERATIONS=5 JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache_ak" JOLT_QUIET=1 "$jolt" -e "
+  (require 'jolt.deps) (jolt.deps/add-deps {:deps {'mylib/mylib {:local/root \"$ak\"}}})
+  (require 'mylib.core) (println (mylib.core/answer))" >/dev/null 2>&1
+ak_after="$(find "$cache_ak" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
+ak_kept="$(find "$cache_ak" -mindepth 1 -maxdepth 1 -type d -name 'stale-gen-*' | sed 's#.*/##' | sort | tr '\n' ' ')"
+rm -rf "$cache_ak"
+if [ "$ak_after" = "5" ] && [ "$ak_kept" = "stale-gen-3 stale-gen-4 stale-gen-5 stale-gen-6 " ]; then
+  echo "PASS: (ak) JOLT_CACHE_GENERATIONS=5 keeps the current and the 4 most recent"; pass=$((pass+1))
+else
+  echo "FAIL: (ak) JOLT_CACHE_GENERATIONS=5 kept $ak_after generations ($ak_kept), want 5"; fails=$((fails+1))
+fi
+
 # --- Phase 8: a cache the process cannot write --------------------------------
 # The cache is an optimisation, so a cache directory the process may not create
 # or write (a sandbox that denies ~/.jolt, a read-only mount) must cost the cache
