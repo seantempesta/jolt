@@ -848,7 +848,8 @@
       (condition-signal timeout-cv))
     (unless timeout-running?
       (set! timeout-running? #t)
-      (fork-thread/daemon #t timeout-thread))      ; a runtime thread: never keeps the process up
+      ;; a runtime thread: never keeps the process up
+      (fork-thread/daemon #t (lambda () (jolt-thread-name-set! (get-thread-id) "jolt-timer") (timeout-thread))))
     (jolt-unlock! timeout-mu)
     e))
 

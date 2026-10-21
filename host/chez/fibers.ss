@@ -1593,7 +1593,11 @@
         (let ((c (vector-ref v i)))
           (jolt-carrier-thread-set! c
             ;; daemon, as the JVM's go dispatch threads are
-            (fork-thread/daemon #t (lambda () (rdr-default-modes!) (jolt-fiber-carrier-loop c))))))))
+            (fork-thread/daemon #t (lambda ()
+                                     (rdr-default-modes!)
+                                     ;; a name, so a thread listing says whose it is
+                                     (jolt-thread-name-set! (get-thread-id) (string-append "jolt-carrier-" (number->string i)))
+                                     (jolt-fiber-carrier-loop c))))))))
   (jolt-unlock! jolt-fiber-pool-mu))
 
 ;; (jolt-fiber-pool-reset!) -> void. Stop every carrier thread (each finishes
@@ -1680,7 +1684,11 @@
     (do ((i 0 (fx+ i 1))) ((fx=? i n))
       (let ((c (vector-ref v i)))
         (jolt-carrier-thread-set! c
-          (fork-thread/daemon #t (lambda () (rdr-default-modes!) (jolt-fiber-pool-carrier-loop c))))))
+          (fork-thread/daemon #t (lambda ()
+                                   (rdr-default-modes!)
+                                   (jolt-thread-name-set! (get-thread-id)
+                                     (string-append "jolt-carrier-" (format "~a" name) "-" (number->string i)))
+                                   (jolt-fiber-pool-carrier-loop c))))))
     p))
 
 (define (jolt-fiber-pool-size p) (vector-length (jolt-pool-carriers p)))

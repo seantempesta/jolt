@@ -913,6 +913,7 @@
     (set-box! tap-thread-started? #t)
     (fork-thread/daemon #t                 ; clojure.core's tap-loop thread is a daemon
      (lambda ()
+       (jolt-thread-name-set! (get-thread-id) "clojure.core/tap-loop") ; the JVM's name
        (*txn* #f)
        (rdr-default-modes!)                ; and not the reader modes of a read it forked from
        (let loop ()
@@ -5113,7 +5114,8 @@
         (let ((old (sa-foreign-alloc 128)))
           (c-pthread-sigmask jolt-sig-block-how jolt-shutdown-sigset old)
           (sa-foreign-free old))
-        (fork-thread-dormant
+        ;; named by its creator: the watcher itself runs no jolt code until a signal comes
+        (jolt-thread-name-set! (sa-thread-id-of (fork-thread-dormant
           (lambda ()
             (let ((sigbuf (sa-foreign-alloc 8)))
               (let loop ()
@@ -5129,7 +5131,8 @@
                             ;; 128+signal is the status a shell reports for a process
                             ;; killed by that signal, and what the JVM exits with here.
                             (c-underscore-exit (+ 128 sig)))))
-                    (loop))))))))) ; EINTR — ask again
+                    (loop))))))) ; EINTR — ask again
+          "jolt-shutdown"))))
   jolt-nil)
 
 ;; --- a child must not inherit jolt's signal mask -----------------------------

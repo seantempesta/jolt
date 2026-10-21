@@ -59,7 +59,8 @@
 (def ^:private compute-executor
   (delay (Executors/newCachedThreadPool
           (reify java.util.concurrent.ThreadFactory
-            (newThread [_ r] (doto (Thread. ^Runnable r) (.setDaemon true)))))))
+            (newThread [_ r] (doto (Thread. ^Runnable r (str "async-compute-" (swap! thread-counter inc)))
+                               (.setDaemon true)))))))
 
 (defn executor-for
   "Given a workload tag, returns the Executor for it. The tags are :io, :compute
