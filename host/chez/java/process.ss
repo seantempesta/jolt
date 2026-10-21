@@ -612,6 +612,7 @@
   (let ((m (make-mutex)) (c (jolt-make-cv)) (done (box #f)))
     (fork-thread/daemon #t                 ; jolt's own plumbing, like the JVM's process reaper
       (lambda ()
+        (jolt-thread-name-set! (get-thread-id) "process-pump")
         (guard (e (#t #f))
           (let loop () (when (proc-copy-chunk src dst) (loop))))
         (when close-dst? (guard (e (#t #f)) (close-port dst)))
@@ -2169,20 +2170,31 @@
 ;; proc-wait-timed already polls for exactly this reason; this is the last caller
 ;; that did not. Backs off 0.2ms -> 10ms so a short-lived child is still reaped
 ;; promptly while a long-lived one costs ~100 wakeups a second.
-;; Every exit status is recorded here, under the process mutex: the box, and the
-;; child's stdin let go of (proc-shut-stdin!).
+;; Every exit status is recorded here, under the process mutex (proc-locked-reap).
 (define (proc-record-exit! st code)
   (set-box! (proc-p-exit-box st) code)
-  (proc-shut-stdin! st)
-  (proc-shut-idle-output! st)
   code)
+;; (proc-locked-reap st thunk): THUNK under the process mutex, and if it recorded the
+;; exit status, the child's stdin and idle outputs let go of AFTER the mutex. Those
+;; shutdowns can park a fiber (the io poller's forget! enters a monitor), and a fiber
+;; must not park while its carrier holds a counted lock: a .waitFor from a fiber threw
+;; that 1 in 10 times, and the exit status it had just read was lost with the fiber.
+(define (proc-locked-reap st thunk)
+  (let ((r+rec (jolt-with-mutex (proc-p-mutex st)
+                 (let* ((had (unbox (proc-p-exit-box st)))
+                        (r (thunk)))
+                   (cons r (and (not had) (unbox (proc-p-exit-box st)) #t))))))
+    (when (cdr r+rec)
+      (proc-shut-stdin! st)
+      (proc-shut-idle-output! st))
+    (car r+rec)))
 (define proc-poll-step-max 10)                   ; 10ms
 ;; ONE reap attempt, under the mutex. -> the exit status, or #f meaning "ask again".
 ;; The mutex is what stops two callers reaping the same child at once, and one
 ;; attempt is all it has to cover: the exit-box is written under it and read under
 ;; it, so a caller that loses the race sees the winner's answer on its next pass.
 (define (proc-reap-once st)
-  (jolt-with-mutex (proc-p-mutex st)
+  (proc-locked-reap st (lambda ()
     (or (unbox (proc-p-exit-box st))
         (call-with-values (lambda () (proc-status-once st))
           (lambda (rc decoded err)
@@ -2197,7 +2209,7 @@
               ;; unwaitable (ECHILD) or waitpid unavailable — no number of retries
               ;; changes that.
               (else (let ((c (proc-lost-status st)))
-                      (proc-record-exit! st c) c))))))))
+                      (proc-record-exit! st c) c)))))))))
 
 ;; THE PAUSE IS OUTSIDE THE MUTEX, and the loop is out here with it. This used to
 ;; hold proc-p-mutex across the entire poll, which is for as long as the child runs.
@@ -2230,14 +2242,14 @@
 ;; reported dead AND has its status cached, so a waitFor after it cannot go looking
 ;; for a child that will never be there.
 (define (proc-alive? st)
-  (jolt-with-mutex (proc-p-mutex st)
+  (proc-locked-reap st (lambda ()
     (if (unbox (proc-p-exit-box st)) #f
         (call-with-values (lambda () (proc-status-once st))
           (lambda (rc decoded err)
             (cond ((= rc 0) #t)                      ; still running
                   (decoded (proc-record-exit! st decoded) #f)
                   ((and (< rc 0) (= err proc-EINTR)) #t)   ; no answer yet, assume alive
-                  (else (proc-record-exit! st (proc-lost-status st)) #f)))))))
+                  (else (proc-record-exit! st (proc-lost-status st)) #f))))))))
 
 ;; Records a terminating signal we sent, so proc-lost-status can still give the
 ;; right answer for a child that something else reaps before we get to it.
@@ -2280,7 +2292,7 @@
               ;; (.waitFor p 10 SECONDS) gave the child 10ms.
               (proc-wait-timed self (tu-args->ms args)))))
         (cons "exitValue" (lambda (self)
-          (jolt-with-mutex (proc-p-mutex self)
+          (proc-locked-reap self (lambda ()
             (or (unbox (proc-p-exit-box self))
                 (call-with-values (lambda () (proc-status-once self))
                   (lambda (rc decoded err)
@@ -2291,7 +2303,7 @@
                           ((and (< rc 0) (not (= err proc-EINTR)))
                            (let ((c (proc-lost-status self)))
                              (proc-record-exit! self c) (->num c)))
-                          (else (throw-jvm (quote IllegalThreadStateException) "process has not exited")))))))))
+                          (else (throw-jvm (quote IllegalThreadStateException) "process has not exited"))))))))))
         (cons "toHandle" (lambda (self) (make-proc-handle (proc-p-pid self))))
         (cons "onExit"   (lambda (self) (make-proc-completable self)))
         (cons "toString" (lambda (self) (string-append "#<Process pid=" (number->string (proc-p-pid self)) ">")))))
@@ -2467,6 +2479,7 @@
   (let ((d (make-cf)))
     (fork-thread/daemon #t                 ; the JVM's process reaper thread is a daemon
      (lambda ()
+       (jolt-thread-name-set! (get-thread-id) "process reaper")   ; the JVM's name
        (let ((r (guard (e (#t (make-cf-alt (jolt-unwrap-throw e))))
                   (proc-wait-blocking proc)
                   proc)))
