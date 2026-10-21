@@ -2754,7 +2754,14 @@
           ;; is the order they ran in when they lived in the boot file. Being
           ;; inside the guard is a bonus — a throw from an app top-level form used
           ;; to escape as Chez's opaque dump, and now reports like any other.
-          (put-string out "      (jolt-app-init!)\n")
+          ;; Bound to the process's argv (after the program name), as clojure.main binds it
+          ;; for a -m run while the namespace loads: an app's top-level forms can read their
+          ;; command line (a config loaded once, at load, with command-line overrides).
+          (put-string out (string-append
+                            "      (jolt-with-thread-bindings\n"
+                            "        (jolt-hash-map (jolt-var \"clojure.core\" \"*command-line-args*\")\n"
+                            "                       (if (null? args) jolt-nil (list->cseq args)))\n"
+                            "        jolt-app-init!)\n"))
           (bld-emit-natives out natives 'optional)
            (put-string out (string-append
                               "      (let ((base (or (getenv \"JOLT_PWD\") \".\")))\n"
@@ -2795,7 +2802,11 @@
                             "            (lambda ()\n"
                             "              (jolt-with-ns-load-vars\n"
                             "                (lambda ()\n"
-                            "                  (let ((jolt-main-result (apply jolt-invoke (var-cell-root maincell) args)))\n"
+                            "                  (let ((jolt-main-result\n"
+                            "                          (jolt-with-thread-bindings\n"
+                            "                            (jolt-hash-map (jolt-var \"clojure.core\" \"*command-line-args*\")\n"
+                            "                                           (if (null? args) jolt-nil (list->cseq args)))\n"
+                            "                            (lambda () (apply jolt-invoke (var-cell-root maincell) args)))))\n"
                             "                    " (bld-startup-profile-form "entry -main") "\n"
                             "                    jolt-main-result))))))))\n"
                             ;; as the CLI: a non-daemon Thread the program started
