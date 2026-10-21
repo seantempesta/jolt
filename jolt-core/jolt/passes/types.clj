@@ -932,7 +932,14 @@
                 rt (cond
                    (= cn "range") (mk-vec :num)
                    (and cn (contains? elem-fns cn) (> n 0))
-                   (let [a0 (ty (nth ares 0))] (if (vec-type? a0) (velem a0) :any))
+                   ;; past the end, (nth v i d) answers d and the others nil; only
+                   ;; nth and rand-nth without a default throw instead
+                   (let [a0 (ty (nth ares 0))]
+                     (if (vec-type? a0)
+                       (cond (= n 3) (join (velem a0) (ty (nth ares 2)))
+                             (contains? #{"nth" "rand-nth"} cn) (velem a0)
+                             :else (join (velem a0) :nil))
+                       :any))
                    ;; flonum arithmetic yields a flonum — flows :double into a callee
                    ;; param (and into the fixpoint's return type) so hintless double
                    ;; code unboxes.

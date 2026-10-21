@@ -837,6 +837,21 @@ if [ "$nil_fold_got" != "$nil_fold_want" ]; then
   echo "  FAIL: nil?/some? fold inverted — got \`$nil_fold_got\`, want \`$nil_fold_want\`"; exit 1
 fi
 
+# An element read off a typed vector may be nil: (nth v i nil) past the end, and
+# first/second/peek/last/fnext of a short vector. Inference typed each as the
+# element, so nil? folded false and a destructured missing slot of a vector of
+# strings reached parse-long as nil (`[a b] (if d [x y] [x])`).
+elem_nil_app="$root/test/chez/elem-nil-app"
+elem_nil_out="$(dirname "$out")/elem-nil-bin"
+if ! JOLT_PWD="$elem_nil_app" "$jolt" build -m app.core -o "$elem_nil_out" >/dev/null 2>&1; then
+  echo "  FAIL: elem-nil build exited non-zero"; exit 1
+fi
+elem_nil_got="$(cd "$elem_nil_app" && "$elem_nil_out" 2>&1)"
+elem_nil_want="$(printf '9 :none\nfalse true true true true false')"
+if [ "$elem_nil_got" != "$elem_nil_want" ]; then
+  echo "  FAIL: nil? folded on a vector element read — got \`$elem_nil_got\`, want \`$elem_nil_want\`"; exit 1
+fi
+
 # A ^String/^Keyword hint is a contract for interop, not a proof of the value.
 # Inference trusted it as one, so under --opt a hinted parameter folded string?
 # true and nil? false, carried the "proof" into the unhinted helper it called,
