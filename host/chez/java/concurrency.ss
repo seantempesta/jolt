@@ -1966,7 +1966,26 @@
 (define (current-interrupt-poll-stack)
   (let ((state (interrupt-poll-stack)) (owner (get-thread-id)))
     (if (and (pair? state) (eqv? (car state) owner)) (cdr state) '())))
-(define (jolt-run-interruptible token thunk)
+;; --- a tick budget: runaway work bounded by the work it does ---------------------
+;;
+;; (jolt.host/run-interruptible token thunk ticks) also ends the body once it has
+;; run `ticks` engine ticks (procedure calls and loop back-edges: work done, never
+;; time). The borrow's handler already knows what it armed for each poll, so the
+;; budget is that sum; it escapes exactly as an interrupt does (lock-safe, the
+;; binding stack restored) and throws {:jolt/interrupted true :jolt/ticks-spent n}.
+;; A tight loop that allocates nothing is still counted. Ticks run inside a nested
+;; borrow are the inner borrow's, not this one's: each extent answers for its own
+;; work. Across a fiber park the count is kept (the quantum restarts, the work
+;; done does not).
+(define ticks-sentinel (cons 'jolt 'ticks-spent))
+(define jolt-kw-ticks-spent (keyword "jolt" "ticks-spent"))
+(define jolt-run-interruptible
+  (case-lambda
+    ((token thunk) (jolt-run-interruptible* token thunk #f))
+    ((token thunk ticks)
+     (jolt-run-interruptible* token thunk
+                              (and (number? ticks) (exact? ticks) (positive? ticks) ticks)))))
+(define (jolt-run-interruptible* token thunk budget)
   ;; Captured ONCE, outside the wind: a before-thunk that re-read it would, on a
   ;; resume, save the handler the SCHEDULER had put back and restore that on the
   ;; real exit — the borrow would hand the carrier its own handler a second time
@@ -1995,15 +2014,19 @@
          ;; before-thunk zeroes it, because a rewind means the fiber has just been
          ;; dispatched and its quantum restarts.
          (borrowed 0)
+         ;; Ticks this extent has run, for the budget: never reset.
+         (spent 0)
          ;; What the borrow last armed, so the accounting adds real ticks. It arms
          ;; the TIGHTER of the two demands, so a quantum shorter than the poll
          ;; interval is still honoured instead of being rounded up to it.
          (armed interrupt-check-ticks)
          (arm!
           (lambda ()
-            (let ((n (if (jolt-current-fiber)
-                         (fxmin interrupt-check-ticks (jolt-fiber-preempt-ticks))
-                         interrupt-check-ticks)))
+            (let* ((n (if (jolt-current-fiber)
+                          (fxmin interrupt-check-ticks (jolt-fiber-preempt-ticks))
+                          interrupt-check-ticks))
+                   ;; the budget's remainder, when it is nearer than the poll
+                   (n (if budget (max 1 (min n (- budget spent))) n)))
               (set! armed n)
               (set-timer n))))
          ;; This wind's own edges are masked (jolt-wind*, locks.ss). A deferred
@@ -2037,8 +2060,16 @@
                                (k interrupt-sentinel)
                                (begin (set! armed (jolt-fiber-preempt-retry-ticks))
                                       (set-timer armed))))
+                          ((and budget (>= (+ spent armed) budget))
+                           ;; the budget is spent: leave as an interrupt leaves, and on
+                           ;; the same test (not while a counted lock is held)
+                           (if (fx=? 0 (jolt-locks-held))
+                               (begin (set! spent (+ spent armed)) (k ticks-sentinel))
+                               (begin (set! armed (jolt-fiber-preempt-retry-ticks))
+                                      (set-timer armed))))
                           (else
                            (set! borrowed (fx+ borrowed armed))
+                           (set! spent (+ spent armed))
                            (cond
                              ;; The quantum has fallen due. Hand it to the
                              ;; scheduler's handler, which either escapes through
@@ -2088,15 +2119,20 @@
                       ((pair? outer-stack) (set-timer interrupt-check-ticks))
                       (else (jolt-fiber-rearm-preempt!)))
                     (when (fx>? (jolt-locks-held) lv) (jolt-locks-exit!))))))))
-    (if (eq? r interrupt-sentinel)
+    (cond
+      ((eq? r ticks-sentinel)
+       (dyn-binding-stack outer-bindings)
+       (jolt-throw (jolt-ex-info "Evaluation spent its tick budget"
+                                 (jolt-hash-map jolt-kw-interrupted #t jolt-kw-ticks-spent spent))))
+      ((eq? r interrupt-sentinel)
         (begin
           ;; The bindings the interrupted body left. Its winds are masked at their
           ;; edges, but a `binding` pops in a user finally, and the escape can land
           ;; in that finally's code before the pop. Everything inside the extent was
           ;; abandoned, so the stack goes back to what it was on the way in.
           (dyn-binding-stack outer-bindings)
-          (jolt-throw (jolt-ex-info "Evaluation interrupted" (jolt-hash-map jolt-kw-interrupted #t))))
-        r)))
+          (jolt-throw (jolt-ex-info "Evaluation interrupted" (jolt-hash-map jolt-kw-interrupted #t)))))
+      (else r))))
 (def-var! "jolt.host" "make-interrupt" jolt-make-interrupt)
 (def-var! "jolt.host" "interrupt!" jolt-interrupt!)
 (def-var! "jolt.host" "interrupted?" jolt-interrupted?)
