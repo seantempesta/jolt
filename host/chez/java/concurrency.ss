@@ -410,7 +410,8 @@
 ;; Otherwise an agent pool thread is never a daemon, whatever thread starts it,
 ;; as clojure.core's pools are not, so the exit waits for it.
 (define (fork-agent-thread thunk)
-  (fork-thread/daemon agent-threads-daemon? thunk))
+  (fork-thread/daemon agent-threads-daemon?
+    (lambda () (jolt-thread-name-set! (get-thread-id) "clojure-agent-pool") (thunk))))
 (define solo-pool-keep-alive-ms 60000)     ; Executors.newCachedThreadPool's 60L, SECONDS
 (define (exit-linger-after-task!)
   (unless (jolt-thread-daemon? (get-thread-id))
@@ -2918,6 +2919,7 @@
           (record-method-dispatch t "start" jolt-nil)
           (fork-thread/daemon (vector-ref st 16)
             (lambda ()
+              (jolt-thread-name-set! (get-thread-id) "pool-worker")   ; no factory named it
               (guard (e (#t (jolt-thread-uncaught! (current-thread-handle) e
                                                    "Exception in executor task:\n")))
                 (worker))))))))

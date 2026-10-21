@@ -304,11 +304,11 @@
     (let ((mb (alt-handler-mailbox h)))
       (vector-set! mb 1 val) (vector-set! mb 2 port) (vector-set! mb 0 #t))
     (let ((w (alt-handler-wake h)))
-      (if w
-          (if jolt-fiber-wake-fn
-              (jolt-fiber-wake-fn w)
-              (jolt-cv-wake! (alt-handler-wcv h)))
-          (jolt-cv-wake! (alt-handler-wcv h))))))
+      (cond
+        ;; a callback waiter (put!/take!): it schedules its callback on a fiber
+        ((procedure? w) (w))
+        ((and w jolt-fiber-wake-fn) (jolt-fiber-wake-fn w))
+        (else (jolt-cv-wake! (alt-handler-wcv h)))))))
 
 ;; ac-notify! — drain pending alt registrations after any channel state mutation.
 ;; Called with the channel mutex held. Loops steps 1→2→3 until a full pass makes
@@ -895,27 +895,60 @@
 
 ;; (put! ch v [cb [on-caller?]]) — async put, optional completion callback. If the
 ;; put completes immediately and on-caller? (default #t), the callback runs on the
-;; calling thread; otherwise on another thread. Returns true unless already closed.
-;; That thread (and take!'s) is a daemon: it stands for core.async's dispatch pool,
-;; and a put or take nobody ever completes must not hold the process up.
+;; calling thread; otherwise on a fiber. Returns true unless already closed.
+;; A put that cannot complete at once is a waiter, the R3 protocol's one notion
+;; (alt-handler, above): registered on the channel's putters under its mutex, in
+;; the caller's call, so pending puts complete in the order they were made, and
+;; its wake is the callback, which alt-deliver! runs on a fiber with the outcome.
+;; No thread stands for core.async's dispatch pool: a pending op costs a handler,
+;; and a callback a fiber (2.2 us / 6 KB against a thread's 8 us / 87 KB, 93af2568).
+;; A put or take nobody ever completes holds nothing up. No cap: the channel has no
+;; MAX-QUEUE-SIZE on pending ops (header).
+(define (async-callback-execute thunk)
+  (async-fiber-execute (lambda () (*txn* #f) (thunk))))
+;; A waiter whose wake is CALL-CB, given what the channel delivers: #t/#f for a
+;; put, the value (nil when closed) for a take.
+(define (async-callback-waiter call-cb)
+  (let ((h (alt-handler-alloc)))
+    (alt-handler-wake-set! h
+      (lambda ()
+        (let ((v (vector-ref (alt-handler-mailbox h) 1)))
+          (async-callback-execute (lambda () (call-cb v))))))
+    h))
 (define (jolt-async-put! ch v . rest)
   (let* ((cb (if (pair? rest) (car rest) jolt-nil))
          (on-caller? (if (and (pair? rest) (pair? (cdr rest))) (jolt-truthy? (cadr rest)) #t))
          (call-cb (lambda (ok) (unless (jolt-nil? cb) (jolt-invoke cb ok)))))
-    (case (ac-try-give! ch v)
-      ((ok) (if on-caller? (call-cb #t) (fork-thread/daemon #t (lambda () (*txn* #f) (call-cb #t)))) #t)
-      ((closed) (if on-caller? (call-cb #f) (fork-thread/daemon #t (lambda () (*txn* #f) (call-cb #f)))) #f)
-      (else (fork-thread/daemon #t (lambda () (*txn* #f) (call-cb (jolt-async-give ch v)))) #t))))
+    (async-check-put! v)                 ; throws — keep it outside the mutex
+    (jolt-chan-lock! ch)
+    (case (jolt-chan-locked-give! ch v)
+      ((ok) (jolt-chan-unlock! ch)
+            (if on-caller? (call-cb #t) (async-callback-execute (lambda () (call-cb #t)))) #t)
+      ((closed) (jolt-chan-unlock! ch)
+                (if on-caller? (call-cb #f) (async-callback-execute (lambda () (call-cb #f)))) #f)
+      (else
+       (async-chan-alt-putters-set! ch
+         (append (async-chan-alt-putters ch) (list (cons (async-callback-waiter call-cb) v))))
+       (ac-notify! ch)
+       (jolt-chan-unlock! ch)
+       #t))))
 
-;; (take! ch cb [on-caller?]) — async take. Same on-caller? rule as put!.
+;; (take! ch cb [on-caller?]) — async take. Same on-caller? rule as put!, and a take
+;; that cannot complete at once is a waiter on the channel's takers, as put!'s.
 (define (jolt-async-take! ch cb . rest)
   (let* ((on-caller? (if (pair? rest) (jolt-truthy? (car rest)) #t))
-         (call-cb (lambda (v) (unless (jolt-nil? cb) (jolt-invoke cb v))))
-         (r (ac-poll! ch)))
-    (cond
-      ((eq? r ac-poll-empty) (fork-thread/daemon #t (lambda () (*txn* #f) (call-cb (jolt-async-take ch)))))
-      (on-caller? (call-cb r))
-      (else (fork-thread/daemon #t (lambda () (*txn* #f) (call-cb r)))))
+         (call-cb (lambda (v) (unless (jolt-nil? cb) (jolt-invoke cb v)))))
+    (jolt-chan-lock! ch)
+    (let ((r (ac-poll!/locked ch)))
+      (if (eq? r ac-poll-empty)
+          (begin
+            (async-chan-alt-takers-set! ch
+              (append (async-chan-alt-takers ch) (list (async-callback-waiter call-cb))))
+            (ac-notify! ch)
+            (jolt-chan-unlock! ch))
+          (begin
+            (jolt-chan-unlock! ch)
+            (if on-caller? (call-cb r) (async-callback-execute (lambda () (call-cb r)))))))
     jolt-nil))
 
 ;; (go-spawn thunk) — run thunk on a thread; return a buffered(1) channel that
@@ -1021,6 +1054,7 @@
     ;; a daemon, as core.async's thread and go pools' threads are on the JVM
     (fork-thread/daemon #t
      (lambda ()
+       (jolt-thread-name-set! (get-thread-id) "async-thread")   ; a thread listing says whose
        (*txn* #f)                          ; go/thread body must not inherit parent's txn
        (dyn-binding-stack snap)
        (let ((r (guard (e (#t (cons #f e))) (cons #t (jolt-invoke thunk)))))
