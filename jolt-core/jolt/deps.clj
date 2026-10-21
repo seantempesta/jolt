@@ -903,7 +903,12 @@
   (memoized [:info lib (ext/dep-id lib coord)]
     (fn []
       (let [path (:local/root coord)]
-        (if (str/ends-with? path ".jar")
+        (cond
+          ;; tools.deps refuses a :local/root that is not there, as for a missing artifact
+          (not (file-exists? path))
+          (do (note-unresolvable! lib path (str ":local/root " path " does not exist"))
+              {:root nil :manifest :none})
+          (str/ends-with? path ".jar")
           ;; a jar local root is read in place, like a Maven jar; the pom it
           ;; packages, if any, is the first META-INF/**/pom.xml entry
           (if (archive-or-note! path lib path)
@@ -913,7 +918,7 @@
                             (jolt.host/zip-entry-names path))]
               {:root path :manifest :mvn :pom pom})
             {:root nil :manifest :none})
-          (manifest-info path))))))
+          :else (manifest-info path))))))
 
 (defmethod ext/coord-info :mvn [lib coord] (mvn-info lib coord))
 (defmethod ext/coord-info :git [lib coord] (git-info lib coord))

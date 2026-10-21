@@ -482,6 +482,12 @@
        2 (if (= :timed-out paths) paths (count paths)))
   (jolt.host/delete-tree! root))
 
+;; A :local/root that does not exist is unresolved, like a missing artifact (tools.deps refuses it)
+(let [gone (str (System/getProperty "java.io.tmpdir") "/local-missing-" (System/currentTimeMillis))
+      data (try (deps/resolve-deps {'k/gone {:local/root gone}} ".") nil
+                (catch :default e (ex-data e)))]
+  (is= "a missing :local/root is unresolved" '[k/gone] (mapv :coord (:unresolved data))))
+
 (println (str "deps-expand: " (- @checks @failures) "/" @checks " passed"))
 (when (pos? @failures)
   (System/exit 1))
