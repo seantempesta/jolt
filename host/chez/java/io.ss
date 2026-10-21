@@ -600,6 +600,7 @@
                         (loop (- n 1))
                         (substring given 0 n))))
          (base (if (string=? trimmed "") p trimmed)))
+    (io-note-file-read! p)   ; a listing is a read: its names (io-note-file-read!)
     (map (lambda (e) (string-append (if (string=? base "/") "" base) "/" e))
          (sort string<? (directory-list p)))))
 (define (jolt-dir? path) (if (file-directory? (project-relative (file-path-of path))) #t #f))
@@ -1829,6 +1830,7 @@
        (list (jfile-listing fp (lambda () (list->cseq (map make-jfile (jolt-list-dir p)))))))
       ;; .list -> the child NAMES (a String[]), nil if not a readable directory.
       ((string=? name "list")
+       (io-note-file-read! fp)
        (list (jfile-listing fp (lambda () (apply jolt-vector (sort string<? (directory-list fp)))))))
       ((string=? name "length")         (list (->num (file-byte-size fp))))
       ((string=? name "lastModified")   (list (->num (file-mtime-millis fp))))
@@ -1916,6 +1918,10 @@
 ;; cache key. Keying on the .clj alone left an edited SQL migration serving the
 ;; previous build's statements out of the cache, silently — the namespace source
 ;; is untouched, so its hash still matches (jolt#576).
+;;
+;; A DIRECTORY that is listed is announced the same way (jolt-list-dir, File.list,
+;; Files/walkFileTree, Files/newDirectoryStream): the cache keys it by its sorted
+;; names, so a macro that reads every file in a directory sees a file added there.
 ;;
 ;; A file that does NOT exist is announced too. (io/resource "migrations/003.sql")
 ;; answering nil is a compile-time answer like any other, and it stops being the
