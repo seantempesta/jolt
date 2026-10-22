@@ -2091,4 +2091,31 @@ for dl in "" "--direct-link"; do
 done
 rm -rf "$sh_d"
 
-echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + split-provider-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + unit-cache + boot-modes + compiler-verdict + gzip-round-trip + signable + include + dep-resources + emitted-head-defs + install-sources)"
+# A macro that evals an earlier def of its namespace at expansion (tools.reader's
+# compile-when over <=clojure-1-7-alpha5): the building process's own eval compiles
+# against the unit it had before the build, never the build's, whose direct-link
+# registry names defs that exist only in the emitted text. JOLT_NO_WP_INFER=1 analyzes
+# in the emit walk, after the def was emitted, where it referenced an unbound jv$.
+ev_d="$(mktemp -d)"
+mkdir -p "$ev_d/src/ev"
+cat > "$ev_d/src/ev/core.clj" <<'EV_EOF'
+(ns ev.core)
+(def flag? true)
+(defmacro when-flag [& body] (when (eval 'flag?) `(do ~@body)))
+(when-flag (defn hi [] :hi))
+(defn -main [& _] (println (hi)))
+EV_EOF
+# inference on is the variable unset (Jolt reads it with getenv: an empty value is off too)
+for wp in on off; do
+  if [ $wp = on ]; then set -- env -u JOLT_NO_WP_INFER; else set -- env JOLT_NO_WP_INFER=1; fi
+  if ! "$@" JOLT_PWD="$ev_d" "$jolt" build -m ev.core -o "$ev_d/bin" >"$ev_d/build.log" 2>&1; then
+    echo "  FAIL: an eval at expansion broke the build (inference $wp)"; tail -5 "$ev_d/build.log"; exit 1
+  fi
+  got_ev="$("$ev_d/bin" 2>&1)"
+  if [ "$got_ev" != ":hi" ]; then
+    echo "  FAIL: eval at expansion (inference $wp): got $got_ev"; exit 1
+  fi
+done
+rm -rf "$ev_d"
+
+echo "build smoke: passed (release + optimized + direct-link + tree-shake + compiler+core shake + data-reader + no-main + optional-native + deps-opt + cljc-cond + jolt-ext + vendored-fs + petite-only-fs + vendored-process + petite-only-process + ffi-clj-layer + petite-only-ffi + declare-only-var + install-owned-order + split-provider-order + embedded-value + sdeps-before-build + source-mode-driver + build-error-location + compile-error-position + scan-alias-set + as-alias + flat-split + runtime-cache + unit-cache + boot-modes + compiler-verdict + gzip-round-trip + signable + include + dep-resources + emitted-head-defs + eval-at-expansion + install-sources)"

@@ -2478,6 +2478,9 @@
                 ;; mode flag below lands on it (the unit the per-form emit reads).
                 ;; The build emits app + core forms that reference clojure.core, which
                 ;; must lower to var-deref, so prelude mode is on for the whole build.
+                ;; The unit before it stays the one the process's own evals compile
+                ;; against (compile-eval.ss ce-outside-build).
+                (ce-build-unit-enter! ((var-deref "jolt.backend-scheme" "current-unit")))
                 (ei-fresh-unit!)
                 ((var-deref "jolt.backend-scheme" "set-prelude-mode!") #t)
                 ;; The passes run for every mode but dev. "release" and
@@ -2596,6 +2599,7 @@
                                 (not (dce-needs-compiler? core-records app-records
                                                           entry-main allow-dynamic)))))))
               (lambda ()
+                (ce-build-unit-leave!)
                 (set-optimize! #f)
                 (set-direct-link-flag! #f)
                 ((var-deref "jolt.backend-scheme" "set-direct-link!") #f)

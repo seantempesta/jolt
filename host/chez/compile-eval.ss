@@ -518,7 +518,43 @@
       (dyn-with-frame (list (cons jolt-unit-tap-cell jolt-nil)) thunk)
       (thunk)))
 
+;; A build publishes its own compilation unit for its walks (build.ss), and that
+;; unit is a closed world: its direct-link registry names every def the emit walk
+;; has emitted so far, whose jv$ bindings exist only in the emitted TEXT, never in
+;; the building process. Code the building process itself compiles and runs
+;; meanwhile -- an (eval …) inside a macro expander, as tools.reader's
+;; compile-when does at expansion, a top-level flag set! -- is open-world runtime
+;; code, so it compiles against the unit the process had before the build (the
+;; one its pass-1 load used), with the build's direct-link/optimize flags off.
+;; Compiled against the build's unit it referenced an unbound jv$ variable as soon
+;; as the referenced def had been emitted (JOLT_NO_WP_INFER=1 analyzes in the emit
+;; walk; whole-program inference analyzed before any def was emitted, so it hid it).
+(define ce-build-runtime-unit #f)   ; the process's unit while a build's is published
+(define (ce-build-unit-enter! runtime-unit) (set! ce-build-runtime-unit runtime-unit))
+(define (ce-build-unit-leave!) (set! ce-build-runtime-unit #f))
+(define jolt-ce-set-emit-unit! (var-deref "jolt.backend-scheme" "set-emit-unit!"))
+(define (ce-outside-build thunk)
+  (let ((runtime ce-build-runtime-unit))
+    (if (not runtime)
+        (thunk)
+        (let ((build-unit #f) (opt hc-optimize?) (dl hc-direct-link?))
+          (dynamic-wind
+            (lambda ()
+              (set! build-unit (jolt-ce-current-unit))
+              (set! ce-build-runtime-unit #f)
+              (jolt-ce-set-emit-unit! runtime)
+              (set-optimize! #f)
+              (set-direct-link-flag! #f))
+            thunk
+            (lambda ()
+              (set-direct-link-flag! dl)
+              (set-optimize! opt)
+              (jolt-ce-set-emit-unit! build-unit)
+              (set! ce-build-runtime-unit runtime)))))))
+
 (define (jolt-analyze-emit-form form ns)
+  (ce-outside-build (lambda () (jolt-analyze-emit-form* form ns))))
+(define (jolt-analyze-emit-form* form ns)
   (let* ((ctx (make-analyze-ctx ns))
          (node (jolt-ce-analyze ctx form)))
     (jolt-lint-node! node)
