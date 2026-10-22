@@ -1975,10 +1975,17 @@
 ;; time). The borrow's handler already knows what it armed for each poll, so the
 ;; budget is that sum; it escapes exactly as an interrupt does (lock-safe, the
 ;; binding stack restored) and throws {:jolt/interrupted true :jolt/ticks-spent n}.
-;; A tight loop that allocates nothing is still counted. Ticks run inside a nested
-;; borrow are the inner borrow's, not this one's: each extent answers for its own
-;; work. Across a fiber park the count is kept (the quantum restarts, the work
-;; done does not).
+;; A tight loop that allocates nothing is still counted. A budget covers all the
+;; work inside its extent, nested borrows' included: an inner borrow charges the
+;; enclosing one what it used of its armed tick when it takes the timer, and its
+;; own work on each way out, and the enclosing one re-arms through its own arm!,
+;; so a spent budget ends at its next tick however much of its work ran inside
+;; inner borrows (a proof run whose tests each run bounded evals of their own once
+;; spun for hours past its budget, Seon's step E, 2026-10-22), and an inner borrow's
+;; own limit is the lesser of its budget and what the enclosing one has left, so it
+;; cannot run past it either. Each borrow pushes its account on the poll stack;
+;; charging is O(1) at entry and exit. Across a
+;; fiber park the count is kept (the quantum restarts, the work done does not).
 (define ticks-sentinel (cons 'jolt 'ticks-spent))
 (define jolt-kw-ticks-spent (keyword "jolt" "ticks-spent"))
 (define jolt-run-interruptible
@@ -2016,8 +2023,16 @@
          ;; before-thunk zeroes it, because a rewind means the fiber has just been
          ;; dispatched and its quantum restarts.
          (borrowed 0)
-         ;; Ticks this extent has run, for the budget: never reset.
+         ;; Ticks this extent has run, for the budget, nested borrows' included: never reset.
          (spent 0)
+         ;; Of spent, what this extent has reported to the enclosing borrow's account.
+         (reported 0)
+         ;; The first entry takes the timer from the enclosing borrow; a resume after a
+         ;; park takes it from the scheduler, which owes the enclosing borrow nothing.
+         (entered? #f)
+         ;; The work this extent may do: its budget, or less, what the enclosing borrow
+         ;; had left when this one began (#f: unbounded). Set at the first entry.
+         (limit budget)
          ;; What the borrow last armed, so the accounting adds real ticks. It arms
          ;; the TIGHTER of the two demands, so a quantum shorter than the poll
          ;; interval is still honoured instead of being rounded up to it.
@@ -2028,9 +2043,21 @@
                           (fxmin interrupt-check-ticks (jolt-fiber-preempt-ticks))
                           interrupt-check-ticks))
                    ;; the budget's remainder, when it is nearer than the poll
-                   (n (if budget (max 1 (min n (- budget spent))) n)))
+                   (n (if limit (max 1 (min n (- limit spent))) n)))
               (set! armed n)
               (set-timer n))))
+         ;; This extent's account, pushed for nested borrows (O(1)): remaining, what
+         ;; was left of this extent's armed tick when an inner borrow took the timer
+         ;; (#f: not from this extent), charged as used; work, the inner borrow's
+         ;; ticks since its last report; rearm?, take the timer back through arm!
+         ;; (whose next tick throws when the budget is spent).
+         (account!
+          (lambda (remaining work rearm?)
+            (when remaining (set! spent (+ spent (max 0 (- armed remaining)))))
+            (set! spent (+ spent work))
+            (when rearm? (arm!))
+            ;; what this extent has left, for an inner borrow's limit
+            (and limit (max 0 (- limit spent)))))
          ;; This wind's own edges are masked (jolt-wind*, locks.ss). A deferred
          ;; interrupt re-arms a short retry, and when the body returned normally
          ;; that retry could land at this after-thunk's entry, the winder already
@@ -2062,7 +2089,7 @@
                                (k interrupt-sentinel)
                                (begin (set! armed (jolt-fiber-preempt-retry-ticks))
                                       (set-timer armed))))
-                          ((and budget (>= (+ spent armed) budget))
+                          ((and limit (>= (+ spent armed) limit))
                            ;; the budget is spent: leave as an interrupt leaves, and on
                            ;; the same test (not while a counted lock is held)
                            (if (fx=? 0 (jolt-locks-held))
@@ -2094,8 +2121,16 @@
                                (set! borrowed 0)
                                (jolt-fiber-preempt-handler))
                               (else (arm!) (void))))))))
+                      ;; The first entry charges the enclosing borrow what it used of
+                      ;; its tick, which this borrow is about to take.
+                      (let ((remaining (set-timer 0)))
+                        (unless entered?
+                          (set! entered? #t)
+                          (when (pair? outer-stack)
+                            (let ((left ((car outer-stack) remaining 0 #f)))
+                              (when left (set! limit (if limit (min limit left) left)))))))
                       ;; Push is the timer-frame ownership linearization point.
-                      (interrupt-poll-stack (cons owner (cons handler outer-stack)))
+                      (interrupt-poll-stack (cons owner (cons account! outer-stack)))
                       (timer-interrupt-handler handler)
                       (arm!)))
                   (jolt-masked-body thunk)
@@ -2104,7 +2139,13 @@
                   ;; where the borrowed tick can fall due on the scheduler's
                   ;; handler, which answers it by preempting.
                   (lambda ()
-                    (set-timer 0)
+                    ;; This extent's partial tick is its work; what it has not yet
+                    ;; reported goes to the enclosing borrow's account.
+                    (let ((remaining (set-timer 0)))
+                      (set! spent (+ spent (max 0 (- armed remaining))))
+                      (set! armed 0)
+                      (when (pair? outer-stack) ((car outer-stack) #f (- spent reported) #f))
+                      (set! reported spent))
                     ;; Pop before restoring the enclosing handler. Every terminal
                     ;; path (return, throw, interrupt, and park unwind) comes here.
                     (interrupt-poll-stack (cons owner outer-stack))
@@ -2118,7 +2159,7 @@
                     ;; polling. Fiber exits retain the scheduler rearm behavior.
                     (cond
                       ((jolt-current-fiber) (jolt-fiber-rearm-preempt!))
-                      ((pair? outer-stack) (set-timer interrupt-check-ticks))
+                      ((pair? outer-stack) ((car outer-stack) #f 0 #t))
                       (else (jolt-fiber-rearm-preempt!)))
                     (when (fx>? (jolt-locks-held) lv) (jolt-locks-exit!))))))))
     (cond
