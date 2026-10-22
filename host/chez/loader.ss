@@ -3351,3 +3351,10 @@
 ;; jolt version string — one source (jolt-version-string, rt.ss): the baked
 ;; release tag in a binary, $JOLT_VERSION under bin/jolt, else "dev".
 (def-var! "jolt.host" "jolt-version" (lambda () (jolt-version-string)))
+;; The runtime's identity as its compiled units are keyed (aot-generation-dir's name:
+;; version, runtime fingerprint, trace tag), so a program can record what ran it; nil when
+;; the runtime cannot be identified (aot-runtime-fingerprint).
+(def-var! "jolt.host" "runtime-fingerprint"
+  (lambda ()
+    (let ((fp (aot-runtime-fingerprint)))
+      (if fp (string-append (jolt-version-string) "-" fp (aot-trace-tag)) jolt-nil))))
