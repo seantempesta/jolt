@@ -1067,6 +1067,39 @@
                                            (hashtable-delete! (hm-tbl self) x)
                                            (hm-drop-key! self x) (if had #t #f))))
         (cons "contains" (lambda (self x) (if (hashtable-contains? (hm-tbl self) x) #t #f)))
+        ;; The bulk Collection methods, as java.util.Set states them: each answers whether
+        ;; the set changed (containsAll: whether every element of c is here).
+        (cons "addAll" (lambda (self c)
+                         (let loop ((xs (seq->list (jolt-seq c))) (changed #f))
+                           (if (null? xs) changed
+                               (let ((had (hashtable-contains? (hm-tbl self) (car xs))))
+                                 (unless had
+                                   (hm-note-key! self (car xs))
+                                   (hashtable-set! (hm-tbl self) (car xs) #t))
+                                 (loop (cdr xs) (or changed (not had))))))))
+        (cons "removeAll" (lambda (self c)
+                            (let loop ((xs (seq->list (jolt-seq c))) (changed #f))
+                              (if (null? xs) changed
+                                  (let ((had (hashtable-contains? (hm-tbl self) (car xs))))
+                                    (when had
+                                      (hashtable-delete! (hm-tbl self) (car xs))
+                                      (hm-drop-key! self (car xs)))
+                                    (loop (cdr xs) (or changed had)))))))
+        (cons "retainAll" (lambda (self c)
+                            (let ((keep (make-hashtable hm-hash jolt=2)))
+                              (for-each (lambda (x) (hashtable-set! keep x #t)) (seq->list (jolt-seq c)))
+                              (let loop ((xs (hs->list self)) (changed #f))
+                                (if (null? xs) changed
+                                    (if (hashtable-contains? keep (car xs))
+                                        (loop (cdr xs) changed)
+                                        (begin (hashtable-delete! (hm-tbl self) (car xs))
+                                               (hm-drop-key! self (car xs))
+                                               (loop (cdr xs) #t))))))))
+        (cons "containsAll" (lambda (self c)
+                              (let loop ((xs (seq->list (jolt-seq c))))
+                                (cond ((null? xs) #t)
+                                      ((hashtable-contains? (hm-tbl self) (car xs)) (loop (cdr xs)))
+                                      (else #f)))))
         (cons "size" (lambda (self) (hashtable-size (hm-tbl self))))
         (cons "isEmpty" (lambda (self) (= 0 (hashtable-size (hm-tbl self)))))
         (cons "clear" (lambda (self) (hashtable-clear! (hm-tbl self)) (hm-ord! self '()) jolt-nil))
