@@ -531,3 +531,32 @@
           (c-pthread-sigmask jolt-sig-setmask-how jolt-empty-sigset old)
           (sa-foreign-free old))))))
 (def-var! "jolt.host" "after-fork-child!" (lambda () (jolt-after-fork-child!) jolt-nil))
+
+;; (jolt.host/ticks) -> the engine ticks the running fiber, else this thread, has run
+;; (fibers.ss jolt-ticks: the count the timer keeps). The cost of a body is the
+;; difference of two reads around it; a budget (jolt.host/run-interruptible) reads
+;; the same count.
+(def-var! "jolt.host" "ticks" (lambda () (jolt-ticks)))
+;; (jolt.host/ticks-of thunk) -> the engine ticks (thunk) ran. The count advances only
+;; while the timer is armed (a budget, a fiber's quantum); with nothing armed, the
+;; measure arms one too far off ever to fire, counts itself open on the thread (so a
+;; bounded run inside it re-arms that on its way out, fibers.ss jolt-fiber-rearm-preempt!),
+;; and on every way out (a throw too) closes and disarms. Off a fiber only: on one the
+;; quantum is always armed.
+(def-var! "jolt.host" "ticks-of"
+  (lambda (thunk)
+    (let* ((s (jolt-ticks-cell))
+           (idle? (and (not (jolt-current-fiber)) (fx=? 0 (vector-ref s 2))))
+           (t0 #f))
+      (dynamic-wind
+        (lambda ()
+          (when idle?
+            (vector-set! s 4 (fx+ (vector-ref s 4) 1))
+            (jolt-set-timer! (most-positive-fixnum)))
+          (unless t0 (set! t0 (jolt-ticks))))
+        thunk
+        (lambda ()
+          (when idle?
+            (vector-set! s 4 (fx- (vector-ref s 4) 1))
+            (when (fx=? 0 (vector-ref s 4)) (jolt-set-timer! 0)))))
+      (- (jolt-ticks) t0))))

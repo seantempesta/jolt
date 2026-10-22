@@ -1972,15 +1972,50 @@
 ;;
 ;; (jolt.host/run-interruptible token thunk ticks) also ends the body once it has
 ;; run `ticks` engine ticks (procedure calls and loop back-edges: work done, never
-;; time). The borrow's handler already knows what it armed for each poll, so the
-;; budget is that sum; it escapes exactly as an interrupt does (lock-safe, the
-;; binding stack restored) and throws {:jolt/interrupted true :jolt/ticks-spent n}.
-;; A tight loop that allocates nothing is still counted. Ticks run inside a nested
-;; borrow are the inner borrow's, not this one's: each extent answers for its own
-;; work. Across a fiber park the count is kept (the quantum restarts, the work
-;; done does not).
+;; time). A budget is (start, limit): start is the running thread's or fiber's
+;; tick count when the body begins (jolt-ticks, fibers.ss: the count the timer
+;; keeps), and the body has spent its budget once that count has moved limit
+;; past it. So a budget covers all the work inside its extent, nested borrows'
+;; included, and nesting costs nothing: each borrow's entry on the poll stack is
+;; its budget, and at every tick any borrow's handler fires it checks them all,
+;; innermost first, and escapes to the innermost spent one, exactly as an interrupt
+;; escapes (lock-safe, the binding stack restored), which throws
+;; {:jolt/interrupted true :jolt/ticks-spent n :jolt/ticks-budget b}. A tight loop
+;; that allocates nothing is still counted, and the count a fiber's park keeps.
 (define ticks-sentinel (cons 'jolt 'ticks-spent))
 (define jolt-kw-ticks-spent (keyword "jolt" "ticks-spent"))
+(define jolt-kw-ticks-budget (keyword "jolt" "ticks-budget"))
+;; A budget is #(start limit k fiber): fiber the one (or #f, a thread) whose count start is
+;; on. Only a budget of the running fiber (or thread) is read against now: a park's
+;; unwind runs with no fiber current, on the carrier's count, and a fiber's budget read
+;; against that is nonsense (it armed 1 tick and escaped from the scheduler mid-switch).
+(define (jolt-budget-current? b f)
+  (and (vector-ref b 0) (vector-ref b 1) (eq? (vector-ref b 3) f)))
+;; The count is read only when a budget is bounded and current, so runs with no budget
+;; never read it (an interrupt token alone costs no read).
+;; The nearest of budgets' remainders now, or #f when none is bounded.
+(define (jolt-budget-left budgets)
+  (let ((f (jolt-current-fiber)))
+    (let loop ((bs budgets) (best #f) (now #f))
+      (if (null? bs)
+          best
+          (let ((b (car bs)))
+            (if (jolt-budget-current? b f)
+                (let* ((now (or now (jolt-ticks)))
+                       (left (- (vector-ref b 1) (- now (vector-ref b 0)))))
+                  (loop (cdr bs) (if best (min best left) left) now))
+                (loop (cdr bs) best now)))))))
+;; The innermost spent budget of budgets now, or #f.
+(define (jolt-budget-spent budgets)
+  (let ((f (jolt-current-fiber)))
+    (let loop ((bs budgets) (now #f))
+      (if (null? bs)
+          #f
+          (let ((b (car bs)))
+            (if (jolt-budget-current? b f)
+                (let ((now (or now (jolt-ticks))))
+                  (if (>= (- now (vector-ref b 0)) (vector-ref b 1)) b (loop (cdr bs) now)))
+                (loop (cdr bs) now)))))))
 (define jolt-run-interruptible
   (case-lambda
     ((token thunk) (jolt-run-interruptible* token thunk #f))
@@ -2016,9 +2051,12 @@
          ;; before-thunk zeroes it, because a rewind means the fiber has just been
          ;; dispatched and its quantum restarts.
          (borrowed 0)
-         ;; Ticks this extent has run, for the budget: never reset.
-         (spent 0)
-         ;; What the borrow last armed, so the accounting adds real ticks. It arms
+         ;; This borrow's budget, its entry on the poll stack: #(start limit k fiber),
+         ;; start the tick count at the body's first entry, on fiber's count (#f: the
+         ;; thread's), k where its escape lands.
+         (self (vector #f budget #f #f))
+         (budgets (cons self outer-stack))
+         ;; What the borrow last armed, for the quantum (borrowed). It arms
          ;; the TIGHTER of the two demands, so a quantum shorter than the poll
          ;; interval is still honoured instead of being rounded up to it.
          (armed interrupt-check-ticks)
@@ -2027,10 +2065,11 @@
             (let* ((n (if (jolt-current-fiber)
                           (fxmin interrupt-check-ticks (jolt-fiber-preempt-ticks))
                           interrupt-check-ticks))
-                   ;; the budget's remainder, when it is nearer than the poll
-                   (n (if budget (max 1 (min n (- budget spent))) n)))
+                   ;; the nearest budget's remainder, when it is nearer than the poll
+                   (left (jolt-budget-left budgets))
+                   (n (if left (max 1 (min n left)) n)))
               (set! armed n)
-              (set-timer n))))
+              (jolt-set-timer! n))))
          ;; This wind's own edges are masked (jolt-wind*, locks.ss). A deferred
          ;; interrupt re-arms a short retry, and when the body returned normally
          ;; that retry could land at this after-thunk's entry, the winder already
@@ -2039,10 +2078,15 @@
          (lv (jolt-locks-held))
          (r (call/cc
               (lambda (k)
+                (vector-set! self 2 k)
                 (jolt-locks-enter!)
                 (dynamic-wind
                   (lambda ()
                     (set! borrowed 0)
+                    ;; the body's first entry starts its budget; a resume continues it
+                    (when (and budget (not (vector-ref self 0)))
+                      (vector-set! self 3 (jolt-current-fiber))
+                      (vector-set! self 0 (jolt-ticks)))
                     (let ((handler
                            (lambda ()
                         (cond
@@ -2061,17 +2105,18 @@
                            (if (fx=? 0 (jolt-locks-held))
                                (k interrupt-sentinel)
                                (begin (set! armed (jolt-fiber-preempt-retry-ticks))
-                                      (set-timer armed))))
-                          ((and budget (>= (+ spent armed) budget))
-                           ;; the budget is spent: leave as an interrupt leaves, and on
-                           ;; the same test (not while a counted lock is held)
-                           (if (fx=? 0 (jolt-locks-held))
-                               (begin (set! spent (+ spent armed)) (k ticks-sentinel))
-                               (begin (set! armed (jolt-fiber-preempt-retry-ticks))
-                                      (set-timer armed))))
+                                      (jolt-set-timer! armed))))
+                          ((jolt-budget-spent budgets)
+                           => (lambda (b)
+                                ;; a budget is spent, this one's or an enclosing one's:
+                                ;; leave to it as an interrupt leaves, and on the same
+                                ;; test (not while a counted lock is held)
+                                (if (fx=? 0 (jolt-locks-held))
+                                    ((vector-ref b 2) ticks-sentinel)
+                                    (begin (set! armed (jolt-fiber-preempt-retry-ticks))
+                                           (jolt-set-timer! armed)))))
                           (else
                            (set! borrowed (fx+ borrowed armed))
-                           (set! spent (+ spent armed))
                            (cond
                              ;; The quantum has fallen due. Hand it to the
                              ;; scheduler's handler, which either escapes through
@@ -2095,7 +2140,7 @@
                                (jolt-fiber-preempt-handler))
                               (else (arm!) (void))))))))
                       ;; Push is the timer-frame ownership linearization point.
-                      (interrupt-poll-stack (cons owner (cons handler outer-stack)))
+                      (interrupt-poll-stack (cons owner budgets))
                       (timer-interrupt-handler handler)
                       (arm!)))
                   (jolt-masked-body thunk)
@@ -2104,7 +2149,7 @@
                   ;; where the borrowed tick can fall due on the scheduler's
                   ;; handler, which answers it by preempting.
                   (lambda ()
-                    (set-timer 0)
+                    (jolt-set-timer! 0)
                     ;; Pop before restoring the enclosing handler. Every terminal
                     ;; path (return, throw, interrupt, and park unwind) comes here.
                     (interrupt-poll-stack (cons owner outer-stack))
@@ -2115,17 +2160,25 @@
                     ;; back. On a real exit from a fiber it re-arms the quantum.
                     ;; On a park, enclosing winds immediately disarm this tick;
                     ;; on a real off-fiber nested exit it keeps the outer token
-                    ;; polling. Fiber exits retain the scheduler rearm behavior.
+                    ;; polling. An enclosing borrow gets its tick (its quantum's, on a
+                    ;; fiber), no later than the nearest enclosing budget's remainder:
+                    ;; a budget its inner runs spent fires at once.
                     (cond
-                      ((jolt-current-fiber) (jolt-fiber-rearm-preempt!))
-                      ((pair? outer-stack) (set-timer interrupt-check-ticks))
+                      ((pair? outer-stack)
+                       (let ((n (if (jolt-current-fiber)
+                                    (fxmin interrupt-check-ticks (jolt-fiber-preempt-ticks))
+                                    interrupt-check-ticks))
+                             (left (jolt-budget-left outer-stack)))
+                         (jolt-set-timer! (if left (max 1 (min n left)) n))))
                       (else (jolt-fiber-rearm-preempt!)))
                     (when (fx>? (jolt-locks-held) lv) (jolt-locks-exit!))))))))
     (cond
       ((eq? r ticks-sentinel)
        (dyn-binding-stack outer-bindings)
        (jolt-throw (jolt-ex-info "Evaluation spent its tick budget"
-                                 (jolt-hash-map jolt-kw-interrupted #t jolt-kw-ticks-spent spent))))
+                                 (jolt-hash-map jolt-kw-interrupted #t
+                                                jolt-kw-ticks-spent (- (jolt-ticks) (vector-ref self 0))
+                                                jolt-kw-ticks-budget budget))))
       ((eq? r interrupt-sentinel)
         (begin
           ;; The bindings the interrupted body left. Its winds are masked at their

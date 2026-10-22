@@ -104,8 +104,10 @@
           ;; one (#f otherwise). A kill escapes rather than raises, so no guard
           ;; -- no try/catch -- between the safe point and here sees it.
           (mutable exit-k)
-          (mutable edge-k))
-  (nongenerative jolt-fiber-v8))
+          (mutable edge-k)
+          ;; engine ticks this fiber has run, summed over its dispatches (jolt-ticks)
+          (mutable ticks))
+  (nongenerative jolt-fiber-v9))
 
 ;; --- the per-fiber dynamic slice ---------------------------------------------
 ;; R2 (jolt-nvpr.3). jolt's `binding` macro pushes by calling the
@@ -727,7 +729,7 @@
             (make-jolt-dslice (jolt-slice-stack-param)
                               (jolt-slice-ns-param)
                               #f)
-            c #f '() 0 #f #f 0 #f ibox #f #f #f #f)))
+            c #f '() 0 #f #f 0 #f ibox #f #f #f #f 0)))
     (when ibox (jolt-fiber-own-ibox! f ibox))
     (when before-run (before-run f))
     (jolt-fiber-enqueue! c f)
@@ -914,7 +916,7 @@
       ;; may in principle sit in the gap for a while, and the promise at the head of
       ;; this section is that no setting opens an unbounded starvation window.
       ((not (eq? (jolt-fiber-state f) 'running))
-       (set-timer (jolt-fiber-preempt-retry-ticks))
+       (jolt-set-timer! (jolt-fiber-preempt-retry-ticks))
        (void))
       ;; A LOCK IS HELD. Switching here loses mutual exclusion whichever way it
       ;; goes: unwinding releases the mutex mid-section, and not unwinding leaves
@@ -924,7 +926,7 @@
       ;; the request instead would quietly restore starvation for a fiber that is
       ;; inside a region whenever the timer fires.
       ((fx>? (jolt-locks-held) 0)
-       (set-timer (jolt-fiber-preempt-retry-ticks))
+       (jolt-set-timer! (jolt-fiber-preempt-retry-ticks))
        (void))
       (else
        (jolt-fiber-bump-preempts! f)
@@ -935,6 +937,65 @@
        ;; Resumed. A compute-bound fiber that was interrupted meets it here, on
        ;; its next quantum, the only safe point it ever reaches.
        (jolt-fiber-check-interrupt! f)))))
+
+;; --- the tick count: the work a thread, or a fiber, has done --------------------
+;;
+;; jolt-set-timer! is the one way jolt arms the engine timer (fibers' quantum,
+;; jolt.host/run-interruptible's poll and budget): it asks set-timer what was left
+;; and adds what was used of the last arm to this thread's count, so the count is
+;; the timer's own, kept at the one place the timer is set. (jolt-thread-ticks)
+;; reads it now, the running arm's part included. A fiber's own count
+;; (jolt-fiber-ticks) is what its dispatches used: the drain loop adds each one's
+;; difference (jolt-fiber-drain!). (jolt-ticks) is the running fiber's, else the
+;; thread's: what a budget, or a measure of a body's cost, reads. Chez feeds the
+;; timer in chunks of at most 1000 ticks, pre-counted; a signal or a collection
+;; request that cuts a chunk short counts it whole, under 1000 ticks each time.
+;; Owner-tagged like interrupt-poll-stack: a child thread inherits the parameter's
+;; value, and the cell is made afresh for a thread that does not own it.
+(define jolt-ticks-state (make-thread-parameter #f))
+(define (jolt-ticks-cell)
+  ;; #(owner consumed armed dispatch-mark measures): measures, the ticks-of extents open
+  ;; off a fiber (each armed the timer to count, and a borrow's exit must leave it so)
+  (let ((s (jolt-ticks-state)) (id (get-thread-id)))
+    (if (and s (eqv? (vector-ref s 0) id))
+        s
+        (let ((s (vector id 0 0 0 0))) (jolt-ticks-state s) s))))
+(define (jolt-set-timer! n)
+  (let* ((s (jolt-ticks-cell)) (left (set-timer n)))
+    (vector-set! s 1 (+ (vector-ref s 1) (fxmax 0 (fx- (vector-ref s 2) left))))
+    (vector-set! s 2 n)
+    left))
+(define (jolt-thread-ticks)
+  ;; read whole: the handler (which arms, so moves consumed and armed) never runs mid-read.
+  ;; A plain pair, not with-interrupts-disabled (a dynamic-wind: a winder and a cons per
+  ;; read); the read cannot throw.
+  (disable-interrupts)
+  (let ((n (jolt-thread-ticks*))) (enable-interrupts) n))
+(define (jolt-thread-ticks*)
+  (let ((s (jolt-ticks-cell)))
+    ;; nothing armed: the count is whole (the disarm counted the last arm), no timer read
+    (if (fx=? 0 (vector-ref s 2))
+        (vector-ref s 1)
+        (+ (vector-ref s 1) (fxmax 0 (fx- (vector-ref s 2) (jolt-timer-left)))))))
+;; What set-timer would answer, read without stopping or re-arming the timer (Chez's own
+;; parts: s/event.ss set-timer, s/prims.ss $get-timer): the ticks not yet fed to the trap,
+;; plus the trap's own fuel unless interrupts are disabled (then the trap is parked, and
+;; set-timer answers the unfed ticks alone). #f: the arm has fired.
+(define (jolt-timer-left)
+  (let ((t (#%$tc-field 'timer-ticks (#%$tc))))
+    (cond ((not t) 0)
+          ((fx> (#%$tc-field 'disable-count (#%$tc)) 0) t)
+          (else (fx+ t (#%$get-timer))))))
+(define (jolt-ticks)
+  ;; one read: never preempted between the fiber's count and the thread's (a plain pair,
+  ;; as jolt-thread-ticks)
+  (disable-interrupts)
+  (let* ((f (jolt-current-fiber))
+         (n (if f
+                (+ (jolt-fiber-ticks f) (- (jolt-thread-ticks*) (vector-ref (jolt-ticks-cell) 3)))
+                (jolt-thread-ticks*))))
+    (enable-interrupts)
+    n))
 
 ;; Arm around a dispatch, disarm on the way back to the drain loop, so the
 ;; scheduler itself is never preempted. Installing the handler per dispatch
@@ -950,8 +1011,8 @@
 (define (jolt-fiber-install-preempt-handler!)
   (timer-interrupt-handler jolt-fiber-preempt-handler))
 (define (jolt-fiber-arm-preempt!)
-  (set-timer jolt-fiber-preempt-ticks-global))
-(define (jolt-fiber-disarm-preempt!) (set-timer 0))
+  (jolt-set-timer! jolt-fiber-preempt-ticks-global))
+(define (jolt-fiber-disarm-preempt!) (jolt-set-timer! 0))
 
 ;; Hand the timer back to the scheduler after something else borrowed it.
 ;;
@@ -973,7 +1034,10 @@
 ;; handler is still installed, and that handler answers a quantum by re-arming
 ;; its own tick — so the borrow would silently outlive itself.
 (define (jolt-fiber-rearm-preempt!)
-  (if (jolt-current-fiber) (jolt-fiber-arm-preempt!) (set-timer 0)))
+  (cond ((jolt-current-fiber) (jolt-fiber-arm-preempt!))
+        ;; a ticks-of measure open on this thread keeps its arm (fibers-async.ss)
+        ((fx>? (vector-ref (jolt-ticks-cell) 4) 0) (jolt-set-timer! (most-positive-fixnum)))
+        (else (jolt-set-timer! 0))))
 
 ;; --- interrupts (an Erlang exit signal: raise in a fiber from outside) -------
 ;; A fiber otherwise stops only when its body returns or raises. An interrupt
@@ -1538,7 +1602,11 @@
   (let loop ()
     (let ((f (jolt-fiber-dequeue! c)))
       (when f
-        (jolt-fiber-run f)
+        ;; the dispatch's ticks are this fiber's (jolt-ticks)
+        (let ((mark (jolt-thread-ticks)))
+          (vector-set! (jolt-ticks-cell) 3 mark)
+          (jolt-fiber-run f)
+          (jolt-fiber-ticks-set! f (+ (jolt-fiber-ticks f) (- (jolt-thread-ticks) mark))))
         (loop)))))
 
 ;; (sa-fiber-run-all) -> void. Drain carrier 0's run queue on the calling
