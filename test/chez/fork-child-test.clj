@@ -50,6 +50,19 @@
           (in-child #(not-any? (fn [t] (re-find #"jolt-carrier" (.getName ^Thread t))) (keys (Thread/getAllStackTraces))))
           0)
 
+(defn in-child-now
+  "The exit status of a child that runs (f) on its one thread, no deadline: 0 true, 1 else."
+  [f]
+  (let [pid (fork-alone true)]
+    (cond (zero? pid) (exit-now (if (true? (f)) 0 1))
+          (neg? pid) pid
+          :else (wait-exit pid))))
+
+(check-eq "the reset starts no thread: the child is the one thread it forked as"
+          (in-child-now #(= 1 (count (Thread/getAllStackTraces)))) 0)
+(check-eq "a child that forks again (a double fork) gives a grandchild whose parked go resumes"
+          (in-child-now #(= 0 (in-child parked-go))) 0)
+
 (if (empty? @failures)
   (do (println "FORK-CHILD-TEST OK") (flush) (System/exit 0))
   (do (doseq [f @failures] (println "FAIL:" f)) (flush) (System/exit 1)))
