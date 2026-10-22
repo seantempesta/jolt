@@ -46,8 +46,8 @@
 (a/<!! (a/timeout 1))
 (check-eq "a go that parks is resumed in the child" (in-child parked-go) 0)
 (check-eq "a timeout fires in the child" (in-child #(= :t (a/alt!! (a/timeout 10) :t))) 0)
-(check-eq "the child's thread table names only the threads it runs"
-          (in-child #(not-any? (fn [t] (re-find #"jolt-carrier|jolt-timer" (.getName ^Thread t))) (keys (Thread/getAllStackTraces))))
+(check-eq "the child's thread table names no carrier of the parent's (the timer and watcher it names are its own, restarted)"
+          (in-child #(not-any? (fn [t] (re-find #"jolt-carrier" (.getName ^Thread t))) (keys (Thread/getAllStackTraces))))
           0)
 
 (if (empty? @failures)
