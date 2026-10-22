@@ -375,6 +375,7 @@ fibers:
 	@$(CHEZ) --script test/chez/fibers-interrupt-test.ss
 	@$(CHEZ) --script test/chez/async-io-thread-test.ss
 	@bin/jolt run test/chez/async-callback-test.clj
+	@bin/jolt run test/chez/fork-child-test.clj
 	@bin/jolt run test/chez/process-fiber-reap-test.clj
 
 # The one (timeout ms) timer thread (jolt-pe84): a timeout closes on its own

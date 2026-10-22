@@ -486,3 +486,43 @@
                                     (jolt-keyword "given") (if n n jolt-nil)))))
       (jolt-fiber-preempt-ticks-set! n)
       jolt-nil)))
+
+;; --- a process fork's child ------------------------------------------------------
+;; fork(2) copies the calling thread only. Every thread jolt started (the fiber
+;; carriers, the timer, the shutdown watcher) is gone in the child, but its
+;; bookkeeping is copied: the carrier vector and started? flag, timeout-running?,
+;; the armed box, the live-thread and name tables. The child then believes its
+;; runtime threads exist: a go spawn is placed on a carrier no thread drains and
+;; parks forever, a deadline never fires, and SIGTERM (blocked in every jolt thread
+;; for the watcher's sigwait) stays pending. (jolt-after-fork-child!) is the
+;; pthread_atfork child rule for that bookkeeping: called by the forking code in
+;; the child, first, it drops what names a dead thread, so the pool and the timer
+;; start afresh on first use, and re-arms the watcher if the parent had armed it.
+;; The mutexes are kept: a parked carrier or timer holds none (condition-wait
+;; released it), and the fork itself is taken on the one running thread. Pools made
+;; with jolt-fiber-pool-make are not restarted: their carriers are gone too, and a
+;; spawn onto one parks; a forking program makes them after the fork.
+(define (jolt-after-fork-child!)
+  (let ((self (get-thread-id)))
+    (set! jolt-fiber-carriers #f)
+    (set! jolt-fiber-rr 0)
+    (set! jolt-fiber-pool-started? #f)
+    (jolt-with-mutex live-threads-mutex
+      (vector-for-each (lambda (id) (unless (eqv? id self) (hashtable-delete! live-threads id)))
+                       (hashtable-keys live-threads))
+      (hashtable-clear! thread-daemons))
+    (jolt-with-mutex thread-handles-mutex
+      (vector-for-each (lambda (id) (unless (eqv? id self) (hashtable-delete! thread-names-by-id id)))
+                       (hashtable-keys thread-names-by-id)))
+    ;; deadlines the parent had pending stay due here (the child holds the same
+    ;; channels); a timer thread restarts at once for them, else at the first one
+    (jolt-lock! timeout-mu)
+    (set! timeout-running? #f)
+    (when (theap-min)
+      (set! timeout-running? #t)
+      (fork-thread/daemon #t (lambda () (jolt-thread-name-set! (get-thread-id) "jolt-timer") (timeout-thread))))
+    (jolt-unlock! timeout-mu)
+    (when (unbox jolt-shutdown-armed)
+      (set-box! jolt-shutdown-armed #f)
+      (jolt-arm-shutdown!))))
+(def-var! "jolt.host" "after-fork-child!" (lambda () (jolt-after-fork-child!) jolt-nil))
