@@ -85,9 +85,10 @@
 ;; left of its ancestors' children. Clojure's own definition splices each node's
 ;; children with mapcat, which cost a concat cell, a lazy seq and a map cell per
 ;; child on every level (~1.1 KB a node). This keeps a list of the sibling seqs
-;; still to walk instead: a node costs its lazy cell, its cons and one push. As
-;; lazy as Clojure's: nothing runs at construction, a node's branch? and children
-;; run when it is reached, its siblings' seq is advanced only as the walk passes.
+;; still to walk instead: a node costs its lazy cell, its cons and one push. Same
+;; pre-order; nothing runs at construction, and a node's branch? and children run
+;; when it is reached. Realizing a leaf finds the next node, so a parent's children
+;; seq is advanced one element as the walk passes the leaf before it.
 (defn tree-seq [branch? children root]
   ;; one self-recursive fn, not a letfn pair: the state image rebuilds a named fn
   ;; that refers to itself, but not two closures that refer to each other

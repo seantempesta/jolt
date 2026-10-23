@@ -24,10 +24,11 @@
 (defn- nodes [x] (count (tree-seq coll? seq x)))
 
 (def shapes
-  "Each shape of about n nodes, and its ceiling in bytes a node visited."
-  [["nested lists, three leaves a level" (fn [n] (reduce (fn [x i] (list 'f i :k x)) 'x (range (quot n 4)))) 360]
-   ["flat vector of leaves" (fn [n] (vec (range n))) 360]
-   ["a form as read: lists of lists" (fn [n] (vec (repeat (quot n 4) '(str :k "s")))) 360]])
+  "Each shape of about n nodes, and its ceiling in bytes a node visited: each between this
+  definition's measure and the old one's, so a revert is red on every row."
+  [["nested lists, three leaves a level" (fn [n] (reduce (fn [x i] (list 'f i :k x)) 'x (range (quot n 4)))) 300]
+   ["flat vector of leaves" (fn [n] (vec (range n))) 340]
+   ["a form as read: lists of lists" (fn [n] (vec (repeat (quot n 4) '(str :k "s")))) 320]])
 
 (def failures (atom 0))
 (doseq [[what f ceiling] shapes]

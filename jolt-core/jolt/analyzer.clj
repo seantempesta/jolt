@@ -142,7 +142,10 @@
 ;; Does the top-level form under analysis hold a reader set form? The 2-arity
 ;; analyze scans it once (form-holds-set-form?); when it holds none, a macro call
 ;; inside it is expanded without walking the call form to turn set forms into sets
-;; (form-expand-1's normalize?), since a macro only ever builds real sets. True by
+;; (form-expand-1's normalize?), since a macro builds real sets (syntax-quote lowers
+;; a set to __sqset). A macro that fabricates the reader's set form itself (a
+;; {:jolt/type :jolt/set} map, or read-string of "#{...}" handed to another macro)
+;; is not normalized for its inner macro calls: assumed, not enforced. True by
 ;; default: an analysis entered another way walks, as before.
 (def ^:dynamic *set-forms?* true)
 

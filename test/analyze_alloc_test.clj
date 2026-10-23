@@ -62,6 +62,27 @@
     (when (> s ceiling)
       (swap! failures inc)
       (println "FAIL:" what "allocates" (long s) "B a unit, past" ceiling))))
+;; ...and what the analysis must still do: a macro sees a real set wherever a set
+;; literal sits in its call form (#762), also when the form is reached through a
+;; macro that holds none and through eval; &env names exactly the locals in scope,
+;; in every binding form.
+(defmacro set-at [x path] (set? (get-in x path)))
+;; the locals the code names (destructuring and catch add generated ones, G__n and
+;; _r$catchn, whose numbers vary)
+(defmacro env-keys [] (vec (sort (filter #(re-matches #"[a-z]+" %) (map str (keys &env))))))
+(doseq [[what got want]
+        [["a nested set literal reaches a macro as a set" (set-at {:a [#{1}]} [:a 0]) true]
+         ["through when" (when true (set-at {:a [#{1}]} [:a 0])) true]
+         ["through eval" (eval '(when true (set-at {:a [#{2}]} [:a 0]))) true]
+         ["no set literal: the map stays a map" (set-at {:a [{:b 1}]} [:a 0]) false]
+         ["&env in fn params" ((fn [a b] (env-keys)) 1 2) ["a" "b"]]
+         ["&env in let and loop" (let [x 1] (loop [y 2] (env-keys))) ["x" "y"]]
+         ["&env with destructuring" (let [{:keys [p q]} {}] (env-keys)) ["p" "q"]]
+         ["&env in letfn" (letfn [(f [z] (env-keys))] (f 1)) ["f" "z"]]
+         ["&env in catch" (try (throw (ex-info "x" {})) (catch Exception e (env-keys))) ["e"]]]]
+  (when-not (= want got)
+    (swap! failures inc)
+    (println "FAIL:" what "- want" (pr-str want) "got" (pr-str got))))
 (if (zero? @failures)
   (println "analyze-alloc: OK")
   (do (println "analyze-alloc:" @failures "FAILED") (System/exit 1)))

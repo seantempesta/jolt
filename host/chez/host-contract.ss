@@ -109,7 +109,8 @@
 ;; *unchecked-math* …)), the analyzer rewrites +/-/*/inc/dec to their wrapping
 ;; unchecked-* forms for the rest of that file, like the JVM.
 ;; Read on every list form the analyzer meets, so the var's cell is found once
-;; (jolt-var interns it: the cell is the var for the process's life) and each
+;; (jolt-var interns it: the cell is the var for the process's life, unless
+;; clojure.core or jolt.host itself is removed, which nothing does) and each
 ;; read is the cell's binding-aware deref, not an "ns/name" string built and
 ;; probed in the var table (~550 B a read, the analyzer's largest per-node cost).
 (define unchecked-math-cell #f)
