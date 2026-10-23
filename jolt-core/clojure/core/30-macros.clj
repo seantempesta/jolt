@@ -469,18 +469,6 @@
     (map? x) (vec (mapcat pattern-syms (vals x)))
     :else []))
 
-;; The name of every symbol a method body holds, at any depth (a superset of the
-;; fields it reads: a quoted or shadowing symbol counts too). deftype and defrecord
-;; bind only the fields named here, so a method entry reads the fields its body
-;; uses and not every field of the type: a protocol call on a 21-field record read
-;; all 21 (~140 ticks) to use one.
-(defn- body-syms [x]
-  (cond
-    (symbol? x) #{(name x)}
-    (map? x) (reduce (fn [s e] (into (into s (body-syms (key e))) (body-syms (val e)))) #{} x)
-    (coll? x) (reduce (fn [s e] (into s (body-syms e))) #{} x)
-    :else #{}))
-
 ;; deftype is sugar over make-deftype-ctor (a ctx-capturing clojure.core fn that
 ;; bakes the ns-qualified type tag at def time) plus extend-type for any inline
 ;; protocol methods — so it compiles as a plain (do …). Each method body sees the
@@ -632,15 +620,13 @@
                           ;; that valAt on every method entry — including valAt's
                           ;; own — and never come back. It is also the cheaper read
                           ;; (straight to the slot, no type cascade).
-                          mbody (map (fn [bf] (rewrite-body inst shadowed bf)) (drop 2 spec))
-                          mbody (if (seq dlets) (list (list* 'clojure.core/let dlets mbody)) mbody)
-                          used (body-syms mbody)
                           binds (vec (mapcat (fn [f] [f (list (symbol "clojure.core" "__deftype-slot")
                                                               inst (keyword (name f)) (get field-idx (name f)))])
                                              (filter (fn [f] (and (not (mutable? f))
-                                                                  (not (contains? pnames (name f)))
-                                                                  (contains? used (name f))))
+                                                                  (not (contains? pnames (name f)))))
                                                      fields)))
+                          mbody (map (fn [bf] (rewrite-body inst shadowed bf)) (drop 2 spec))
+                          mbody (if (seq dlets) (list (list* 'clojure.core/let dlets mbody)) mbody)
                           mbody (underscore-rebind (nth spec 1) raw mbody)]
                       (list argv (list* 'clojure.core/let binds mbody))))
         groups (group-by-head (drop-type-opts body))
@@ -1014,15 +1000,10 @@
                           ;; including a name a destructured param binds, whose let
                           ;; sits inside the field binds.
                           pnames (set (map name (concat argv (mapcat pattern-syms dlets))))
+                          binds (vec (mapcat (fn [f] [f `(get ~inst ~(keyword (name f)))])
+                                             (remove (fn [f] (contains? pnames (name f))) fields)))
                           mbody (drop 2 spec)
                           mbody (if (seq dlets) (list (list* 'clojure.core/let dlets mbody)) mbody)
-                          ;; only the fields the body names: the get on the proven
-                          ;; `this` is what --opt lowers to the shape's own accessor
-                          used (body-syms mbody)
-                          binds (vec (mapcat (fn [f] [f `(get ~inst ~(keyword (name f)))])
-                                             (filter (fn [f] (and (not (contains? pnames (name f)))
-                                                                  (contains? used (name f))))
-                                                     fields)))
                           mbody (underscore-rebind (nth spec 1) raw mbody)]
                       (list hinted (list* 'clojure.core/let binds mbody))))
         groups (group-by-head (drop-type-opts body))
