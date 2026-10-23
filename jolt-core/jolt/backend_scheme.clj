@@ -572,6 +572,13 @@
 ;; So core's literals register too. The seed prelude grows by their source forms;
 ;; that is the price, and it is paid once at mint rather than by every program.
 (defn- fnsrc-system-ns? [ns] (nil? ns))
+;; The registrations' collector for one top-level form, or nil when the code being
+;; compiled asks for none: *compiler-options* {:image-fn-forms false}. Registering
+;; is what lets a state image rebuild a closure from its source; a program that
+;; writes no image pays for it on every compile (a third of a defn's allocation),
+;; so it may opt out. Absent or true, every literal registers, as before.
+(defn- fnsrc-regs []
+  (when-not (false? (get *compiler-options* :image-fn-forms)) (atom [])))
 ;; True while emitting a node in TAIL position. Only used, in trace mode, to mark a
 ;; tail call so the runtime routes its callee into the current history rib instead
 ;; of a new one (rt.ss). It never affects semantics — a wrong value only mislabels
@@ -2516,7 +2523,7 @@
     (catch Exception _ nil)))
 
 (defn- fnsrc-flush []
-  (if (or (fnsrc-system-ns? *fnsrc-ns*) (empty? @*fnsrc-regs*))
+  (if (or (nil? *fnsrc-regs*) (fnsrc-system-ns? *fnsrc-ns*) (empty? @*fnsrc-regs*))
     ""
     ;; best-effort: a macro can splice a LIVE value (a namespace, a var's
     ;; value) into a fn body, and emit-quoted has no rendering for those.
@@ -2980,14 +2987,14 @@
               ;; the same maker treatment as an anonymous literal below, and for
               ;; the same reason — a letfn-bound fn that a lazy-seq thunk closes
               ;; over is exactly what map-indexed, distinct and tree-seq capture
-              (if (or (:live-names node) (nil? *cache-cells*)
+              (if (or (nil? *fnsrc-regs*) (:live-names node) (nil? *cache-cells*)
                     ;; nothing captured, nothing to recover: the restore wrapper
                     ;; binds no free names, so this closure never needs a layout
                     (empty? (:free-names node))
                     (some *letrec-binders* (:free-names node)))
-                (do (swap! *fnsrc-regs* conj
-                           [fnsrc-nm (:src-form node) fnsrc-src-ns (:free-names node)
-                            (:live-names node)])
+                (do (some-> *fnsrc-regs* (swap! conj
+                                       [fnsrc-nm (:src-form node) fnsrc-src-ns (:free-names node)
+                                        (:live-names node)]))
                     inner)
                 (do (swap! *fnsrc-regs* conj
                            [fnsrc-nm (:src-form node) fnsrc-src-ns (:free-names node) nil])
@@ -3052,13 +3059,13 @@
           ;; :live-names records, so there is no honest parameter list to give a
           ;; maker. Those still need inspector information, which the builds that
           ;; splice (an app build, not the seed) generate by default.
-          (if (or lives (nil? *cache-cells*)
+          (if (or (nil? *fnsrc-regs*) lives (nil? *cache-cells*)
                   (empty? frees)
                   (some *letrec-binders* frees))
             ;; no maker: a spliced copy (see above), or a literal emitted outside
             ;; any cache-cell scope — there would be nowhere to bind one, and a
             ;; site calling an unbound maker is worse than a closure that refuses.
-            (do (swap! *fnsrc-regs* conj [nm form fnsrc-src-ns frees lives])
+            (do (some-> *fnsrc-regs* (swap! conj [nm form fnsrc-src-ns frees lives]))
                 inner)
             (do (swap! *fnsrc-regs* conj [nm form fnsrc-src-ns frees nil])
                 (fnsrc-maker-site nm frees inner))))))))
@@ -4298,7 +4305,7 @@
                    *fnsrc-ns* (:ns node)
                    *fnsrc-def* (:name node)
                    *fnsrc-counter* (atom 0)
-                   *fnsrc-regs* (atom [])
+                   *fnsrc-regs* (fnsrc-regs)
                    *fnsrc-def-init?* (= :fn (:op (:init node)))]
            (let [reg (trace-source-reg node)
                  d (cond
@@ -4391,7 +4398,7 @@
                             *fnsrc-ns* ns
                             *fnsrc-def* nm
                             *fnsrc-counter* (atom 0)
-                            *fnsrc-regs* (atom [])
+                            *fnsrc-regs* (fnsrc-regs)
                             *fnsrc-def-init?* fn?]
                     (let [i (emit-with-cells #(emit (:init node)))]
                       [i (trace-callsite-reg) (fnsrc-flush)]))
@@ -4470,7 +4477,7 @@
             *fnsrc-def* (or (when (#{:def :defmacro} (:op node)) (:name node))
                             fnsrc-def)
             *fnsrc-counter* (atom 0)
-            *fnsrc-regs* (atom [])]
+            *fnsrc-regs* (fnsrc-regs)]
     (let [scm (cond
                 ;; off direct-link (the seed mint + runtime-via-image) this is exactly
                 ;; `emit`, whose :def case already wraps cache cells, so the seed stays

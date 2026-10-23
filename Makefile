@@ -186,7 +186,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   hasheq narrowhash \
   protoret accfix pic narrow directlink mintgate directcall defmetacells staticsite arraymap arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flonumdisp flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost recordshadow emittedheads adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc analyzealloc treeseqcost hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost recordshadow emittedheads adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc analyzealloc treeseqcost imagefnforms hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotcachesourcepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
   systemstreams closedstdout stderrsplit userdirpaths utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest tickbudget monitorescape windescape threadsafety maskedacquire ioerrno cas flow remotechan
@@ -1432,6 +1432,11 @@ analyzealloc:
 # one push, under a ceiling; same order and laziness as Clojure's definition.
 treeseqcost:
 	@bin/jolt run test/tree_seq_cost_test.clj
+
+# *compiler-options* {:image-fn-forms false} compiles without image registration
+# (a third less allocation); JOLT_COMPILER_OPTIONS sets the root at start.
+imagefnforms:
+	@bin/jolt run test/image_fn_forms_test.clj
 
 # An unhinted method call allocates its argument vector and at most one arg
 # list: no arm converts the rest args before testing the receiver.

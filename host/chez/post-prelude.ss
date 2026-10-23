@@ -393,3 +393,12 @@
                   (cons "protocol-dispatch1" protocol-dispatch1)
                   (cons "protocol-dispatch2" protocol-dispatch2)
                 (cons "protocol-dispatch3" protocol-dispatch3)))
+
+;; *compiler-options*' root from JOLT_COMPILER_OPTIONS, an EDN map, read once at
+;; start: what JVM Clojure takes from the clojure.compiler.* system properties. A
+;; program sets compile options for everything its process compiles (its build, its
+;; runtime evals) without wrapping each in a binding, e.g. {:image-fn-forms false}
+;; (backend_scheme.clj fnsrc-regs). Unset or empty: nil, as before.
+(let ((e (getenv "JOLT_COMPILER_OPTIONS")))
+  (when (and e (not (string=? e "")))
+    (var-root-set! (jolt-var "clojure.core" "*compiler-options*") (jolt-read-string e))))
