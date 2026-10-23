@@ -89,16 +89,17 @@
 ;; lazy as Clojure's: nothing runs at construction, a node's branch? and children
 ;; run when it is reached, its siblings' seq is advanced only as the walk passes.
 (defn tree-seq [branch? children root]
-  (letfn [(walk [node more]
-            (lazy-seq
-              (cons node (pending (when (branch? node) (seq (children node))) more))))
-          ;; the next node after one whose children are s: s's first, else the
-          ;; first of the pending seqs (more) that still has one
-          (pending [s more]
-            (loop [s s more more]
-              (cond s (walk (first s) (cons (rest s) more))
-                    (seq more) (recur (seq (first more)) (rest more))
-                    :else nil)))]
+  ;; one self-recursive fn, not a letfn pair: the state image rebuilds a named fn
+  ;; that refers to itself, but not two closures that refer to each other
+  (let [walk (fn walk [node more]
+               (lazy-seq
+                 (cons node
+                       ;; the next node: this one's first child, else the first of the
+                       ;; pending sibling seqs (more) that still has one
+                       (loop [s (when (branch? node) (seq (children node))) more more]
+                         (cond s (walk (first s) (cons (rest s) more))
+                               (seq more) (recur (seq (first more)) (rest more))
+                               :else nil)))))]
     (walk root ())))
 
 ;; file-seq: the tree of paths under root (root included), directories walked

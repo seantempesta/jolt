@@ -92,6 +92,7 @@ form-bigdec-value-source
 form-bigdec-value?
 form-float-value-double
 form-float-value?
+form-holds-set-form?
 form-bigdec?
 form-char-code
 form-char?

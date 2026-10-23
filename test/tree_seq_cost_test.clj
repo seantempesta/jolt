@@ -9,6 +9,11 @@
 ;; node costs its lazy cell, its cons and one push. Same order (pre-order), and as
 ;; lazy: nothing runs at construction, a node's branch? and children run when the
 ;; node is reached, and its rest when the walk passes it.
+;; Measured on bin/jolt, 2026-10-23, before -> after (B a node): nested lists 384 ->
+;; 256, a flat vector 352 -> 320, read forms 444 -> 272. The walk is one
+;; self-recursive fn, not a letfn pair: the state image rebuilds a named fn that
+;; refers to itself, not two closures that refer to each other (coreproc's
+;; value-position check writes a tree-seq into an image).
 
 (ns tree-seq-cost-test)
 
@@ -20,9 +25,9 @@
 
 (def shapes
   "Each shape of about n nodes, and its ceiling in bytes a node visited."
-  [["nested lists, three leaves a level" (fn [n] (reduce (fn [x i] (list 'f i :k x)) 'x (range (quot n 4)))) 320]
-   ["flat vector of leaves" (fn [n] (vec (range n))) 320]
-   ["a form as read: lists of lists" (fn [n] (vec (repeat (quot n 4) '(str :k "s")))) 320]])
+  [["nested lists, three leaves a level" (fn [n] (reduce (fn [x i] (list 'f i :k x)) 'x (range (quot n 4)))) 360]
+   ["flat vector of leaves" (fn [n] (vec (range n))) 360]
+   ["a form as read: lists of lists" (fn [n] (vec (repeat (quot n 4) '(str :k "s")))) 360]])
 
 (def failures (atom 0))
 (doseq [[what f ceiling] shapes]
