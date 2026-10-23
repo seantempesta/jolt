@@ -34,7 +34,7 @@
                                form-class-value? form-class-value-name
                                form-tagged? form-tag-name
                                unchecked-math? allow-unresolved-vars? invoke-rewriter
-                               form-macro? form-expand-1 resolve-global resolvable-names
+                               form-macro? form-expand-1 form-holds-set-form? resolve-global resolvable-names
                                form-sym-meta form-coll-meta host-intern! form-syntax-quote-lower
                                form-syntax-quote-expand
                                record-type? record-ctor-key deftype-ctor-class form-position form-line late-bind?
@@ -139,6 +139,12 @@
 ;; is applied and cleared after, so a throw out of the expander leaves the
 ;; macro's name in the box for the diagnostic to read.
 (def ^:dynamic *macro-run-box* nil)
+;; Does the top-level form under analysis hold a reader set form? The 2-arity
+;; analyze scans it once (form-holds-set-form?); when it holds none, a macro call
+;; inside it is expanded without walking the call form to turn set forms into sets
+;; (form-expand-1's normalize?), since a macro only ever builds real sets. True by
+;; default: an analysis entered another way walks, as before.
+(def ^:dynamic *set-forms?* true)
 
 ;; The position a diagnostic should carry: the innermost positioned form's, or nil
 ;; when nothing under analysis had reader metadata (a macro-built form, or a form
@@ -259,27 +265,32 @@
 ;; A new binding of a name forgets what was known about the one it shadows: its
 ;; type hint and its JVM primitive type. An outer ^String s used to lend its hint
 ;; to an inner, unhinted s, since add-hint only ever adds.
+;; The hints and primitive types of a shadowed name are dropped only when there
+;; are any: an unconditional update on every binding was three map copies a name.
+;; :amp is the &env a macro is handed (amp-env-map), kept as the locals are added
+;; rather than rebuilt from every local in scope on every macro call.
 (defn- add-locals [env names]
-  (-> env
-      (update :locals #(reduce conj % names))
-      (update :hints #(reduce dissoc % names))
-      (update :jprims #(reduce dissoc % names))))
+  (let [shadows? (fn [m] (and (some? m) (some #(contains? m %) names)))
+        hints (:hints env) jprims (:jprims env)]
+    (cond-> (assoc env
+                   :locals (reduce conj (:locals env) names)
+                   :amp (reduce (fn [m n] (assoc m (symbol n) nil)) (or (:amp env) {}) names))
+      (shadows? hints) (assoc :hints (reduce dissoc hints names))
+      (shadows? jprims) (assoc :jprims (reduce dissoc jprims names)))))
 ;; &env value handed to a macro: a map of each in-scope local SYMBOL to nil
 ;; (Clojure's &env maps locals to compiler binding objects; consumers like
 ;; core.logic's matche only read its keys to tell locals from fresh pattern vars).
-(defn- amp-env-map [env]
-  (reduce (fn [m n] (assoc m (symbol n) nil)) {} (:locals env)))
+(defn- amp-env-map [env] (or (:amp env) {}))
 ;; The macro var's qualified symbol, as the reference names an expanding macro
 ;; whose argument check failed (clojure.core/let for a bare `let`); the head as
 ;; written when it does not resolve to a var (it cannot fail to, having passed
 ;; form-macro?, but a name is better than a nil either way). The macro-run box
 ;; carries this AND the head as written, for the two spellings macro-run-symbol
 ;; picks between.
-(defn- macro-symbol [ctx head]
-  (let [r (resolve-global ctx head)]
-    (if (and (= :var (:kind r)) (:ns r))
-      (symbol (:ns r) (:name r))
-      (symbol (form-sym-name head)))))
+(defn- macro-symbol [r head]
+  (if (and (= :var (:kind r)) (:ns r))
+    (symbol (:ns r) (:name r))
+    (symbol (form-sym-name head))))
 ;; A recur target carries its name (the compiled self-call) and its ARITY (the
 ;; binding count) so a recur with the wrong number of args is a compile error,
 ;; like the JVM, instead of failing only at runtime on the branch that runs.
@@ -1924,8 +1935,8 @@
 ;; #'ns/name". Plain throw (not uncompilable) so it surfaces rather than punting
 ;; to an interpreter fallback. #'foo and (var foo) of a macro are handled in
 ;; `analyze` (form-var-value?) and analyze-special ("var") and never reach here.
-(defn- deny-macro-value [ctx form r]
-  (when (form-macro? ctx form)
+(defn- deny-macro-value [r]
+  (when (:macro r)
     (analysis-error :analyze/invalid-macro-value
            (str "Can't take value of a macro: #'" (:ns r) "/" (:name r)))))
 
@@ -1954,8 +1965,8 @@
 ;; so resolve the value-position ref to it. (A bare deftype/shim name passed as a
 ;; value still can't produce a class value — that residual keeps the macro's
 ;; known divergence.) Returns the node to emit, or nil to fall through.
-(defn- macro-value-fn [ctx form r]
-  (when (and (form-macro? ctx form)
+(defn- macro-value-fn [r]
+  (when (and (:macro r)
              (= "clojure.core" (:ns r)) (= "instance?" (:name r)))
     (var-ref "clojure.core" "instance-check")))
 
@@ -2115,9 +2126,9 @@
             (throw (ClassNotFoundException. (str "Unable to resolve component classname: " ns)))))
       ns (let [r (resolve-global ctx form)]
            (if (= :var (:kind r))
-             (or (macro-value-fn ctx form r)
+             (or (macro-value-fn r)
                  (do (deny-private form r false)
-                     (deny-macro-value ctx form r)
+                     (deny-macro-value r)
                      (cond-> (var-ref (:ns r) (:name r)) (:num-ret r) (assoc :num-ret (:num-ret r)))))
              ;; A non-var qualified ref `Class/member` is a host class static
              ;; (Math/sqrt, Long/MAX_VALUE, System/getenv). The Chez back end
@@ -2165,9 +2176,9 @@
               (case (:kind r)
                 ;; :num-ret (a ^double/^long declared return) rides on the var node so
                 ;; jolt.passes.numeric types a call to it (an accumulator over the result).
-                :var (or (macro-value-fn ctx form r)
+                :var (or (macro-value-fn r)
                          (do (deny-private form r false)
-                             (deny-macro-value ctx form r)
+                             (deny-macro-value r)
                              (cond-> (var-ref (:ns r) (:name r)) (:num-ret r) (assoc :num-ret (:num-ret r)))))
                 :host (host-ref (:name r))
                 ;; a class-name symbol (java.util.Map) self-evaluates to an interned
@@ -2328,11 +2339,12 @@
             ;; The RUN of the expander is marked separately (macro-run box): a
             ;; throw out of it is filed under the reference's macro phases and
             ;; names the macro, which is a different thing from the note above.
-            (let* [_ (deny-private head (resolve-global ctx head) true)
+            (let* [r (resolve-global ctx head)
+                   _ (deny-private head r true)
                    mbox *macro-run-box*
                    mprev (when mbox @mbox)
-                   _ (when mbox (reset! mbox [(macro-symbol ctx head) head form]))
-                   expanded (form-expand-1 ctx form (amp-env-map env))
+                   _ (when mbox (reset! mbox [(macro-symbol r head) head form]))
+                   expanded (form-expand-1 ctx form (amp-env-map env) *set-forms?*)
                    _ (when mbox (reset! mbox mprev))
                    ebox *expansion-box*
                    prev (when ebox @ebox)
@@ -2611,8 +2623,10 @@
        ;; Stamp the compile namespace on the TOP-LEVEL node so the back end can
        ;; gate anon-fn naming/registration on it even for a non-def form (a def
        ;; carries its own :ns). Invisible to emission unless read.
-       (assoc (analyze ctx (form-syntax-quote-expand ctx form) (empty-env))
-              :fnsrc-ns (compile-ns ctx))
+       (let [form (form-syntax-quote-expand ctx form)]
+         (binding [*set-forms?* (form-holds-set-form? form)]
+           (assoc (analyze ctx form (empty-env))
+                  :fnsrc-ns (compile-ns ctx))))
        (catch Throwable e (throw (as-analysis-diagnostic e))))))
   ([ctx form env]
    (cond

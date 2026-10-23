@@ -32,6 +32,7 @@
 (define hc-kw-name  (keyword #f "name"))
 (define hc-kw-var   (keyword #f "var"))
 (define hc-kw-private (keyword #f "private"))
+(define hc-kw-macro (keyword #f "macro"))
 (define hc-kw-unresolved (keyword #f "unresolved"))
 (define hc-kw-class (keyword #f "class"))
 (define hc-kw-num-ret (keyword #f "num-ret"))
@@ -107,8 +108,14 @@
 ;; *unchecked-math* read at compile time: when truthy (a file's (set!
 ;; *unchecked-math* …)), the analyzer rewrites +/-/*/inc/dec to their wrapping
 ;; unchecked-* forms for the rest of that file, like the JVM.
+;; Read on every list form the analyzer meets, so the var's cell is found once
+;; (jolt-var interns it: the cell is the var for the process's life) and each
+;; read is the cell's binding-aware deref, not an "ns/name" string built and
+;; probed in the var table (~550 B a read, the analyzer's largest per-node cost).
+(define unchecked-math-cell #f)
 (define (hc-unchecked-math?)
-  (jolt-truthy? (guard (e (#t #f)) (var-deref "clojure.core" "*unchecked-math*"))))
+  (unless unchecked-math-cell (set! unchecked-math-cell (jolt-var "clojure.core" "*unchecked-math*")))
+  (jolt-truthy? (var-cell-deref unchecked-math-cell)))
 
 ;; *allow-unresolved-vars* read at compile time — clojure.core's var, the same one
 ;; RT.ALLOW_UNRESOLVED_VARS is on the JVM. Default false: an unqualified symbol
@@ -128,8 +135,11 @@
 ;; hand-written one. nil (the default) costs one deref per var call analyzed.
 ;; jolt.loader binds it while evaluating a context's source, so `require` and
 ;; its kin carry the loader that owns the code, whoever calls the fn later.
+;; Its cell found once, as *unchecked-math*'s above.
+(define invoke-rewrite-cell #f)
 (define (hc-invoke-rewriter)
-  (let ((f (guard (e (#t #f)) (var-deref "jolt.host" "*invoke-rewrite*"))))
+  (unless invoke-rewrite-cell (set! invoke-rewrite-cell (jolt-var "jolt.host" "*invoke-rewrite*")))
+  (let ((f (var-cell-deref invoke-rewrite-cell)))
     (if (or (not f) (jolt-nil? f)) #f f)))
 
 ;; --- form accessors ---------------------------------------------------------
@@ -470,6 +480,30 @@
              (if (fx>=? i (pvec-count items)) s
                  (loop (fx+ i 1) (pset-conj s (pvec-nth-d items i jolt-nil)))))))))
 (define (hc-macro-arg x) (hc-walk-form hc-set-form->set x))
+
+;; Does form hold a reader set form anywhere hc-macro-arg would rewrite one? A
+;; scan of the same shapes that allocates nothing. The analyzer asks it once per
+;; top-level form: a macro builds real sets, never the reader's set form, so when
+;; the form as read holds none, no call form any of its macros is handed holds
+;; one, and expanding one need not walk it (form-expand-1's normalize? argument).
+;; Walking every call form whole made nested macros quadratic: each expansion
+;; walked every level below it again, a list cell per node even when nothing
+;; changed (100 nested whens: 1.69 MB, against 0.21 MB as if/do).
+(define (hc-holds-set-form? x)
+  (cond
+    ((rdr-set-form? x) #t)
+    ((symbol-t? x) (let ((m (symbol-t-meta x))) (and (pmap? m) (hc-holds-set-form? m))))
+    ((or (hc-literal? x) (empty-list-t? x)) #f)
+    ((cseq? x) (let loop ((s x))
+                 (cond ((jolt-nil? s) #f)
+                       ((hc-holds-set-form? (seq-first s)) #t)
+                       (else (loop (jolt-seq (seq-more s)))))))
+    ((pvec? x) (let ((n (pvec-count x)))
+                 (let loop ((i 0))
+                   (and (fx<? i n) (or (hc-holds-set-form? (pvec-nth-in-range x i)) (loop (fx+ i 1)))))))
+    ((pset? x) (pset-fold x (lambda (e a) (or a (hc-holds-set-form? e))) #f))
+    ((pmap? x) (pmap-fold x (lambda (k v a) (or a (hc-holds-set-form? k) (hc-holds-set-form? v))) #f))
+    (else #f)))
 ;; &form and &env are the expander fn's first two PARAMETERS, as on the JVM —
 ;; the lowering that adds them is analyzer.clj's macro-fn-arities (and its build
 ;; path twin, ce-macro-arities). They used to be dynamic vars bound around the
@@ -479,7 +513,8 @@
 ;; ArityException. Params also outlive the expansion, so a closure a macro
 ;; returns over &form still has it.
 ;; The analyzer passes amp-env (the in-scope locals); macroexpand-1 has none, so
-;; it defaults to {}.
+;; it defaults to {}. The analyzer passes normalize? #f when its top-level form
+;; holds no reader set form (hc-holds-set-form?); every other caller walks.
 ;; &form meta matches the JVM's {:line :column}. hc-kw-file is defined above
 ;; with hc-kw-line/hc-kw-column. hc-form-sans-file strips :file from &form meta
 ;; so a macro reading (meta &form) doesn't see it — libraries branch on its presence.
@@ -488,7 +523,7 @@
     (if (or (jolt-nil? m) (jolt-nil? (jolt-get m hc-kw-file jolt-nil)))
         form
         (jolt-with-meta form (jolt-dissoc2 m hc-kw-file)))))
-(define (hc-expand-1 ctx form . maybe-env)
+(define (hc-expand-1 ctx form . opts)
   ;; Normalize the WHOLE call form once, then take both the arguments and &form
   ;; out of the result. Walking each argument separately left &form holding the
   ;; raw shapes — a macro reading (nth &form 1) rather than its parameter still
@@ -496,12 +531,12 @@
   ;; #762 hazard surviving in the one place the argument walk did not reach. One
   ;; walk is also less work than one per argument, and an unchanged form comes
   ;; back unallocated.
-  (let* ((nform (hc-macro-arg form))
+  (let* ((nform (if (and (pair? opts) (pair? (cdr opts)) (not (cadr opts))) form (hc-macro-arg form)))
          (items (seq->list nform))
          (head (car items))
          (args (cdr items))
          (expander (var-cell-root (hc-resolve-cell ctx head)))
-         (amp-env (if (pair? maybe-env) (car maybe-env) (jolt-hash-map))))
+         (amp-env (if (pair? opts) (car opts) (jolt-hash-map))))
     ;; A macro's two implicit parameters are invisible to its caller, so an arity
     ;; error names the DECLARED count: (m 1 2) on a one-param macro is (2), not
     ;; the (4) the expander is actually called with. The JVM corrects that after
@@ -620,7 +655,10 @@
                                     hc-kw-ns (var-cell-ns cell)
                                     hc-kw-name (var-cell-name cell)))
                (nr (hc-cell-num-ret cell))
-               (base (if nr (jolt-assoc base hc-kw-num-ret nr) base)))
+               (base (if nr (jolt-assoc base hc-kw-num-ret nr) base))
+               ;; :macro, so a caller holding the answer need not ask form-macro?
+               ;; of the same symbol again (a var reference asked it twice more)
+               (base (if (macro-var? cell) (jolt-assoc base hc-kw-macro #t) base)))
           ;; :private — a ^:private var of ANOTHER namespace, which the analyzer
           ;; refuses to reference ("var: a/hidden is not public"), as the JVM's
           ;; Compiler.resolveIn / isMacro do. (var a/hidden) still takes it.
@@ -1222,6 +1260,7 @@
   (def-var! "jolt.host" "late-bind?" hc-late-bind?)
   (def-var! "jolt.host" "form-macro?" hc-macro?)
   (def-var! "jolt.host" "form-expand-1" hc-expand-1)
+  (def-var! "jolt.host" "form-holds-set-form?" hc-holds-set-form?)
   (def-var! "jolt.host" "resolve-global" hc-resolve-global)
   (def-var! "jolt.host" "resolvable-names" hc-resolvable-names)
   (def-var! "jolt.host" "host-class-name?" hc-host-class-name?)
