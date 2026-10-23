@@ -81,15 +81,25 @@
            (when-let [s (seq coll)]
              (reductions f (f init (first s)) (rest s)))))))
 
-;; Lazy pre-order DFS (matches Clojure): node, then its children's walks spliced
-;; via the (now lazy) mapcat.
+;; Lazy pre-order DFS (matches Clojure): node, then its children, then what is
+;; left of its ancestors' children. Clojure's own definition splices each node's
+;; children with mapcat, which cost a concat cell, a lazy seq and a map cell per
+;; child on every level (~1.1 KB a node). This keeps a list of the sibling seqs
+;; still to walk instead: a node costs its lazy cell, its cons and one push. As
+;; lazy as Clojure's: nothing runs at construction, a node's branch? and children
+;; run when it is reached, its siblings' seq is advanced only as the walk passes.
 (defn tree-seq [branch? children root]
-  (let [walk (fn walk [node]
-               (lazy-seq
-                 (cons node
-                       (when (branch? node)
-                         (mapcat walk (children node))))))]
-    (walk root)))
+  (letfn [(walk [node more]
+            (lazy-seq
+              (cons node (pending (when (branch? node) (seq (children node))) more))))
+          ;; the next node after one whose children are s: s's first, else the
+          ;; first of the pending seqs (more) that still has one
+          (pending [s more]
+            (loop [s s more more]
+              (cond s (walk (first s) (cons (rest s) more))
+                    (seq more) (recur (seq (first more)) (rest more))
+                    :else nil)))]
+    (walk root ())))
 
 ;; file-seq: the tree of paths under root (root included), directories walked
 ;; via the host dir primitives. Paths (strings), not File objects. (Lives below
