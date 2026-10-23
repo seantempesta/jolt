@@ -2771,6 +2771,20 @@
                           (cond ((and (jolt-nil? a) (jolt-nil? b)) #t)
                                 ((or (jolt-nil? a) (jolt-nil? b)) #f)
                                 (else (ja-equal? a b)))))
+         ;; Arrays.compare over two arrays of one primitive kind: nil first, then the
+         ;; first differing element (signed, its sign as Byte.compare's), then the
+         ;; length (a prefix first). Datahike orders :db.type/bytes values by it.
+         (cons "compare" (lambda (a b)
+                           (cond ((and (jolt-nil? a) (jolt-nil? b)) 0)
+                                 ((jolt-nil? a) -1)
+                                 ((jolt-nil? b) 1)
+                                 (else
+                                  (let ((na (ja-len a)) (nb (ja-len b)))
+                                    (let loop ((i 0))
+                                      (if (or (fx=? i na) (fx=? i nb))
+                                          (- na nb)
+                                          (let ((x (ja-ref a i)) (y (ja-ref b i)))
+                                            (if (= x y) (loop (fx+ i 1)) (if (< x y) -1 1))))))))))
          (cons "fill" (lambda (a v)
                         (let ((n (ja-len a)) (v (na-elem-of (jolt-array-kind a) v)))
                           (do ((i 0 (fx+ i 1))) ((fx=? i n) jolt-nil) (ja-set! a i v)))))

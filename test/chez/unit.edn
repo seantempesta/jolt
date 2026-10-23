@@ -9,6 +9,8 @@
   {:suite "large-bytes" :expr "(let [a (byte-array 70000 (byte -1))] (System/gc) [(alength a) (aget a 0) (aget a 69999)])" :expected "[70000 -1 -1]"}
   {:suite "large-bytes" :expr "(let [a (byte-array 70000 200)] [(aget a 0) (reduce + (take 4 a))])" :expected "[-56 -224]"}
   {:suite "large-bytes" :expr "(let [a (byte-array 70000) b (aclone a)] (aset b 69999 (byte 5)) (System/gc) [(aget a 69999) (aget b 69999) (java.util.Arrays/equals a b)])" :expected "[0 5 false]"}
+  ;; java.util.Arrays/compare: signed elements first (-1 sorts before 1), then length, nil first
+  {:suite "arrays-compare" :expr "(let [c (fn [a b] (java.util.Arrays/compare a b))] [(c (byte-array [1 2]) (byte-array [1 2])) (c (byte-array [-1]) (byte-array [1])) (c (byte-array [1 2]) (byte-array [1])) (c nil (byte-array [0])) (c (long-array [5]) (long-array [3]))])" :expected "[0 -1 1 -1 1]"}
   ;; an array of the same kind is copied backing to backing: a fresh array, equal elements
   {:suite "array-ctor-copy" :expr "(let [a (byte-array [1 -2 127]) b (byte-array a)] (aset b 0 (byte 9)) [(vec a) (vec b) (identical? a b)])" :expected "[[1 -2 127] [9 -2 127] false]"}
   {:suite "array-ctor-copy" :expr "(let [a (long-array [1 2 3]) b (long-array a) d (double-array (double-array [1.5 2.5])) c (char-array (char-array \"hi\")) o (object-array (object-array [:k nil]))] [(vec b) (vec d) (vec c) (vec o)])" :expected "[[1 2 3] [1.5 2.5] [\\h \\i] [:k nil]]"}
