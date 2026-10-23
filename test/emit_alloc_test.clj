@@ -48,10 +48,18 @@
     (when (> s ceiling)
       (swap! failures inc)
       (println "FAIL:" what "allocates" (long s) "B a unit, past" ceiling))))
-;; ...and what it emits is unchanged: Chez's escapes for the named characters, a
-;; hex escape outside printable ASCII, and every other character as itself.
+;; ...and the text it emits: Chez's named escapes, a hex escape for every other
+;; character outside printable ASCII (one past the BMP included), and printable
+;; ASCII as itself; a name holding a character to escape is munged the same way.
+(defn- emitted [form]
+  (let [ctx (jolt.host/ctx-for-ns "emit-alloc-test")]
+    (be/emit-top-form (jolt.passes/run-passes (ana/analyze ctx form) ctx))))
 (doseq [[what got want]
-        [["a string literal round-trips" (eval (list 'identity "a\"b\\c\nd\te\rf é ☃ \u0001")) "a\"b\\c\nd\te\rf é ☃ \u0001"]
+        [["a string literal's text"
+          (.contains ^String (emitted (list 'fn* [] "a\"b\\c\nd\te\rf é ☃ 😀 \u0001"))
+                     "\"a\\\"b\\\\c\\nd\\te\\rf \\xe9; \\x2603; \\x1f600; \\x1;\"")
+          true]
+         ["a string literal round-trips" (eval (list 'identity "a\"b\\c\nd\te\rf é ☃ 😀 \u0001")) "a\"b\\c\nd\te\rf é ☃ 😀 \u0001"]
          ["a local whose name needs munging" (let [a|b 1 c#d 2] (+ a|b c#d)) 3]]]
   (when-not (= want got)
     (swap! failures inc)
