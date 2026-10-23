@@ -493,11 +493,19 @@
         (= cp 35) "$H"
         (= cp 124) "$V"
         :else (str "$U" (format "%x" cp) "$")))
-(defn- munge-chars [s]
-  ;; a name with nothing to escape (nearly all of them) is returned as-is
-  (if (some (fn [c] (munge-unsafe? (int c))) s)
-    (apply str (map (fn [c] (let [cp (int c)] (if (munge-unsafe? cp) (munge-char cp) c))) s))
-    s))
+(defn- munge-chars [^String s]
+  ;; a name with nothing to escape (nearly all of them) is returned as-is; one
+  ;; indexed pass, no per-char seq or string
+  (let [n (.length s)]
+    (if (loop [i 0] (cond (= i n) false (munge-unsafe? (int (.charAt s i))) true :else (recur (inc i))))
+      (let [sb (StringBuilder.)]
+        (loop [i 0]
+          (when (< i n)
+            (let [cp (int (.charAt s i))]
+              (if (munge-unsafe? cp) (.append sb ^String (munge-char cp)) (.append sb (.charAt s i))))
+            (recur (inc i))))
+        (.toString sb))
+      s)))
 
 ;; A direct-link Scheme binding name for a var: jv$ + the munged fqn (ns/name),
 ;; the same identity the direct-link registry keys on (dl-fqn), so two distinct
@@ -1357,18 +1365,30 @@
 ;; A Chez string literal. Every char outside printable ASCII becomes a
 ;; codepoint hex escape \x<cp>; ; the named escapes (\n \t \r \" \\) match what
 ;; Chez's reader accepts. For pure printable ASCII this is byte-identical to %j.
-(defn- char-escape [cp]
+(defn- char-escape
+  "The escape for codepoint cp, or nil when cp is printable ASCII and stands as itself."
+  [cp]
   (cond
     (= cp 34) "\\\""
     (= cp 92) "\\\\"
     (= cp 10) "\\n"
     (= cp 9) "\\t"
     (= cp 13) "\\r"
-    (and (>= cp 32) (< cp 127)) (str (char cp))
+    (and (>= cp 32) (< cp 127)) nil
     :else (str "\\x" (format "%x" cp) ";")))
 
-(defn- chez-str-lit [s]
-  (str "\"" (apply str (map (fn [c] (char-escape (int c))) s)) "\""))
+(defn- chez-str-lit [^String s]
+  ;; one indexed pass into one buffer: a docstring is thousands of chars, and a
+  ;; string per char joined by apply str was most of what emit allocated
+  (let [n (.length s) sb (StringBuilder. (+ n 2))]
+    (.append sb "\"")
+    (loop [i 0]
+      (when (< i n)
+        (let [c (.charAt s i)]
+          (if-let [e (char-escape (int c))] (.append sb ^String e) (.append sb c)))
+        (recur (inc i))))
+    (.append sb "\"")
+    (.toString sb)))
 
 ;; Hoist the VAR CELL a late-bound reference reads through, so the name lookup
 ;; (string-append + string-hash + a hashtable probe, measured at ~102ns) runs once
@@ -3246,7 +3266,7 @@
 
 ;; A plain Scheme application: (callee op ...).
 (defn- plain-call [callee operand-strs]
-  (str "(" callee (if (seq operand-strs) (str " " (str/join " " operand-strs)) "") ")"))
+  (txt "(" callee (if (seq operand-strs) (txt " " (join-txt " " operand-strs)) "") ")"))
 ;; A tail call in trace mode (R4, bead jolt-hm1p): ONE virtual-register store
 ;; of the static ('ns/fn' . line) site pair, after the operands are temp-bound
 ;; — an operand's own tail site would otherwise stomp the slot before the call
