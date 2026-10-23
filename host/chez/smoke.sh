@@ -1307,6 +1307,17 @@ else
   fails=$((fails + 1))
 fi
 
+# File/createTempFile: a temp path no other process holds (eight processes in one
+# millisecond, every path distinct), and a file already at the next name is skipped.
+temp_out="$($jolt run test/chez/temp-file-test.clj "$jolt" 2>&1)"
+if printf '%s' "$temp_out" | grep -q 'TEMP-FILE OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: File.createTempFile"
+  printf '%s\n' "$temp_out" | tail -8 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
 # java.io.File path normalization — every JVM constructor collapses duplicate
 # separators and drops a trailing one, so a File's path is always normalized.
 # "." and ".." are left alone; resolving those is getCanonicalPath's job above.

@@ -3423,14 +3423,22 @@
   (let* ((d (cond ((pair? dir) (file-path-of (car dir)))
                   (else (host-temp-dir))))
          (sfx (if (or (null? (list suffix)) (jolt-nil? suffix)) ".tmp" (jolt-str-render-one suffix))))
-    (let ((n (jolt-with-mutex io-counter-mutex
-              (set! temp-file-counter (+ temp-file-counter 1))
-              temp-file-counter)))
-    (let loop ((n n))
-      (let ((p (string-append d "/" (jolt-str-render-one prefix)
-                              (number->string (now-millis)) "-" (number->string n) sfx)))
-        (if (file-exists? p) (loop (+ n 1))
-            (begin (close-port (open-output-file p 'truncate)) (make-jfile p))))))))
+    ;; The name is the pid and this process's counter, unique among live processes; the
+    ;; file is created exclusively, so a path that exists (another process's, a dead one's
+    ;; with a reused pid, a file put there) fails the create and the next counter is tried.
+    ;; Before, the name was the millisecond and the counter, checked then created: two
+    ;; processes in one millisecond got one path (four test shards started at once).
+    (let loop ()
+      (let* ((n (jolt-with-mutex io-counter-mutex
+                  (set! temp-file-counter (+ temp-file-counter 1))
+                  temp-file-counter))
+             (p (string-append d "/" (jolt-str-render-one prefix)
+                               (number->string (proc-c-getpid)) "-" (number->string n) sfx)))
+        (if (guard (e ((i/o-file-already-exists-error? e) #f))
+              (close-port (open-file-output-port p (file-options)))
+              #t)
+            (make-jfile p)
+            (loop))))))
 ;; File.listRoots: the filesystem roots. POSIX has exactly one; Windows has one
 ;; per mounted drive, and answering "/" there named a directory on whichever
 ;; drive the process happened to be on rather than enumerating anything
