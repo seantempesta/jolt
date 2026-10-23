@@ -1147,7 +1147,7 @@
     ;; not a public name — the deftype macro's field bindings lower through it
     ;; (records.ss jrec-field). Declared here like the rest so the list matches
     ;; native-ops, which manifest-check.sh enforces.
-    "__deftype-field" "__deftype-slot" "__deftype-mslot" "__deftype-slot-set!"
+    "__deftype-field" "__deftype-slot" "__deftype-mslot" "__deftype-slot-set!" "__record-get"
     ;; the `lazy-seq` macro's two halves (lazy-bridge.ss): internal names too
     "make-lazy-seq" "coll->cells" "chunked-seq?"
     "aget" "aset" "alength"

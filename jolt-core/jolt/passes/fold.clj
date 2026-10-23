@@ -1,6 +1,6 @@
 (ns jolt.passes.fold
   "Constant folding (always-on IR pass) plus the shared const-shape predicate.
-  Bottom-up numeric folding + dead-branch and unread-binding removal, total over node :ops (unknown
+  Bottom-up numeric folding, dead-branch removal and unread record-field binds, total over node :ops (unknown
   ops pass through with folded children). Portable Clojure: kernel-tier fns +
   seed primitives only — it loads with the compiler namespaces, before the later
   core tiers."
@@ -36,27 +36,24 @@
               (= op :host))
       (get foldable (get fnode :name)))))
 
-;; A let binding nothing after it reads, whose init only reads (a local, a
-;; constant, a get or keyword lookup of them, a deftype field's slot), is dropped:
-;; its value was never used and the read has no effect and cannot throw.
-;; deftype and defrecord methods bind every field of their type, as Clojure's do,
-;; and this keeps only the ones the method's analyzed (macroexpanded) body reads:
-;; a protocol call on a 21-field record read all 21 (~6 ticks each in the runtime
-;; spine) to use one. A field named like a var, or reached only through a macro,
-;; is a :local of the expanded body, so it is read and kept. __deftype-slot is
-;; only emitted by deftype on the method's own instance, where it cannot throw.
-(declare kw-callee? get-callee?)
-
-(defn- read-only? [n]
-  (let [op (get n :op)]
-    (or (= op :local) (= op :const)
-        (and (= op :invoke)
-             (let [f (get n :fn) args (get n :args) k (count args)]
-               (and (every? (fn [a] (let [o (get a :op)] (or (= o :local) (= o :const)))) args)
-                    (or (and (kw-callee? f) (or (= k 1) (= k 2)))
-                        (and (get-callee? f) (or (= k 2) (= k 3)))
-                        (and (= :var (get f :op)) (= "clojure.core" (get f :ns))
-                             (= "__deftype-slot" (get f :name)) (= k 3)))))))))
+;; deftype and defrecord methods bind every field of their type, as Clojure's do
+;; (__deftype-slot, __record-get on the method's own instance); a binding the
+;; method's analyzed body never reads is dropped here, in every mode: a protocol
+;; call on a 21-field record read all 21 (~6 ticks each in the runtime spine) to
+;; use one. A field named like a var, or reached only through a macro's
+;; expansion, is a :local of the expanded body, so it is read and kept. Only
+;; these reads are dropped: on the method's own record they read a declared slot,
+;; with no effect and no throw, where a get on any value may run a comparator or
+;; a type's own valAt.
+(defn- field-read? [n]
+  (and (= :invoke (get n :op))
+       (let [f (get n :fn) args (get n :args)]
+         (and (= :var (get f :op)) (= "clojure.core" (get f :ns))
+              (= :local (get (first args) :op))
+              (= :const (get (second args) :op)) (keyword? (get (second args) :val))
+              (or (and (= "__record-get" (get f :name)) (= 2 (count args)))
+                  (and (= "__deftype-slot" (get f :name)) (= 3 (count args))
+                       (number? (get (nth args 2) :val))))))))
 
 ;; the names of the locals node reads, added to acc
 (defn- local-reads [node acc]
@@ -64,10 +61,12 @@
     (conj acc (get node :name))
     (reduce-ir-children (fn [a c] (local-reads c a)) acc node)))
 
-(defn- drop-unread-reads [node]
+;; a method's field binds are one let at its entry, so the body is walked once
+;; per method
+(defn- drop-unread-fields [node]
   (let [binds (get node :bindings)]
     (if (or (get node :letrec)
-            (not (some (fn [b] (read-only? (nth b 1))) binds)))
+            (not (some (fn [b] (field-read? (nth b 1))) binds)))
       node
       ;; from the last binding back: one is read if the body or a kept later
       ;; init reads its name (a later rebinding of the name keeps it too)
@@ -77,14 +76,14 @@
                 (empty? kept) (get node :body)
                 :else (assoc node :bindings (vec kept)))
           (let [b (nth binds i)]
-            (if (and (read-only? (nth b 1)) (not (contains? used (nth b 0))))
+            (if (and (field-read? (nth b 1)) (not (contains? used (nth b 0))))
               (recur (dec i) used kept)
               (recur (dec i) (local-reads (nth b 1) used) (cons b kept)))))))))
 
 (defn const-fold
   "Bottom-up constant folding: a call of a foldable numeric fn whose args are
   all constant numbers becomes a constant; an if with a constant test becomes
-  the taken branch; a let binding nothing reads, whose init only reads, is
+  the taken branch; a record method's field binding its body never reads is
   dropped."
   [node]
   (let [op (get node :op)]
@@ -114,7 +113,7 @@
                  :then (const-fold (get node :then))
                  :else (const-fold (get node :else)))))
 
-      (= op :let) (drop-unread-reads (map-ir-children const-fold node))
+      (= op :let) (drop-unread-fields (map-ir-children const-fold node))
 
       ;; every other op: fold each child (let/loop bindings are [name init]
       ;; pairs, handled by the combinator)
@@ -140,5 +139,6 @@
 (defn get-callee?
   "True if fnode is the clojure.core/get (or host get) callee — the (get m k) form."
   [fnode]
-  (or (and (= :var (get fnode :op)) (= "clojure.core" (get fnode :ns)) (= "get" (get fnode :name)))
+  (or (and (= :var (get fnode :op)) (= "clojure.core" (get fnode :ns))
+           (or (= "get" (get fnode :name)) (= "__record-get" (get fnode :name))))
       (and (= :host (get fnode :op)) (= "get" (get fnode :name)))))

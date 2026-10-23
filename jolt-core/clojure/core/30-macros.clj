@@ -987,8 +987,10 @@
         mk-clause (fn [spec]
                     ;; rename each _ parameter to a fresh symbol so two _ params
                     ;; (the common (m [_ _] …) on a 1-arg protocol method) don't
-                    ;; collide — the field binds read (get this :field) off the
-                    ;; FIRST param, which an ignored second _ would otherwise shadow.
+                    ;; collide — the field binds read (__record-get this :field), get
+                    ;; under a name the fold knows (jolt.passes.fold drops one the
+                    ;; body never reads), off the FIRST param, which an ignored
+                    ;; second _ would otherwise shadow.
                     (let [raw (mapv (fn [p] (if (= p (quote _)) (gensym "_p") p)) (nth spec 1))
                           dp (destructured-params raw)
                           argv (nth dp 0)
@@ -1000,7 +1002,7 @@
                           ;; including a name a destructured param binds, whose let
                           ;; sits inside the field binds.
                           pnames (set (map name (concat argv (mapcat pattern-syms dlets))))
-                          binds (vec (mapcat (fn [f] [f `(get ~inst ~(keyword (name f)))])
+                          binds (vec (mapcat (fn [f] [f `(__record-get ~inst ~(keyword (name f)))])
                                              (remove (fn [f] (contains? pnames (name f))) fields)))
                           mbody (drop 2 spec)
                           mbody (if (seq dlets) (list (list* 'clojure.core/let dlets mbody)) mbody)

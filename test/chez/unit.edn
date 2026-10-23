@@ -21,14 +21,16 @@
   {:suite "large-fx" :expr "(let [a (long-array 70000)] (aset a 1 Long/MAX_VALUE) (System/gc) [(aget a 0) (aget a 1) (alength a)])" :expected "[0 9223372036854775807 70000]"}
   {:suite "fnsrc-naming" :expr "(let [ctx (jolt.host/ctx-for-ns \"app.core\") e (fn [f] (jolt.backend-scheme/emit-top-form (jolt.analyzer/analyze ctx f (@#'jolt.analyzer/empty-env)))) ids (fn [s] (set (re-seq #\"jfn\\$[A-Za-z0-9_$./]*\" s))) a (ids (e (quote (defmacro m1 [x] ((fn [] 1)))))) b (ids (e (quote (defmacro m2 [x] ((fn [] 2))))))] (and (seq a) (seq b) (empty? (clojure.set/intersection a b))))" :expected "true"}
   {:suite "fnsrc-naming" :expr "(let [ctx (jolt.host/ctx-for-ns \"app.core\") s (jolt.backend-scheme/emit-top-form (jolt.analyzer/analyze ctx (quote (defmacro mm [x] ((fn [] 1)))) (@#'jolt.analyzer/empty-env)))] (boolean (re-find #\"jfn\\$app\\.core/mm\\$\" s)))" :expected "true"}
-  ;; A method binds every field of its type, and the fold drops the bindings its
-  ;; analyzed body never reads (jolt.passes.fold drop-unread-reads): a field named
-  ;; like a clojure.core var, or reached only through a macro's expansion, is read
-  ;; and must stay bound; an unread binding whose init only reads is gone.
+  ;; A method binds every field of its type, and the fold drops the field binds its
+  ;; analyzed body never reads (jolt.passes.fold drop-unread-fields): a field named
+  ;; like a clojure.core var, reached only through a macro's expansion, read in a
+  ;; closure or through a later binding is read and must stay bound; an unread field
+  ;; bind is gone, and a get on any other value is never dropped.
   {:suite "field-binds" :expr "(do (defprotocol FbP (fb [x])) (defrecord FbR [name key meta] FbP (fb [_] [name key meta])) (fb (->FbR \"n\" :k 3)))" :expected "[\"n\" :k 3]"}
   {:suite "field-binds" :expr "(do (defmacro fb-field [] (quote v)) (defprotocol FbQ (fq [x])) (defrecord FbM [v w] FbQ (fq [_] (fb-field))) (fq (->FbM 7 8)))" :expected "7"}
   {:suite "field-binds" :expr "(do (defmacro fb-field2 [] (quote v)) (defprotocol FbT (ft [x])) (deftype FbD [v w] FbT (ft [_] (fb-field2))) (ft (FbD. 9 8)))" :expected "9"}
-  {:suite "field-binds" :expr "(let [ctx (jolt.host/ctx-for-ns \"user\") s (jolt.backend-scheme/emit-top-form (jolt.passes.fold/const-fold (jolt.analyzer/analyze ctx (quote (fn [m] (let [a (get m :a) b (:b m) c (get m :c)] c))) (@#'jolt.analyzer/empty-env))))] [(boolean (re-find #\"#f \\\"a\\\"\" s)) (boolean (re-find #\"#f \\\"b\\\"\" s)) (boolean (re-find #\"#f \\\"c\\\"\" s))])" :expected "[false false true]"}
+  {:suite "field-binds" :expr "(do (defprotocol FbC (fc [x]) (fc2 [x])) (defrecord FbK [v w] FbC (fc [_] ((fn [] v))) (fc2 [_] (let [y w] (inc y)))) [(fc (->FbK 5 6)) (fc2 (->FbK 5 6))])" :expected "[5 7]"}
+  {:suite "field-binds" :expr "(let [ctx (jolt.host/ctx-for-ns \"user\") s (jolt.backend-scheme/emit-top-form (jolt.passes.fold/const-fold (jolt.analyzer/analyze ctx (quote (fn [this m] (let [a (clojure.core/__record-get this :a) b (clojure.core/__record-get this :b) x (get m :x)] b))) (@#'jolt.analyzer/empty-env))))] [(boolean (re-find #\"#f \\\"a\\\"\" s)) (boolean (re-find #\"#f \\\"b\\\"\" s)) (boolean (re-find #\"#f \\\"x\\\"\" s))])" :expected "[false true true]"}
   {:suite "securerandom" :expr "(let [r (java.security.SecureRandom.)] (int? (.nextInt r)))" :expected "true"}
   {:suite "securerandom" :expr "(let [r (SecureRandom.)] (every? (fn [x] (and (>= x 0) (< x 10))) (repeatedly 500 (fn [] (.nextInt r 10)))))" :expected "true"}
   {:suite "securerandom" :expr "(let [r (SecureRandom.) b (byte-array 16)] (.nextBytes r b) [(alength b) (> (count (distinct (seq b))) 4)])" :expected "[16 true]"}

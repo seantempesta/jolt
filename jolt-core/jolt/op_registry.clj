@@ -139,6 +139,10 @@
    ;; (not pure: a set! between two reads must be observed), -slot-set! the
    ;; write, with a constant flag for a ^double field. (records.ss jrec-slot.)
    "__deftype-slot"      {:call "jrec-slot" :arity #(= % 3) :pure? true}
+   ;; defrecord's field binding: get of a declared field on the method's own
+   ;; record (records.ss), a name of its own so the fold knows it can drop one
+   ;; nothing reads
+   "__record-get"        {:call "jolt-get" :arity #(= % 2) :pure? true}
    "__deftype-mslot"     {:call "jrec-mslot" :arity #(= % 4)}
    "__deftype-slot-set!" {:call "jrec-slot-set!" :arity #(= % 5)}
    "nth"         {:call "jolt-nth"     :arity #(or (= % 2) (= % 3))}

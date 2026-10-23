@@ -693,6 +693,10 @@
         (begin (jrec-field-set! r i v) v)
         (jolt-set-field! r k v))))
 (def-var! "clojure.core" "__deftype-slot" jrec-slot)
+;; a defrecord method's field binding: get on the method's own record, so --opt
+;; lowers it to the shape's accessor as it does get, and the fold may drop it
+;; unread (jolt.passes.fold), which it may not do to a get on any value
+(def-var! "clojure.core" "__record-get" jolt-get)
 (define (jrec-mslot r k i dbl?) (jrec-slot r k i))
 (def-var! "clojure.core" "__deftype-mslot" jrec-mslot)
 (def-var! "clojure.core" "__deftype-slot-set!" jrec-slot-set!)
