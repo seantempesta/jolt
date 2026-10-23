@@ -576,7 +576,8 @@
 ;; compiled asks for none: *compiler-options* {:image-fn-forms false}. Registering
 ;; is what lets a state image rebuild a closure from its source; a program that
 ;; writes no image pays for it on every compile (a third of a defn's allocation),
-;; so it may opt out. Absent or true, every literal registers, as before.
+;; so it may opt out. Absent or true, every literal registers, as before. A binding of
+;; *compiler-options* replaces the map: merge into the previous value to keep the option.
 (defn- fnsrc-regs []
   (when-not (false? (get *compiler-options* :image-fn-forms)) (atom [])))
 ;; True while emitting a node in TAIL position. Only used, in trace mode, to mark a
@@ -2992,9 +2993,10 @@
                     ;; binds no free names, so this closure never needs a layout
                     (empty? (:free-names node))
                     (some *letrec-binders* (:free-names node)))
-                (do (some-> *fnsrc-regs* (swap! conj
-                                       [fnsrc-nm (:src-form node) fnsrc-src-ns (:free-names node)
-                                        (:live-names node)]))
+                (do (when *fnsrc-regs*
+                      (swap! *fnsrc-regs* conj
+                             [fnsrc-nm (:src-form node) fnsrc-src-ns (:free-names node)
+                              (:live-names node)]))
                     inner)
                 (do (swap! *fnsrc-regs* conj
                            [fnsrc-nm (:src-form node) fnsrc-src-ns (:free-names node) nil])
@@ -3065,7 +3067,7 @@
             ;; no maker: a spliced copy (see above), or a literal emitted outside
             ;; any cache-cell scope — there would be nowhere to bind one, and a
             ;; site calling an unbound maker is worse than a closure that refuses.
-            (do (some-> *fnsrc-regs* (swap! conj [nm form fnsrc-src-ns frees lives]))
+            (do (when *fnsrc-regs* (swap! *fnsrc-regs* conj [nm form fnsrc-src-ns frees lives]))
                 inner)
             (do (swap! *fnsrc-regs* conj [nm form fnsrc-src-ns frees nil])
                 (fnsrc-maker-site nm frees inner))))))))

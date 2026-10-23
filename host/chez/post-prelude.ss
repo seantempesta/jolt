@@ -399,6 +399,10 @@
 ;; program sets compile options for everything its process compiles (its build, its
 ;; runtime evals) without wrapping each in a binding, e.g. {:image-fn-forms false}
 ;; (backend_scheme.clj fnsrc-regs). Unset or empty: nil, as before.
+;; A value that is no EDN map stops the start, naming the variable and the value.
 (let ((e (getenv "JOLT_COMPILER_OPTIONS")))
   (when (and e (not (string=? e "")))
-    (var-root-set! (jolt-var "clojure.core" "*compiler-options*") (jolt-read-string e))))
+    (let ((m (guard (c (#t (error 'jolt "JOLT_COMPILER_OPTIONS is not EDN" e)))
+               (jolt-read-string e))))
+      (unless (pmap? m) (error 'jolt "JOLT_COMPILER_OPTIONS is not a map" e))
+      (var-root-set! (jolt-var "clojure.core" "*compiler-options*") m))))
