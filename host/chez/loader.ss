@@ -1671,8 +1671,7 @@
   (hashtable-clear! aot-res-digest-memo)
   (hashtable-clear! aot-ct-state-memo)
   (hashtable-clear! aot-assumed-memo)
-  (unless (eq? aot-readers-digest-memo 'computing)
-    (set! aot-readers-digest-memo 'unset)))
+  (set! aot-readers-digest-memo 'unset))
 (define (aot-own-key name)
   (let ((m (hashtable-ref aot-own-key-memo name #f)))
     (if m
@@ -1736,29 +1735,34 @@
 ;; forms the read produced, not just into a macro expansion. The registry is
 ;; small and changes rarely, so noticing WHICH tags a source used is not worth a
 ;; read-time hook; folding all of them over-invalidates on a reader edit, never
-;; under-invalidates. Memoized per process (a merge resets it), with 'computing
-;; cutting a recursive walk — a reader namespace that requires the namespace
-;; being keyed — at the same constant an empty registry folds to.
+;; under-invalidates. Memoized per process (a merge or a sidecar write resets it).
+;;
+;; Folded once, at the top of each key (aot-base-full), and never inside a
+;; namespace's digest: it is one value for the whole process, so folding it per
+;; dependency adds nothing, and doing so made the two definitions cyclic (a
+;; reader namespace's closure reaches the namespaces being keyed). A cycle cut
+;; by a 'computing marker gives a digest that depends on which was asked first:
+;; the dep digests memoized inside the readers walk folded the cut constant, and
+;; the same dep's digest asked later folded the full value. Which came first
+;; moved whenever a run recompiled something (a sidecar write resets the memo),
+;; so one miss moved the keys of every namespace loaded after it, and their
+;; artifacts were published under keys no later run asked for: a cache shared by
+;; busy checkouts, where some entry is always still compiling, never hit.
 (define (aot-readers-digest)
-  (cond
-    ((eq? aot-readers-digest-memo 'unset)
-     (set! aot-readers-digest-memo 'computing)
-     (let* ((names (sort string<? (aot-reader-namespaces)))
-            (d (fold-left (lambda (h ns) (aot-hash-mix h (aot-ns-digest ns))) 17 names)))
-       (set! aot-readers-digest-memo d)
-       d))
-    ((eq? aot-readers-digest-memo 'computing) 17)
-    (else aot-readers-digest-memo)))
+  (when (eq? aot-readers-digest-memo 'unset)
+    (set! aot-readers-digest-memo
+      (fold-left (lambda (h ns) (aot-hash-mix h (aot-ns-digest ns))) 17
+                 (sort string<? (aot-reader-namespaces)))))
+  aot-readers-digest-memo)
 (define (aot-ns-digest name)
   ;; a namespace's whole contribution: its own hash, the files its compile read,
-  ;; its deps', and the project's data readers. All four so a change anywhere
-  ;; below reaches every consumer.
+  ;; and its deps'. All three so a change anywhere below reaches every consumer;
+  ;; the data readers are folded by the key itself (aot-readers-digest).
   (let ((own (aot-own-key name)))
     (if (not own)
         0
-        (aot-hash-mix (aot-hash-mix (aot-hash-mix (equal-hash own) (aot-res-digest name own))
-                                    (aot-dep-digest name own))
-                      (aot-readers-digest)))))
+        (aot-hash-mix (aot-hash-mix (equal-hash own) (aot-res-digest name own))
+                      (aot-dep-digest name own)))))
 (define (aot-dep-digest name own)
   (or (hashtable-ref aot-dep-digest-memo name #f)
       (let ((ik (aot-inflight-key name)))
@@ -2039,8 +2043,7 @@
       (hashtable-delete! aot-res-digest-memo name)
       (hashtable-delete! aot-ct-state-memo name)
       (hashtable-delete! aot-assumed-memo name)
-      (unless (eq? aot-readers-digest-memo 'computing)
-        (set! aot-readers-digest-memo 'unset)))))
+      (set! aot-readers-digest-memo 'unset))))
 ;; The artifact under its full key: the captured Scheme, then its fasl.
 (define (aot-publish-artifact! name own deps res captured stamps)
   (let* ((base (aot-base-full name own deps res))
