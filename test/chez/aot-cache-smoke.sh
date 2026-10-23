@@ -1057,6 +1057,40 @@ else
   fails=$((fails+1))
 fi
 rm -rf "$cache_ac3"
+# ...and a cache missing one artifact, as a shared cache is while another
+# process's worker is still compiling it. Only that namespace may miss. The
+# readers digest was folded into every namespace's digest and the readers walk
+# reaches them, so a dep digest memoized inside that walk folded a cut constant,
+# and the same digest asked again after the recompile folded the full value:
+# every later consumer of the missing namespace moved its key and missed too,
+# which in a busy shared cache never settled. Macros, so each dependency folds
+# its whole digest rather than an inert surface.
+ac4="$tmp/ac4"; mkdir -p "$ac4/src/rd"
+printf '{rd/tag rd.readers/read-tag}\n' > "$ac4/src/data_readers.clj"
+printf '(ns rd.leaf)\n(defmacro tagged [x] `(str "tagged:" ~x))\n' > "$ac4/src/rd/leaf.clj"
+printf '(ns rd.mid (:require [rd.leaf :as l]))\n(defmacro label [x] `(l/tagged ~x))\n' > "$ac4/src/rd/mid.clj"
+printf '(ns rd.readers (:require [rd.mid :as m]))\n(defn read-tag [x] (m/label x))\n' > "$ac4/src/rd/readers.clj"
+printf '(ns rd.plain (:require [rd.mid :as m]))\n(defn v [] (m/label 7))\n' > "$ac4/src/rd/plain.clj"
+cache_ac4="$(mktemp -d)"
+ac4run() {
+  JOLT_DEBUG=1 JOLT_AOT_CACHE=1 JOLT_AOT_ASYNC=0 JOLT_CACHE_DIR="$cache_ac4" JOLT_QUIET=1 "$jolt" -e "
+    (require 'jolt.deps) (jolt.deps/add-deps {:deps {'rd/rd {:local/root \"$ac4\"}}})
+    (require 'rd.plain) (println (rd.plain/v))" 2>&1
+}
+ac4run >/dev/null
+find "$cache_ac4" -name 'rd.mid-*.so' -exec rm -f {} +
+ac4_part="$(ac4run)"
+ac4_next="$(ac4run)"
+if echo "$ac4_part" | grep -q '^tagged:7$' \
+   && [ "$(echo "$ac4_part" | grep -c 'miss ' || true)" -eq 1 ] && echo "$ac4_part" | grep -q 'miss rd.mid' \
+   && [ "$(echo "$ac4_part" | grep -c 'hit rd\.' || true)" -eq 3 ] \
+   && ! echo "$ac4_next" | grep -q 'miss '; then
+  echo "PASS: (ac4) a missing artifact under a reader namespace misses alone"; pass=$((pass+1))
+else
+  echo "FAIL: (ac4) with rd.mid missing: $(echo "$ac4_part" | grep -E 'hit |miss ' | tr '\n' ' '); next: $(echo "$ac4_next" | grep -E 'hit |miss ' | tr '\n' ' ')"
+  fails=$((fails+1))
+fi
+rm -rf "$cache_ac4"
 
 # --- (ae) a recovery recompile does not see the failed load's later defs ------
 # recover! recompiles in the process the damaged artifact already ran in. That
