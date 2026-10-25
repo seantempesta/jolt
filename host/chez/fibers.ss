@@ -1664,7 +1664,10 @@
           (else
            (let ((ms (and next (max 0 (mono-ms-until next)))))
              (cond
-               ((and jolt-main-io-wait (jolt-main-io-wait ms)) (void))
+               ;; a wait woken by a signal (jolt.io-poller/wake-on-signals!) runs its handler
+               ;; now: Chez runs a signal's handler at its next event check, and the loop would
+               ;; otherwise go back into kevent before one came
+               ((and jolt-main-io-wait (jolt-main-io-wait ms)) (#%$event))
                (ms (let ((secs (exact (floor (/ ms 1000)))))
                      (sleep (make-time 'time-duration (min 999999999 (exact (round (* 1000000 (- ms (* 1000 secs)))))) secs))))
                (else (error 'jolt-main-carrier

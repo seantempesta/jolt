@@ -138,6 +138,7 @@
 (def ^:private EV-DELETE 2)
 (def ^:private EV-CLEAR 0x20)
 (def ^:private EVFILT-USER -10)
+(def ^:private EVFILT-SIGNAL -6)
 (def ^:private NOTE-TRIGGER 0x01000000)
 (def ^:private EFD-NONBLOCK 0x800)
 (def ^:private EFD-CLOEXEC 0x80000)
@@ -479,8 +480,15 @@
                   ;; it and drop it.
                   (loop [i 0 acc []]
                     (if (< i n)
-                      (if (ev-error? evbuf i)
+                      (cond
+                        (ev-error? evbuf i)
                         (do (swap! ev-errors inc) (recur (inc i) acc))
+                        ;; a signal a main carrier waits for (wake-on-signals!): its ident is the
+                        ;; signal's number, not a descriptor; the wake itself is the event
+                        (and macos? (= (bit-and (ffi/read evbuf :uint (+ (* i KEVENT-SIZE) 8)) 0xffff)
+                                       (bit-and EVFILT-SIGNAL 0xffff)))
+                        (recur (inc i) acc)
+                        :else
                         (let [fd (ev-fd evbuf i)]
                           (recur (inc i)
                                  (into acc (map (fn [f] [fd f]) (ev-filts evbuf i))))))
@@ -702,7 +710,7 @@
 (def ^:private main-deletes (volatile! #{}))
 
 (defn- awaited? [st]
-  (or (seq (:pending st))
+  (or (seq (:pending st)) (seq (:signals st))
       (some (fn [[_ fm]] (some (fn [[_ e]] (seq (:waiters e))) fm)) (:fds st))))
 
 (defn- main-io-wait [timeout-ms]
@@ -714,6 +722,25 @@
             :else (let [[woken nd] (process-events! evs)]
                     (vreset! main-deletes nd)
                     (doseq [f woken] (jolt.host/fiber-resume f))))
+      true)))
+
+(declare ensure-started!)
+(defn wake-on-signals!
+  "A main carrier's loop also wakes when any of signals sigs arrives (kqueue's EVFILT_SIGNAL,
+  which records a delivery its handler also takes), so a program whose only wake source is a
+  signal (an interrupt from its parent) waits for it instead of being stuck. macOS only;
+  answers false elsewhere (Linux would need a signalfd)."
+  [sigs]
+  (if-not macos?
+    false
+    (locking pm
+      (ensure-started!)
+      (let [ch (ffi/alloc (* (count sigs) KEVENT-SIZE))]
+        (try
+          (doseq [[i sig] (map-indexed vector sigs)] (kevent-put! ch i sig EVFILT-SIGNAL EV-ADD))
+          (c-kevent (:kq @state) ch (count sigs) ffi/null 0 ffi/null)
+          (finally (ffi/free ch))))
+      (swap! state update :signals (fnil into #{}) sigs)
       true)))
 
 (defn- main-after-fork!

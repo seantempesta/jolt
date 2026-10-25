@@ -5,7 +5,7 @@
 ;; timers and the I/O. Such a program stays one OS thread, so it forks safely while its go
 ;; blocks and remote channels are mid-traffic; and a wait nothing can ever end raises out of
 ;; main-carrier-run! instead of hanging.
-(require '[clojure.core.async :as a] '[jolt.scheme :as scm] '[jolt.async.remote :as remote])
+(require '[clojure.core.async :as a] '[jolt.scheme :as scm] '[jolt.async.remote :as remote] '[jolt.io-poller])
 
 (def failures (atom []))
 (defn check-eq [what got want]
@@ -99,6 +99,21 @@
     (check-eq "the echo child ran to its end" (wait-exit echo) 0)
     (check-eq "the parent started no thread" (threads) base)))
 
+        ;; a wait whose only wake is a signal (as an agent's on its parent's interrupt) waits for
+        ;; it; in a child, since once signals can wake a program it is never stuck (the check below)
+        (let [sig 31
+              on-sig (scm/eval-string "(lambda (sig f) (register-signal-handler sig (lambda (s) (f))))")
+              kill (scm/eval-string "(foreign-procedure \"kill\" (int int) int)")
+              getppid (scm/eval-string "(foreign-procedure \"getppid\" () int)")]
+          (check-eq "a take answered only by a signal's handler, in a child"
+                    (in-child #(let [ch (a/chan 1)]
+                                 (on-sig sig (fn [] (a/put! ch :signalled)))
+                                 (and (jolt.io-poller/wake-on-signals! [sig])
+                                      (let [pid (fork-alone)]
+                                        (if (zero? pid)
+                                          (exit-now (do (kill (getppid) sig) 0))
+                                          (and (= :signalled (a/<!! ch)) (= 0 (wait-exit pid))))))))
+                    0))
         ;; last: a take no one can ever answer
         (a/<!! (a/chan))
         :returned))
