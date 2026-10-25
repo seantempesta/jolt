@@ -596,6 +596,14 @@
        pid))))
 (def-var! "jolt.host" "fork-alone" (lambda () (jolt-fork-alone)))
 (def-var! "jolt.host" "user-threads" (lambda () (jolt-user-threads-live)))
+;; (jolt.host/runtime-thread name f): a daemon thread of the runtime's own, as the timer is, for
+;; plumbing a library of Jolt's runs for the life of the process (the io poller): it is not one of
+;; the program's threads (jolt.host/user-threads), so a fork-alone is not refused for it. It must
+;; hold no lock while it waits, and its library resets what it owned in a fork's child.
+(def-var! "jolt.host" "runtime-thread"
+  (lambda (name f)
+    (fork-thread/daemon #t (lambda () (*txn* #f) (rdr-default-modes!) (jolt-thread-name-set! (get-thread-id) name) (jolt-invoke f)))
+    jolt-nil))
 ;; the living program threads' names (jolt-thread-name), sorted: what jolt.host/user-threads counts
 (def-var! "jolt.host" "user-thread-names"
   (lambda ()

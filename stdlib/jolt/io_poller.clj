@@ -697,9 +697,7 @@
 (defn- ensure-started-wsapoll! []
   (open-wake-pair!)
   (swap! state assoc :started? true)
-  (doto (Thread. wsapoll-loop "jolt-io-poller")
-    (.setDaemon true)
-    (.start)))
+  (jolt.host/runtime-thread "jolt-io-poller" wsapoll-loop))
 
 ;; -- the main carrier's rounds -------------------------------------------------
 ;; In a program whose fibers run on its one thread (jolt.host/main-carrier-run!), no poller
@@ -780,11 +778,10 @@
             (if (jolt.host/main-carrier?)
               ;; a main-carrier process: no poller thread; its loop runs the rounds (main-io-wait)
               (jolt.host/main-io-wait-set! main-io-wait)
-              ;; a daemon thread, not a future: the poller runs for the life of
-              ;; the process, and a non-daemon thread would keep it from ending
-              (doto (Thread. (fn [] (poller-loop kq)) "jolt-io-poller")
-                (.setDaemon true)
-                (.start)))))
+              ;; a runtime thread, not a future or a program Thread: the poller runs for the
+              ;; life of the process, never keeps it up, and is not a program thread a
+              ;; fork-alone waits out (its child resets the table: after-fork!)
+              (jolt.host/runtime-thread "jolt-io-poller" (fn [] (poller-loop kq))))))
         (finally (ffi/free pfds))))))
 
 ;; -- the wait API --------------------------------------------------------------
