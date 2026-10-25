@@ -559,7 +559,7 @@
 ;; ((cs)fork_alone: the thread mutex and the allocation mutex, and -2 when another Chez
 ;; thread is active), forks, and both processes release them; the child then drops what it did
 ;; not inherit (jolt-after-fork-child!). Answers the pid here, 0 in the child, -1 when the OS
-;; refused.
+;; refused. Its caller holds no lock of the program's: the fork waits on the timer's thunks, which may take one.
 (define jolt-fork-alone-c
   (and (foreign-entry? "(cs)fork_alone") (foreign-procedure "(cs)fork_alone" () iptr)))
 (define (jolt-fork-alone)
@@ -567,33 +567,40 @@
     ((not jolt-fork-alone-c) (error 'jolt.host/fork-alone "this Chez has no (cs)fork_alone"))
     ((fx>? (jolt-user-threads-live) 0) -3)
     (else
-     ;; the timer first: a timer thread firing holds whatever its thunks take, so the fork
-     ;; waits, under timeout-mu, until it is back in its wait (timeout-idle?)
-     (jolt-lock! timeout-mu)
-     (let wait () (when (and timeout-running? (not timeout-idle?)) (jolt-condition-wait timeout-idle-cv timeout-mu) (wait)))
-     (jolt-lock! jolt-user-threads-mu)
-     (jolt-lock! exit-mu)
-     (jolt-lock! live-threads-mutex)
-     (jolt-lock! thread-handles-mutex)
-     ;; the default pool's carriers, outside main-carrier mode: each held under its mu, and
-     ;; the fork made only if every one is idle (in its loop's wait, queue empty: outside every
-     ;; fiber, holding no lock), else -4
-     (let* ((cs (if (and jolt-fiber-pool-started? (not jolt-main-thread) jolt-fiber-carriers)
-                    (vector->list jolt-fiber-carriers) '()))
-            (_ (for-each (lambda (c) (jolt-lock! (jolt-carrier-mu c))) cs))
-            (idle? (for-all (lambda (c) (or (not (jolt-carrier-thread c))
-                                            (and (jolt-carrier-idle? c) (not (jolt-carrier-head c)))))
-                            cs))
-            ;; a program thread started while these were taken: it was counted before it forked
-            (pid (cond ((fx>? jolt-user-threads 0) -3) ((not idle?) -4) (else (jolt-fork-alone-c)))))
-       (for-each (lambda (c) (jolt-unlock! (jolt-carrier-mu c))) (reverse cs))
-       (jolt-unlock! thread-handles-mutex)
-       (jolt-unlock! live-threads-mutex)
-       (jolt-unlock! exit-mu)
-       (jolt-unlock! jolt-user-threads-mu)
+     (let round ()
+       ;; the timer first: a timer thread firing holds whatever its thunks take, so the fork
+       ;; waits until it is back in its wait (timeout-idle?). timeout-mu is a leaf lock (taken
+       ;; under any other, nothing under it: jolt-timer-cancel!), so this wait holds it alone
+       (jolt-lock! timeout-mu)
+       (let wait () (when (and timeout-running? (not timeout-idle?)) (jolt-condition-wait timeout-idle-cv timeout-mu) (wait)))
        (jolt-unlock! timeout-mu)
-       (when (eqv? pid 0) (jolt-after-fork-child!))
-       pid))))
+       (jolt-lock! jolt-user-threads-mu)
+       (jolt-lock! exit-mu)
+       (jolt-lock! live-threads-mutex)
+       (jolt-lock! thread-handles-mutex)
+       ;; the default pool's carriers, outside main-carrier mode: each held under its mu, and
+       ;; the fork made only if every one is idle (in its loop's wait, queue empty: outside every
+       ;; fiber, holding no lock), else -4. Another pool's carrier is Chez's to count: a busy one
+       ;; is active (-2)
+       (let* ((cs (if (and jolt-fiber-pool-started? (not jolt-main-thread) jolt-fiber-carriers)
+                      (vector->list jolt-fiber-carriers) '()))
+              (_ (for-each (lambda (c) (jolt-lock! (jolt-carrier-mu c))) cs))
+              (_ (jolt-lock! timeout-mu))        ; the leaf, last
+              (timer-idle? (or (not timeout-running?) timeout-idle?))
+              (idle? (for-all (lambda (c) (or (not (jolt-carrier-thread c))
+                                              (and (jolt-carrier-idle? c) (not (jolt-carrier-head c)))))
+                              cs))
+              ;; a program thread started while these were taken: it was counted before it forked
+              (pid (cond ((not timer-idle?) #f)
+                         ((fx>? jolt-user-threads 0) -3) ((not idle?) -4) (else (jolt-fork-alone-c)))))
+         (jolt-unlock! timeout-mu)
+         (for-each (lambda (c) (jolt-unlock! (jolt-carrier-mu c))) (reverse cs))
+         (jolt-unlock! thread-handles-mutex)
+         (jolt-unlock! live-threads-mutex)
+         (jolt-unlock! exit-mu)
+         (jolt-unlock! jolt-user-threads-mu)
+         (cond ((not pid) (round))              ; the timer fired between its wait and here: wait again
+               (else (when (eqv? pid 0) (jolt-after-fork-child!)) pid)))))))
 (def-var! "jolt.host" "fork-alone" (lambda () (jolt-fork-alone)))
 (def-var! "jolt.host" "user-threads" (lambda () (jolt-user-threads-live)))
 ;; (jolt.host/runtime-thread name f): a daemon thread of the runtime's own, as the timer is, for
