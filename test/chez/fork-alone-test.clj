@@ -25,16 +25,18 @@
   else, 2 when it threw; or [:refused code]."
   [f]
   (let [pid (jolt.host/fork-alone)]
-    (cond (zero? pid) (exit-now (try (if (true? (f)) 0 1) (catch Throwable _ 2)))
+    (cond (zero? pid) (exit-now (try (if (true? (f)) 0 1) (catch Throwable t (binding [*out* *err*] (println "CHILD THREW" (ex-message t) (pr-str (ex-data t))) (flush)) 2)))
           (neg? pid) [:refused pid]
           :else (wait-exit pid))))
 
 (defn child-works
-  "In the child: a timeout fires, a go block parks and resumes, and a collection runs."
+  "In the child: a collection runs (first: Chez collects on demand only while one thread is
+  active, and the go block below starts the child's carriers), a timeout fires, and a go block
+  parks and resumes."
   []
-  (and (nil? (a/<!! (a/timeout 1)))
-       (= 41 (let [c (a/chan) r (a/go (a/<! c))] (a/>!! c 41) (a/<!! r)))
-       (do (collect!) true)))
+  (and (do (collect!) true)
+       (nil? (a/<!! (a/timeout 1)))
+       (= 41 (let [c (a/chan) r (a/go (a/<! c))] (a/>!! c 41) (a/<!! r)))))
 
 ;; refused beside a thread the program started, while it lives
 (let [go (promise) t (Thread. #(deref go))]
