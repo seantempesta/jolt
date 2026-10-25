@@ -410,7 +410,7 @@
 ;; Otherwise an agent pool thread is never a daemon, whatever thread starts it,
 ;; as clojure.core's pools are not, so the exit waits for it.
 (define (fork-agent-thread thunk)
-  (fork-thread/daemon agent-threads-daemon?
+  (fork-thread/user agent-threads-daemon?
     (lambda () (jolt-thread-name-set! (get-thread-id) "clojure-agent-pool") (thunk))))
 (define solo-pool-keep-alive-ms 60000)     ; Executors.newCachedThreadPool's 60L, SECONDS
 (define (exit-linger-after-task!)
@@ -2316,7 +2316,7 @@
             ;; born with the object's daemon flag; the object is registered as
             ;; the thread's by the parent once the fork returns (below) and by the
             ;; child as its first act, so it is what every way of asking finds
-            (let ((t (fork-thread/daemon (jthread-daemon? st) (lambda ()
+            (let ((t (fork-thread/user (jthread-daemon? st) (lambda ()
                (*txn* #f)                          ; child thread must not inherit parent's txn
                (rdr-default-modes!)                ; and not the reader modes of a read it forked from
                ;; Adopt the Thread object's own interrupt flag, so .interrupt from
@@ -3006,7 +3006,7 @@
                      (and (not (jolt-nil? t)) t)))))
       (if t
           (record-method-dispatch t "start" jolt-nil)
-          (fork-thread/daemon (vector-ref st 16)
+          (fork-thread/user (vector-ref st 16)
             (lambda ()
               (jolt-thread-name-set! (get-thread-id) "pool-worker")   ; no factory named it
               (guard (e (#t (jolt-thread-uncaught! (current-thread-handle) e

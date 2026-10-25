@@ -1650,6 +1650,8 @@
   (when (foreign-entry? "(cs)collect_sweepers")
     ((foreign-procedure "(cs)collect_sweepers" (iptr) iptr) 0))
   (let* ((c (vector-ref jolt-fiber-carriers 0))
+         (_ (set! jolt-user-threads-idle-hook
+              (lambda () (jolt-lock! (jolt-carrier-mu c)) (condition-signal (jolt-carrier-cv c)) (jolt-unlock! (jolt-carrier-mu c)))))
          (box (vector #f #f #f))    ; done? value error
          (f (sa-fiber-spawn
               (lambda ()
@@ -1672,8 +1674,16 @@
                ((and jolt-main-io-wait (jolt-main-io-wait ms)) (#%$event))
                (ms (let ((secs (exact (floor (/ ms 1000)))))
                      (sleep (make-time 'time-duration (min 999999999 (exact (round (* 1000000 (- ms (* 1000 secs)))))) secs))))
+               ;; a thread the program started still lives (a future at work): it may wake a
+               ;; fiber, which lands on this carrier's queue and signals its condition, as the
+               ;; thread's end does (jolt-user-threads-idle-hook), so the loop looks again
+               ((fx>? (jolt-user-threads-live) 0)
+                (jolt-lock! (jolt-carrier-mu c))
+                (unless (or (jolt-carrier-head c) (fx=? 0 jolt-user-threads))
+                  (jolt-condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c)))
+                (jolt-unlock! (jolt-carrier-mu c)))
                (else (error 'jolt-main-carrier
-                            "stuck: the program waits, and nothing is queued, no timer is set and no descriptor is awaited, so nothing can ever wake it")))
+                            "stuck: the program waits, and nothing is queued, no timer is set, no descriptor is awaited and no thread it started lives, so nothing can ever wake it")))
              (loop))))))))
 
 ;; --- the carrier loop and the pool lifecycle (R4 carrier, generalized R5) ----

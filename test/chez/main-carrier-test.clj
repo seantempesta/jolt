@@ -114,7 +114,16 @@
                                           (exit-now (do (kill (getppid) sig) 0))
                                           (and (= :signalled (a/<!! ch)) (= 0 (wait-exit pid))))))))
                     0))
-        ;; last: a take no one can ever answer
+        ;; a thread the program started can still wake a fiber, so a wait on it is not stuck:
+        ;; before, the loop saw no queue, timer or descriptor and raised stuck while the future
+        ;; worked (task jolt.async/the-main-carrier-is-stuck-only-when-no-thread-runs)
+        (check-eq "a promise a working future delivers is waited for, not stuck"
+                  (let [p (promise)] (future (loop [i 0] (if (< i 2000000) (recur (inc i)) (deliver p i)))) (deref p)) 2000000)
+        (check-eq "and one a Thread delivers"
+                  (let [p (promise)] (.start (Thread. #(deliver p :thread))) (deref p)) :thread)
+        (check-eq "a go block's take a future's put answers"
+                  (let [c (a/chan)] (future (a/>!! c :put)) (a/<!! (a/go (a/<! c)))) :put)
+        ;; last: a take no one can ever answer, once every thread the program started has ended
         (a/<!! (a/chan))
         :returned))
     (catch Throwable t (str (ex-message t) " " t))))

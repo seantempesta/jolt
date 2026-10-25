@@ -382,6 +382,28 @@
 (define (fork-thread thunk) (%ls-fork-thread #t 'inherit thunk))
 ;; (fork-thread/daemon d thunk): a thread whose daemon status is D whoever forks it.
 (define (fork-thread/daemon d thunk) (%ls-fork-thread #t d thunk))
+;; The threads the program starts (a Thread, a future's or an agent's pool worker, an
+;; executor's worker), never the runtime's own (carriers, timer, reaper, taps): while one
+;; lives, it may still wake a fiber, so the main carrier is not stuck (jolt-main-carrier-run!).
+;; The last one's end calls jolt-user-threads-idle-hook, so a main carrier waiting on it
+;; looks again.
+(define jolt-user-threads 0)
+(define jolt-user-threads-mu (make-mutex))
+(define jolt-user-threads-idle-hook (lambda () (void)))
+(define (jolt-user-threads-live) (jolt-with-mutex jolt-user-threads-mu jolt-user-threads))
+(define (fork-thread/user d thunk)
+  (jolt-with-mutex jolt-user-threads-mu (set! jolt-user-threads (fx+ jolt-user-threads 1)))
+  (guard (e (#t (jolt-with-mutex jolt-user-threads-mu (set! jolt-user-threads (fx- jolt-user-threads 1))) (raise e)))
+    (fork-thread/daemon d
+      (lambda ()
+        (dynamic-wind
+          (lambda () #f)
+          thunk
+          (lambda ()
+            (when (fx=? 0 (jolt-with-mutex jolt-user-threads-mu
+                            (set! jolt-user-threads (fx- jolt-user-threads 1))
+                            jolt-user-threads))
+              (jolt-user-threads-idle-hook))))))))
 
 ;; A thread that parks in a foreign call and runs no jolt code until something
 ;; wakes it has not made the process multi-threaded, and saying that it has is not
