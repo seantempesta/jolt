@@ -496,21 +496,27 @@
 (define (jolt-fiber-enqueue!/locked c f)
   (if (jolt-carrier-tail c)
       (begin (jolt-fiber-next-set! (jolt-carrier-tail c) f)
-             (jolt-carrier-tail-set! c f))
+             (jolt-carrier-tail-set! c f)
+             #f)
       (begin (condition-signal (jolt-carrier-cv c))
-             ;; a main carrier waiting for readiness waits in the io poller's kevent, not on its
-             ;; condition: a fiber another thread queues (a future's put, ring-chez's acceptor
-             ;; handing on a connection) must end that wait, or it never runs
-             (when (and jolt-main-io-wake jolt-main-thread (not (eqv? (get-thread-id) jolt-main-thread)))
-               (jolt-main-io-wake))
              (jolt-carrier-head-set! c f)
-             (jolt-carrier-tail-set! c f))))
+             (jolt-carrier-tail-set! c f)
+             #t)))
+
+;; After an enqueue that made the queue non-empty (its answer, woke?), with the carrier's mu
+;; released: a main carrier waiting for readiness waits in the io poller's kevent, not on its
+;; condition, so a fiber another thread queued (a future's put, ring-chez's acceptor handing on a
+;; connection) ends that wait through the poller's wake pipe, or it never runs. Outside the mu:
+;; the wake takes the poller's lock, which the park path holds while it takes the mu.
+(define (jolt-main-wake-after! woke?)
+  (when (and woke? jolt-main-io-wake jolt-main-thread (not (eqv? (get-thread-id) jolt-main-thread)))
+    (jolt-main-io-wake)))
 
 (define (jolt-fiber-enqueue! c f)
-  (begin
-    (jolt-lock! (jolt-carrier-mu c))
-    (jolt-fiber-enqueue!/locked c f)
-    (jolt-unlock! (jolt-carrier-mu c))))
+  (jolt-lock! (jolt-carrier-mu c))
+  (let ((woke? (jolt-fiber-enqueue!/locked c f)))
+    (jolt-unlock! (jolt-carrier-mu c))
+    (jolt-main-wake-after! woke?)))
 
 (define (jolt-fiber-dequeue! c)
   (begin
@@ -692,10 +698,11 @@
 (define (sa-fiber-resume f)
   (let ((c (jolt-fiber-carrier f)))
     (jolt-lock! (jolt-carrier-mu c))
-    (when (eq? (jolt-fiber-state f) 'parked)
-      (jolt-fiber-state-set! f 'ready)
-      (jolt-fiber-enqueue!/locked c f))
-    (jolt-unlock! (jolt-carrier-mu c))))
+    (let ((woke? (and (eq? (jolt-fiber-state f) 'parked)
+                      (begin (jolt-fiber-state-set! f 'ready)
+                             (jolt-fiber-enqueue!/locked c f)))))
+      (jolt-unlock! (jolt-carrier-mu c))
+      (jolt-main-wake-after! woke?))))
 
 ;; (sa-fiber-spawn thunk) -> fiber. Create a fiber running THUNK, place it
 ;; round-robin on a carrier, and make it runnable; return the record.
@@ -1117,12 +1124,13 @@
 (define (jolt-fiber-iwait-wake! f)
   (let* ((c (jolt-fiber-carrier f)) (mu (jolt-carrier-mu c)))
     (jolt-lock! mu)
-    (when (and (eq? (jolt-fiber-state f) 'parked)
-               (jolt-fiber-iwait f)
-               (eq? (jolt-fiber-parked-on f) (jolt-fiber-iwait f)))
-      (jolt-fiber-state-set! f 'ready)
-      (jolt-fiber-enqueue!/locked c f))
-    (jolt-unlock! mu)))
+    (let ((woke? (and (eq? (jolt-fiber-state f) 'parked)
+                      (jolt-fiber-iwait f)
+                      (eq? (jolt-fiber-parked-on f) (jolt-fiber-iwait f))
+                      (begin (jolt-fiber-state-set! f 'ready)
+                             (jolt-fiber-enqueue!/locked c f)))))
+      (jolt-unlock! mu)
+      (jolt-main-wake-after! woke?))))
 
 (set! jolt-interrupt-owner-wake jolt-fiber-iwait-wake!)
 
@@ -1676,8 +1684,14 @@
                ;; now: Chez runs a signal's handler at its next event check, and the loop would
                ;; otherwise go back into kevent before one came
                ((and jolt-main-io-wait (jolt-main-io-wait ms)) (#%$event))
-               (ms (let ((secs (exact (floor (/ ms 1000)))))
-                     (sleep (make-time 'time-duration (min 999999999 (exact (round (* 1000000 (- ms (* 1000 secs)))))) secs))))
+               ;; up to the next timer, on the carrier's condition: a fiber another thread queues
+               ;; signals it (jolt-fiber-enqueue!/locked), so it runs then, not at the timer
+               (ms (let* ((secs (exact (floor (/ ms 1000))))
+                          (until (make-time 'time-duration (min 999999999 (exact (round (* 1000000 (- ms (* 1000 secs)))))) secs)))
+                     (jolt-lock! (jolt-carrier-mu c))
+                     (unless (jolt-carrier-head c)
+                       (jolt-condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c) until))
+                     (jolt-unlock! (jolt-carrier-mu c))))
                (else (error 'jolt-main-carrier
                             "stuck: the program waits, and nothing is queued, no timer is set and no descriptor is awaited, so nothing can ever wake it")))
              (loop))))))))
