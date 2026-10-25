@@ -38,6 +38,11 @@
        (nil? (a/<!! (a/timeout 1)))
        (= 41 (let [c (a/chan) r (a/go (a/<! c))] (a/>!! c 41) (a/<!! r)))))
 
+;; first, before anything has collected: the shutdown watcher sits in sigwait, a collect-safe call,
+;; and counts as active until something converts it (Chez's native_in_native); the fork converts
+;; it, so this goes through rather than refused (-2) until the first collection
+(check-eq "a fork before the first collection, beside the shutdown watcher, works" (forked (fn [] true)) 0)
+
 ;; refused beside a thread the program started, while it lives
 (let [go (promise) t (Thread. #(deref go))]
   (.start t)
@@ -61,6 +66,25 @@
   (let [ts (doall (for [ms [0 1 2]] (a/timeout ms)))]
     (check-eq (str "fork " i " beside idle carriers: the child works") (forked child-works) 0)
     (doseq [t ts] (a/<!! t))))
+;; the io poller (a runtime thread, jolt.host/runtime-thread) runs once a fiber waits on a socket:
+;; in kevent it holds no lock, so forks beside it go through, and each child, whose poller the
+;; fork left behind (after-fork! resets the table), starts its own and reads a socket from a fiber
+(defn socket-read
+  "A fiber's read of one byte a socket peer writes, true when it came (the io poller wakes it)."
+  []
+  (let [ss (java.net.ServerSocket. 0 50 (java.net.InetAddress/getLoopbackAddress))
+        c (java.net.Socket. "127.0.0.1" (.getLocalPort ss)) s (.accept ss)
+        o (binding [a/*go-backend* :fiber] (a/go (.read (.getInputStream c) (byte-array 1) 0 1)))]
+    (Thread/sleep 5)
+    (.write (.getOutputStream s) (byte-array [120]) 0 1)
+    (let [n (a/<!! o)] (.close c) (.close s) (.close ss) (= 1 n))))
+(check-eq "a fiber reads a socket" (socket-read) true)
+(check-eq "the io poller runs, and is not a program thread"
+          [(boolean (some #{"jolt-io-poller"} (map #(.getName ^Thread %) (keys (Thread/getAllStackTraces))))) (jolt.host/user-threads)]
+          [true 0])
+(dotimes [i 20]
+  (check-eq (str "fork " i " beside the io poller: the child works and reads a socket")
+            (forked #(and (child-works) (socket-read))) 0))
 ;; a carrier running a go block may hold any lock of the program's: refused (-4)
 (let [stop (atom false) started (promise)
       busy (a/go (deliver started true) (loop [] (when-not @stop (recur))) :stopped)]
