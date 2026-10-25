@@ -1672,8 +1672,18 @@
                ;; now: Chez runs a signal's handler at its next event check, and the loop would
                ;; otherwise go back into kevent before one came
                ((and jolt-main-io-wait (jolt-main-io-wait ms)) (#%$event))
-               (ms (let ((secs (exact (floor (/ ms 1000)))))
-                     (sleep (make-time 'time-duration (min 999999999 (exact (round (* 1000000 (- ms (* 1000 secs)))))) secs))))
+               (ms (let* ((secs (exact (floor (/ ms 1000))))
+                          (until (make-time 'time-duration (min 999999999 (exact (round (* 1000000 (- ms (* 1000 secs)))))) secs)))
+                     ;; a thread the program started may wake a fiber before the timer is due: wait
+                     ;; on this carrier's condition, which its enqueue signals, up to the timer;
+                     ;; with none, nothing but the timer can come
+                     (if (fx>? (jolt-user-threads-live) 0)
+                         (begin
+                           (jolt-lock! (jolt-carrier-mu c))
+                           (unless (jolt-carrier-head c)
+                             (jolt-condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c) until))
+                           (jolt-unlock! (jolt-carrier-mu c)))
+                         (sleep until))))
                ;; a thread the program started still lives (a future at work): it may wake a
                ;; fiber, which lands on this carrier's queue and signals its condition, as the
                ;; thread's end does (jolt-user-threads-idle-hook), so the loop looks again
