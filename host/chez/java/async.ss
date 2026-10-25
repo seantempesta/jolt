@@ -822,15 +822,25 @@
 ;; Everything due, removed from the list, newest deadline last. Called with
 ;; timeout-mu held; answers '() after waiting when nothing is due yet, so the
 ;; caller's loop is "collect, release, run, repeat".
+;; timeout-idle?: the timer thread is in its wait under timeout-mu (between its fires, holding no
+;; lock but that one, which the wait releases), told on timeout-idle-cv: a fork waits for it
+;; (jolt-fork-alone), since a timer firing runs thunks that take the program's locks
+(define timeout-idle? #f)
+(define timeout-idle-cv (make-condition))
+(define (timeout-wait! . until)
+  (set! timeout-idle? #t)
+  (condition-broadcast timeout-idle-cv)
+  (if (null? until) (jolt-condition-wait timeout-cv timeout-mu) (jolt-condition-wait timeout-cv timeout-mu (car until)))
+  (set! timeout-idle? #f))
 (define (timeout-collect-due!)
   (let ((due (timeout-take-due!/locked)))
     (if (pair? due)
         due
         (let ((m (theap-min)))
           (if (not m)
-              (jolt-condition-wait timeout-cv timeout-mu)
+              (timeout-wait!)
               (unless (mono-due? (car m))
-                (jolt-condition-wait timeout-cv timeout-mu (mono-duration-until (car m)))))
+                (timeout-wait! (mono-duration-until (car m)))))
           ;; Either deadline or signal, the answer is the same: come back and re-read
           ;; the min. A spurious wake costs one empty trip.
           '()))))

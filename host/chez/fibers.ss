@@ -346,8 +346,11 @@
           ;; default pool. live: how many fibers spawned onto it have not
           ;; finished, counted under mu for a pool carrier only, so a shut-down
           ;; pool's carrier knows when it may stop (see jolt-fiber-pool-make).
-          pool (mutable live))
-  (nongenerative jolt-carrier-v7))
+          pool (mutable live)
+          ;; idle?: in its loop's wait for work, queue empty, under mu (set before the wait, cleared
+          ;; after it): a carrier so is outside every fiber and holds no lock (jolt-fork-alone)
+          (mutable idle?))
+  (nongenerative jolt-carrier-v8))
 
 ;; (jolt-fiber-bump-sm-parks! f) / (jolt-fiber-bump-chan-parks! f) — called by the
 ;; parking fiber, on its own carrier's field, so no two threads touch one field.
@@ -445,7 +448,7 @@
         (do ((i 0 (fx+ i 1))) ((fx=? i n))
           (vector-set! v i
             (make-jolt-carrier (make-mutex) (make-condition) #f #f #f
-                               (make-jolt-dslice #f #f #f) #f #f 0 0 0 0 #f 0)))
+                               (make-jolt-dslice #f #f #f) #f #f 0 0 0 0 #f 0 #f)))
         (set! jolt-fiber-carriers v)))
     (jolt-unlock! jolt-fiber-rr-mu)))
 
@@ -1720,7 +1723,9 @@
     (cond
       ((jolt-carrier-stop? c) (jolt-unlock! (jolt-carrier-mu c)) (void))
       ((jolt-carrier-head c) (jolt-unlock! (jolt-carrier-mu c)) (loop))
-      (else (jolt-condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c))
+      (else (jolt-carrier-idle?-set! c #t)
+            (jolt-condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c))
+            (jolt-carrier-idle?-set! c #f)
             (jolt-unlock! (jolt-carrier-mu c))
             (loop)))))
 
@@ -1811,7 +1816,9 @@
       ((jolt-carrier-head c) (jolt-unlock! (jolt-carrier-mu c)) (loop))
       ((and (jolt-carrier-stop? c) (fx=? 0 (jolt-carrier-live c)))
        (jolt-unlock! (jolt-carrier-mu c)) (void))
-      (else (jolt-condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c))
+      (else (jolt-carrier-idle?-set! c #t)
+            (jolt-condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c))
+            (jolt-carrier-idle?-set! c #f)
             (jolt-unlock! (jolt-carrier-mu c))
             (loop)))))
 
@@ -1825,7 +1832,7 @@
     (do ((i 0 (fx+ i 1))) ((fx=? i n))
       (vector-set! v i
         (make-jolt-carrier (make-mutex) (make-condition) #f #f #f
-                           (make-jolt-dslice #f #f #f) #f #f 0 0 0 0 p 0)))
+                           (make-jolt-dslice #f #f #f) #f #f 0 0 0 0 p 0 #f)))
     (jolt-pool-carriers-set! p v)
     (do ((i 0 (fx+ i 1))) ((fx=? i n))
       (let ((c (vector-ref v i)))

@@ -54,6 +54,21 @@
     (check-eq (str "fork " i ": the child's timers, go blocks and collections work") (forked child-works) 0)
     (doseq [t ts] (a/<!! t))))
 
+;; the carriers started (a go block ran): idle, each in its loop's wait with its queue empty, they
+;; hold no lock, so 20 more forks with timers firing go through, and every child works
+(check-eq "a go block runs on the carriers" (a/<!! (a/go 7)) 7)
+(dotimes [i 20]
+  (let [ts (doall (for [ms [0 1 2]] (a/timeout ms)))]
+    (check-eq (str "fork " i " beside idle carriers: the child works") (forked child-works) 0)
+    (doseq [t ts] (a/<!! t))))
+;; a carrier running a go block may hold any lock of the program's: refused (-4)
+(let [stop (atom false) started (promise)
+      busy (a/go (deliver started true) (loop [] (when-not @stop (recur))) :stopped)]
+  @started
+  (check-eq "a fork beside a busy carrier is refused (-4)" (forked (constantly true)) [:refused -4])
+  (reset! stop true)
+  (check-eq "the busy go block ends" (a/<!! busy) :stopped))
+
 (if (empty? @failures)
   (do (println "FORK-ALONE-TEST OK") (flush) (System/exit 0))
   (do (doseq [f @failures] (println "FAIL:" f)) (flush) (System/exit 1)))
