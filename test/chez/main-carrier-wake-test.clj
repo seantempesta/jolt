@@ -29,12 +29,14 @@
                      (future (Thread/sleep 20) (a/>!! ch 7))
                      (let [r (a/<!! woken)] (.write out (byte-array [1]) 0 1) (a/<!! idle) r)))
             ;; nothing awaited, a timer 30 s out: the go block runs when the future wakes it,
-            ;; before the timer (priority: the timer's channel first, so a wake the timer
-            ;; carried would lose to it)
+            ;; not when the timer ends the loop's wait (the loop runs its queue before its timers,
+            ;; so only when it ran tells the two apart: 15 s is a margin no load reaches against a
+            ;; 20 ms wake)
             r2 (do (reset! at "a future wakes a go block while the loop waits up to a timer")
-                   (let [ch (a/chan) woken (fiber-go #(a/<! ch)) t (a/timeout 30000)]
+                   (let [ch (a/chan) woken (fiber-go #(a/<! ch)) t (a/timeout 30000) t0 (System/nanoTime)]
                      (future (Thread/sleep 20) (a/>!! ch 8))
-                     (let [[v p] (a/alts!! [t woken] :priority true)] (if (= p woken) v :timer-first))))
+                     (let [v (a/<!! woken) ms (/ (- (System/nanoTime) t0) 1e6)]
+                       (if (< ms 15000) v [:ran-at-the-timer ms]))))
             ;; the lock order: futures resume fibers (the carrier's mutex, then the wake) while
             ;; the main fiber parks on a socket again and again (the poller's lock, then the mutex)
             r3 (do (reset! at "eight futures resume fibers while the main fiber parks on a socket")
