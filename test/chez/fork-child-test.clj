@@ -50,6 +50,19 @@
           (in-child #(not-any? (fn [t] (re-find #"jolt-carrier" (.getName ^Thread t))) (keys (Thread/getAllStackTraces))))
           0)
 
+(require '[jolt.async.remote :as remote])
+(defn remote-echo
+  "A value through a fresh jolt.async.remote pair with fiber pumps, whose readiness the poller
+  reports: true when it comes back."
+  []
+  (let [[fa fb] (remote/socketpair) ea (remote/open fa {:pump :fiber}) eb (remote/open fb {:pump :fiber})]
+    (a/>!! (:out ea) 7)
+    (let [v (a/<!! (:in eb))] (remote/close! ea) (remote/close! eb) (= 7 v))))
+
+(check-eq "the parent's poller runs (fiber pumps on a socket)" (remote-echo) true)
+(check-eq "a child of a process whose poller ran waits on a socket: its table starts afresh, not on the parent's dead kqueue"
+          (in-child remote-echo) 0)
+
 (defn in-child-now
   "The exit status of a child that runs (f) on its one thread, no deadline: 0 true, 1 else."
   [f]

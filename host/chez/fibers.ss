@@ -1633,7 +1633,7 @@
 ;; always has a wake source, so it never raises that: it waits. Answers the program's value,
 ;; or rethrows what it threw.
 (define jolt-main-io-wait #f)    ; (timeout-ms | #f) -> #t waited, #f nothing awaited; jolt.io-poller's
-(define jolt-main-after-fork #f) ; jolt.io-poller's reset of its table in a forked child
+(define jolt-io-after-fork #f)   ; jolt.io-poller's reset of its table in a forked child (any mode)
 
 (define (jolt-main-carrier-run! thunk)
   (when jolt-fiber-pool-started?

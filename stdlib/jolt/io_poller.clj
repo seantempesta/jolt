@@ -745,13 +745,16 @@
       (swap! state update :signals (fnil into #{}) sigs)
       true)))
 
-(defn- main-after-fork!
+(defn- after-fork!
   "In a forked child: the kqueue is not inherited, so the table starts afresh (the next wait
   makes a new one); the parent's pipe descriptors are closed."
   []
   (doseq [fd (:pipe @state)] (c-close fd))
   (vreset! main-deletes #{})
   (reset! state {:fds {} :pending {} :pipe nil :kq nil :started? false :cancelled #{} :threads {}}))
+
+;; every forked child resets the table (jolt-after-fork-child!): its kqueue and poller thread are the parent's
+(jolt.host/io-after-fork-set! after-fork!)
 
 (defn- ensure-started! []
   ;; under pm. One poller thread per process, started on the first fiber wait.
@@ -776,7 +779,7 @@
               (ep-ctl! kq EPOLL-ADD r :read))
             (if (jolt.host/main-carrier?)
               ;; a main-carrier process: no poller thread; its loop runs the rounds (main-io-wait)
-              (jolt.host/main-io-wait-set! main-io-wait main-after-fork!)
+              (jolt.host/main-io-wait-set! main-io-wait)
               ;; a daemon thread, not a future: the poller runs for the life of
               ;; the process, and a non-daemon thread would keep it from ending
               (doto (Thread. (fn [] (poller-loop kq)) "jolt-io-poller")

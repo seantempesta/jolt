@@ -540,20 +540,24 @@
         (let ((old (sa-foreign-alloc 128)))
           (c-pthread-sigmask jolt-sig-setmask-how jolt-empty-sigset old)
           (sa-foreign-free old))))
-    ;; the poller's kqueue is not inherited by fork: its table starts afresh
-    (when (and jolt-main-thread jolt-main-after-fork) (jolt-main-after-fork))))
+    ;; the poller's kqueue and thread are not inherited by fork: its table starts afresh, and
+    ;; the child's first wait sets it up for the child (a thread, or a main carrier's rounds).
+    ;; Without it, every child of a process whose poller had run waited on a dead kqueue
+    (when jolt-io-after-fork (jolt-io-after-fork))))
 (def-var! "jolt.host" "after-fork-child!" (lambda () (jolt-after-fork-child!) jolt-nil))
 
 ;; The main carrier (fibers.ss): this process's fibers, timers and I/O on its one thread.
 (def-var! "jolt.host" "main-carrier-run!" (lambda (f) (jolt-main-carrier-run! (lambda () (jolt-invoke f)))))
 (def-var! "jolt.host" "main-carrier?" (lambda () (if jolt-main-thread #t #f)))
 ;; jolt.io-poller's half: (f timeout-ms-or-nil) waits for readiness on this thread and
-;; answers true, or false when no descriptor is awaited; after-fork, its reset in a child
+;; answers true, or false when no descriptor is awaited
 (def-var! "jolt.host" "main-io-wait-set!"
-  (lambda (f after-fork)
+  (lambda (f)
     (set! jolt-main-io-wait (lambda (ms) (jolt-truthy? (jolt-invoke f (if ms ms jolt-nil)))))
-    (set! jolt-main-after-fork (lambda () (jolt-invoke after-fork)))
     jolt-nil))
+;; jolt.io-poller's reset of its table in a forked child, registered when it loads
+(def-var! "jolt.host" "io-after-fork-set!"
+  (lambda (f) (set! jolt-io-after-fork (lambda () (jolt-invoke f))) jolt-nil))
 
 ;; (jolt.host/ticks) -> the engine ticks the running fiber, else this thread, has run
 ;; (fibers.ss jolt-ticks: the count the timer keeps). The cost of a body is the
