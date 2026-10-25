@@ -391,16 +391,20 @@
 (define jolt-user-threads-mu (make-mutex))
 (define jolt-user-threads-idle-hook (lambda () (void)))
 (define (jolt-user-threads-live) (jolt-with-mutex jolt-user-threads-mu jolt-user-threads))
+;; the living ones' thread ids, so they can be named (jolt.host/user-thread-names): a future's
+;; or a pool's worker has no Thread object, so getAllStackTraces cannot list it
+(define jolt-user-thread-ids (make-eqv-hashtable))
 (define (fork-thread/user d thunk)
   (jolt-with-mutex jolt-user-threads-mu (set! jolt-user-threads (fx+ jolt-user-threads 1)))
   (guard (e (#t (jolt-with-mutex jolt-user-threads-mu (set! jolt-user-threads (fx- jolt-user-threads 1))) (raise e)))
     (fork-thread/daemon d
       (lambda ()
         (dynamic-wind
-          (lambda () #f)
+          (lambda () (jolt-with-mutex jolt-user-threads-mu (hashtable-set! jolt-user-thread-ids (get-thread-id) #t)))
           thunk
           (lambda ()
             (when (fx=? 0 (jolt-with-mutex jolt-user-threads-mu
+                            (hashtable-delete! jolt-user-thread-ids (get-thread-id))
                             (set! jolt-user-threads (fx- jolt-user-threads 1))
                             jolt-user-threads))
               (jolt-user-threads-idle-hook))))))))

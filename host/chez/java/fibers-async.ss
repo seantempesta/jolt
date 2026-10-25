@@ -596,6 +596,11 @@
        pid))))
 (def-var! "jolt.host" "fork-alone" (lambda () (jolt-fork-alone)))
 (def-var! "jolt.host" "user-threads" (lambda () (jolt-user-threads-live)))
+;; the living program threads' names (jolt-thread-name), sorted: what jolt.host/user-threads counts
+(def-var! "jolt.host" "user-thread-names"
+  (lambda ()
+    (let ((ids (jolt-with-mutex jolt-user-threads-mu (vector->list (hashtable-keys jolt-user-thread-ids)))))
+      (apply jolt-vector (list-sort string<? (map jolt-thread-name ids))))))
 
 ;; The main carrier (fibers.ss): this process's fibers, timers and I/O on its one thread.
 (def-var! "jolt.host" "main-carrier-run!" (lambda (f) (jolt-main-carrier-run! (lambda () (jolt-invoke f)))))
