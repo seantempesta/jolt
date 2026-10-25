@@ -376,6 +376,7 @@ fibers:
 	@$(CHEZ) --script test/chez/async-io-thread-test.ss
 	@bin/jolt run test/chez/async-callback-test.clj
 	@bin/jolt run test/chez/fork-child-test.clj
+	@bin/jolt run test/chez/main-carrier-test.clj
 	@bin/jolt run test/chez/nested-budget-test.clj
 	@bin/jolt run test/chez/process-fiber-reap-test.clj
 

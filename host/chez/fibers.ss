@@ -1618,6 +1618,59 @@
   (jolt-fiber-ensure-carriers!)
   (jolt-fiber-drain! (vector-ref jolt-fiber-carriers 0)))
 
+;; --- the main carrier: a program and its fibers on its one thread -------------
+;; (jolt-main-carrier-run! thunk) runs thunk as a fiber on carrier 0 and drives carrier 0
+;; from the calling thread, here, until it finishes: no carrier, timer or poller thread is
+;; ever started. Every wait the program makes is then a fiber's park, and this one loop is
+;; the scheduler beneath every fiber of the process, at one base, as an event loop is
+;; (ClojureScript's core.async on its one thread). Due timers run here (async.ss,
+;; jolt-timers-run-due!), and when nothing can run the loop waits for readiness on this
+;; thread (jolt-main-io-wait, jolt.io-poller's) or sleeps until the next deadline. The
+;; process stays one OS thread, so it forks safely with its fibers mid-flight: no other
+;; thread exists to hold a lock at the fork. A loop with nothing queued, no timer and no
+;; descriptor awaited while the program has not finished can never move again: it raises
+;; instead of hanging. Answers the program's value, or rethrows what it threw.
+(define jolt-main-io-wait #f)    ; (timeout-ms | #f) -> #t waited, #f nothing awaited; jolt.io-poller's
+(define jolt-main-after-fork #f) ; jolt.io-poller's reset of its table in a forked child
+
+(define (jolt-main-carrier-run! thunk)
+  (when jolt-fiber-pool-started?
+    (error 'jolt-main-carrier-run! "fibers already run on carrier threads: call it before the first fiber"))
+  (jolt-fiber-carrier-count-set! 1)
+  (set! jolt-fiber-pool-started? #t)
+  (jolt-fiber-ensure-carriers!)
+  (set! jolt-main-thread (get-thread-id))
+  ;; physics: a process that forks must never start Chez's parallel-collector sweepers (a
+  ;; child of one hangs or faults in its collections). Where this Chez can fix the pool
+  ;; (chez-patches/0008-fixed-sweeper-pool), it is fixed at none; a stock Chez can still
+  ;; start them beside the runtime's own watcher thread (measured: 1-2 faulting runs in 10 of
+  ;; test/chez/main-carrier-test.clj on stock Chez 10, none in 20 with the pool fixed).
+  (when (foreign-entry? "(cs)collect_sweepers")
+    ((foreign-procedure "(cs)collect_sweepers" (iptr) iptr) 0))
+  (let* ((c (vector-ref jolt-fiber-carriers 0))
+         (box (vector #f #f #f))    ; done? value error
+         (f (sa-fiber-spawn
+              (lambda ()
+                (guard (e (#t (vector-set! box 2 e) (vector-set! box 0 #t)))
+                  (vector-set! box 1 (thunk))
+                  (vector-set! box 0 #t))))))
+    (let loop ()
+      (jolt-fiber-drain! c)
+      (let* ((fired (jolt-timers-run-due!)) (next (cdr fired)))
+        (cond
+          ((vector-ref box 0)
+           (if (vector-ref box 2) (raise (vector-ref box 2)) (vector-ref box 1)))
+          ((or (car fired) (jolt-carrier-head c)) (loop))
+          (else
+           (let ((ms (and next (max 0 (mono-ms-until next)))))
+             (cond
+               ((and jolt-main-io-wait (jolt-main-io-wait ms)) (void))
+               (ms (let ((secs (exact (floor (/ ms 1000)))))
+                     (sleep (make-time 'time-duration (min 999999999 (exact (round (* 1000000 (- ms (* 1000 secs)))))) secs))))
+               (else (error 'jolt-main-carrier
+                            "stuck: the program waits, and nothing is queued, no timer is set and no descriptor is awaited, so nothing can ever wake it")))
+             (loop))))))))
+
 ;; --- the carrier loop and the pool lifecycle (R4 carrier, generalized R5) ----
 ;; R3 found that sa-fiber-run-all is a ONE-SHOT drain, not a scheduler: a
 ;; cross-thread wake lands a fiber on the queue after the drain returned and

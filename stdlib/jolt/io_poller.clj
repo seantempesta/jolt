@@ -368,7 +368,10 @@
 ;; failed, which is a different thing from an empty list and poller-loop treats it
 ;; as one: empty means the kernel processed the changelist and reported nothing
 ;; usable, nil means it may never have seen it.
-(defn- poller-round [kq to-delete]
+(declare timespec ceil-long)
+(defn- poller-round
+  ([kq to-delete] (poller-round kq to-delete nil))
+  ([kq to-delete timeout-ms]
   ;; Read AND clear :pending in ONE critical section. As two — read, then clear —
   ;; a registration landing in between was erased without ever being applied to
   ;; the kqueue/epoll set, so that fd's readiness was never reported and the fiber
@@ -441,8 +444,10 @@
         (swap! waits inc)
         (let [evbuf (ffi/alloc (if macos? (* 256 KEVENT-SIZE) (* 256 EPOLL-EVENT-SIZE)))]
           (try
-            (let [n (if macos? (c-kevent kq (or chbuf ffi/null) nch evbuf 256 ffi/null)
-                                (c-epoll-wait kq evbuf 256 -1))]
+            (let [ts (when (and macos? timeout-ms) (timespec timeout-ms))
+                  n (try (if macos? (c-kevent kq (or chbuf ffi/null) nch evbuf 256 (or ts ffi/null))
+                                    (c-epoll-wait kq evbuf 256 (if timeout-ms (min (ceil-long timeout-ms) 2147483647) -1)))
+                         (finally (when ts (ffi/free ts))))]
               (if (neg? n)
                   ;; The wait FAILED, and :pending was drained and cleared under pm
                   ;; before the call — so without this the registrations that were in
@@ -481,7 +486,7 @@
                                  (into acc (map (fn [f] [fd f]) (ev-filts evbuf i))))))
                       acc))))
             (finally (ffi/free evbuf))))
-        (finally (when chbuf (ffi/free chbuf)))))))
+        (finally (when chbuf (ffi/free chbuf))))))))
 
 (defn- process-events! [evs]
   ;; under pm: for each (fd, filter) that fired, mark THAT filter ready, collect +
@@ -688,6 +693,37 @@
     (.setDaemon true)
     (.start)))
 
+;; -- the main carrier's rounds -------------------------------------------------
+;; In a program whose fibers run on its one thread (jolt.host/main-carrier-run!), no poller
+;; thread exists: that thread's loop (fibers.ss, jolt-main-carrier-run!) calls main-io-wait
+;; when nothing else can run. It runs one round here, waiting at most timeout-ms (nil: until
+;; a descriptor is ready), and resumes the woken fibers; it answers false at once when no
+;; fiber waits on any descriptor, so the loop knows nothing here can end its wait.
+(def ^:private main-deletes (volatile! #{}))
+
+(defn- awaited? [st]
+  (or (seq (:pending st))
+      (some (fn [[_ fm]] (some (fn [[_ e]] (seq (:waiters e))) fm)) (:fds st))))
+
+(defn- main-io-wait [timeout-ms]
+  (if-not (awaited? @state)
+    false
+    (let [evs (poller-round (:kq @state) @main-deletes timeout-ms)]
+      (cond (nil? evs) nil
+            (empty? evs) (vreset! main-deletes #{})
+            :else (let [[woken nd] (process-events! evs)]
+                    (vreset! main-deletes nd)
+                    (doseq [f woken] (jolt.host/fiber-resume f))))
+      true)))
+
+(defn- main-after-fork!
+  "In a forked child: the kqueue is not inherited, so the table starts afresh (the next wait
+  makes a new one); the parent's pipe descriptors are closed."
+  []
+  (doseq [fd (:pipe @state)] (c-close fd))
+  (vreset! main-deletes #{})
+  (reset! state {:fds {} :pending {} :pipe nil :kq nil :started? false :cancelled #{} :threads {}}))
+
 (defn- ensure-started! []
   ;; under pm. One poller thread per process, started on the first fiber wait.
   (cond
@@ -709,11 +745,14 @@
                   (c-kevent kq ch 1 ffi/null 0 ffi/null)
                   (finally (ffi/free ch))))
               (ep-ctl! kq EPOLL-ADD r :read))
-            ;; a daemon thread, not a future: the poller runs for the life of
-            ;; the process, and a non-daemon thread would keep it from ending
-            (doto (Thread. (fn [] (poller-loop kq)) "jolt-io-poller")
-              (.setDaemon true)
-              (.start))))
+            (if (jolt.host/main-carrier?)
+              ;; a main-carrier process: no poller thread; its loop runs the rounds (main-io-wait)
+              (jolt.host/main-io-wait-set! main-io-wait main-after-fork!)
+              ;; a daemon thread, not a future: the poller runs for the life of
+              ;; the process, and a non-daemon thread would keep it from ending
+              (doto (Thread. (fn [] (poller-loop kq)) "jolt-io-poller")
+                (.setDaemon true)
+                (.start)))))
         (finally (ffi/free pfds))))))
 
 ;; -- the wait API --------------------------------------------------------------
@@ -736,6 +775,13 @@
 ;; A positive time left, rounded up to a whole unit, for a syscall that takes one:
 ;; rounded down, the last wait ends short of the deadline and goes round again.
 (defn- ceil-long [x] (let [q (long (quot x 1))] (if (> x q) (inc q) q)))
+(defn- timespec
+  "A struct timespec of ms (exact or fractional) from now, for kevent's timeout: the caller frees it."
+  [ms]
+  (let [ts (ffi/alloc 16) ns (ceil-long (* (max 0 ms) 1000000))]
+    (ffi/write ts :int64 (quot ns 1000000000) 0)
+    (ffi/write ts :int64 (rem ns 1000000000) 8)
+    ts))
 
 ;; (wait-ready fd filt deadline-ms) is the same wait bounded by a deadline on
 ;; clock-ms, answering :timeout when the deadline passed first and nil otherwise

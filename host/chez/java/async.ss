@@ -846,12 +846,39 @@
     (jolt-lock! timeout-mu)
     (when (timeout-insert! e)
       (condition-signal timeout-cv))
-    (unless timeout-running?
+    ;; a main-carrier process runs its timers in its loop (jolt-timers-run-due!), not on a thread
+    (unless (or timeout-running? jolt-main-thread)
       (set! timeout-running? #t)
       ;; a runtime thread: never keeps the process up
       (fork-thread/daemon #t (lambda () (jolt-thread-name-set! (get-thread-id) "jolt-timer") (timeout-thread))))
     (jolt-unlock! timeout-mu)
     e))
+
+;; The thread a main-carrier program runs on (fibers.ss, jolt-main-carrier-run!), #f
+;; otherwise: its timers run in its loop, so no timer thread starts.
+(define jolt-main-thread #f)
+
+;; The main carrier's half of the timer (fibers.ss, jolt-main-carrier-run!'s loop): run every deadline
+;; already due on the calling thread, and answer (fired? . next): whether any ran, and the
+;; earliest deadline still pending (mono millis) or #f. The same heap and cancel discipline as timeout-thread's, without its wait.
+(define (jolt-timers-run-due!)
+  (let ((due (jolt-with-mutex timeout-mu
+               (let collect ((acc '()))
+                 (let ((m (theap-min)))
+                   (cond
+                     ((and m (not (cdr m)))
+                      (theap-pop-min!) (set! timeout-heap-dead (fx- timeout-heap-dead 1)) (collect acc))
+                     ((and m (mono-due? (car m)))
+                      (let* ((e (theap-pop-min!)) (thunk (cdr e))) (set-cdr! e #f) (collect (cons thunk acc))))
+                     (else (reverse acc))))))))
+    (for-each (lambda (fire) (guard (e (#t #f)) (fire))) due)
+    (cons (pair? due)
+          (jolt-with-mutex timeout-mu
+            (let next ()
+              (let ((m (theap-min)))
+                (cond ((and m (not (cdr m))) (theap-pop-min!) (set! timeout-heap-dead (fx- timeout-heap-dead 1)) (next))
+                      (m (car m))
+                      (else #f))))))))
 
 ;; (jolt-timer-cancel! handle) — drop a pending deadline before it fires, so the
 ;; heap lets go of its thunk now rather than at the deadline. #t when it was still
