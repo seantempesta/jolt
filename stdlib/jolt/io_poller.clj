@@ -778,8 +778,9 @@
                   (finally (ffi/free ch))))
               (ep-ctl! kq EPOLL-ADD r :read))
             (if (jolt.host/main-carrier?)
-              ;; a main-carrier process: no poller thread; its loop runs the rounds (main-io-wait)
-              (jolt.host/main-io-wait-set! main-io-wait)
+              ;; a main-carrier process: no poller thread; its loop runs the rounds (main-io-wait),
+              ;; and a fiber another thread queues ends the round through the wake pipe
+              (jolt.host/main-io-wait-set! main-io-wait (fn [] (locking pm (pipe-write!))))
               ;; a daemon thread, not a future: the poller runs for the life of
               ;; the process, and a non-daemon thread would keep it from ending
               (doto (Thread. (fn [] (poller-loop kq)) "jolt-io-poller")

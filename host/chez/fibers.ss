@@ -498,6 +498,11 @@
       (begin (jolt-fiber-next-set! (jolt-carrier-tail c) f)
              (jolt-carrier-tail-set! c f))
       (begin (condition-signal (jolt-carrier-cv c))
+             ;; a main carrier waiting for readiness waits in the io poller's kevent, not on its
+             ;; condition: a fiber another thread queues (a future's put, ring-chez's acceptor
+             ;; handing on a connection) must end that wait, or it never runs
+             (when (and jolt-main-io-wake jolt-main-thread (not (eqv? (get-thread-id) jolt-main-thread)))
+               (jolt-main-io-wake))
              (jolt-carrier-head-set! c f)
              (jolt-carrier-tail-set! c f))))
 
@@ -1633,6 +1638,7 @@
 ;; always has a wake source, so it never raises that: it waits. Answers the program's value,
 ;; or rethrows what it threw.
 (define jolt-main-io-wait #f)    ; (timeout-ms | #f) -> #t waited, #f nothing awaited; jolt.io-poller's
+(define jolt-main-io-wake #f)    ; () -> ends that wait now (its wake pipe); jolt.io-poller's
 (define jolt-io-after-fork #f)   ; jolt.io-poller's reset of its table in a forked child (any mode)
 
 (define (jolt-main-carrier-run! thunk)
