@@ -1629,7 +1629,9 @@
 ;; process stays one OS thread, so it forks safely with its fibers mid-flight: no other
 ;; thread exists to hold a lock at the fork. A loop with nothing queued, no timer and no
 ;; descriptor awaited while the program has not finished can never move again: it raises
-;; instead of hanging. Answers the program's value, or rethrows what it threw.
+;; instead of hanging. A program that waits for signals (jolt.io-poller/wake-on-signals!)
+;; always has a wake source, so it never raises that: it waits. Answers the program's value,
+;; or rethrows what it threw.
 (define jolt-main-io-wait #f)    ; (timeout-ms | #f) -> #t waited, #f nothing awaited; jolt.io-poller's
 (define jolt-main-after-fork #f) ; jolt.io-poller's reset of its table in a forked child
 

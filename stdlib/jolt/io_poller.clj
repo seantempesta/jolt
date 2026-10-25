@@ -717,6 +717,8 @@
   (if-not (awaited? @state)
     false
     (let [evs (poller-round (:kq @state) @main-deletes timeout-ms)]
+      ;; nil: the wait itself failed, most often EINTR (a signal this loop also waits for);
+      ;; poller-round put the adds back, and the loop's next round carries them, as poller-loop's
       (cond (nil? evs) nil
             (empty? evs) (vreset! main-deletes #{})
             :else (let [[woken nd] (process-events! evs)]

@@ -800,7 +800,10 @@
 ;; Everything due, removed from the list, newest deadline last. Called with
 ;; timeout-mu held; answers '() after waiting when nothing is due yet, so the
 ;; caller's loop is "collect, release, run, repeat".
-(define (timeout-collect-due!)
+;; Everything due, removed from the heap, earliest first, without waiting: '() when
+;; nothing is due. Called with timeout-mu held, by the timer thread (timeout-collect-due!)
+;; and by a main carrier's loop (jolt-timers-run-due!), the one place a deadline is taken.
+(define (timeout-take-due!/locked)
   (let due ((acc '()))
     (cond
       ;; a cancelled entry that reached the top is dropped whatever its deadline
@@ -814,28 +817,33 @@
        (let* ((e (theap-pop-min!)) (thunk (cdr e)))
          (set-cdr! e #f)
          (due (cons thunk acc))))
-      ((pair? acc) (reverse acc))
-      (else
-       (let ((m (theap-min)))
-         (if (not m)
-             (jolt-condition-wait timeout-cv timeout-mu)
-             (unless (mono-due? (car m))
-               (jolt-condition-wait timeout-cv timeout-mu (mono-duration-until (car m))))))
-       ;; Either deadline or signal, the answer is the same: come back and re-read
-       ;; the min. A spurious wake costs one empty trip.
-       '()))))
+      (else (reverse acc)))))
+
+;; Everything due, removed from the list, newest deadline last. Called with
+;; timeout-mu held; answers '() after waiting when nothing is due yet, so the
+;; caller's loop is "collect, release, run, repeat".
+(define (timeout-collect-due!)
+  (let ((due (timeout-take-due!/locked)))
+    (if (pair? due)
+        due
+        (let ((m (theap-min)))
+          (if (not m)
+              (jolt-condition-wait timeout-cv timeout-mu)
+              (unless (mono-due? (car m))
+                (jolt-condition-wait timeout-cv timeout-mu (mono-duration-until (car m)))))
+          ;; Either deadline or signal, the answer is the same: come back and re-read
+          ;; the min. A spurious wake costs one empty trip.
+          '()))))
+
+;; Run due thunks; one must not be able to stop the timer for everything else. A channel
+;; close cannot raise; a wake takes a lock it does not own the discipline of, so this is the
+;; seam where a bug in somebody else's deadline stays theirs.
+(define (timeout-fire! due) (for-each (lambda (fire) (guard (e (#t #f)) (fire))) due))
 
 (define (timeout-thread)
   (let loop ()
-    (let ((due (jolt-with-mutex timeout-mu (timeout-collect-due!))))
-      (for-each (lambda (fire)
-                  ;; One thunk must not be able to stop the timer for everything
-                  ;; else. A channel close cannot raise; a wake takes a lock it does
-                  ;; not own the discipline of, so this is the seam where a bug in
-                  ;; somebody else's deadline stays theirs.
-                  (guard (e (#t #f)) (fire)))
-                due)
-      (loop))))
+    (timeout-fire! (jolt-with-mutex timeout-mu (timeout-collect-due!)))
+    (loop)))
 
 ;; (jolt-timer-at! deadline-ms thunk) — run thunk on the timer thread once the
 ;; deadline has passed, in mono-millis (host-static-methods.ss). The one deadline facility in the runtime.
@@ -862,16 +870,8 @@
 ;; already due on the calling thread, and answer (fired? . next): whether any ran, and the
 ;; earliest deadline still pending (mono millis) or #f. The same heap and cancel discipline as timeout-thread's, without its wait.
 (define (jolt-timers-run-due!)
-  (let ((due (jolt-with-mutex timeout-mu
-               (let collect ((acc '()))
-                 (let ((m (theap-min)))
-                   (cond
-                     ((and m (not (cdr m)))
-                      (theap-pop-min!) (set! timeout-heap-dead (fx- timeout-heap-dead 1)) (collect acc))
-                     ((and m (mono-due? (car m)))
-                      (let* ((e (theap-pop-min!)) (thunk (cdr e))) (set-cdr! e #f) (collect (cons thunk acc))))
-                     (else (reverse acc))))))))
-    (for-each (lambda (fire) (guard (e (#t #f)) (fire))) due)
+  (let ((due (jolt-with-mutex timeout-mu (timeout-take-due!/locked))))
+    (timeout-fire! due)
     (cons (pair? due)
           (jolt-with-mutex timeout-mu
             (let next ()
