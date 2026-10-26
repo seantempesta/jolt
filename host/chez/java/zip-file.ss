@@ -403,14 +403,15 @@
   (let ((bv (zipdir-read-at read-at! (zipdir-data-offset read-at! ent) (zdirent-csize ent))))
     (or bv (zip-zerror "ZipFile invalid LOC header (bad signature)"))))
 ;; The compressed bytes of ENT: through the scope's reader when one is open,
-;; else from a reader opened for the call.
+;; else from a reader opened for the call and closed when it ends (never at a
+;; park: jolt-finally-in, as the scope's).
 (define (zipdir-raw-bytes d ent)
   (let ((readers (zipdir-scope-readers)))
     (if readers
         (zipdir-raw-bytes-via (car (zipdir-scoped-reader readers d)) ent)
         (let-values (((read-at! close!) (zipdir-file-reader (zipdir-path d))))
           (dynamic-wind
-            (lambda () #f)
+            jolt-finally-in
             (lambda () (zipdir-raw-bytes-via read-at! ent))
             close!)))))
 

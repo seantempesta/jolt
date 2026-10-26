@@ -1664,8 +1664,10 @@
                             ;; as the JDK copies through an 8 KiB buffer: the
                             ;; stream never has to fit in memory
                             (let ((port (open-file-output-port d (file-options no-fail) (buffer-mode block))))
+                              ;; closed when the copy ends, never at a park of the
+                              ;; fiber copying (jolt-finally-in, as copy-bytes-into!)
                               (->num (dynamic-wind
-                                       (lambda () #f)
+                                       jolt-finally-in
                                        (lambda () (copy-bytes-into! src (lambda (bv) (put-bytevector port bv))))
                                        (lambda () (close-port port)))))))
                          ;; copy(Path, OutputStream): the file's bytes into the
