@@ -126,10 +126,10 @@
 
 ;; swap!, reset!, add-watch and the rest of atoms.ss's reference fns reach a
 ;; deftype, record or reify through the interface it declares, as instance? sees
-;; it (atoms.ss, iface-call).
+;; it, supers included (a type declaring IAtom2 is an IAtom) (atoms.ss, iface-call).
 (set-iface-method-hook!
   (lambda (x interface method nargs)
-    (and (own-type-declares? interface x) (iface-method x method nargs))))
+    (and (instance-check (jolt-symbol #f interface) x) (iface-method x method nargs))))
 
 (define (instance-check-base type-sym val)
   (let ((tname (symbol-t-name type-sym)))
