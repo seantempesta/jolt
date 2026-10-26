@@ -2634,11 +2634,14 @@
           total
           (begin (sink! bv) (loop (+ total (bytevector-length bv))))))))
 ;; INPUT's bytes into SINK! a chunk at a time when it is a stream, else its
-;; bytes (or its text's UTF-8) whole; the byte count.
+;; bytes (or its text's UTF-8) whole; the byte count. The source is released
+;; when the copy ends, never at a park of the fiber copying (a read of a pipe or
+;; a socket parks): its winder's before-thunk is jolt-finally-in, which a park
+;; drops (fibers.ss jolt-finally-winder?).
 (define (copy-bytes-into! input sink!)
   (let-values (((port release!) (stream-source-port input)))
     (if port
-        (dynamic-wind (lambda () #f)
+        (dynamic-wind jolt-finally-in
                       (lambda () (copy-port-chunks! port sink!))
                       release!)
         (let ((bv (or (input-bytes input) (string->utf8 (input-text input)))))
@@ -2669,7 +2672,8 @@
      (let-values (((src release!) (if (string? input) (values #f #f) (stream-source-port input))))
        (cond
          (src
-          (dynamic-wind (lambda () #f)
+          ;; released at the copy's end, never at a park (as copy-bytes-into!)
+          (dynamic-wind jolt-finally-in
                         (lambda ()
                           (with-port (open-file-output-port (path-of output) (file-options no-fail) (buffer-mode block))
                             (lambda (port) (copy-port-chunks! src (lambda (bv) (put-bytevector port bv))))))
