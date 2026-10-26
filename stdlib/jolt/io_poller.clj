@@ -756,6 +756,14 @@
 ;; every forked child resets the table (jolt-after-fork-child!): its kqueue and poller thread are the parent's
 (jolt.host/io-after-fork-set! after-fork!)
 
+(defn- start-poller-thread!
+  "The poller's thread over kqueue (or epoll) kq: a daemon thread, not a future, as the poller
+  runs for the life of the process, and a non-daemon thread would keep it from ending."
+  [kq]
+  (doto (Thread. (fn [] (poller-loop kq)) "jolt-io-poller")
+    (.setDaemon true)
+    (.start)))
+
 (defn- ensure-started! []
   ;; under pm. One poller thread per process, started on the first fiber wait.
   (cond
@@ -780,12 +788,10 @@
             (if (jolt.host/main-carrier?)
               ;; a main-carrier process: no poller thread; its loop runs the rounds (main-io-wait),
               ;; and a fiber another thread queues ends the round through the wake pipe
-              (jolt.host/main-io-wait-set! main-io-wait (fn [] (locking pm (pipe-write!))))
-              ;; a daemon thread, not a future: the poller runs for the life of
-              ;; the process, and a non-daemon thread would keep it from ending
-              (doto (Thread. (fn [] (poller-loop kq)) "jolt-io-poller")
-                (.setDaemon true)
-                (.start)))))
+              (jolt.host/main-io-wait-set! main-io-wait (fn [] (locking pm (pipe-write!)))
+                                           ;; the program returned: this kqueue's waits are the poller thread's
+                                           (fn [] (start-poller-thread! kq)))
+              (start-poller-thread! kq))))
         (finally (ffi/free pfds))))))
 
 ;; -- the wait API --------------------------------------------------------------

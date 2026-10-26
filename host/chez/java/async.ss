@@ -855,12 +855,21 @@
     (when (timeout-insert! e)
       (condition-signal timeout-cv))
     ;; a main-carrier process runs its timers in its loop (jolt-timers-run-due!), not on a thread
-    (unless (or timeout-running? jolt-main-thread)
-      (set! timeout-running? #t)
-      ;; a runtime thread: never keeps the process up
-      (fork-thread/daemon #t (lambda () (jolt-thread-name-set! (get-thread-id) "jolt-timer") (timeout-thread))))
+    (unless jolt-main-thread (timeout-thread-start!/locked))
     (jolt-unlock! timeout-mu)
     e))
+
+;; Start the timer thread once, timeout-mu held. A runtime thread: never keeps the process up.
+(define (timeout-thread-start!/locked)
+  (unless timeout-running?
+    (set! timeout-running? #t)
+    (fork-thread/daemon #t (lambda () (jolt-thread-name-set! (get-thread-id) "jolt-timer") (timeout-thread)))))
+
+;; A main-carrier program's return (fibers.ss, jolt-main-carrier-leave!): the deadlines it left
+;; pending are the timer thread's from now on, so it starts when any is.
+(define (jolt-timer-thread-ensure!)
+  (jolt-with-mutex timeout-mu
+    (when (fx>? (fx- timeout-heap-n timeout-heap-dead) 0) (timeout-thread-start!/locked))))
 
 ;; The thread a main-carrier program runs on (fibers.ss, jolt-main-carrier-run!), #f
 ;; otherwise: its timers run in its loop, so no timer thread starts.
