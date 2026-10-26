@@ -875,7 +875,9 @@
 (define (dot-coll-method obj name args)
   (cond
     ((string=? name "count") (list (jolt-count obj)))
-    ((string=? name "seq")   (list (jolt-seq obj)))
+    ;; Seqable.seq() only: (.seq sc ascending?) is Sorted's, answered by the
+    ;; sorted arm past this one (it walks a sorted map in reverse on false)
+    ((and (string=? name "seq") (null? args)) (list (jolt-seq obj)))
     ((string=? name "nth")   (list (apply jolt-nth obj args)))
     ((or (string=? name "get") (string=? name "valAt"))
      (list (apply jolt-get obj args)))
