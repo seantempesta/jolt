@@ -363,8 +363,14 @@
 ;; same path is a new zipdir (zipdir-for), and an old descriptor would read the
 ;; old file.
 ;;
-;; The scope closes its readers on ANY exit, a fiber park included; a resumed
-;; load that reads again just opens a new one.
+;; The scope closes its readers when it ends, never at a fiber's park: a park
+;; unwinds the fiber's winders on its way to the scheduler, and a read the fiber
+;; resumes may hold a reader the scope opened (a stream mid-entry, a whole-entry
+;; read preempted between its reads). Its winder's before-thunk is the shared
+;; jolt-finally-in, so the park drops it (fibers.ss jolt-finally-winder?), as it
+;; drops a `finally`'s. Unfixed, a fiber parked mid-read had its port closed
+;; under it, and the read it resumed raised on the closed port (a Seon fork
+;; server reading its deps' jars at boot, a preemptible fiber, died of it).
 ;;
 ;; The parameter holds (thread-id . readers) and a scope answers only on the
 ;; thread that opened it. A forked thread starts with its creator's parameter
@@ -380,7 +386,7 @@
       (thunk)
       (let ((readers (make-eq-hashtable)))
         (dynamic-wind
-          (lambda () #f)
+          jolt-finally-in
           (lambda () (parameterize ((zipdir-read-scope (cons (get-thread-id) readers))) (thunk)))
           (lambda ()
             (let-values (((ds rs) (hashtable-entries readers)))
