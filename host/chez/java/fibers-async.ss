@@ -563,11 +563,13 @@
 (def-var! "jolt.host" "main-carrier-run!" (lambda (f) (jolt-main-carrier-run! (lambda () (jolt-invoke f)))))
 (def-var! "jolt.host" "main-carrier?" (lambda () (if jolt-main-thread #t #f)))
 ;; jolt.io-poller's half: (f timeout-ms-or-nil) waits for readiness on this thread and
-;; answers true, or false when no descriptor is awaited; (wake) ends that wait from another thread
+;; answers true, or false when no descriptor is awaited; (wake) ends that wait from another thread;
+;; (leave), at the program's return, hands what is awaited to the poller's own thread
 (def-var! "jolt.host" "main-io-wait-set!"
-  (lambda (f wake)
+  (lambda (f wake leave)
     (set! jolt-main-io-wait (lambda (ms) (jolt-truthy? (jolt-invoke f (if ms ms jolt-nil)))))
     (set! jolt-main-io-wake (lambda () (jolt-invoke wake)))
+    (set! jolt-main-io-leave (lambda () (jolt-invoke leave)))
     jolt-nil))
 ;; jolt.io-poller's reset of its table in a forked child, registered when it loads
 (def-var! "jolt.host" "io-after-fork-set!"

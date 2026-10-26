@@ -512,6 +512,18 @@
   (when (and woke? jolt-main-io-wake jolt-main-thread (not (eqv? (get-thread-id) jolt-main-thread)))
     (jolt-main-io-wake)))
 
+;; A deadline another thread set ahead of every other (jolt-timer-at!): the main loop waits up to
+;; the next deadline it read before this one existed, in the poller's wait or on carrier 0's
+;; condition, so both are woken and it reads again (it re-reads under the mu, jolt-timer-before?,
+;; so a signal before its wait is not lost). Called with no lock held, after timeout-mu is released.
+(define (jolt-main-wake-for-timer!)
+  (when (and jolt-main-thread (not (eqv? (get-thread-id) jolt-main-thread)))
+    (let ((c (vector-ref jolt-fiber-carriers 0)))
+      (jolt-lock! (jolt-carrier-mu c))
+      (condition-signal (jolt-carrier-cv c))
+      (jolt-unlock! (jolt-carrier-mu c)))
+    (when jolt-main-io-wake (jolt-main-io-wake))))
+
 (define (jolt-fiber-enqueue! c f)
   (jolt-lock! (jolt-carrier-mu c))
   (let ((woke? (jolt-fiber-enqueue!/locked c f)))
@@ -1751,7 +1763,7 @@
 ;; --- the main carrier: a program and its fibers on its one thread -------------
 ;; (jolt-main-carrier-run! thunk) runs thunk as a fiber on carrier 0 and drives carrier 0
 ;; from the calling thread, here, until it finishes: no carrier, timer or poller thread is
-;; ever started. Every wait the program makes is then a fiber's park, and this one loop is
+;; started while it runs, and at its return the process starts them (jolt-main-carrier-leave!). Every wait the program makes is then a fiber's park, and this one loop is
 ;; the scheduler beneath every fiber of the process, at one base, as an event loop is
 ;; (ClojureScript's core.async on its one thread). Due timers run here (async.ss,
 ;; jolt-timers-run-due!), and when nothing can run the loop waits for readiness on this
@@ -1764,11 +1776,20 @@
 ;; or rethrows what it threw.
 (define jolt-main-io-wait #f)    ; (timeout-ms | #f) -> #t waited, #f nothing awaited; jolt.io-poller's
 (define jolt-main-io-wake #f)    ; () -> ends that wait now (its wake pipe); jolt.io-poller's
+(define jolt-main-io-leave #f)   ; () -> its own thread waits from now on; jolt.io-poller's
 (define jolt-io-after-fork #f)   ; jolt.io-poller's reset of its table in a forked child (any mode)
 
 (define (jolt-main-carrier-run! thunk)
+  (if (and jolt-main-thread (eqv? (get-thread-id) jolt-main-thread) (jolt-current-fiber))
+      ;; already a fiber of this process's main carrier (a child forked from inside one, as an
+      ;; agent of Seon's fork server is): thunk runs here, beneath the loop already driving it
+      (thunk)
+      (jolt-main-carrier-run/loop! thunk)))
+
+(define (jolt-main-carrier-run/loop! thunk)
   (when jolt-fiber-pool-started?
     (error 'jolt-main-carrier-run! "fibers already run on carrier threads: call it before the first fiber"))
+  (set! jolt-main-carrier-pool-n (jolt-fiber-carrier-count))
   (jolt-fiber-carrier-count-set! 1)
   (set! jolt-fiber-pool-started? #t)
   (jolt-fiber-ensure-carriers!)
@@ -1792,6 +1813,7 @@
       (let* ((fired (jolt-timers-run-due!)) (next (cdr fired)))
         (cond
           ((vector-ref box 0)
+           (jolt-main-carrier-leave! c)
            (if (vector-ref box 2) (raise (vector-ref box 2)) (vector-ref box 1)))
           ((or (car fired) (jolt-carrier-head c)) (loop))
           (else
@@ -1806,12 +1828,46 @@
                (ms (let* ((secs (exact (floor (/ ms 1000))))
                           (until (make-time 'time-duration (min 999999999 (exact (round (* 1000000 (- ms (* 1000 secs)))))) secs)))
                      (jolt-lock! (jolt-carrier-mu c))
-                     (unless (jolt-carrier-head c)
+                     ;; nor when another thread set a deadline earlier than next since it was read
+                     ;; (jolt-timer-at!, which signals this condition after it): read again under the mu
+                     (unless (or (jolt-carrier-head c) (jolt-timer-before? next))
                        (jolt-condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c) until))
                      (jolt-unlock! (jolt-carrier-mu c))))
                (else (error 'jolt-main-carrier
                             "stuck: the program waits, and nothing is queued, no timer is set and no descriptor is awaited, so nothing can ever wake it")))
              (loop))))))))
+
+;; The program returned: from here the process is an ordinary one, so its fibers, timers and
+;; I/O get the threads the loop stood for. What the program left behind runs on them: a fiber
+;; it left parked on a channel is queued onto carrier 0 when the channel is put to, a deadline
+;; it left pending is the timer thread's, a descriptor it left awaited is the poller thread's.
+;; The pool grows to its configured size around carrier 0 (one carrier was the main carrier's
+;; count), and every carrier gets its thread. A process can so load on its one thread, fork a
+;; child that shares what it loaded, then start its threads (test/chez/main-carrier-returns-test.clj).
+;; Called on the one thread, at the return, so nothing else runs while it rebuilds.
+(define jolt-main-carrier-pool-n 1)   ; the pool's count before the main carrier set it to one
+(define (jolt-main-carrier-leave! c0)
+  (set! jolt-main-thread #f)
+  (jolt-fiber-carrier-count-set! #f)
+  (jolt-fiber-preempt-refresh!)
+  (let* ((n jolt-main-carrier-pool-n) (v (make-vector n)))
+    (vector-set! v 0 c0)
+    (do ((i 1 (fx+ i 1))) ((fx=? i n))
+      (vector-set! v i (make-jolt-carrier (make-mutex) (make-condition) #f #f #f
+                                          (make-jolt-dslice #f #f #f) #f #f 0 0 0 0 #f 0)))
+    (set! jolt-fiber-carriers v)
+    (do ((i 0 (fx+ i 1))) ((fx=? i n))
+      (let ((c (vector-ref v i)) (name (string-append "jolt-carrier-" (number->string i))))
+        (jolt-carrier-thread-set! c
+          (fork-thread/daemon #t (lambda ()
+                                   (rdr-default-modes!)
+                                   (jolt-thread-name-set! (get-thread-id) name)
+                                   (jolt-fiber-carrier-loop c)))))))
+  (jolt-timer-thread-ensure!)
+  (when jolt-main-io-leave (jolt-main-io-leave))
+  (set! jolt-main-io-wait #f)
+  (set! jolt-main-io-wake #f)
+  (set! jolt-main-io-leave #f))
 
 ;; --- the carrier loop and the pool lifecycle (R4 carrier, generalized R5) ----
 ;; R3 found that sa-fiber-run-all is a ONE-SHOT drain, not a scheduler: a

@@ -48,10 +48,20 @@
                          (.write out (byte-array [1]) 0 1)
                          (a/<!! rd)))
                      (run! deref fs)
-                     (a/<!! sum)))]
+                     (a/<!! sum)))
+            ;; a deadline another thread sets, earlier than the one the loop waits toward: the loop
+            ;; read its next deadline (30 s out) before this one existed, so it is woken to read
+            ;; again; unfixed the 10 ms deadline fired with the 30 s one (a forked child's 5 s
+            ;; deadline, fork-child-test, ran its check's timeout at 5 s)
+            r4 (do (reset! at "a future sets a deadline earlier than the one the loop waits toward")
+                   (let [p (promise) t (a/timeout 30000) t0 (System/nanoTime)]
+                     (future (Thread/sleep 20)
+                             (jolt.host/timer-at! (+ (/ (System/nanoTime) 1000000) 10) #(deliver p :fired)))
+                     (let [v (deref p) ms (/ (- (System/nanoTime) t0) 1e6)]
+                       (if (< ms 15000) v [:fired-at-the-later-deadline ms]))))]
         (.close s) (.close c) (.close ss)
-        [r1 r2 r3]))))
+        [r1 r2 r3 r4]))))
 (deliver outcome got)
-(if (= [7 8 1600] got)
+(if (= [7 8 1600 :fired] got)
   (do (println "MAIN-CARRIER-WAKE-TEST OK") (flush) (System/exit 0))
   (do (println "FAIL: got" (pr-str got)) (flush) (System/exit 1)))
