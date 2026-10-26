@@ -1678,7 +1678,7 @@
                             (io-note-file-read! s)
                             (let ((port (nio-open-input-port s (nio-shown src))))
                               (->num (dynamic-wind
-                                       (lambda () #f)
+                                       jolt-finally-in
                                        (lambda ()
                                          (copy-port-chunks! port
                                            (lambda (bv)

@@ -999,7 +999,7 @@
 ;; Run BODY with the wide copy of S, freeing it however BODY leaves.
 (define (win32-with-wstr s proc)
   (let ((w (win32-wstr s)))
-    (dynamic-wind (lambda () #f) (lambda () (proc w)) (lambda () (sa-foreign-free w)))))
+    (dynamic-wind jolt-finally-in (lambda () (proc w)) (lambda () (sa-foreign-free w)))))
 
 (define win32-INVALID-FILE-ATTRIBUTES #xFFFFFFFF)
 (define win32-FILE-ATTRIBUTE-HIDDEN   #x2)
@@ -1069,7 +1069,7 @@
                       (create w access win32-FILE-SHARE-ALL 0
                               win32-OPEN-EXISTING (win32-attr-open-flags follow?) 0)))))
            (and (not (= h win32-INVALID-HANDLE-VALUE))
-                (dynamic-wind (lambda () #f) (lambda () (proc h)) (lambda () (close h))))))))
+                (dynamic-wind jolt-finally-in (lambda () (proc h)) (lambda () (close h))))))))
 
 ;; Files.setLastModifiedTime / setAttribute on Windows, as WindowsFileAttributeViews
 ;; does it: open the path for FILE_WRITE_ATTRIBUTES — with
@@ -1362,7 +1362,7 @@
     (and ff fc
          (let ((data (sa-foreign-alloc win32-find-data-size)))
            (dynamic-wind
-             (lambda () #f)
+             jolt-finally-in
              (lambda ()
                (let ((h (win32-with-wstr path (lambda (w) (ff w data)))))
                  (and (not (= h win32-INVALID-HANDLE-VALUE))

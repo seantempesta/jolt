@@ -207,7 +207,7 @@
                               (zip-throw "java.nio.file.NoSuchFileException" (or name path)))))
               (open-file-input-port path))))
     (dynamic-wind
-      (lambda () #f)
+      jolt-finally-in
       (lambda ()
         (let ((size (port-length in)))
           (when (= size 0) (zip-zerror "zip file is empty"))
@@ -426,7 +426,7 @@
   (let-values (((zs code msg) (zstream-open 'inflate -15 0 0)))
     (unless zs (zip-throw "java.lang.InternalError" (or msg "inflateInit2 failed")))
     (dynamic-wind
-      (lambda () #f)
+      jolt-finally-in
       (lambda ()
         (let ((len (bytevector-length bv)))
           (define (grown out need)
