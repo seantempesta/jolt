@@ -9,8 +9,9 @@
 ;;
 ;; The directory is removed by exit-handler, so a runner that loads this must end
 ;; through (exit ...), as these three do (gate-summary exits): a --script that falls
-;; off its end never calls the handler. The hung-row watchdog's
-;; jolt-exit-process skips it too, leaving one directory behind on that failure.
+;; off its end never calls the handler. jolt-exit-process (the hung-row watchdog's,
+;; and System/exit's from any row: it halts as the JVM does, running only the
+;; shutdown hooks) skips it too, leaving one directory behind on that path.
 ;;
 ;; Load after the runtime (host-temp-dir).
 

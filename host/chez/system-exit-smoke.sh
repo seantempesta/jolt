@@ -15,5 +15,6 @@ check "a finally around System/exit does not run" 3 "" '(try (System/exit 3) (fi
 check "nor on the main carrier" 3 "" '(jolt.host/main-carrier-run! (fn [] (try (System/exit 3) (finally (println "finally ran") (System/exit 1)))))'
 check "a shutdown hook runs" 4 "hook ran" '(.addShutdownHook (Runtime/getRuntime) (Thread. (fn [] (println "hook ran")))) (System/exit 4)'
 check "output written before it is flushed" 5 "written" '(print "written") (System/exit 5)'
+check "from a thread the program started, with its hook run" 6 "hook ran" '(.addShutdownHook (Runtime/getRuntime) (Thread. (fn [] (println "hook ran")))) (future (try (System/exit 6) (finally (println "finally ran")))) @(promise)'
 echo "system-exit-smoke: $pass passed, $fail failed"
 [ "$fail" = 0 ]
