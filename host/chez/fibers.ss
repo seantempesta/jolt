@@ -756,7 +756,9 @@
 ;; fiber the frames of the continuation it will resume (Chez's inspector: each frame's
 ;; procedure name and source), innermost first. It reads and prints; it changes nothing.
 ;; SIGINFO runs it (fibers-async.ss), on the thread whose event check takes the signal: a
-;; main carrier idle in its poller's kevent wakes for it. It cannot reach a thread that is
+;; main carrier idle in its poller's kevent wakes for it. A forked child lists the fibers it
+;; inherited as they were at the fork: those of the forking thread's carrier can resume in
+;; it, those of the carriers fork(2) did not copy never will (their carrier is not this one). It cannot reach a thread that is
 ;; in a foreign call, a condition wait (a promise's deref) or a lock, which run no event
 ;; check: a parked fiber's frames are reachable from any thread, a running thread's are not.
 ;; A weak list, not a weak table, pushed without a lock: a spawn CASes one weak pair onto
@@ -767,11 +769,14 @@
 (define jolt-fiber-registry (box '()))
 (define jolt-fiber-registry-pushes 0)    ; approximate (unlocked): only times the next drop
 (define jolt-fiber-registry-limit 1024)
-(define (jolt-fiber-registry-live)
-  (let loop ((l (unbox jolt-fiber-registry)) (acc '()))
-    (cond ((null? l) (reverse acc))
-          ((bwp-object? (car l)) (loop (cdr l) acc))
-          (else (loop (cdr l) (cons (car l) acc))))))
+;; the fibers of weak list l still held, each car read once (a collection between two reads
+;; of one weak car could leave the broken-weak-pointer object in the result)
+(define (jolt-fiber-held l)
+  (let loop ((l l) (acc '()))
+    (if (null? l)
+        (reverse acc)
+        (let ((f (car l))) (loop (cdr l) (if (bwp-object? f) acc (cons f acc)))))))
+(define (jolt-fiber-registry-live) (jolt-fiber-held (unbox jolt-fiber-registry)))
 (define (jolt-fiber-register! f)
   (let retry ()
     (let ((old (unbox jolt-fiber-registry)))
@@ -781,10 +786,7 @@
     (set! jolt-fiber-registry-pushes 0)
     (let retry ()
       (let* ((old (unbox jolt-fiber-registry))
-             (live (let loop ((l old) (acc '()))
-                     (cond ((null? l) (reverse acc))
-                           ((bwp-object? (car l)) (loop (cdr l) acc))
-                           (else (loop (cdr l) (cons (car l) acc)))))))
+             (live (jolt-fiber-held old)))
         (if (box-cas! jolt-fiber-registry old (fold-right weak-cons '() live))
             (set! jolt-fiber-registry-limit (fxmax 1024 (fx* 2 (length live))))
             (retry))))))
@@ -797,9 +799,10 @@
   (let loop ((i 0) (acc '()))
     (if (fx>=? i (o 'length))
         (reverse acc)
-        (let* ((v (guard (e (#t #f)) (((o 'ref i) 'ref) 'value)))
-               (name (cond ((and v (var-cell? v)) (string-append (var-cell-ns v) "/" (var-cell-name v)))
-                           ((and v (procedure? v) (proc-name-of v)) => (lambda (p) (string-append (car p) "/" (cdr p))))
+        (let* ((r (o 'ref i))
+               (v (and (eq? 'variable (r 'type)) ((r 'ref) 'value)))
+               (name (cond ((and v (var-cell? v)) (format "~a/~a" (var-cell-ns v) (var-cell-name v)))
+                           ((and v (procedure? v) (proc-name-of v)) => (lambda (p) (format "~a/~a" (car p) (cdr p))))
                            (else #f))))
           (loop (fx+ i 1) (if (and name (not (member name acc))) (cons name acc) acc))))))
 (define (jolt-continuation-frames k limit)
@@ -838,7 +841,8 @@
                  (jolt-fiber-describe-wait (jolt-fiber-parked-on f))
                  (or (jolt-fiber-wstate f) "none") (jolt-fiber-ticks f))
         (cond
-          ((jolt-fiber-k f)
+          ;; a running fiber's k is the one it last parked with, stale: only a parked one's is shown
+          ((and (eq? 'parked (jolt-fiber-state f)) (jolt-fiber-k f))
            => (lambda (k)
                 (let ((frames (jolt-continuation-frames k 40)))
                   (let loop ((fr frames) (i 0))
