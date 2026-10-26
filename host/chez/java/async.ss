@@ -860,12 +860,21 @@
 (define (jolt-timer-at! deadline-ms thunk)
   (let ((e (cons deadline-ms thunk)))
     (jolt-lock! timeout-mu)
-    (when (timeout-insert! e)
-      (condition-signal timeout-cv))
-    ;; a main-carrier process runs its timers in its loop (jolt-timers-run-due!), not on a thread
-    (unless jolt-main-thread (timeout-thread-start!/locked))
-    (jolt-unlock! timeout-mu)
+    (let ((first? (timeout-insert! e)))
+      (when first? (condition-signal timeout-cv))
+      ;; a main-carrier process runs its timers in its loop (jolt-timers-run-due!), not on a thread
+      (unless jolt-main-thread (timeout-thread-start!/locked))
+      (jolt-unlock! timeout-mu)
+      ;; and that loop waits toward the deadline it read last: one set ahead of it wakes it
+      (when (and first? jolt-main-thread) (jolt-main-wake-for-timer!)))
     e))
+
+;; Is a pending deadline earlier than mono-ms deadline next (#f: none was pending)? A main
+;; carrier's loop, about to wait toward next, holding carrier 0's mu (that mu, then timeout-mu).
+(define (jolt-timer-before? next)
+  (jolt-with-mutex timeout-mu
+    (let ((m (theap-min)))
+      (and m (cdr m) (or (not next) (< (car m) next))))))
 
 ;; Start the timer thread once, timeout-mu held. A runtime thread: never keeps the process up.
 (define (timeout-thread-start!/locked)

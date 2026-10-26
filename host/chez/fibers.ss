@@ -512,6 +512,18 @@
   (when (and woke? jolt-main-io-wake jolt-main-thread (not (eqv? (get-thread-id) jolt-main-thread)))
     (jolt-main-io-wake)))
 
+;; A deadline another thread set ahead of every other (jolt-timer-at!): the main loop waits up to
+;; the next deadline it read before this one existed, in the poller's wait or on carrier 0's
+;; condition, so both are woken and it reads again (it re-reads under the mu, jolt-timer-before?,
+;; so a signal before its wait is not lost). Called with no lock held, after timeout-mu is released.
+(define (jolt-main-wake-for-timer!)
+  (when (and jolt-main-thread (not (eqv? (get-thread-id) jolt-main-thread)))
+    (let ((c (vector-ref jolt-fiber-carriers 0)))
+      (jolt-lock! (jolt-carrier-mu c))
+      (condition-signal (jolt-carrier-cv c))
+      (jolt-unlock! (jolt-carrier-mu c)))
+    (when jolt-main-io-wake (jolt-main-io-wake))))
+
 (define (jolt-fiber-enqueue! c f)
   (jolt-lock! (jolt-carrier-mu c))
   (let ((woke? (jolt-fiber-enqueue!/locked c f)))
@@ -1699,7 +1711,9 @@
                (ms (let* ((secs (exact (floor (/ ms 1000))))
                           (until (make-time 'time-duration (min 999999999 (exact (round (* 1000000 (- ms (* 1000 secs)))))) secs)))
                      (jolt-lock! (jolt-carrier-mu c))
-                     (unless (jolt-carrier-head c)
+                     ;; nor when another thread set a deadline earlier than next since it was read
+                     ;; (jolt-timer-at!, which signals this condition after it): read again under the mu
+                     (unless (or (jolt-carrier-head c) (jolt-timer-before? next))
                        (jolt-condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c) until))
                      (jolt-unlock! (jolt-carrier-mu c))))
                (else (error 'jolt-main-carrier
