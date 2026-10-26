@@ -466,7 +466,8 @@
   (cond
     (symbol? x) (if (= (name x) "&") [] [x])
     (vector? x) (vec (mapcat pattern-syms x))
-    (map? x) (vec (mapcat pattern-syms (vals x)))
+    ;; {s :k} binds its key, {:keys [a]} its vals
+    (map? x) (vec (mapcat pattern-syms (concat (keys x) (vals x))))
     :else []))
 
 ;; deftype is sugar over make-deftype-ctor (a ctx-capturing clojure.core fn that
@@ -534,23 +535,25 @@
                   (get field-idx (name (second form)))
                   (rw inst shadowed (nth form 2))
                   (get field-dbl (name (second form))))
-            ;; let/loop-style vector-binding forms: rewrite inits, then shadow the
-            ;; bound names in the body.
+            ;; vector-binding forms: a binder is a pattern, never rewritten, and
+            ;; shadows every name it destructures for the inits after it and the
+            ;; body. for / doseq bindings also hold :let [pairs], :when x and :while x.
             (and (seq? form) (seq form) (symbol? (first form))
                  (contains? #{"let" "let*" "loop" "binding" "when-let" "if-let"
-                              "when-some" "if-some"} (name (first form)))
+                              "when-some" "if-some" "dotimes" "with-open"
+                              "for" "doseq"} (name (first form)))
                  (vector? (second form)))
-            (let [bv (second form) n (count bv)
-                  bv' (loop [i 0 acc []]
-                        (if (< i n)
-                          (recur (+ i 2)
-                                 (let [a (conj acc (nth bv i))]
-                                   (if (< (inc i) n) (conj a (rw inst shadowed (nth bv (inc i)))) a)))
-                          acc))
-                  sh (loop [i 0 acc shadowed]
-                       (if (< i n)
-                         (recur (+ i 2) (if (symbol? (nth bv i)) (conj acc (nth bv i)) acc))
-                         acc))]
+            (let [pairs (fn pairs [sh bv]
+                          (loop [i 0 sh sh acc []]
+                            (if (< i (count bv))
+                              (let [b (nth bv i) init (when (< (inc i) (count bv)) (nth bv (inc i)))
+                                    init' (cond (= :let b) (pairs sh init)
+                                                (keyword? b) [(rw inst sh init) sh]
+                                                :else [(rw inst sh init) (into sh (pattern-syms b))])]
+                                (recur (+ i 2) (second init')
+                                       (if (< (inc i) (count bv)) (conj acc b (first init')) (conj acc b))))
+                              [acc sh])))
+                  [bv' sh] (pairs shadowed (second form))]
               (cons (first form) (cons bv' (map (fn [x] (rw inst sh x)) (drop 2 form)))))
             ;; fn/fn*: shadow each arity's params in its body.
             (and (seq? form) (seq form) (symbol? (first form))

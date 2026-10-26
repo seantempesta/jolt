@@ -63,7 +63,7 @@
        (loop (cddr o) validator (cadr o)))
       (else (loop (cddr o) validator m)))))
 
-;; The five mutators reach into the atom record directly, so each opens with
+;; The five mutators reach into the atom record directly, so each branches on
 ;; jolt-atom? BEFORE it validates or reads a field (compare-and-set! validates the
 ;; new value first). Any other receiver goes through the interface it declares.
 ;; A deftype or record declaring clojure.lang.IAtom / IAtom2 / IRef is one on the
@@ -71,7 +71,10 @@
 ;; validator fns are calls through that interface (.swap, .reset, .addWatch …).
 ;; The record layer loads after this file, so it supplies the lookup:
 ;; (iface-method-hook x interface method nargs) answers the method x declares
-;; through INTERFACE, or #f. A receiver declaring none raises the class the JVM
+;; through INTERFACE, or #f: it asks instance-check, so a type declaring IAtom2
+;; is an IAtom as on the JVM, and a method that merely shares a name is not one.
+;; A hook rather than a call: atoms.ss may not name a record op a later file
+;; defines (make recordinline). A receiver declaring none raises the class the JVM
 ;; names (nil is its NullPointerException), never a raw host error naming jolt's
 ;; record type, which classes as :object and so matches EVERY catch clause.
 (define iface-method-hook #f)
@@ -155,7 +158,8 @@
            (let* ((old (jolt-atom-val a)) (nv (jolt-invoke3 f old x y)))
              (if (jolt-swap-commit! a old nv) nv (retry))))
          (iface-call a "clojure.lang.IAtom" "swap" f x y)))
-    ;; IAtom's widest swap is (f x y ISeq args): the args past y go as one seq
+    ;; three or more args past f: IAtom's widest swap is (f x y ISeq args), the
+    ;; args past y going as one seq
     ((a f . args)
      (if (jolt-atom? a)
          (let retry ()
@@ -299,7 +303,7 @@
      a)
     ((declared-method a "clojure.lang.IRef" "addWatch" 3)
      => (lambda (m) (jolt-invoke m a key f)))
-    (else (throw-jvm (quote ClassCastException) "add-watch: not a watchable reference"))))
+    (else (jolt-cast-throw a "clojure.lang.IRef"))))
 (define (jolt-remove-watch a key)
   (cond
     ((jolt-atom? a)
@@ -312,7 +316,7 @@
      a)
     ((declared-method a "clojure.lang.IRef" "removeWatch" 2)
      => (lambda (m) (jolt-invoke m a key)))
-    (else (throw-jvm (quote ClassCastException) "remove-watch: not a watchable reference"))))
+    (else (jolt-cast-throw a "clojure.lang.IRef"))))
 (define (jolt-set-validator! a f)
   (let ((vf (if (jolt-nil? f) jolt-nil f)))
     (cond
@@ -328,14 +332,14 @@
          (hashtable-set! iref-validator-tbl a vf)))
       ((declared-method a "clojure.lang.IRef" "setValidator" 2)
        => (lambda (m) (jolt-invoke m a vf)))
-      (else (throw-jvm (quote ClassCastException) "set-validator!: not a reference")))
+      (else (jolt-cast-throw a "clojure.lang.IRef")))
     jolt-nil))
 (define (jolt-get-validator a)
   (cond ((jolt-atom? a) (jolt-atom-validator a))
         ((iref? a) (iref-validator-of a))
         ((declared-method a "clojure.lang.IRef" "getValidator" 1)
          => (lambda (m) (jolt-invoke m a)))
-        (else jolt-nil)))
+        (else (jolt-cast-throw a "clojure.lang.IRef"))))
 
 ;; The rest of the ARef surface, which only the java interop layer reaches:
 ;; records-dispatch.ss's rd-iref-method answers .getWatches and .notifyWatches
