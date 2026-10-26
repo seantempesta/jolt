@@ -835,14 +835,22 @@
           ;; the min. A spurious wake costs one empty trip.
           '()))))
 
-;; Run due thunks; one must not be able to stop the timer for everything else. A channel
-;; close cannot raise; a wake takes a lock it does not own the discipline of, so this is the
-;; seam where a bug in somebody else's deadline stays theirs.
-(define (timeout-fire! due) (for-each (lambda (fire) (guard (e (#t #f)) (fire))) due))
+;; Run due thunks. The runtime's own are total: a channel close, a condition's wake, a
+;; CompletableFuture's settle handed to its executor. The one that runs foreign code is
+;; jolt.host/timer-at!'s fn, and its throw is its owner's error, never silence: on a main
+;; carrier the thunks run in the program's loop (jolt-timers-run-due!), so a throw ends
+;; main-carrier-run! with its cause; on the timer thread it is a thread body's throw, which
+;; goes where the JVM sends one (jolt-thread-uncaught!: the default handler, else a report),
+;; and the thread lives on for every other deadline. Swallowing it (an earlier guard) left
+;; no fact anywhere (test/chez/timer-throw-test.clj, main-carrier-timer-throw-test.clj).
+(define (timeout-fire! due) (for-each (lambda (fire) (fire)) due))
 
 (define (timeout-thread)
   (let loop ()
-    (timeout-fire! (jolt-with-mutex timeout-mu (timeout-collect-due!)))
+    (for-each (lambda (fire)
+                (guard (e (#t (jolt-thread-uncaught! #f e "Exception in thread \"jolt-timer\":\n")))
+                  (fire)))
+              (jolt-with-mutex timeout-mu (timeout-collect-due!)))
     (loop)))
 
 ;; (jolt-timer-at! deadline-ms thunk) — run thunk on the timer thread once the
