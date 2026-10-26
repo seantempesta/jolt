@@ -588,6 +588,9 @@
                   (get field-dbl (name form)))
             (seq? form) (map (fn [x] (rw inst shadowed x)) form)
             (vector? form) (mapv (fn [x] (rw inst shadowed x)) form)
+            ;; a map or set literal holds forms too: {:val state} reads the field
+            (and (map? form) (not (record? form))) (into {} (map (fn [e] [(rw inst shadowed (key e)) (rw inst shadowed (val e))])) form)
+            (set? form) (into #{} (map (fn [x] (rw inst shadowed x))) form)
             :else form))
         ;; inline impls register for dispatch but are NOT extenders of the
         ;; protocol (the JVM compiles them into the class) — register-inline-method,

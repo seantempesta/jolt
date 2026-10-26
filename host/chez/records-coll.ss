@@ -141,6 +141,12 @@
 (define (jrec-declares? x interface)
   (and (jrec? x) (jch-isa? (jrec-tag x) interface)))
 
+;; swap!, reset!, add-watch and the rest of atoms.ss's reference fns reach a
+;; deftype or record through the interface it declares (atoms.ss, iface-call).
+(set-iface-method-hook!
+  (lambda (x interface method nargs)
+    (and (jrec-declares? x interface) (jrec-method-arity x method nargs))))
+
 ;; Everything about a type that follows from its DECLARED interfaces, derived once
 ;; per descriptor: is it a defrecord, does it declare a collection interface, which
 ;; collection shape does it print in, is it a CharSequence. These sit on hot paths —

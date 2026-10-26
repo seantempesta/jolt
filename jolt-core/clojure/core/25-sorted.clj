@@ -377,7 +377,9 @@
 
 (defn sorted-map? [x] (= :jolt/sorted-map (sfield x :jolt/type)))
 (defn sorted-set? [x] (= :jolt/sorted-set (sfield x :jolt/type)))
-(defn sorted? [x] (or (sorted-map? x) (sorted-set? x)))
+;; A type declaring clojure.lang.Sorted is sorted on the JVM (sorted? is an
+;; instance? test there), and subseq / rsubseq reach it through the interface.
+(defn sorted? [x] (or (sorted-map? x) (sorted-set? x) (instance? clojure.lang.Sorted x)))
 
 ;; --- subseq / rsubseq ---------------------------------------------------------
 ;; test is one of < <= > >= applied Clojure-style to the comparator result:
@@ -390,16 +392,27 @@
 
 (defn- sc-mode [sc] (if (sorted-map? sc) 0 1))
 
+;; jolt's own sorted colls walk their tree; any other Sorted is asked through the
+;; interface's comparator, entryKey, seqFrom and seq, as clojure.core does.
+(defn- native-sorted? [sc] (or (sorted-map? sc) (sorted-set? sc)))
+
 ;; clojure.core/mk-bound-fn
 (defn- mk-bound-fn [sc test k]
-  (let [cmp (the-cmp sc) map? (sorted-map? sc)]
-    (fn [e] (test (cmp (if map? (key e) e) k) 0))))
+  (if (native-sorted? sc)
+    (let [cmp (the-cmp sc) map? (sorted-map? sc)]
+      (fn [e] (test (cmp (if map? (key e) e) k) 0)))
+    (let [cmp (.comparator sc)]
+      (fn [e] (test (.compare cmp (.entryKey sc e) k) 0)))))
 
 (defn- seq-from [sc k asc?]
-  (jolt.host/sorted-seq-from (sfield sc :tree) asc? (sc-mode sc) (the-cmp sc) k))
+  (if (native-sorted? sc)
+    (jolt.host/sorted-seq-from (sfield sc :tree) asc? (sc-mode sc) (the-cmp sc) k)
+    (.seqFrom sc k asc?)))
 
 (defn- sc-seq [sc asc?]
-  (jolt.host/sorted-seq (sfield sc :tree) asc? (sc-mode sc)))
+  (if (native-sorted? sc)
+    (jolt.host/sorted-seq (sfield sc :tree) asc? (sc-mode sc))
+    (.seq sc asc?)))
 
 (defn- assert-sorted [sc]
   (when-not (sorted? sc)

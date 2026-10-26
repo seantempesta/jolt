@@ -63,16 +63,24 @@
        (loop (cddr o) validator (cadr o)))
       (else (loop (cddr o) validator m)))))
 
-;; The five mutators reach into the atom record directly, so a non-atom receiver
-;; would raise a raw host error with no class for a catch to select — one naming
-;; jolt's own record type ("is not of type #<record type jolt-atom-v3>"), which
-;; classes as :object and therefore matches EVERY catch clause. Name the class the
-;; JVM names instead (nil is its NullPointerException). Every entry point that can
-;; take a receiver from user code opens with this, BEFORE it validates or reads a
-;; field: compare-and-set! validates the new value first, so the check has to come
-;; ahead of that or the raw error is back.
-(define (jolt-need-atom a)
-  (if (jolt-atom? a) a (jolt-cast-throw a "clojure.lang.IAtom")))
+;; The five mutators reach into the atom record directly, so each opens with
+;; jolt-atom? BEFORE it validates or reads a field (compare-and-set! validates the
+;; new value first). Any other receiver goes through the interface it declares.
+;; A deftype or record declaring clojure.lang.IAtom / IAtom2 / IRef is one on the
+;; JVM, where swap!, reset!, compare-and-set!, the -vals pair and the watch and
+;; validator fns are calls through that interface (.swap, .reset, .addWatch …).
+;; The record layer loads after this file, so it supplies the lookup:
+;; (iface-method-hook x interface method nargs) answers the method x declares
+;; through INTERFACE, or #f. A receiver declaring none raises the class the JVM
+;; names (nil is its NullPointerException), never a raw host error naming jolt's
+;; record type, which classes as :object and so matches EVERY catch clause.
+(define iface-method-hook #f)
+(define (set-iface-method-hook! f) (set! iface-method-hook f))
+(define (declared-method x interface method nargs)
+  (and iface-method-hook (iface-method-hook x interface method nargs)))
+(define (iface-call x interface method . args)
+  (let ((m (declared-method x interface method (fx+ 1 (length args)))))
+    (if m (apply jolt-invoke m x args) (jolt-cast-throw x interface))))
 
 ;; validate a candidate value: a non-nil validator that returns falsey rejects.
 (define (jolt-atom-validate a v)
@@ -130,43 +138,59 @@
 (define jolt-swap!
   (case-lambda
     ((a f)
-     (jolt-need-atom a)
-     (let retry ()
-       (let* ((old (jolt-atom-val a)) (nv (jolt-invoke1 f old)))
-         (if (jolt-swap-commit! a old nv) nv (retry)))))
+     (if (jolt-atom? a)
+         (let retry ()
+           (let* ((old (jolt-atom-val a)) (nv (jolt-invoke1 f old)))
+             (if (jolt-swap-commit! a old nv) nv (retry))))
+         (iface-call a "clojure.lang.IAtom" "swap" f)))
     ((a f x)
-     (jolt-need-atom a)
-     (let retry ()
-       (let* ((old (jolt-atom-val a)) (nv (jolt-invoke2 f old x)))
-         (if (jolt-swap-commit! a old nv) nv (retry)))))
+     (if (jolt-atom? a)
+         (let retry ()
+           (let* ((old (jolt-atom-val a)) (nv (jolt-invoke2 f old x)))
+             (if (jolt-swap-commit! a old nv) nv (retry))))
+         (iface-call a "clojure.lang.IAtom" "swap" f x)))
     ((a f x y)
-     (jolt-need-atom a)
-     (let retry ()
-       (let* ((old (jolt-atom-val a)) (nv (jolt-invoke3 f old x y)))
-         (if (jolt-swap-commit! a old nv) nv (retry)))))
+     (if (jolt-atom? a)
+         (let retry ()
+           (let* ((old (jolt-atom-val a)) (nv (jolt-invoke3 f old x y)))
+             (if (jolt-swap-commit! a old nv) nv (retry))))
+         (iface-call a "clojure.lang.IAtom" "swap" f x y)))
+    ;; IAtom's widest swap is (f x y ISeq args): the args past y go as one seq
     ((a f . args)
-     (jolt-need-atom a)
-     (let retry ()
-       (let* ((old (jolt-atom-val a)) (nv (apply jolt-invoke f old args)))
-         (if (jolt-swap-commit! a old nv) nv (retry)))))))
+     (if (jolt-atom? a)
+         (let retry ()
+           (let* ((old (jolt-atom-val a)) (nv (apply jolt-invoke f old args)))
+             (if (jolt-swap-commit! a old nv) nv (retry))))
+         (iface-call a "clojure.lang.IAtom" "swap" f (car args) (cadr args)
+                     (list->cseq (cddr args)))))))
 
 (define (jolt-reset! a v)
-  (jolt-need-atom a)
-  (jolt-atom-validate a v)
-  (let ((old (jolt-atom-exchange! a v)))
-    (jolt-atom-notify a old v)
-    v))
+  (if (jolt-atom? a)
+      (begin
+        (jolt-atom-validate a v)
+        (let ((old (jolt-atom-exchange! a v)))
+          (jolt-atom-notify a old v)
+          v))
+      (iface-call a "clojure.lang.IAtom" "reset" v)))
 
 ;; compare-and-set! is the CAS helper with the JVM's identity comparison.
 (define (jolt-compare-and-set! a oldv newv)
-  (jolt-need-atom a)
-  (jolt-atom-validate a newv)
-  (let ((swapped (jolt-atom-cas! a oldv newv)))
-    (when swapped (jolt-atom-notify a oldv newv))
-    swapped))
+  (if (jolt-atom? a)
+      (begin
+        (jolt-atom-validate a newv)
+        (let ((swapped (jolt-atom-cas! a oldv newv)))
+          (when swapped (jolt-atom-notify a oldv newv))
+          swapped))
+      (iface-call a "clojure.lang.IAtom" "compareAndSet" oldv newv)))
 
 (define (jolt-swap-vals! a f . args)
-  (jolt-need-atom a)
+  (if (jolt-atom? a)
+      (jolt-atom-swap-vals! a f args)
+      (if (fx<? (length args) 3)
+          (apply iface-call a "clojure.lang.IAtom2" "swapVals" f args)
+          (iface-call a "clojure.lang.IAtom2" "swapVals" f (car args) (cadr args)
+                      (list->cseq (cddr args))))))
+(define (jolt-atom-swap-vals! a f args)
   (let retry ()
     (let* ((old (jolt-atom-val a))
            (nv (apply jolt-invoke f old args)))
@@ -176,11 +200,13 @@
           (retry)))))
 
 (define (jolt-reset-vals! a v)
-  (jolt-need-atom a)
-  (jolt-atom-validate a v)
-  (let ((old (jolt-atom-exchange! a v)))
-    (jolt-atom-notify a old v)
-    (jolt-vector old v)))
+  (if (jolt-atom? a)
+      (begin
+        (jolt-atom-validate a v)
+        (let ((old (jolt-atom-exchange! a v)))
+          (jolt-atom-notify a old v)
+          (jolt-vector old v)))
+      (iface-call a "clojure.lang.IAtom2" "resetVals" v)))
 
 ;; --- watches / validators: the IRef seam --------------------------------------
 ;; On the JVM these are the ARef contract shared by atom/var/agent/ref. The atom
@@ -271,6 +297,8 @@
        (hashtable-set! iref-watch-tbl a
          (jolt-watch-add (hashtable-ref iref-watch-tbl a '()) key f)))
      a)
+    ((declared-method a "clojure.lang.IRef" "addWatch" 3)
+     => (lambda (m) (jolt-invoke m a key f)))
     (else (throw-jvm (quote ClassCastException) "add-watch: not a watchable reference"))))
 (define (jolt-remove-watch a key)
   (cond
@@ -282,6 +310,8 @@
        (hashtable-set! iref-watch-tbl a
          (remp (lambda (kv) (jolt=2 (car kv) key)) (hashtable-ref iref-watch-tbl a '()))))
      a)
+    ((declared-method a "clojure.lang.IRef" "removeWatch" 2)
+     => (lambda (m) (jolt-invoke m a key)))
     (else (throw-jvm (quote ClassCastException) "remove-watch: not a watchable reference"))))
 (define (jolt-set-validator! a f)
   (let ((vf (if (jolt-nil? f) jolt-nil f)))
@@ -296,11 +326,15 @@
        (jolt-with-mutex iref-tbl-mu
          (iref-tbl-bump!)
          (hashtable-set! iref-validator-tbl a vf)))
+      ((declared-method a "clojure.lang.IRef" "setValidator" 2)
+       => (lambda (m) (jolt-invoke m a vf)))
       (else (throw-jvm (quote ClassCastException) "set-validator!: not a reference")))
     jolt-nil))
 (define (jolt-get-validator a)
   (cond ((jolt-atom? a) (jolt-atom-validator a))
         ((iref? a) (iref-validator-of a))
+        ((declared-method a "clojure.lang.IRef" "getValidator" 1)
+         => (lambda (m) (jolt-invoke m a)))
         (else jolt-nil)))
 
 ;; The rest of the ARef surface, which only the java interop layer reaches:
