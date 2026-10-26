@@ -55,11 +55,13 @@
 
 (def payload (vec (.getBytes (apply str (repeat 200 "copied across a park\n")))))
 
+(defn fds "This process's open descriptors." [] (count (.list (java.io.File. "/dev/fd"))))
 (def got-copies
   ;; one main carrier a process: the scope's reads and the copies on it
   (jolt.host/main-carrier-run!
     (fn []
-      [[(read-across jar (fn [] nil))
+      [(fds)
+       [(read-across jar (fn [] nil))
         ;; the fiber parks on a timeout: the scope's winders are unwound and rewound
         (read-across jar (fn [] (a/<!! (a/timeout 1))))]
       (let [to-bytes (java.io.ByteArrayOutputStream.)
@@ -70,9 +72,12 @@
          (run #(clojure.java.io/copy (parking-stream payload) (java.io.File. f1)))
          (= payload (vec (.getBytes (slurp f1))))
          (run #(java.nio.file.Files/copy (parking-stream payload) (java.nio.file.Paths/get f2 (into-array String [])) (into-array java.nio.file.CopyOption [])))
-         (= payload (vec (.getBytes (slurp f2))))])])))
-(def got (first got-copies))
-(def copies (second got-copies))
+         (= payload (vec (.getBytes (slurp f2))))])
+       (fds)])))
+(def got (nth got-copies 1))
+(def copies (nth got-copies 2))
+(check-eq "every reader, source and file the parked reads and copies opened is closed at their end"
+          (nth got-copies 3) (first got-copies))
 
 (check-eq "io/copy into a stream and into a file, and Files/copy, from a source that parks" copies [:copied true :copied true :copied true])
 
