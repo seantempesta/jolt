@@ -1,9 +1,12 @@
-;; A process forked from a jolt program whose runtime threads were up (the fiber
-;; carriers, the timer, the shutdown watcher; all parked, so one thread is active)
-;; gets none of those threads, only their bookkeeping. jolt.host/after-fork-child!,
-;; called first in the child, drops it: a go that parks is resumed, a timeout fires,
-;; and the thread table names only the threads that exist. Without it each check's
-;; child hangs (exit 2 below), as the forked agents of a Seon root did (2026-10-22).
+;; A process forked from a jolt program gets only the bookkeeping of the runtime it forked from,
+;; none of its threads or waits. jolt.host/after-fork-child!, called first in the child, drops it:
+;; a go that parks is resumed, a timeout fires, the poller's table starts afresh, and the thread
+;; table names only the threads that exist. Without it each check's child hangs (exit 2 below), as
+;; the forked agents of a Seon root did (2026-10-22). The forks are made where a program that
+;; forks makes them: on its main carrier (jolt.host/main-carrier-run!), its one thread, with its
+;; fibers, timers and poller rounds mid-flight. A fork beside live runtime threads (carriers, the
+;; timer, the poller's) is refused (-2) whenever one of them is active at that instant, so this
+;; test forked from such a process only when it won that race (main-carrier-returns-test.clj).
 (require '[clojure.core.async :as a] '[jolt.scheme :as scm])
 
 (def failures (atom []))
@@ -42,14 +45,6 @@
 
 (defn parked-go [] (let [c (a/chan) r (a/go (a/<! c))] (a/>!! c 41) (= 41 (a/<!! r))))
 
-(check-eq "the parent's carriers are up" (parked-go) true)
-(a/<!! (a/timeout 1))
-(check-eq "a go that parks is resumed in the child" (in-child parked-go) 0)
-(check-eq "a timeout fires in the child" (in-child #(= :t (a/alt!! (a/timeout 10) :t))) 0)
-(check-eq "the child's thread table names no thread of the parent's"
-          (in-child #(not-any? (fn [t] (re-find #"jolt-carrier" (.getName ^Thread t))) (keys (Thread/getAllStackTraces))))
-          0)
-
 (require '[jolt.async.remote :as remote])
 (defn remote-echo
   "A value through a fresh jolt.async.remote pair with fiber pumps, whose readiness the poller
@@ -59,9 +54,6 @@
     (a/>!! (:out ea) 7)
     (let [v (a/<!! (:in eb))] (remote/close! ea) (remote/close! eb) (= 7 v))))
 
-(check-eq "the parent's poller runs (fiber pumps on a socket)" (remote-echo) true)
-(check-eq "a child of a process whose poller ran waits on a socket: its table starts afresh, not on the parent's dead kqueue"
-          (in-child remote-echo) 0)
 
 (defn in-child-now
   "The exit status of a child that runs (f) on its one thread, no deadline: 0 true, 1 else."
@@ -71,10 +63,25 @@
           (neg? pid) pid
           :else (wait-exit pid))))
 
-(check-eq "the reset starts no thread: the child is the one thread it forked as"
-          (in-child-now #(= 1 (count (Thread/getAllStackTraces)))) 0)
-(check-eq "a child that forks again (a double fork) gives a grandchild whose parked go resumes"
-          (in-child-now #(= 0 (in-child parked-go))) 0)
+
+(jolt.host/main-carrier-run!
+  (fn []
+    (check-eq "the parent's go blocks run" (parked-go) true)
+    (a/<!! (a/timeout 1))
+    (check-eq "a go that parks is resumed in the child" (in-child parked-go) 0)
+    (check-eq "a timeout fires in the child" (in-child #(= :t (a/alt!! (a/timeout 10) :t))) 0)
+    (check-eq "the child's thread table names no thread of the parent's"
+              (in-child #(not-any? (fn [t] (re-find #"jolt-carrier" (.getName ^Thread t))) (keys (Thread/getAllStackTraces))))
+              0)
+
+    (check-eq "the parent's poller runs (fiber pumps on a socket)" (remote-echo) true)
+    (check-eq "a child of a process whose poller ran waits on a socket: its table starts afresh, not on the parent's dead kqueue"
+              (in-child remote-echo) 0)
+
+    (check-eq "the reset starts no thread: the child is the one thread it forked as"
+              (in-child-now #(= 1 (count (Thread/getAllStackTraces)))) 0)
+    (check-eq "a child that forks again (a double fork) gives a grandchild whose parked go resumes"
+              (in-child-now #(= 0 (in-child parked-go))) 0)))
 
 (if (empty? @failures)
   (do (println "FORK-CHILD-TEST OK") (flush) (System/exit 0))
