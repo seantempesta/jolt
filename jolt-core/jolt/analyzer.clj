@@ -2006,9 +2006,13 @@
 (defn- suggest-threshold [n]
   (cond (<= n 3) 1 (<= n 6) 2 :else 3))
 
-;; Up to 3 candidate names closest to nm within the threshold, nearest first,
-;; ties broken alphabetically for a stable message.
-(defn- suggestions-for [nm candidates]
+(defn suggestions-for
+  "Up to 3 of candidates (strings) closest to the string nm by edit distance,
+  within a threshold that grows with nm's length (1 up to 3 chars, 2 up to 6,
+  else 3), nearest first, ties alphabetical; nm itself is never one. The
+  \"did you mean\" of an unresolved symbol, public for a host that answers a
+  missing name with the same ranking (a REPL's source of a name that is no var)."
+  [nm candidates]
   (let [thr (suggest-threshold (count nm))
         scored (filter (fn [p] (<= (second p) thr))
                        (map (fn [c] [c (edit-distance nm c)])
