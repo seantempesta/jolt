@@ -53,11 +53,16 @@
 ;; Bootstrap-safe by the same star-ns-cell test chez-current-ns uses: it is #f
 ;; until dyn-binding.ss captures the cell, and the boot writes just set the
 ;; parameter.
+;;
+;; And it keeps Var.set's owner rule, as jolt-set-var! does: a frame conveyed to
+;; another fiber (a go block, a future) is shared with the one that bound it, so a
+;; write from any fiber but the binder's would change the binder's *ns* too (two
+;; loads under one inherited binding set each other's: loader.ss ldr-with-own-ns).
 (define (set-chez-ns! ns)
-  (let ((p (and star-ns-cell (dyn-find-binding star-ns-cell))))
-    (if p
-        (set-cdr! p (intern-ns! ns))
-        (chez-current-ns-param ns))))
+  (let ((f (and star-ns-cell (dyn-find-binding-frame star-ns-cell))))
+    (cond ((not f) (chez-current-ns-param ns))
+          ((eqv? (car f) (dyn-owner)) (set-cdr! (assq star-ns-cell (cdr f)) (intern-ns! ns)))
+          (else (throw-jvm (quote IllegalStateException) "Can't set!: *ns* from non-binding thread")))))
 
 (define-record-type jolt-multifn
   (fields name dispatch-fn methods default hierarchy prefers

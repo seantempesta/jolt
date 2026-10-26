@@ -2531,11 +2531,11 @@
                    (throw-jvm 'java.io.FileNotFoundException
                               (string-append "Could not locate " (ns-name->rel name)
                                              ".jolt (or .clj/.cljc) on the source roots"))))
-         (saved (chez-current-ns))
-         (base (guard (e (else (set-chez-ns! saved) (raise e)))
-                 (cpath-with-compile-files
-                   (lambda () (cpath-compile-load name file dir))))))
-    (set-chez-ns! saved)
+         ;; in a *ns* binding of its own, as a load (ldr-with-own-ns)
+         (base (ldr-with-own-ns
+                 (lambda ()
+                   (cpath-with-compile-files
+                     (lambda () (cpath-compile-load name file dir)))))))
     (unless (or (ns-has-vars? name) (hashtable-ref ns-registry name #f))
       (throw-jvm 'java.lang.Exception
                  (string-append "namespace '" name "' not found after loading '" file "'")))
@@ -3032,32 +3032,26 @@
          (display (string-append "Loading " name " from " (or art file) "\n")
                   (current-error-port)))
        (ldr-mark-loaded! name)            ; mark before load so a cycle terminates
-       (let ((saved (chez-current-ns)))
-         ;; the ns restore is on the way out, not written twice on the two paths
-         ;; that used to reach it — a load leaving *ns* pointing at the file it was
-         ;; part way through is the kind of damage that surfaces three forms later
-         ;; somewhere else, so it happens however the body exits.
-         ;; Masked at its edges (jolt-wind*, locks.ss), so an interrupt cannot
-         ;; skip the restore.
-         (jolt-wind*
-           (lambda () #f)
-           #f
-           (lambda ()
-             (guard (e (else
-                         (unless was-loaded? (ldr-unmark-loaded! name)) ; roll the mark back
-                         (raise e)))
-               (cond
-                 (art (ldr-with-compiled-ns-vars (lambda () (load (cpath-so-file art)))))
-                 ;; inside a compile, loading from source also emits the artifact
-                 ;; — RT.load's COMPILE_FILES branch, which is what carries a
-                 ;; compile through to the whole load closure.
-                 ((cpath-compiling-dir file)
-                  => (lambda (dir) (cpath-compile-load name file dir)))
-                 (else (aot-load-or-compile name file force?)))))
-           (set-chez-ns! saved))   ; the current ns is thread-local
-         ;; the hook feeds `jolt build`, which needs the SOURCE path; an
-         ;; artifact-only namespace has none to give.
-         (ns-loaded-hook name (or file art))))
+       ;; in a *ns* binding of its own (ldr-with-own-ns): a load leaving *ns*
+       ;; pointing at the file it was part way through is the kind of damage that
+       ;; surfaces three forms later somewhere else, and the frame pops however the
+       ;; body exits
+       (ldr-with-own-ns
+         (lambda ()
+           (guard (e (else
+                       (unless was-loaded? (ldr-unmark-loaded! name)) ; roll the mark back
+                       (raise e)))
+             (cond
+               (art (ldr-with-compiled-ns-vars (lambda () (load (cpath-so-file art)))))
+               ;; inside a compile, loading from source also emits the artifact
+               ;; — RT.load's COMPILE_FILES branch, which is what carries a
+               ;; compile through to the whole load closure.
+               ((cpath-compiling-dir file)
+                => (lambda (dir) (cpath-compile-load name file dir)))
+               (else (aot-load-or-compile name file force?))))))
+       ;; the hook feeds `jolt build`, which needs the SOURCE path; an
+       ;; artifact-only namespace has none to give.
+       (ns-loaded-hook name (or file art)))
       ;; No source file but the namespace exists in memory (AOT'd into a built
       ;; binary): it's already defined — mark loaded and move on.
       ((ns-has-vars? name)
@@ -3083,12 +3077,28 @@
                                               " was compiled by a different jolt build, or"
                                               " a namespace it requires has changed — recompile it"))))))))))
 
-;; load-file / load run a file's forms starting in the current ns, and put
-;; *ns* back afterwards however the load exits: Compiler.load binds *ns* for the
-;; duration, so an `ns` form in the loaded file never leaks into the caller.
+;; A load binds *ns* for its own extent, as Compiler.load does
+;; (pushThreadBindings of CURRENT_NS): the file's `ns` form and every in-ns in it
+;; write the load's OWN frame, which pops when the load exits however it exits, so
+;; nothing leaks into the caller and nothing needs restoring. Saving the current
+;; ns and writing it back on exit was not that: under a *ns* binding the file's
+;; ns form wrote the binding it found (set-chez-ns!), and conveyance shares a
+;; frame between fibers (a go block, a future: Frame.clone shares the TBoxes), so
+;; two loads under one inherited (binding [*ns* ..]) wrote the same cell. On the
+;; main carrier, where a load parks part way through its file, each set the other's
+;; *ns* and a file's later forms interned into another namespace
+;; (test/chez/main-carrier-load-ns-test.clj). Before dyn-binding.ss captures the
+;; *ns* cell (the boot's own loads, one thread) the parameter is all there is.
+(define (ldr-with-own-ns thunk)
+  (if star-ns-cell
+      (dyn-with-frame (list (cons star-ns-cell (intern-ns! (chez-current-ns)))) thunk)
+      (let ((saved (chez-current-ns)))
+        (jolt-wind* (lambda () #f) #f thunk (set-chez-ns! saved)))))
+
+;; load-file / load run a file's forms starting in the current ns, in a *ns*
+;; binding of their own (ldr-with-own-ns).
 (define (load-jolt-file/restoring-ns path)
-  (let ((saved (chez-current-ns)))
-    (jolt-wind* (lambda () #f) #f (lambda () (load-jolt-file path)) (set-chez-ns! saved))))
+  (ldr-with-own-ns (lambda () (load-jolt-file path))))
 
 ;; load-file: load an explicit path, in the current ns.
 ;; The path is absolute, as Compiler.loadFile's is (File.getAbsolutePath), and is
