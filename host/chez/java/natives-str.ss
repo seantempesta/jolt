@@ -681,7 +681,7 @@
         (sa-foreign-set! 'unsigned-64 cells 24 outcap)))
     (define (replace!) (put-bytevector acc #vu8(#xEF #xBF #xBD)))
     (let ((r (dynamic-wind
-      void
+      jolt-finally-in
       (lambda ()
         (let ((slice (make-bytevector n)))
           (bytevector-copy! bv lo slice 0 n)

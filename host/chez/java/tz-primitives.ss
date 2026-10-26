@@ -244,7 +244,7 @@
              (tm (sa-foreign-alloc 56)))
          ;; tm is freed on the way out however the body leaves, throw included.
          (dynamic-wind
-           (lambda () #f)
+           jolt-finally-in
            (lambda ()
              (sa-foreign-set! 'integer-32 tm 0 0) (sa-foreign-set! 'integer-32 tm 4 0)
              (sa-foreign-set! 'integer-32 tm 8 0) (sa-foreign-set! 'integer-32 tm 12 1)
