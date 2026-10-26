@@ -303,9 +303,17 @@
 (define jolt-boot-thread-id (get-thread-id))
 (define jolt-c-exit (jolt-foreign-proc-safe "_exit" '(int) 'void))
 (define (jolt-exit-process code)
-  (if (or (eqv? (get-thread-id) jolt-boot-thread-id) (not jolt-c-exit))
+  ;; As the JVM's Runtime.exit: the shutdown hooks run, the console is flushed, and the process
+  ;; halts, from whichever thread called it. Never through Chez's exit on the boot thread: its
+  ;; base handler leaves through the program's top-level continuation, which unwinds every
+  ;; dynamic-wind on the way, so a `finally` around the call ran, and one that exited again
+  ;; replaced the status (a Seon agent's (System/exit 3) reached its root as 1, the status its
+  ;; forked process's boundary set in a `finally`). The hooks' runner is once per process
+  ;; (concurrency.ss), loaded after this file: resolved when called.
+  (if (not jolt-c-exit)
       (exit code)
       (begin
+        (guard (_ (#t #f)) (jolt-run-shutdown-hooks!))
         (guard (_ (#t #f)) (flush-output-port (current-output-port)))
         (guard (_ (#t #f)) (flush-output-port (current-error-port)))
         (jolt-c-exit code))))
