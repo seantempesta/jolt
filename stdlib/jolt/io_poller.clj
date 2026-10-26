@@ -585,8 +585,11 @@
       (Thread/sleep 10))
     (recur)))
 
-(defn- poller-loop [kq]
-  (loop [to-delete #{}]
+(defn- poller-loop
+  "The poller thread's rounds over kq, from the deletes a main carrier's rounds left (none for
+  a thread started as the poller)."
+  [kq deletes]
+  (loop [to-delete deletes]
     (let [evs (poller-round kq to-delete)]
       (cond
         ;; nil — the WAIT ITSELF failed, so the changelist may never have reached the
@@ -757,10 +760,11 @@
 (jolt.host/io-after-fork-set! after-fork!)
 
 (defn- start-poller-thread!
-  "The poller's thread over kqueue (or epoll) kq: a daemon thread, not a future, as the poller
-  runs for the life of the process, and a non-daemon thread would keep it from ending."
-  [kq]
-  (doto (Thread. (fn [] (poller-loop kq)) "jolt-io-poller")
+  "The poller's thread over kqueue (or epoll) kq, carrying the deletes it is given: a daemon
+  thread, not a future, as the poller runs for the life of the process, and a non-daemon thread
+  would keep it from ending."
+  [kq deletes]
+  (doto (Thread. (fn [] (poller-loop kq deletes)) "jolt-io-poller")
     (.setDaemon true)
     (.start)))
 
@@ -790,8 +794,10 @@
               ;; and a fiber another thread queues ends the round through the wake pipe
               (jolt.host/main-io-wait-set! main-io-wait (fn [] (locking pm (pipe-write!)))
                                            ;; the program returned: this kqueue's waits are the poller thread's
-                                           (fn [] (start-poller-thread! kq)))
-              (start-poller-thread! kq))))
+                                           ;; with the deletes its rounds carried (main-deletes): a retired
+                                           ;; registration left in the set fires every round
+                                           (fn [] (start-poller-thread! kq @main-deletes) (vreset! main-deletes #{})))
+              (start-poller-thread! kq #{}))))
         (finally (ffi/free pfds))))))
 
 ;; -- the wait API --------------------------------------------------------------
