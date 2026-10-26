@@ -379,7 +379,8 @@
 (defn sorted-set? [x] (= :jolt/sorted-set (sfield x :jolt/type)))
 ;; A type declaring clojure.lang.Sorted is sorted on the JVM (sorted? is an
 ;; instance? test there), and subseq / rsubseq reach it through the interface.
-(defn sorted? [x] (or (sorted-map? x) (sorted-set? x) (instance? clojure.lang.Sorted x)))
+;; instance? is a macro defined later (30-macros); instance-check is its runtime fn.
+(defn sorted? [x] (or (sorted-map? x) (sorted-set? x) (instance-check 'clojure.lang.Sorted x)))
 
 ;; --- subseq / rsubseq ---------------------------------------------------------
 ;; test is one of < <= > >= applied Clojure-style to the comparator result:

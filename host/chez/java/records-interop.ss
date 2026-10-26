@@ -124,6 +124,13 @@
          (reify-declares-class? (jreify-protos val) tname))
         (else #f)))
 
+;; swap!, reset!, add-watch and the rest of atoms.ss's reference fns reach a
+;; deftype, record or reify through the interface it declares, as instance? sees
+;; it (atoms.ss, iface-call).
+(set-iface-method-hook!
+  (lambda (x interface method nargs)
+    (and (own-type-declares? interface x) (iface-method x method nargs))))
+
 (define (instance-check-base type-sym val)
   (let ((tname (symbol-t-name type-sym)))
     (cond

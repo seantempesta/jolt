@@ -1027,11 +1027,6 @@
 (define (jrec-declares? x interface)
   (and (jrec? x) (jch-isa? (jrec-tag x) interface)))
 
-(set-iface-method-hook!
-  (lambda (x interface method nargs)
-    (and (jrec-declares? x interface)
-         (jrec-method-arity x method nargs))))
-
 (define jrdesc-ifc-tbl (make-weak-eq-hashtable))
 
 (define jrdesc-ifc-mutex (make-mutex))
