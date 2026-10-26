@@ -270,8 +270,10 @@
         found (volatile! nil)
         t (tree-ins cmp tree k v found)]
     (if (nil? t)
-      ;; the key is present: keep its first-inserted key, replace the value
-      (if (= v (nd-val @found))
+      ;; the key is present: keep its first-inserted key, replace the value. The
+      ;; map is kept only for the SAME value (PersistentTreeMap.assoc's ==): a value
+      ;; = to the old one replaces it, so identity-keyed caches see the new one
+      (if (identical? v (nd-val @found))
         sm
         (make-sorted :jolt/sorted-map (tree-replace cmp tree k v) (sfield sm :cnt) (sfield sm :cmp) (sfield sm :cmp-fn) (sfield sm :ops)))
       (make-sorted :jolt/sorted-map (blacken t) (inc (sfield sm :cnt)) (sfield sm :cmp) (sfield sm :cmp-fn) (sfield sm :ops)))))
