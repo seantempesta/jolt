@@ -197,11 +197,13 @@
   (define name (and (pair? rest) (car rest)))
   ;; a file that is not there is the JDK's NoSuchFileException (its
   ;; Files.readAttributes, before the open); one that is there but cannot be
-  ;; opened is the RandomAccessFile's FileNotFoundException, "(Permission
-  ;; denied)" as the JDK spells the EACCES it got
+  ;; opened is the RandomAccessFile's FileNotFoundException, its reason the
+  ;; open's own strerror (io.ss io-open-reason): "Too many open files" is the
+  ;; process's, not the file's, and was reported as "Permission denied"
   (let ((in (guard (e (#t (if (file-exists? path)
                               (zip-throw "java.io.FileNotFoundException"
-                                         (string-append (or name path) " (Permission denied)"))
+                                         (string-append (or name path) " ("
+                                                        (or (io-open-reason (list e)) "Permission denied") ")"))
                               (zip-throw "java.nio.file.NoSuchFileException" (or name path)))))
               (open-file-input-port path))))
     (dynamic-wind
@@ -527,20 +529,23 @@
 
 ;; --- the index the loader shares ---------------------------------------------
 ;; One zipdir per archive path, keyed by the file's modification time: a jar
-;; re-fetched at the same path is read again. A path that is not a readable
-;; archive answers #f, and is not remembered, so it is asked again — the
-;; archive may be finished by then. The table is read under its lock; a build
-;; runs outside it, so two threads may read one archive at once and the second
-;; store wins, which is harmless: the two are equal.
+;; re-fetched at the same path is read again. A path that holds no file, or a
+;; file that is not a whole archive (zipdir-read's ZipException), answers #f,
+;; and is not remembered, so it is asked again — the archive may be finished by
+;; then. Any other failure (the open's, a read's: the process out of
+;; descriptors, an I/O error) is no answer about the file, so it raises to the
+;; caller with its own cause. The table is read under its lock; a build runs
+;; outside it, so two threads may read one archive at once and the second store
+;; wins, which is harmless: the two are equal.
 (define zipdir-cache (make-hashtable string-hash string=?))
 (define zipdir-cache-mu (make-mutex))
 (define (zipdir-for path)
-  (let ((stamp (guard (e (#t #f)) (sa-file-mtime-ms path))))
-    (and stamp
+  (and (file-exists? path) (not (file-directory? path))
+       (let ((stamp (sa-file-mtime-ms path)))
          (let ((hit (jolt-with-mutex zipdir-cache-mu (hashtable-ref zipdir-cache path #f))))
            (if (and hit (eqv? (car hit) stamp))
                (cdr hit)
-               (let ((d (guard (e (#t #f)) (zipdir-read path #f))))
+               (let ((d (guard (e ((zip-thrown? e "ZipException") #f)) (zipdir-read path #f))))
                  (when d
                    (jolt-with-mutex zipdir-cache-mu
                      (hashtable-set! zipdir-cache path (cons stamp d))))
