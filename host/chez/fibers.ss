@@ -742,10 +742,123 @@
                               (jolt-slice-ns-param)
                               #f)
             c #f '() 0 #f #f 0 #f ibox #f #f #f #f 0)))
+    (jolt-fiber-register! f)
     (when ibox (jolt-fiber-own-ibox! f ibox))
     (when before-run (before-run f))
     (jolt-fiber-enqueue! c f)
     f))
+
+;; --- every live fiber, and the dump of them ----------------------------------
+;; A hang is a fiber parked on something that never comes, and a native sample of the
+;; process shows only the carrier idle in kevent. So every fiber is held, weakly (a
+;; finished one is collected as before), from its spawn, and (jolt-fiber-dump port) writes
+;; each: its state, carrier, what it is parked on, its engine ticks, and for a parked
+;; fiber the frames of the continuation it will resume (Chez's inspector: each frame's
+;; procedure name and source), innermost first. It reads and prints; it changes nothing.
+;; SIGINFO runs it (fibers-async.ss), on the thread whose event check takes the signal: a
+;; main carrier idle in its poller's kevent wakes for it. It cannot reach a thread that is
+;; in a foreign call, a condition wait (a promise's deref) or a lock, which run no event
+;; check: a parked fiber's frames are reachable from any thread, a running thread's are not.
+;; A weak list, not a weak table, pushed without a lock: a spawn CASes one weak pair onto
+;; the box (a weak eq-hashtable's insert under a mutex cost 0.45 us a spawn, 20%). The pairs
+;; whose fiber was collected are dropped when the pushes reach twice the live count at the
+;; last drop, so the list stays within twice the live fibers; the drop is a CAS of the
+;; pruned list over the one it read, retried if a push landed between, so no push is lost.
+(define jolt-fiber-registry (box '()))
+(define jolt-fiber-registry-pushes 0)    ; approximate (unlocked): only times the next drop
+(define jolt-fiber-registry-limit 1024)
+(define (jolt-fiber-registry-live)
+  (let loop ((l (unbox jolt-fiber-registry)) (acc '()))
+    (cond ((null? l) (reverse acc))
+          ((bwp-object? (car l)) (loop (cdr l) acc))
+          (else (loop (cdr l) (cons (car l) acc))))))
+(define (jolt-fiber-register! f)
+  (let retry ()
+    (let ((old (unbox jolt-fiber-registry)))
+      (unless (box-cas! jolt-fiber-registry old (weak-cons f old)) (retry))))
+  (set! jolt-fiber-registry-pushes (fx+ jolt-fiber-registry-pushes 1))
+  (when (fx>=? jolt-fiber-registry-pushes jolt-fiber-registry-limit)
+    (set! jolt-fiber-registry-pushes 0)
+    (let retry ()
+      (let* ((old (unbox jolt-fiber-registry))
+             (live (let loop ((l old) (acc '()))
+                     (cond ((null? l) (reverse acc))
+                           ((bwp-object? (car l)) (loop (cdr l) acc))
+                           (else (loop (cdr l) (cons (car l) acc)))))))
+        (if (box-cas! jolt-fiber-registry old (fold-right weak-cons '() live))
+            (set! jolt-fiber-registry-limit (fxmax 1024 (fx* 2 (length live))))
+            (retry))))))
+
+;; up to limit frames of continuation k as (name source-datum-or-#f vars), innermost first,
+;; and how many were left: the last element is that count, 0 when none. A compiled Clojure
+;; fn's code is unnamed, so vars names a frame by what it holds: each var cell among its
+;; variables (the vars it calls) and each fn a var was defined as (proc-name-of, rt.ss)
+(define (jolt-frame-vars o)
+  (let loop ((i 0) (acc '()))
+    (if (fx>=? i (o 'length))
+        (reverse acc)
+        (let* ((v (guard (e (#t #f)) (((o 'ref i) 'ref) 'value)))
+               (name (cond ((and v (var-cell? v)) (string-append (var-cell-ns v) "/" (var-cell-name v)))
+                           ((and v (procedure? v) (proc-name-of v)) => (lambda (p) (string-append (car p) "/" (cdr p))))
+                           (else #f))))
+          (loop (fx+ i 1) (if (and name (not (member name acc))) (cons name acc) acc))))))
+(define (jolt-continuation-frames k limit)
+  (let loop ((o (inspect/object k)) (i 0) (acc '()))
+    (cond ((not (eq? (o 'type) 'continuation)) (reverse (cons 0 acc)))
+          ((fx>=? i limit)
+           (let count ((o o) (n 0))
+             (if (eq? (o 'type) 'continuation) (count (o 'link) (fx+ n 1)) (reverse (cons n acc)))))
+          (else
+           (let* ((code (o 'code)) (src (o 'source)))
+             (loop (o 'link) (fx+ i 1)
+                   (cons (list (and code (code 'name)) (and src (src 'value)) (jolt-frame-vars o)) acc)))))))
+
+(define (jolt-fiber-describe-wait x)
+  (cond ((not x) "nothing")
+        ((symbol? x) (symbol->string x))
+        ((record? x) (symbol->string (record-type-name (record-rtd x))))
+        ((procedure? x) (let ((code ((inspect/object x) 'code)))
+                          (format "the procedure ~a" (or (and code (code 'name)) "?"))))
+        (else "a value")))
+
+(define (jolt-fiber-dump port)
+  (let* ((fs (jolt-fiber-registry-live))
+         (carrier-index (lambda (c) (let ((cs jolt-fiber-carriers))
+                                      (and cs (let loop ((i 0))
+                                                (cond ((fx=? i (vector-length cs)) #f)
+                                                      ((eq? c (vector-ref cs i)) i)
+                                                      (else (loop (fx+ i 1)))))))))
+         (live (filter (lambda (f) (not (memq (jolt-fiber-state f) '(done dead)))) fs)))
+    (fprintf port "jolt fiber dump: ~a live fibers of ~a held, on thread ~a~%"
+             (length live) (length fs) (get-thread-id))
+    (for-each
+      (lambda (f n)
+        (fprintf port "fiber ~a: ~a, carrier ~a, parked on ~a, wait state ~a, ~a ticks~%"
+                 n (jolt-fiber-state f) (or (carrier-index (jolt-fiber-carrier f)) "of a pool")
+                 (jolt-fiber-describe-wait (jolt-fiber-parked-on f))
+                 (or (jolt-fiber-wstate f) "none") (jolt-fiber-ticks f))
+        (cond
+          ((jolt-fiber-k f)
+           => (lambda (k)
+                (let ((frames (jolt-continuation-frames k 40)))
+                  (let loop ((fr frames) (i 0))
+                    (cond ((null? (cdr fr))
+                           (unless (fx=? 0 (car fr)) (fprintf port "  ... ~a more frames~%" (car fr))))
+                          (else
+                           (let* ((v (cadar fr))
+                                  (t (and v (with-output-to-string (lambda () (write v)))))
+                                  (vars (caddar fr)))
+                             ;; a frame's source form, or its length where it is longer than a line
+                             (fprintf port "  ~a ~a~a~a~%" i (or (caar fr) "?")
+                                      (if (null? vars) "" (format " [~{~a~^ ~}]" vars))
+                                      (cond ((not t) "")
+                                            ((fx>? (string-length t) 160) (format " (a form of ~a chars)" (string-length t)))
+                                            (else (string-append " " t)))))
+                           (loop (cdr fr) (fx+ i 1))))))))
+          ((jolt-fiber-sm f) => (lambda (sm) (fprintf port "  a CPS step: ~a~%" (jolt-fiber-describe-wait sm))))
+          (else (fprintf port "  no saved continuation (~a)~%" (jolt-fiber-state f)))))
+      live (iota (length live)))
+    (flush-output-port port)))
 
 ;; --- preemption (swish's quantum, erlang.ss:872 and @yield) ------------------
 ;; Without this a fiber only ever leaves its carrier at a channel op, so a

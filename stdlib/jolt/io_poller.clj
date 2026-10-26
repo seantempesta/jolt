@@ -139,6 +139,8 @@
 (def ^:private EV-CLEAR 0x20)
 (def ^:private EVFILT-USER -10)
 (def ^:private EVFILT-SIGNAL -6)
+;; <sys/signal.h> on macOS: the status request (^T), which runs the fiber dump
+(def ^:private SIGINFO 29)
 (def ^:private NOTE-TRIGGER 0x01000000)
 (def ^:private EFD-NONBLOCK 0x800)
 (def ^:private EFD-CLOEXEC 0x80000)
@@ -771,10 +773,14 @@
           (let [kq (if macos? (c-kqueue) (c-epoll-create1 0))]
             (swap! state assoc :pipe [r w] :kq kq :started? true)
             (if macos?
-              (let [ch (ffi/alloc KEVENT-SIZE)]
+              (let [ch (ffi/alloc (* 2 KEVENT-SIZE))]
                 (try
                   (kevent-put! ch 0 r EVFILT-READ EV-ADD)
-                  (c-kevent kq ch 1 ffi/null 0 ffi/null)
+                  ;; SIGINFO wakes a round, so a main carrier idle here runs the fiber dump's
+                  ;; handler (jolt.host/fiber-dump, fibers-async.ss); not one of :signals, so it
+                  ;; is no wake source a stuck loop could count on (awaited?)
+                  (kevent-put! ch 1 SIGINFO EVFILT-SIGNAL EV-ADD)
+                  (c-kevent kq ch 2 ffi/null 0 ffi/null)
                   (finally (ffi/free ch))))
               (ep-ctl! kq EPOLL-ADD r :read))
             (if (jolt.host/main-carrier?)

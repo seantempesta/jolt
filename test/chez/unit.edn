@@ -410,6 +410,8 @@
   ;; are all daemons, and a Thread made on one inherits it. The fiber row is jolt's
   ;; own: a go block on a fiber is a virtual thread, which is always a daemon.
   {:suite "threads / daemon" :expr "(do (require (quote [clojure.core.async :as a])) (let [me (fn [] (.isDaemon (Thread/currentThread)))] [(a/<!! (a/thread (me))) (a/<!! (a/go (me))) (a/<!! (a/thread (.isDaemon (Thread. (fn []))))) (a/<!! (a/io-thread (me))) (a/<!! (a/thread-call me :compute))]))" :expected "[true true true true true]"}
+  ;; the fiber dump (fibers.ss jolt-fiber-dump, SIGINFO's): a fiber parked in a channel take is listed with what it waits on and the frames it will resume in, and one that finished is not
+  {:suite "fibers / dump" :expr "(do (require (quote [clojure.core.async :as a]) (quote [jolt.fibers :as fib]) (quote [clojure.string :as str])) (let [c (a/chan) done (fib/spawn (fn [] 1)) _ (Thread/sleep 50) f (fib/spawn (fn [] (a/<!! c)))] (Thread/sleep 200) (let [d (jolt.host/fiber-dump)] (a/close! c) [(str/includes? d \"1 live fibers\") (str/includes? d \"parked, carrier\") (str/includes? d \"parked on alt-handler\") (str/includes? d \"jolt-fiber-<!*\")])))" :expected "[true true true true]"}
   {:suite "threads / daemon" :expr "(do (require (quote [clojure.core.async :as a])) (binding [a/*go-backend* :fiber] (a/<!! (a/go [(jolt.host/fiber?) (.isDaemon (Thread/currentThread))]))))" :expected "[true true]"}
   ;; A thread blocked in a core.async channel op is WAITING (<!!, >!!, and alts!!
   ;; over a timeout channel, which parks untimed). Probed on JVM Clojure 1.12.5 +

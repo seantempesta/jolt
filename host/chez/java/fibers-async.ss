@@ -398,6 +398,13 @@
       (enable-interrupts)
       (jolt-fiber-check-interrupt! f))))
 (def-var! "jolt.host" "fiber-resume" sa-fiber-resume)
+;; (jolt.host/fiber-dump): every live fiber, what it is parked on and its frames, as text
+;; (fibers.ss, jolt-fiber-dump). SIGINFO (^T, kill -INFO) writes it to stderr at the next
+;; event check of a thread that takes the signal; a main carrier idle in its poller wakes for it.
+(def-var! "jolt.host" "fiber-dump"
+  (lambda () (let-values (((port text) (open-string-output-port))) (jolt-fiber-dump port) (text))))
+(when (eq? (sa-os-family) 'macos)
+  (register-signal-handler 29 (lambda (sig) (jolt-fiber-dump (current-error-port)))))
 ;; The interrupt's throwable is a jolt value, raised as a throw would raise it,
 ;; so the fiber's own try/catch sees exactly what the caller passed.
 (def-var! "jolt.host" "fiber-interrupt!"
