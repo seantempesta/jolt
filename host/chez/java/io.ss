@@ -1822,7 +1822,9 @@
       ((string=? name "toURL")          (list (make-url (jfile->url-spec fp))))
       ((string=? name "exists")         (list (if (file-exists? fp) #t #f)))
       ((string=? name "isDirectory")    (list (if (file-directory? fp) #t #f)))
-      ((string=? name "isFile")         (list (if (and (file-exists? fp) (not (file-directory? fp))) #t #f)))
+      ;; a regular file, as File.isFile is: a FIFO, a socket or a device is neither
+      ;; it nor a directory (a scan that slurped a FIFO blocked forever on it)
+      ((string=? name "isFile")         (list (if (file-regular? fp) #t #f)))
       ((string=? name "isAbsolute")     (list (if (jfile-path-absolute? p) #t #f)))
       ;; listFiles builds each child from the path AS GIVEN (new File(this, name)
       ;; on the JVM), so a File made from a relative path lists relative children.
