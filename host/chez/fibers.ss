@@ -1651,6 +1651,13 @@
 (define jolt-io-after-fork #f)   ; jolt.io-poller's reset of its table in a forked child (any mode)
 
 (define (jolt-main-carrier-run! thunk)
+  (if (and jolt-main-thread (eqv? (get-thread-id) jolt-main-thread) (jolt-current-fiber))
+      ;; already a fiber of this process's main carrier (a child forked from inside one, as an
+      ;; agent of Seon's fork server is): thunk runs here, beneath the loop already driving it
+      (thunk)
+      (jolt-main-carrier-run/loop! thunk)))
+
+(define (jolt-main-carrier-run/loop! thunk)
   (when jolt-fiber-pool-started?
     (error 'jolt-main-carrier-run! "fibers already run on carrier threads: call it before the first fiber"))
   (set! jolt-main-carrier-pool-n (jolt-fiber-carrier-count))

@@ -30,9 +30,15 @@
             on-timer (fiber-go #(do (a/<! (a/timeout 50)) :fired))
             p (.start (ProcessBuilder. ["sh" "-c" "sleep 0.2; echo ready"]))
             on-fd (fiber-go #(.readLine (java.io.BufferedReader. (java.io.InputStreamReader. (.getInputStream p)))))]
-        {:ch ch :on-chan on-chan :on-timer on-timer :on-fd on-fd :main? (jolt.host/main-carrier?)}))))
+        {:ch ch :on-chan on-chan :on-timer on-timer :on-fd on-fd :main? (jolt.host/main-carrier?)
+         ;; called again from a fiber already on the main carrier (an agent forked from inside
+         ;; one): it runs in place, and its return leaves nothing
+         :nested (jolt.host/main-carrier-run! (fn [] [:nested (jolt.host/main-carrier?)]))
+         :after-nested (jolt.host/main-carrier?)}))))
 
 (check-eq "the program ran on the main carrier" (:main? left) true)
+(check-eq "a run from a fiber already on it runs in place" (:nested left) [:nested true])
+(check-eq "and its return leaves the main carrier in place" (:after-nested left) true)
 (check-eq "after the return the process is no main carrier" (jolt.host/main-carrier?) false)
 
 (reset! at "a fiber the program left parked on a channel")
