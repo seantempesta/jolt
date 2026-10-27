@@ -6797,6 +6797,10 @@
   ;; toArray is a Collection method, so a HashSet answers it too — it had none
   ;; at all, and (.toArray h) was "No matching field found".
   {:suite "interop / java.util collections" :label "HashSet answers the same toArray contract" :expected "[[1 2] true [true [1 2 nil]] [false [1 2]]]" :actual "[(vec (.toArray (java.util.HashSet. #{1 2}))) (instance? (Class/forName \"[Ljava.lang.Object;\") (.toArray (java.util.HashSet. #{1}))) (let [h (java.util.HashSet. #{1 2}) d (object-array [:o :o :keep])] [(identical? d (.toArray h d)) (vec (.toArray h d))]) (let [h (java.util.HashSet. #{1 2}) d (object-array 1)] [(identical? d (.toArray h d)) (vec (.toArray h d))])]" :portability :jvm}
+  ;; Arrays.hashCode and HashSet.iterator, which Datahike's recursive rules call: the JDK's hash
+  ;; (31*h + each element's from 1, int arithmetic; an int element is itself, a long Long's hash)
+  {:suite "interop / java.util collections" :label "Arrays/hashCode is the JDK's" :expected "[955331 990 31 0]" :actual "[(java.util.Arrays/hashCode (object-array [1 2 nil \"a\"])) (java.util.Arrays/hashCode (int-array [1 -2])) (java.util.Arrays/hashCode (long-array [-1])) (java.util.Arrays/hashCode nil)]" :portability :jvm}
+  {:suite "interop / java.util collections" :label "HashSet answers iterator" :expected "[[1 2] false]" :actual "(let [it (.iterator (java.util.HashSet. #{1 2})) xs [(.next it) (.next it)]] [(vec (sort xs)) (.hasNext it)])" :portability :jvm}
   {:suite "interop / exceptions" :label "SQLException constructs and catches as Exception" :expected "\"boom\"" :actual "(try (throw (java.sql.SQLException. \"boom\")) (catch Exception e (ex-message e)))" :portability :jvm}
   {:suite "interop / exceptions" :label "StackOverflowError is an Error with its own class" :expected "[true true]" :actual "(let [e (java.lang.StackOverflowError. \"so\")] [(instance? Error e) (= java.lang.StackOverflowError (class e))])" :portability :jvm}
   {:suite "interop / exceptions" :label "NoSuchElementException is a RuntimeException" :expected "true" :actual "(instance? RuntimeException (java.util.NoSuchElementException. \"n\"))" :portability :jvm}

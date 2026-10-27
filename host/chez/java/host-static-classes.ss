@@ -1108,6 +1108,9 @@
         ;; found: toArray for class java.util.HashSet". Same jcoll-to-array the
         ;; ArrayList family uses, over the set's own iteration order.
         (cons "toArray" (lambda (self . args) (jcoll-to-array (hs->list self) args)))
+        ;; The Collection method, over the set's iteration order as of the call (a snapshot, as
+        ;; ArrayList's here): Datahike's recursive rules walk a HashSet with it.
+        (cons "iterator" (lambda (self) (make-jiterator (list->cseq (hs->list self)))))
         (cons "forEach" (lambda (self f) (jcoll-for-each (hs->list self) f)))
         (cons "removeIf" (lambda (self pred)
                            (let* ((xs (hs->list self)) (keep (jcoll-keep xs pred)))
@@ -2816,7 +2819,22 @@
                                             (fold-left (lambda (acc s) (string-append acc ", " s))
                                                        (car parts) (cdr parts)))
                                     "]")))))
-         (cons "asList" arrays-as-list))))
+         (cons "asList" arrays-as-list)
+         ;; Arrays.hashCode, the JDK's: 31*h + each element's hash from 1, in int arithmetic, 0 for
+         ;; a nil array. An int, short or byte element hashes as itself, a char as its code, a
+         ;; boolean as 1231/1237, anything else as its hashCode (Long's, Double's, an Object's).
+         (cons "hashCode" (lambda (a)
+                            (if (jolt-nil? a) 0
+                                (let ((kind (jolt-array-kind a)) (n (ja-len a)))
+                                  (let loop ((i 0) (h 1))
+                                    (if (fx=? i n) h
+                                        (let* ((x (ja-ref a i))
+                                               (e (case kind
+                                                    ((int short byte) x)
+                                                    ((char) (char->integer x))
+                                                    ((boolean) (if x 1231 1237))
+                                                    (else (jolt-java-hashcode x)))))
+                                          (loop (fx+ i 1) (i32 (+ (* 31 h) e)))))))))))))
   (register-class-statics! "Arrays" arrays-statics)
   (register-class-statics! "java.util.Arrays" arrays-statics))
 
