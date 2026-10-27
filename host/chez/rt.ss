@@ -652,7 +652,10 @@
 ;; stack to most of the machine before overflowing. With no ceiling at all
 ;; (JOLT_MAX_HEAP=off) it is 80% of RLIMIT_AS if that is finite, else of
 ;; RLIMIT_DATA, else of physical RAM. Applied to each thread's stack
-;; separately, as Guile's is per thread.
+;; separately, as Guile's is per thread. Under a ceiling, the limit in force is
+;; also never more than 80% of the room the ceiling leaves the stack
+;; (jolt-stack-limit-in-force): in a process already holding much of its ceiling,
+;; a recursion otherwise met the ceiling first, as an OutOfMemoryError.
 ;;
 ;; The default follows the ceiling actually in force whichever is installed
 ;; first: jolt-install-gc-policy! tells the stack limit when it sets or drops
@@ -795,14 +798,31 @@
                         (display "\n  " p) (display (or nm "?") p))
                       (loop (guard (e (#t #f)) (o 'link)) (fx+ n 1))))))))))
   #f)
+;; The limit in force for a stack of N bytes: the configured one, and never more than 80% of the
+;; room the heap ceiling leaves this stack (the ceiling less what else is live). 80% of the whole
+;; ceiling cannot be reached in a process whose live heap is already a fifth of it, and there the
+;; recursion met the ceiling first, as an OutOfMemoryError whose continuation is the overflowed
+;; stack: a caught one kept (a test report) held the heap at the ceiling (a Seon agent's test
+;; child, 2026-10-28: 1.3 GB live of a 2.4 GB ceiling). What else is live is read from the last
+;; full collection (gc-live-after-full, less this stack), never more than the heap now: this check
+;; runs after a young pass, before the policy's full one, when the heap still holds old garbage
+;; that would make the room look smaller than it is and overflow a recursion that fits.
+(define (jolt-stack-limit-in-force limit n)
+  (let ((ceiling jolt-heap-ceiling-bytes))
+    (if ceiling
+        (let ((other (max 0 (- (min (sa-bytes-allocated) gc-live-after-full) n))))
+          (min limit (quotient (* 4 (max 0 (- ceiling other))) 5)))
+        limit)))
 (define (jolt-stack-check!)
   (let ((limit jolt-stack-limit-bytes))
     (when limit
       (let ((n (guard (c (#t (jolt-stack-check-failed! c)))
                  (and (fx=? 0 (jolt-locks-held)) (not (jolt-stack-overflowing))
                       (sa-current-stack-bytes)))))
-        (when (and n (> n limit))
-          (jolt-stack-overflow! limit))))))
+        (when n
+          (let ((in-force (jolt-stack-limit-in-force limit n)))
+            (when (> n in-force)
+              (jolt-stack-overflow! in-force))))))))
 ;; The throwable's trace is resolved here, at the throw, and kept as frames
 ;; rather than as the continuation (rt.ss jolt-remember-throw! keeps a k for
 ;; every other throwable): the continuation IS the overflowed stack, and a

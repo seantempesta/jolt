@@ -33,6 +33,10 @@ expect() {
 expect "runaway under 64m" '^runaway ok$' runaway JOLT_STACK_LIMIT=64m JOLT_MAX_HEAP=384m
 printf '%s\n' "$out" | grep '^elapsed-ms' | sed 's/^/stacklimit: runaway x12 under 64m: /'
 
+# 1b. Under the default limit, in a process whose live heap is already a large share of its
+#     ceiling: the stack overflows before the heap meets the ceiling, and the heap comes back.
+expect "runaway beside a large live heap, default limit" '^ballast ok$' ballast JOLT_MAX_HEAP=600m
+
 # 2. Legitimate depth under the default.
 expect "1M frames under the default" '^1000000$' deep
 
