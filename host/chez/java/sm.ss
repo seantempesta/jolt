@@ -418,7 +418,7 @@
                 f h ch #t intr? (lambda () (jolt-invoke k (vector-ref (alt-handler-mailbox h) 1)))))))))))
 
 (cca-def! "__sm-spawn" jolt-sm-spawn)
-(cca-def! "__sm-take" jolt-sm-take)
+(cca-def! "__sm-take" (lambda (ch k) (jolt-sm-take (jolt-async-port ch) k)))
 (cca-def! "__sm-put" jolt-sm-put)
-(cca-def! "__sm-take!!" jolt-sm-take!!)
+(cca-def! "__sm-take!!" (lambda (ch k) (jolt-sm-take!! (jolt-async-port ch) k)))
 (cca-def! "__sm-put!!" jolt-sm-put!!)

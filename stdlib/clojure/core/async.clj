@@ -454,13 +454,19 @@
 ;; The __do-alts host primitive handles the fast pass, registration, wait, and
 ;; unregistration atomically under per-channel locks.
 
+(defn- port-chan
+  "port as a channel: itself, or, for a port that is not one, the promise-chan reading
+  it through ReadPort's take! (clojure.core.async.impl.protocols/read-port, installed as
+  the native __port's reader)."
+  [port] (clojure.core.async/__port port))
+
 (defn- alt-attempt [port]
   (if (vector? port)
     (let [ch (nth port 0) v (nth port 1)]
       (assert (some? v) "Can't put nil on channel")
       (let [r (clojure.core.async/__offer! ch v)]
         (when (some? r) [r ch])))
-    (let [r (clojure.core.async/__poll! port)]
+    (let [r (clojure.core.async/__poll! (port-chan port))]
       (when (not= r ::none) [r port]))))
 
 (defn- do-alts*
@@ -485,7 +491,11 @@
         hit
         (if has-default
           [(:default opts) :default]
-          (clojure.core.async/__do-alts ports (boolean (:priority opts)) blocking?))))))
+          ;; a take port that is not a channel is registered as the promise-chan reading
+          ;; it (port-chan); the answer names the caller's own port
+          (let [chans (mapv (fn [p] (if (vector? p) p (port-chan p))) ports)
+                [v c] (clojure.core.async/__do-alts chans (boolean (:priority opts)) blocking?)]
+            [v (or (some (fn [i] (when (identical? c (nth chans i)) (nth ports i))) (range n)) c)]))))))
 
 (defn do-alts
   "Returns [val port] for the first ready op among ports. ports is a vector of
@@ -601,7 +611,7 @@
   "Takes a val from port if possible immediately. Never blocks. Returns the value
   or nil."
   [port]
-  (let [r (clojure.core.async/__poll! port)]
+  (let [r (clojure.core.async/__poll! (port-chan port))]
     (when (not= r ::none) r)))
 
 ;; --- thread variants --------------------------------------------------------

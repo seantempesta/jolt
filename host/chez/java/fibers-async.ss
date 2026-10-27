@@ -311,9 +311,9 @@
 ;; thread block. The one difference between the pairs is interruption: <!! / >!!
 ;; answer .interrupt with InterruptedException on either kind of waiter, as a
 ;; JVM thread blocked in them does, and <! / >! do not (async.ss ac-intr-wait!).
-(cca-def! "<!" (lambda (ch) (if (jolt-current-fiber) (jolt-fiber-<! ch) (jolt-async-take ch))))
+(cca-def! "<!" (lambda (ch) (let ((ch (jolt-async-port ch))) (if (jolt-current-fiber) (jolt-fiber-<! ch) (jolt-async-take ch)))))
 (cca-def! ">!" (lambda (ch v) (if (jolt-current-fiber) (jolt-fiber->! ch v) (jolt-async-give ch v))))
-(cca-def! "<!!" (lambda (ch) (if (jolt-current-fiber) (jolt-fiber-<!* ch #t) (jolt-async-take!! ch))))
+(cca-def! "<!!" (lambda (ch) (let ((ch (jolt-async-port ch))) (if (jolt-current-fiber) (jolt-fiber-<!* ch #t) (jolt-async-take!! ch)))))
 (cca-def! ">!!" (lambda (ch v) (if (jolt-current-fiber) (jolt-fiber->!* ch v #t) (jolt-async-give!! ch v))))
 
 ;; (fiber-execute runnable) -> nil. Run RUNNABLE on a fiber and forget it: no

@@ -1398,8 +1398,22 @@
 (define (cca-thread-macro _form _env . body)
   (jolt-list cca-thread-spawn-sym (apply jolt-list cca-fn*-sym empty-pvec body)))
 
+;; --- a port that is not a channel ---------------------------------------------
+;; Upstream reads every port through ReadPort's take!; jolt's channels are native,
+;; so the take entry points below go straight to the channel record. A port that is
+;; not one (a reify implementing ReadPort, as Datahike's write results are) is read
+;; the way upstream reads it: impl.protocols installs, by __set-port-reader!, a fn that
+;; turns such a port into a promise-chan its take! delivers into
+;; (clojure.core.async.impl.protocols/read-port), and every take entry point asks it first. Before
+;; the overlay loads, or for a value no reader claims, the port passes as it is.
+(define jolt-async-port-reader #f)
+(define (jolt-async-port x)
+  (if (or (async-chan? x) (not jolt-async-port-reader)) x (jolt-invoke jolt-async-port-reader x)))
+
 ;; --- install clojure.core.async ---------------------------------------------
 (define (cca-def! name v) (def-var! "clojure.core.async" name v))
+(cca-def! "__set-port-reader!" (lambda (f) (set! jolt-async-port-reader f) jolt-nil))
+(cca-def! "__port" jolt-async-port)
 (cca-def! "chan" jolt-async-chan)
 ;; (promise-chan) | (promise-chan xform) | (promise-chan xform ex-handler): the
 ;; transducer and handler go through chan, as on the JVM; they were dropped.
@@ -1412,11 +1426,12 @@
 (cca-def! "__promise-buffer" (lambda () (make-async-buffer 1 'promise)))
 (cca-def! "unblocking-buffer?" jolt-async-unblocking-buffer?)
 (cca-def! "close!" jolt-async-close!)
-(cca-def! "<!" jolt-async-take)   (cca-def! "<!!" jolt-async-take!!)
+(cca-def! "<!" (lambda (ch) (jolt-async-take (jolt-async-port ch))))
+(cca-def! "<!!" (lambda (ch) (jolt-async-take!! (jolt-async-port ch))))
 (cca-def! ">!" jolt-async-give)   (cca-def! ">!!" jolt-async-give!!)
 (cca-def! "timeout" jolt-async-timeout)
 (cca-def! "put!" jolt-async-put!)
-(cca-def! "take!" jolt-async-take!)
+(cca-def! "take!" (lambda (ch cb . rest) (apply jolt-async-take! (jolt-async-port ch) cb rest)))
 (cca-def! "offer!" jolt-async-offer!)
 (cca-def! "go-spawn" async-go-spawn)
 ;; thread-spawn: always a real OS thread, whatever *go-backend* says (thread

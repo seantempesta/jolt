@@ -64,3 +64,25 @@
 (extend-type clojure.core.async.impl.channels.ManyToManyChannel
   ReadPort
   (take! [port f] (clojure.core.async/take! port f)))
+
+;; --- a port that is not a channel ----------------------------------------------
+;; Upstream reads every port through take! above; jolt's take entry points go
+;; straight to the native channel, so they ask the reader installed here first
+;; (host/chez/java/async.ss, jolt-async-port).
+
+(defn read-port
+  "A promise-chan holding what port answers, port a value implementing ReadPort that
+  is not one of jolt's channels (a reify, as Datahike's write results are): read as
+  upstream reads every port, through take!, given a fn of the value (jolt has no
+  Handler protocol: a channel's take! calls the fn, so a port that delegates to one
+  works). nil closes the promise-chan. Every take entry point (<!, <!!, take!, poll!,
+  alts!, the go pass's parks) reads such a port through this. A take commits when it
+  is asked, so alts! over such a port takes from it even when another port wins: a
+  promise answers the same value again, and a channel-like port loses that value."
+  [port]
+  (let [c (clojure.core.async/promise-chan)]
+    (take! port (fn [v] (if (nil? v) (clojure.core.async/close! c) (clojure.core.async/put! c v))))
+    c))
+
+(clojure.core.async/__set-port-reader! (fn [x] (if (satisfies? ReadPort x) (read-port x) x)))
+
