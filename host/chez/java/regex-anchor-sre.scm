@@ -291,7 +291,7 @@
           (vector-set! matches slot w)))))
 
 (define %cell-counter 0)
-(define %cell-mutex (make-mutex))
+(define-process-local %cell-mutex (make-mutex))
 (define (%new-cell!)
   (with-mutex %cell-mutex
     (let ((k %cell-counter)) (set! %cell-counter (fx+ k 1)) k)))

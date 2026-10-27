@@ -57,7 +57,7 @@
 ;; collection), so a program whose record metadata is all gone again skips the
 ;; lookup.
 (define meta-table (make-weak-eq-hashtable))
-(define meta-table-mu (make-mutex))
+(define-process-local meta-table-mu (make-mutex))
 (define meta-gen (box 0))
 (define (meta-gen-bump!) (set-box! meta-gen (fx+ 1 (unbox meta-gen))))
 (define (meta-table-set! k v)

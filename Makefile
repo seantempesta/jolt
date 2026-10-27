@@ -187,7 +187,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   protoret accfix pic narrow directlink mintgate directcall defmetacells staticsite arraymap arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flonumdisp flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost recordshadow emittedheads adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc numequivalloc analyzealloc emitalloc treeseqcost imagefnforms hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
-  gatebootsmoke aotcachesmoke aotcachepathsmoke aotcachesourcepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments buildunitwrite threadeddeadlock compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotcachesourcepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments buildunitwrite threadeddeadlock forkheldlocks compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
   systemstreams closedstdout stderrsplit userdirpaths utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest tickbudget monitorescape windescape threadsafety maskedacquire ioerrno cas flow remotechan
 TEST-GATES := submodules selfhost ci
@@ -1597,6 +1597,10 @@ buildsegments:
 # wait another thread can end is never told.
 threadeddeadlock:
 	@bin/jolt run test/chez/threaded-deadlock-test.clj
+# A child forked while another thread of its parent holds the runtime's locks runs: the child
+# makes each process-wide lock afresh (locks.ss define-process-local, jolt-after-fork-child!).
+forkheldlocks:
+	@bin/jolt run test/chez/fork-held-locks-test.clj
 # A split app unit is written once from memory as UTF-8 bytes, its line-marker
 # table read off the text it was assembled from (bld-write-unit!): the same bytes
 # the textual write and its read-back off the disk made.

@@ -2637,7 +2637,7 @@
                          (slurp-path fp (if (file-url-string? src) (file-url->path src) src)))))
     (else (throw-jvm (quote IllegalArgumentException) (string-append "Cannot open <" (jolt-pr-str src) "> as a Reader.")))))
 
-(define io-counter-mutex (make-mutex))
+(define-process-local io-counter-mutex (make-mutex))
 (define spit-tmp-counter 0)
 (define (jolt-spit path content . opts)
   ;; Render BEFORE any file is touched — a throwing toString used to leave the
@@ -3163,7 +3163,7 @@
 ;; daemon status and priority live in the id-keyed tables below and in
 ;; lazy-bridge.ss, so an object made for it from another thread reads the same.
 (define java-thread-id-next 2)                 ; 1 is main's
-(define java-thread-id-mu (make-mutex))
+(define-process-local java-thread-id-mu (make-mutex))
 (define (next-java-thread-id!)
   (jolt-with-mutex java-thread-id-mu
     (let ((n java-thread-id-next)) (set! java-thread-id-next (+ n 1)) n)))
@@ -3257,7 +3257,7 @@
 ;; thread, and a child must not report the parent's object as its own.
 (define thread-handle-cell (make-thread-parameter #f))      ; (thread-id . object)
 (define thread-handles-by-id (make-eqv-hashtable))
-(define thread-handles-mutex (make-mutex))
+(define-process-local thread-handles-mutex (make-mutex))
 ;; Thread.start: the started thread IS its object. Registered by the parent right
 ;; after the fork and again by the child, so it is there whichever runs first.
 (define (register-thread-object! id obj)

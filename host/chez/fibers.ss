@@ -390,8 +390,8 @@
 ;; parkable IO + offload), with `thread` as the documented escape.
 (define jolt-fiber-carriers #f)           ; vector of jolt-carrier, or #f
 (define jolt-fiber-rr 0)                  ; round-robin cursor (under rr-mu)
-(define jolt-fiber-rr-mu (make-mutex))
-(define jolt-fiber-pool-mu (make-mutex))  ; guards pool start/reset
+(define-process-local jolt-fiber-rr-mu (make-mutex))
+(define-process-local jolt-fiber-pool-mu (make-mutex))  ; guards pool start/reset
 (define jolt-fiber-pool-started? #f)
 
 ;; The pool size. N defaults to the machine's processor count (jolt's
@@ -1471,7 +1471,7 @@
 ;; dying fiber's own carrier, so it is a shared side table and takes the same
 ;; treatment as the others (jolt-3907): one mutex, held only to swap the list,
 ;; never while a monitor runs.
-(define jolt-fiber-monitor-mu (make-mutex))
+(define-process-local jolt-fiber-monitor-mu (make-mutex))
 
 ;; (jolt-fiber-monitor! f proc) -> void. Register PROC on fiber F.
 ;;
@@ -1864,8 +1864,8 @@
 ;; detector runs only on threads. Telling nothing new (every waiter told already, or masked) says
 ;; so once on stderr: the process is left as it was, never spun.
 (define jolt-io-awaited #f)        ; () -> true while a descriptor is awaited; jolt.io-poller's
-(define jolt-asleep-det-mu (make-mutex))
-(define jolt-asleep-det-cv (make-condition))
+(define-process-local jolt-asleep-det-mu (make-mutex))
+(define-process-local jolt-asleep-det-cv (make-condition))
 (define jolt-asleep-det-pending #f)
 (define jolt-asleep-det-started (box #f))
 (define jolt-asleep-said #f)

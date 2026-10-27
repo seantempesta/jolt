@@ -224,6 +224,9 @@
               (jolt-swallow-io fail!
                 (write-char c inner)
                 (when (char=? c #\newline) (flush-output-port inner)))))))
+    ;; a process stream's lock is the process's own (locks.ss define-process-local): a forked
+    ;; child's first print must not wait on a parent thread caught mid-write
+    (jolt-process-local-add! (lambda () mu) (lambda () (set! mu (make-mutex))))
     (let ((p (sa-make-output-port name
                (lambda (c) (jolt-with-mutex mu (put! c)))
                (lambda (s start count) (jolt-with-mutex mu (put-some! s start count)) count)
@@ -1657,7 +1660,7 @@
 ;; backtrace path where a lock would be pointless anyway. One mutex for all four
 ;; because one registration writes up to four of them and they are never read
 ;; under it.
-(define jolt-callsite-mu (make-mutex))
+(define-process-local jolt-callsite-mu (make-mutex))
 ;; Membership is answered by a companion index, not by scanning the list being
 ;; built. jolt-tail-entries is keyed by CALLEE, so its list is every tail site
 ;; that reaches one function: (member entry cur) made registering n of them cost
@@ -1923,7 +1926,7 @@
           (mutable dyn-bound?) (mutable dynamic?))
   (nongenerative var-cell-v5))
 (define var-table (make-hashtable string-hash string=?))
-(define var-table-mu (make-mutex))
+(define-process-local var-table-mu (make-mutex))
 ;; var-table-mu covers EVERY mutation of var-table and of ns-has-vars-set below
 ;; (jolt-var's insert, declare-var!'s insert, def-var!'s index write, remove-ns's
 ;; sweep in ns.ss, the gate harnesses' prune) and every WHOLE-TABLE scan
@@ -2095,7 +2098,7 @@
 ;; later inside the collector naming nothing. Every read is cold — printing a fn's
 ;; arity name (seq.ss), the image walker (state-image.ss), the class arm
 ;; (java/host-class.ss) — so none of them can afford to skip it either.
-(define proc-name-mu (make-mutex))
+(define-process-local proc-name-mu (make-mutex))
 (define (proc-name-of v) (jolt-with-mutex proc-name-mu (hashtable-ref proc-name-tbl v #f)))
 ;; Name a procedure def-var! never saw. A core fn in VALUE position compiles to
 ;; the runtime's own procedure, not the var's root, and a native that is
@@ -2146,7 +2149,7 @@
 ;; back end hoists the call, so it runs once per def load, not per evaluation.
 ;; Reads are unlocked (a single-key read of a strong table, as var-table).
 (define site-const-tbl (make-hashtable string-hash string=?))
-(define site-const-mu (make-mutex))
+(define-process-local site-const-mu (make-mutex))
 (define (jolt-site-const id make)
   (or (hashtable-ref site-const-tbl id #f)
       (let ((v (make)))
@@ -2172,7 +2175,7 @@
 ;; into a strong hashtable lose each other — see var-table above); the
 ;; single-key reads are unlocked for the reasons set out there.
 (define var-linked-tbl (make-eq-hashtable))
-(define var-linked-mu (make-mutex))
+(define-process-local var-linked-mu (make-mutex))
 ;; Called with the cell on every root write once something installs it: the
 ;; inline stash (host-contract.ss) drops a body stashed by a direct-linked REPL
 ;; form when its var is written again, since a caller compiled after that must
@@ -2829,7 +2832,7 @@
 ;; coarse clock cannot hand out one seed twice.
 (define random-seeded? (make-thread-parameter #f))
 (define random-seed-counter 0)
-(define random-seed-mutex (make-mutex))
+(define-process-local random-seed-mutex (make-mutex))
 
 (define (seed-random!)
   (let* ((t (current-time 'time-utc))

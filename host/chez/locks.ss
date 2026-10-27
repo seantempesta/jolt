@@ -44,6 +44,29 @@
 ;; carrier is handed to another fiber that reads the same register while this one
 ;; is parked.
 
+;; A lock the whole process shares (a table's mutex, its condition) is the process's own, and a
+;; forked child holds only its own definitions: fork(2) copies the forking thread alone, so a mutex
+;; another thread held at the fork is held in the child by a thread that does not exist, and the
+;; child's first take of it waits forever (a Seon agent's test child, 2026-10-28: its second thread
+;; in mutex_acquire, its main idle). Re-made in the child rather than taken before the fork (POSIX's
+;; atfork prepare): taking every lock from the forking thread is a lock-order deadlock against a
+;; thread holding one and wanting another, while the child is its one thread, where making a lock
+;; anew takes nothing. jolt-after-fork-child! runs (jolt-process-locals-remake!) first. A lock inside
+;; an object (a monitor, a promise's condition, a carrier) is that object's, and is not covered.
+(define-syntax define-process-local
+  (syntax-rules ()
+    ((_ name expr)
+     (begin (define name expr)
+            (jolt-process-local-add! (lambda () name) (lambda () (set! name expr)))))))
+;; Register one: GET answers its current value, REMAKE! makes it afresh. Kept as a property of the
+;; symbol jolt, not in a variable, so rt.ss's re-load of this file keeps the ones registered
+;; between the two loads.
+(define (jolt-process-local-add! get remake!)
+  (putprop 'jolt 'process-locals (cons (cons get remake!) (getprop 'jolt 'process-locals '()))))
+(define (jolt-process-locals-remake!) (for-each (lambda (r) ((cdr r))) (getprop 'jolt 'process-locals '())))
+;; Their current values (a mutex, a condition, a vector of mutexes): what a test of the rule holds.
+(define (jolt-process-locals) (map (lambda (r) ((car r))) (getprop 'jolt 'process-locals '())))
+
 ;; Slot 7: how many locks this carrier currently holds. Per thread, like the
 ;; other virtual registers, and a fresh thread starts it at fixnum 0 — which is
 ;; the correct answer for a thread that never runs fibers.
@@ -437,7 +460,7 @@
 ;; is about to block anyway. A fiber never waits here; its state is the fiber
 ;; layer's to report (jolt-thread-state-hook, java/concurrency.ss).
 (define thread-state-boxes (make-eqv-hashtable))          ; thread id -> box
-(define thread-state-mu (make-mutex))
+(define-process-local thread-state-mu (make-mutex))
 (define thread-state-cell (make-thread-parameter #f))     ; (thread id . box)
 (define (thread-state-box)
   (let ((c (thread-state-cell)) (id (get-thread-id)))
@@ -517,7 +540,7 @@
 ;;
 ;; jolt-asleep-mu is the last lock in every order: taken with at most the waiter's own mu held,
 ;; and nothing is taken under it.
-(define jolt-asleep-mu (make-mutex))
+(define-process-local jolt-asleep-mu (make-mutex))
 (define jolt-asleep-epoch 0)                   ; moves on every enter, leave, thread start and end
 (define jolt-asleep-ids (make-eqv-hashtable))   ; thread id -> while it is asleep: (cv . mu) in a
                                                ; value wait (to tell), #t in a raw one
@@ -990,7 +1013,7 @@
 ;; and no other fiber on its carrier is disturbed. Every waiter woken re-checks,
 ;; and the check CLEARS — one interrupt, one InterruptedException, as on the JVM.
 (define jolt-interrupt-waits (make-weak-eq-hashtable))   ; interrupt box -> entry set
-(define jolt-interrupt-waits-mu (make-mutex))
+(define-process-local jolt-interrupt-waits-mu (make-mutex))
 
 ;; An ENTRY is what the interrupter wakes: a (mu . cv) pair, poked as
 ;; (jolt-with-mutex mu (jolt-cv-wake! cv)), or a procedure of no arguments that

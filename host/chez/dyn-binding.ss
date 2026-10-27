@@ -281,7 +281,7 @@
 ;; the same TBox there too, since Frame.clone shares the map. Weak keys so a
 ;; popped frame's boxes go with it.
 (define tbox-tbl (make-weak-eq-hashtable))
-(define tbox-mutex (make-mutex))
+(define-process-local tbox-mutex (make-mutex))
 (define (jolt-var-thread-binding v)
   (let ((p (and (var-cell? v) (dyn-find-binding v))))
     (if (not p)
@@ -378,7 +378,7 @@
 ;; the whole reason for the counter, and unlocked two threads draw the same
 ;; number. See jolt-gensym in converters.ss.
 (define local-var-counter 0)
-(define local-var-mutex (make-mutex))
+(define-process-local local-var-mutex (make-mutex))
 (define local-var-meta (jolt-hash-map (keyword #f "dynamic") #t))
 (define (jolt-local-var . args)
   (let* ((name (string-append "local-"

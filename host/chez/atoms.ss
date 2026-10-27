@@ -246,7 +246,7 @@
 ;; read cannot tear.
 (define iref-watch-tbl (make-weak-eq-hashtable))
 (define iref-validator-tbl (make-weak-eq-hashtable))
-(define iref-tbl-mu (make-mutex))
+(define-process-local iref-tbl-mu (make-mutex))
 (define iref-writes (box 0))
 (define (iref-any?) (not (eqv? 0 (unbox iref-writes))))
 ;; call with iref-tbl-mu HELD — the read-modify-write is not atomic on its own.

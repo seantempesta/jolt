@@ -42,7 +42,7 @@
 ;; hashtables read single-key, which is safe for the reasons set out at var-table,
 ;; and jolt-extension-value is the hot path this whole epoch scheme exists to keep
 ;; cheap.
-(define ext-mu (make-mutex))
+(define-process-local ext-mu (make-mutex))
 (define extension-epoch-n 0)
 ;; call with ext-mu HELD
 (define (bump-extension-epoch!) (set! extension-epoch-n (fx+ extension-epoch-n 1)))

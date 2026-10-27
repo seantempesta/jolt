@@ -2012,7 +2012,7 @@
 ;; does not move such objects, or one that cannot be asked not to).
 (define sa-pin-guardian (make-guardian))
 (define sa-pin-boxes (make-weak-eq-hashtable))
-(define sa-pin-mutex (make-mutex))
+(define-process-local sa-pin-mutex (make-mutex))
 ;; under sa-pin-mutex
 (define (sa-pin-release! b)
   (when (unbox b)

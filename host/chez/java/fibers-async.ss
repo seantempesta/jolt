@@ -516,34 +516,26 @@
 ;; on one in the child is gone with its carrier), the watcher is disarmed, and the
 ;; child's mask is emptied, the default mask jolt gives every child it spawns
 ;; (jolt-with-empty-sigmask): SIGTERM ends it until a hook registered here re-arms
-;; the watcher. The mutexes are kept: a parked carrier or timer holds none
-;; (condition-wait released it), and the fork itself is taken on the one running
-;; thread. Pools made with jolt-fiber-pool-make are not restarted: their carriers
-;; are gone too, and a spawn onto one parks; a forking program makes them after the fork.
+;; the watcher. The process's locks are made afresh (locks.ss, define-process-local):
+;; one held at the fork by a thread the fork did not copy is held by nobody here.
+;; Pools made with jolt-fiber-pool-make are not restarted: their carriers are gone
+;; too, and a spawn onto one parks; a forking program makes them after the fork.
 (define (jolt-after-fork-child!)
-  ;; the runtime's mutexes are made afresh before anything here takes one. A thread fork(2) did
-  ;; not copy may hold one at the fork instant without counting as active: the timer thread whose
-  ;; timed wait on timeout-cv fired takes timeout-mu back, then waits to rejoin the active threads,
-  ;; which the forking thread's hold on $tc-mutex stops. The child got that mutex held by nobody
-  ;; it has, and its first deadline (or the reset below) waited forever (a Seon agent's test child,
-  ;; 2026-10-27)
-  (set! timeout-mu (make-mutex))
-  (set! timeout-cv (make-condition))
+  ;; the process's locks are made afresh before anything here takes one (locks.ss,
+  ;; define-process-local): a thread fork(2) did not copy may hold one at the fork instant without
+  ;; counting as active, as the timer thread whose timed wait fired holds timeout-mu while it waits
+  ;; to rejoin the active threads (a Seon agent's test child, 2026-10-27)
+  (jolt-process-locals-remake!)
   ;; all asleep (locks.ss): the child is its one thread, waiting on nothing, and its detector is
-  ;; the parent's (not forked); its mutexes are its own for the same reason as the others'
-  (set! jolt-asleep-mu (make-mutex))
+  ;; the parent's (not forked)
   (hashtable-clear! jolt-asleep-ids)
   (hashtable-clear! jolt-asleep-on)
   (set! jolt-boot-thread-id (get-thread-id))
   (set! jolt-asleep-det-id #f)
   (hashtable-clear! jolt-asleep-told)
-  (set! jolt-asleep-det-mu (make-mutex))
   (set! jolt-asleep-det-pending #f)
   (set-box! jolt-asleep-det-started #f)
   (set! jolt-asleep-said #f)
-  (set! live-threads-mutex (make-mutex))
-  (set! thread-handles-mutex (make-mutex))
-  (set! jolt-shutdown-mutex (make-mutex))
   (let ((self (get-thread-id)))
     (if jolt-main-thread
         ;; a main-carrier program forked from inside its own fiber: the child keeps carrier 0

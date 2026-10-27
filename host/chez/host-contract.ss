@@ -725,7 +725,7 @@
 ;; now parallel across namespaces, and unlocked two threads draw the same number
 ;; — see jolt-gensym in converters.ss.
 (define hc-sq-gensym-counter 0)
-(define hc-sq-gensym-mutex (make-mutex))
+(define-process-local hc-sq-gensym-mutex (make-mutex))
 (define (hc-sq-gensym base)
   (jolt-symbol #f (string-append base "__"
                                  (number->string
@@ -965,7 +965,7 @@
 ;; fetch is a single-key read and stays unlocked: it sits at every candidate call
 ;; site, and an unlocked read of a strong table is safe (see var-table in rt.ss).
 (define inline-stash-table (make-hashtable string-hash string=?))
-(define inline-stash-mu (make-mutex))
+(define-process-local inline-stash-mu (make-mutex))
 ;; Has this var been defined more than once, with a value, in the program loaded
 ;; so far? The inline pass asks before stashing: splicing a var that is redefined
 ;; later freezes whichever definition was current when the CALLER compiled, so one

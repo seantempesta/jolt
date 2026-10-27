@@ -274,7 +274,7 @@
 ;; under the lock. So the hot path — every keyword after the first — is the same
 ;; bare hashtable-ref it was, and only a first-ever intern pays the mutex.
 ;; The lock is a leaf: compute-keyword-hasheq is pure arithmetic.
-(define keyword-table-mu (make-mutex))
+(define-process-local keyword-table-mu (make-mutex))
 (define (keyword ns name)
   (if ns
       (let ((k (keyword-intern-key ns name)))
@@ -318,7 +318,7 @@
 ;; argument as khash below, and the reason the memo needs no lock while the
 ;; identity-conferring string slot does.
 (define symbol-string-pool (make-hashtable string-hash string=?))
-(define symbol-string-pool-mu (make-mutex))
+(define-process-local symbol-string-pool-mu (make-mutex))
 (define (make-symstr s) (cons s #f))
 (define (symstr-str c) (car c))
 (define (symstr-mhash c) (cdr c))                   ; murmur3-hash-unencoded-chars

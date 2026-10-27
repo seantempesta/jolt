@@ -160,7 +160,7 @@
 ;; still collectable. A miss inserts under the mutex; reads stay lock-free, which
 ;; a Chez hashtable survives (writer-vs-writer is what corrupts one).
 (define jrdesc-ifc-tbl (make-weak-eq-hashtable))
-(define jrdesc-ifc-mutex (make-mutex))
+(define-process-local jrdesc-ifc-mutex (make-mutex))
 (define (jrdesc-ifc d) (hashtable-ref jrdesc-ifc-tbl d #f))
 (define (jrdesc-ifc-set! d v) (jolt-with-mutex jrdesc-ifc-mutex (hashtable-set! jrdesc-ifc-tbl d v)))
 (define (jrdesc-ifc-epoch) (fx+ jch-graph-epoch jolt-proto-epoch))

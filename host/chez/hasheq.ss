@@ -682,7 +682,7 @@
 ;; hash it structurally and let equal-field instances collide as map keys).
 ;; One shared table: the id is per OBJECT, whatever its type.
 (define proc-hasheq-tbl (make-weak-eq-hashtable))
-(define proc-hasheq-mu (make-mutex))
+(define-process-local proc-hasheq-mu (make-mutex))
 (define proc-hasheq-counter 0)
 (define (jolt-identity-hasheq p)
   (jolt-with-mutex proc-hasheq-mu
@@ -743,7 +743,7 @@
 ;; seq views) compute directly as before. Compute outside the lock:
 ;; hash-ordered recurses into elements, and a seq of seqs re-enters.
 (define seq-hasheq-tbl (make-weak-eq-hashtable))
-(define seq-hasheq-mu (make-mutex))
+(define-process-local seq-hasheq-mu (make-mutex))
 (define (seq-hasheq-cached x)
   (if (or (cseq? x) (jolt-lazyseq? x))
       (or (jolt-with-mutex seq-hasheq-mu (hashtable-ref seq-hasheq-tbl x #f))

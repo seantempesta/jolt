@@ -119,7 +119,7 @@
 ;; dump outright ("incorrect number of arguments to #<procedure constructor>").
 ;; Memoized per rtd — the walk asks once per object.
 (define image-record-fields-tbl (make-eq-hashtable))
-(define image-record-fields-mutex (make-mutex))
+(define-process-local image-record-fields-mutex (make-mutex))
 (define (image-record-fields rtd)      ; -> vector of (name . accessor)
   (or (hashtable-ref image-record-fields-tbl rtd #f)
       (let* ((chain (let up ((r rtd) (acc '()))

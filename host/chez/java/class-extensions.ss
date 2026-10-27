@@ -50,7 +50,7 @@
 ;; the same reason register-tagged-methods! does: two namespaces loading in
 ;; parallel and registering against one class each built their own inner table
 ;; and published it over the other's. Reads stay unlocked (strong hashtables).
-(define class-ext-mu (make-mutex))
+(define-process-local class-ext-mu (make-mutex))
 ;; The override arm is registered on FIRST use, not at load: a process that never
 ;; extends a class must not pay a per-.method-call arm walk for a feature it does
 ;; not use. The arm still tests the table size on every call after that, because

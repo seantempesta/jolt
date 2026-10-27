@@ -672,7 +672,7 @@
 ;; WRITTEN once per map literal read, so copying per write would be quadratic in
 ;; the size of the source being read. The lock is noise against the read + analyze
 ;; it sits inside.
-(define rdr-side-mu (make-mutex))
+(define-process-local rdr-side-mu (make-mutex))
 (define rdr-map-order (make-weak-eq-hashtable))
 (define (rdr-map-order-ref m) (jolt-with-mutex rdr-side-mu (hashtable-ref rdr-map-order m #f)))
 (define (rdr-map-order-set! m es) (jolt-with-mutex rdr-side-mu (hashtable-set! rdr-map-order m es)))
@@ -993,7 +993,7 @@
 ;; runtime: unlocked, two threads reading a form at once draw the same number and
 ;; the "#" auto-gensym these mint is no longer unique. See jolt-gensym.
 (define rdr-anon-counter 0)
-(define rdr-name-counter-mutex (make-mutex))
+(define-process-local rdr-name-counter-mutex (make-mutex))
 (define (rdr-anon-gensym)
   (jolt-symbol #f (string-append "p__"
                                  (number->string
@@ -1355,7 +1355,7 @@
 ;; every `#` in every file jolt reads and take no lock: a reader sees either the
 ;; old list or the new one, where a Chez hashtable read while another thread
 ;; writes it faults in the collector.
-(define rdr-dispatch-mu (make-mutex))
+(define-process-local rdr-dispatch-mu (make-mutex))
 (define rdr-dispatch-macros '())        ; ((char raw? . fn) …) — swapped, never mutated
 
 (define (rdr-dispatch-macro-ref c)

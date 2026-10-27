@@ -266,7 +266,7 @@
 ;; before the parent reads its id leaves that marker behind, one fixnum key
 ;; that no later thread's id can equal. jolt-started-thread? reads #t only.
 (define live-threads (make-eqv-hashtable))
-(define live-threads-mutex (make-mutex))
+(define-process-local live-threads-mutex (make-mutex))
 (define (live-thread-ids)
   (jolt-with-mutex live-threads-mutex
     (let loop ((ks (vector->list (hashtable-keys live-threads))) (acc '()))
@@ -317,8 +317,8 @@
 ;;
 ;; All of it is under exit-mu and announced on exit-cv, whose only waiter is the
 ;; exiting main thread, so a plain condition is enough.
-(define exit-mu (make-mutex))
-(define exit-cv (make-condition))
+(define-process-local exit-mu (make-mutex))
+(define-process-local exit-cv (make-condition))
 (define exit-nondaemon-live 0)
 ;; What a thread's end means to its java.lang.Thread object (io.ss): it is no
 ;; longer alive, join returns, and the id-keyed tables let it go.

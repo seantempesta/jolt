@@ -545,7 +545,7 @@
 ;; outside it, so two threads may read one archive at once and the second store
 ;; wins, which is harmless: the two are equal.
 (define zipdir-cache (make-hashtable string-hash string=?))
-(define zipdir-cache-mu (make-mutex))
+(define-process-local zipdir-cache-mu (make-mutex))
 (define (zipdir-for path)
   (and (file-exists? path) (not (file-directory? path))
        (let ((stamp (sa-file-mtime-ms path)))

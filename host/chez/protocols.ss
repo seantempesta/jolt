@@ -175,7 +175,7 @@
 ;; A name spelled by another string object fills its own entry; the key it gets
 ;; is still the one identity the string table hands out.
 (define pm-key-eq-cache (make-weak-eq-hashtable))
-(define pm-key-eq-mu (make-mutex))
+(define-process-local pm-key-eq-mu (make-mutex))
 (define (intern-pm-key proto method)
   (let* ((inner (hashtable-ref pm-key-eq-cache proto #f))
          (k (and inner (hashtable-ref inner method #f))))
@@ -335,7 +335,7 @@
 ;; resolves to, and both only ever increase. Nested tag -> qname -> (epoch . bool)
 ;; so a hit is two refs and no allocation.
 (define type-class-memo (make-hashtable string-hash string=?))
-(define type-class-memo-mu (make-mutex))
+(define-process-local type-class-memo-mu (make-mutex))
 (define (type-implements-class? type-tag qname)
   (let* ((epoch (jrdesc-ifc-epoch))
          (inner (hashtable-ref type-class-memo type-tag #f))

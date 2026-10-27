@@ -46,7 +46,7 @@
 ;; mutex; the single-key lookup below stays unlocked, which is safe here for the
 ;; reasons set out at var-table in rt.ss.
 (define fn-form-tbl (make-hashtable string-hash string=?))
-(define fn-form-tbl-mu (make-mutex))
+(define-process-local fn-form-tbl-mu (make-mutex))
 
 
 ;; LIVE-NAMES is the optional fifth argument, and only a SPLICED copy of a

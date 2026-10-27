@@ -28,7 +28,7 @@
 ;; of them with confidence, which is exactly the misattribution the marker exists
 ;; to prevent (400 contended pairs missed it 3 times). Reads stay unlocked: this is
 ;; a strong hashtable and every read of it is single-key.
-(define source-registry-mu (make-mutex))
+(define-process-local source-registry-mu (make-mutex))
 ;; The same records, keyed "ns/name" instead of by emitted procedure name. A
 ;; spliced call site names its callee by fqn (the trace marker carries it) and has
 ;; no procedure of its own to look up, so this is the index that answers it. Fed
@@ -509,7 +509,7 @@
 ;; form, under tracing only, negligible against the analysis+emit already paid.
 (define jolt-eval-source-max 4096)
 (define jolt-eval-source-counter 0)
-(define jolt-eval-source-mutex (make-mutex))
+(define-process-local jolt-eval-source-mutex (make-mutex))
 (define jolt-eval-marker-registry (make-hashtable string-hash string=?))
 (define jolt-eval-source-queue '())          ; names in insertion order (FIFO)
 (define jolt-eval-source-queue-tail '())

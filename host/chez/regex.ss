@@ -180,7 +180,7 @@
          (else #f))))))
 
 (define regex-cache (make-hashtable string-hash string=?))
-(define regex-cache-mutex (make-mutex 'regex-cache))
+(define-process-local regex-cache-mutex (make-mutex 'regex-cache))
 
 ;; A pattern the engine will not compile is a PatternSyntaxException, the same
 ;; catchable thing the JVM throws — not the raw internal error, which surfaced as

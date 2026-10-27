@@ -712,8 +712,8 @@
 ;;     forked stays alive forever. 100 sequential (timeout 1) calls left 100
 ;;     timer threads. The flag now means "the one timer thread exists", which
 ;;     once true never stops being true.
-(define timeout-mu (make-mutex))
-(define timeout-cv (make-condition))
+(define-process-local timeout-mu (make-mutex))
+(define-process-local timeout-cv (make-condition))
 ;; Pending timeouts as a binary min-heap on deadline — (deadline . thunk)
 ;; entries in timeout-heap[0..n), guarded by timeout-mu like the sorted list it
 ;; replaces. The list insert walked O(k) per (timeout ms) with k pending —
@@ -1159,7 +1159,7 @@
 ;; channel with no entry (a plain chan, or a go channel whose entry the collector
 ;; took) reads as "nothing to report" rather than raising.
 (define go-completions (make-weak-eq-hashtable))
-(define go-completions-mu (make-mutex))
+(define-process-local go-completions-mu (make-mutex))
 (define (go-chan-register! ch)
   (jolt-with-mutex go-completions-mu
     (hashtable-set! go-completions ch (vector #f #f '()))))

@@ -827,7 +827,7 @@
 ;; a few hundred spawns on bionic), so the drain holds a lock. Registering needs
 ;; none, since it goes on the calling thread's own list until a collection.
 (define proc-fd-guardian (make-guardian))
-(define proc-fd-guardian-mutex (make-mutex))
+(define-process-local proc-fd-guardian-mutex (make-mutex))
 (define (proc-fd-collect-released!)
   (let loop ()
     (let ((l (jolt-with-mutex proc-fd-guardian-mutex (proc-fd-guardian))))
@@ -835,7 +835,7 @@
 
 ;; the stdin lifetime of each live child port, for proc-shut-stdin!
 (define proc-fd-lives (make-weak-eq-hashtable))
-(define proc-fd-lives-mutex (make-mutex))
+(define-process-local proc-fd-lives-mutex (make-mutex))
 (define (proc-fd-register! port l)
   (proc-fd-guardian port l)
   (jolt-with-mutex proc-fd-lives-mutex (hashtable-set! proc-fd-lives port l))
@@ -992,7 +992,7 @@
 ;; F_SETFD are still two separate syscalls with a gap between them. Exclusion
 ;; by mutex instead: no other fd-level spawn runs between pipe() and
 ;; posix_spawn.
-(define proc-spawn-fd-mutex (make-mutex))
+(define-process-local proc-spawn-fd-mutex (make-mutex))
 
 ;; --- the child gets its own stdio and nothing else ---------------------------
 ;; A descriptor with no file action IS the parent's descriptor, and posix_spawn

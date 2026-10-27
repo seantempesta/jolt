@@ -167,7 +167,7 @@
           (zlib-proc (vector-ref es zf-crc32) (unsigned-long u8* unsigned-int) unsigned-long)
           (zlib-proc (vector-ref es zf-adler32) (unsigned-long u8* unsigned-int) unsigned-long)))))
 
-(define zlib-mu (make-mutex))
+(define-process-local zlib-mu (make-mutex))
 (define zlib-bound #f)
 
 ;; Bound once; after that the vector is read without the lock. A failed bind is
@@ -364,7 +364,7 @@
 ;; streams are freed at the next zstream-open, as jolt.ffi drains its automatic
 ;; arenas (java/ffi.ss).
 (define zstream-guardian (make-guardian))
-(define zstream-guardian-mu (make-mutex))
+(define-process-local zstream-guardian-mu (make-mutex))
 
 ;; (zstream-guard! owner zs) | (zstream-guard! owner zs mu)
 (define (zstream-guard! owner zs . mu)

@@ -27,7 +27,7 @@
 ;; (reachable from Clojure as clojure.core/__register-class-methods!, so from a
 ;; namespace load, which is now parallel). Single-key reads of both stay
 ;; unlocked — strong hashtables, per var-table.
-(define hsc-mu (make-mutex))
+(define-process-local hsc-mu (make-mutex))
 
 ;; (instance? clojure.lang.IFoo x) for the core clojure.lang interfaces libraries
 ;; branch on — jolt's value model satisfies them, so report it. Matched by the

@@ -422,7 +422,7 @@
 ;; (rt.ss jolt-source-location). A location nothing resolved, such as load-file's
 ;; path, is its own name. Two roots holding the same name (a vendored copy and a
 ;; jar copy) map back to the location resolved last.
-(define ldr-names-mu (make-mutex))
+(define-process-local ldr-names-mu (make-mutex))
 (define ldr-location->name (make-hashtable string-hash string=?))
 (define ldr-name->location (make-hashtable string-hash string=?))
 (define (ldr-note-name! loc name)
@@ -523,7 +523,7 @@
 ;; ldr-tbl-mu covers every MUTATION of loaded-ns and of the AOT memos below, and
 ;; every WHOLE-TABLE scan of them. Single-key reads stay unlocked (strong general
 ;; hashtables — see rt.ss's var-table note for why that is sound).
-(define ldr-tbl-mu (make-mutex))
+(define-process-local ldr-tbl-mu (make-mutex))
 (define loaded-ns (make-hashtable string-hash string=?))
 (vector-for-each (lambda (c) (hashtable-set! loaded-ns (var-cell-ns c) #t))
                  (var-table-cells))
@@ -589,7 +589,7 @@
 ;; Call with NO loader mutex held either. A (dosync (require ...)) reaches ldr-tbl-mu
 ;; while holding stm-lock, so the loader taking these in the other order would be the
 ;; same cycle by another route. Sequential, never nested, is what keeps them apart.
-(define ldr-libs-mu (make-mutex))
+(define-process-local ldr-libs-mu (make-mutex))
 (define (ldr-libs-update! f)
   (let* ((libs-cell (var-cell-lookup "clojure.core" "*loaded-libs*"))
          (libs-ref (and libs-cell (var-cell-root libs-cell))))
@@ -2684,8 +2684,8 @@
 ;;                      stm-lock across a whole dosync body. So no load may acquire
 ;;                      stm-lock — see ldr-libs-update!, where that cycle was real
 ;;                      and hung.
-(define ldr-load-mu (make-mutex))
-(define ldr-load-cv (make-condition))
+(define-process-local ldr-load-mu (make-mutex))
+(define-process-local ldr-load-cv (make-condition))
 (define ldr-loading (make-hashtable string-hash string=?))  ; ns -> the context loading it
 (define ldr-waiting (make-eqv-hashtable))                   ; context -> ns it waits on
 (define ldr-fiber-waiters (make-hashtable string-hash string=?))  ; ns -> parked fibers

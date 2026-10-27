@@ -66,7 +66,7 @@
 ;; into-array / make-array asks, and the munge walk cost them 2x. Reads are the
 ;; bare hashtable-ref; only a first-ever name takes the lock to publish.
 (define na-name-kind-tbl (make-hashtable string-hash string=?))
-(define na-name-kind-mu (make-mutex))
+(define-process-local na-name-kind-mu (make-mutex))
 (define (na-name-kind n)
   (or (hashtable-ref na-name-kind-tbl n #f)
       (let* ((hit (assoc n na-prim-type-kinds))

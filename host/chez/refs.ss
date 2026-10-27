@@ -39,7 +39,7 @@
 ;; lock costs nothing measurable.
 (define ref-min-history-tbl (make-weak-eq-hashtable))
 (define ref-max-history-tbl (make-weak-eq-hashtable))
-(define ref-history-mu (make-mutex))
+(define-process-local ref-history-mu (make-mutex))
 
 ;; --- transaction record -------------------------------------------------------
 ;; A per-transaction record, held in the thread-parameter *txn* (#f when

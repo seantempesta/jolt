@@ -399,7 +399,7 @@
 ;; first-inclusion order hands load-natives!) and a path set so the same .so is
 ;; not dlopen'd twice. Mutated only from load-natives!/jolt-build-load-native,
 ;; but guarded anyway in case a repl loads a native lazily.
-(define ffi-native-mu (make-mutex))
+(define-process-local ffi-native-mu (make-mutex))
 ;; cell[0] = list of (path . handle) pairs, oldest first. The PATH rides along
 ;; only so a duplicate-symbol report can name the libraries involved (issue
 ;; #731); resolution itself reads the handle.
@@ -1403,7 +1403,7 @@
 ;; Both tables are written at RUN time — __ccallable mints a callback and
 ;; ffi-export registers a name — from whatever thread does it, so every mutation
 ;; takes this mutex. Single-key reads stay unlocked.
-(define ffi-tbl-mu (make-mutex))
+(define-process-local ffi-tbl-mu (make-mutex))
 (define ffi-callable-table (make-eqv-hashtable))   ; entry-point addr -> code object
 (define (jolt-ffi-register-callable! co)
   (sa-lock-object co)
@@ -1570,11 +1570,12 @@
 ;; masking them directly would put every entry in shard 0.
 (define ffi-size-shard-count 16)
 (define ffi-size-tables (make-vector ffi-size-shard-count))
-(define ffi-size-mutexes (make-vector ffi-size-shard-count))
+(define-process-local ffi-size-mutexes
+  (let ((v (make-vector ffi-size-shard-count)))
+    (do ((i 0 (fx+ i 1))) ((fx=? i ffi-size-shard-count) v) (vector-set! v i (make-mutex)))))
 (let loop ((i 0))
   (when (fx<? i ffi-size-shard-count)
     (vector-set! ffi-size-tables i (make-eqv-hashtable))
-    (vector-set! ffi-size-mutexes i (make-mutex))
     (loop (fx+ i 1))))
 
 (define (ffi-size-shard-index a)
@@ -1604,7 +1605,7 @@
     (seq->list (jolt-seq ps)))
   jolt-nil)
 
-(define ffi-auto-mu (make-mutex))
+(define-process-local ffi-auto-mu (make-mutex))
 (define ffi-auto-guardian (make-guardian))
 (define (jolt-ffi-auto-guard! token)
   (jolt-with-mutex ffi-auto-mu (ffi-auto-guardian token))

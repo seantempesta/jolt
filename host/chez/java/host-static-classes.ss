@@ -359,7 +359,7 @@
 ;; Only the real process stream takes this path: with-out-str resolves 'out to a
 ;; string port, which can only take characters, so a byte[] written there decodes
 ;; as before.
-(define pw-byte-port-mu (make-mutex))
+(define-process-local pw-byte-port-mu (make-mutex))
 (define pw-stdout-bytes (box #f))
 (define pw-stderr-bytes (box #f))
 (define (pw-byte-port-memo cell open)

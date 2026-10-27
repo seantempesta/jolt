@@ -12,7 +12,7 @@
 
 ;; LC_TIME varies by platform: 5 on macOS, 2 on Linux/glibc.
 (define tzp-LC_TIME (if (eq? (sa-os-family) 'macos) 5 2))
-(define tzp-mutex (make-mutex))
+(define-process-local tzp-mutex (make-mutex))
 
 ;; Guard-wrapped FFI via jolt-foreign-proc-safe (deferred symbol lookup so a
 ;; missing entry doesn't abort boot). nil on failure -> graceful fallback.

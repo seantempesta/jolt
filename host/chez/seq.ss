@@ -605,7 +605,7 @@
 ;; an error naming this table. Both sides take the mutex; on the read side that is
 ;; the apply path, where a mutex is noise next to the list building around it.
 (define variadic-fixed-arity-tbl (make-weak-eq-hashtable))
-(define variadic-tbl-mu (make-mutex))
+(define-process-local variadic-tbl-mu (make-mutex))
 (define (jolt-register-variadic! v proc)
   (jolt-with-mutex variadic-tbl-mu (hashtable-set! variadic-fixed-arity-tbl proc v))
   proc)

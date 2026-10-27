@@ -30,7 +30,7 @@
 ;; Interning is double-checked for the same reason jolt-var is: two threads
 ;; racing (create-ns 'foo) on a name that does not exist yet would otherwise each
 ;; build their own jns, and find-ns would hand out two objects for one namespace.
-(define ns-registry-mu (make-mutex))
+(define-process-local ns-registry-mu (make-mutex))
 (define (intern-ns! name)
   (or (hashtable-ref ns-registry name #f)
       (jolt-with-mutex ns-registry-mu
@@ -99,7 +99,7 @@
 ;; loads a namespace — an nREPL session and the main program at once, say — and
 ;; unsynchronized inserts into one of these drop mappings, which surfaces as a
 ;; symbol that will not resolve in a namespace that plainly refers it.
-(define ns-map-mu (make-mutex))
+(define-process-local ns-map-mu (make-mutex))
 (define ns-alias-table (make-hashtable equal-hash equal?))
 (define (chez-register-alias! cns alias target)
   (jolt-with-mutex ns-map-mu (hashtable-set! ns-alias-table (cons cns alias) target)))

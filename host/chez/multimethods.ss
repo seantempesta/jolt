@@ -102,7 +102,7 @@
 ;;
 ;; User code never runs under this mutex: mm-find-isa calls isa? / parents, and
 ;; every caller resolves before it locks.
-(define mm-tbl-mu (make-mutex))
+(define-process-local mm-tbl-mu (make-mutex))
 
 ;; A fresh multimethod value: the dispatch fn, the default dispatch value, the
 ;; hierarchy to resolve isa? against (#f = the global one), and the three empty

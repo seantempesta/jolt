@@ -262,7 +262,7 @@
 ;; namespaces load in parallel, so this is reachable, and it is the same defect
 ;; the analyzer's gen-name has an atomic swap! for.
 (define jolt-gensym-counter 0)
-(define jolt-gensym-mutex (make-mutex))
+(define-process-local jolt-gensym-mutex (make-mutex))
 (define (jolt-gensym . prefix)
   (let ((p (if (null? prefix) "G__" (car prefix)))
         (n (jolt-with-mutex jolt-gensym-mutex

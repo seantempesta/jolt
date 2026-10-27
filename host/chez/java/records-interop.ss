@@ -220,7 +220,7 @@
 (define (instance-kind-epoch)
   (fx+ instance-arms-epoch (fx+ jch-graph-epoch jolt-proto-epoch)))
 (define instance-kind-memo (make-weak-eq-hashtable))
-(define instance-kind-mu (make-mutex))
+(define-process-local instance-kind-mu (make-mutex))
 ;; Walk arms from RS until STOP (exclusive); 'pass when none decided.
 (define (instance-arms-until rs stop ts val)
   (let loop ((rs rs))

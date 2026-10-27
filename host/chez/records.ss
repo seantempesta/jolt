@@ -211,7 +211,7 @@
 ;; impl. And find-method-any-protocol walks (hashtable-keys ti), which under a
 ;; concurrent registration returns trailing FILL slots — a hashtable-ref on 0
 ;; against a #f inner table, i.e. a crash on the dispatch path.
-(define rec-tbl-mu (make-mutex))
+(define-process-local rec-tbl-mu (make-mutex))
 
 (define chez-record-type-tbl (make-hashtable string-hash string=?))
 ;; The string-keyed lookup. jrec-record? answers from the per-type cache instead
@@ -241,7 +241,7 @@
 ;; deftypes) and happens only at definition time. The GC's own rehash of a weak
 ;; table is not a factor: it stops the world.
 (define chez-deftype-ctor-tag-box (box (make-weak-eq-hashtable)))
-(define chez-deftype-ctor-tag-mu (make-mutex))
+(define-process-local chez-deftype-ctor-tag-mu (make-mutex))
 (define (deftype-ctor-tag p) (hashtable-ref (unbox chez-deftype-ctor-tag-box) p #f))
 (define (deftype-ctor-tag-set! ctor tag)
   ;; The token is = to its Class (host-static-classes.ss), so pin its identity
@@ -356,7 +356,7 @@
 ;; mutate other tables: chez-type-owns-lookup? (consulted per record while
 ;; building the shapes map) reads the defrecord-type and protocol-method
 ;; registries, so a change there changes the materialized map.
-(define chez-infer-map-mu (make-mutex))
+(define-process-local chez-infer-map-mu (make-mutex))
 (define chez-infer-registry-gen 0)
 (define chez-record-shapes-memo #f)      ; (generation . map) or #f
 (define chez-protocol-methods-memo #f)
@@ -708,7 +708,7 @@
 ;; descriptor (eq?): the string-keyed chez-record-dbl-tbl read this replaced hashed
 ;; the whole type tag on every set!, which was most of a deftype field write.
 (define jrec-dbl-flags-tbl (make-weak-eq-hashtable))
-(define jrec-dbl-flags-mu (make-mutex))
+(define-process-local jrec-dbl-flags-mu (make-mutex))
 (define (jrec-dbl-flags inst)
   (let* ((d (jrec-desc inst))
          (f (hashtable-ref jrec-dbl-flags-tbl d 'none)))
@@ -761,7 +761,7 @@
 ;; same cache keyed by descriptor. Weak, so a redefined type's descriptor stays
 ;; collectable; no epoch guard because a descriptor's tag never changes.
 (define jrdesc-class-hash-tbl (make-weak-eq-hashtable))
-(define jrdesc-class-hash-mu (make-mutex))
+(define-process-local jrdesc-class-hash-mu (make-mutex))
 (define (jrdesc-class-hash d)
   (or (hashtable-ref jrdesc-class-hash-tbl d #f)
       (let ((h (compute-symbol-hasheq #f (jrdesc-tag d))))

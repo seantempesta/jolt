@@ -581,7 +581,7 @@
           (else (attempt delete-file #f)))))
 
 (define nio-temp-counter 0)
-(define nio-temp-mutex (make-mutex))
+(define-process-local nio-temp-mutex (make-mutex))
 (define (nio-tmp-dir) (host-temp-dir))
 ;; A temp path in `dir` (default the system temp dir), unique across processes
 ;; via now-millis + a retry counter, like java.nio.file's createTemp*.

@@ -1199,7 +1199,7 @@
 ;; for every instance the site builds and its layout is computed once, keyed eq?
 ;; on it. FNS follow in the order the names list them.
 (define reify-shape-memo (make-weak-eq-hashtable))
-(define reify-shape-mu (make-mutex))
+(define-process-local reify-shape-mu (make-mutex))
 (define (reify-shape-layout shape)
   (or (hashtable-ref reify-shape-memo shape #f)
       (let* ((names (seq->list (jolt-nth shape 0)))
@@ -1331,7 +1331,7 @@
 ;; sixth of six, against the JVM's ~45 ns) and a miss walked the reify's tags
 ;; through the registry. A proxy consults its delegate, so it walks.
 (define reify-satisfies-memo (make-weak-eq-hashtable))
-(define reify-satisfies-mu (make-mutex))
+(define-process-local reify-satisfies-mu (make-mutex))
 (define (reify-satisfies? obj pn-str)
   (let* ((protos (jreify-protos obj))
          (epoch (fx+ jolt-proto-epoch jch-graph-epoch))

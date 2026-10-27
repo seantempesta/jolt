@@ -870,7 +870,7 @@
 
 ;; The registered taps are a set (a fn registers once). Held as a Scheme list
 ;; under a lock; identity comparison matches the JVM's set semantics for fns.
-(define tapset-mu (make-mutex))
+(define-process-local tapset-mu (make-mutex))
 (define tapset (box '()))
 (define (tapset-add! f)
   (jolt-with-mutex tapset-mu
@@ -1240,7 +1240,7 @@
 ;; mechanism in this section. Making those four fiber-aware is not making all of them
 ;; so, which is the line that keeps the rest of the runtime on jolt-with-mutex.
 (define monitor-table (make-weak-eq-hashtable))
-(define monitor-table-lock (make-mutex))
+(define-process-local monitor-table-lock (make-mutex))
 ;; #(bk owner count cv fibers box wcv waiters)
 ;;   bk     the bookkeeping mutex — held across a decision, never across a body
 ;;   owner  the OWNER WORD: the FIBER when a fiber holds it, else the thread's
@@ -2202,7 +2202,7 @@
 ;; the JVM's construction-order default rather than nothing, so .getName has an
 ;; answer before the thread has an id to be named after.
 (define jthread-name-counter 0)
-(define jthread-name-mutex (make-mutex))
+(define-process-local jthread-name-mutex (make-mutex))
 (define (next-jthread-name)
   (jolt-with-mutex jthread-name-mutex
     (let ((n jthread-name-counter))
@@ -2508,7 +2508,7 @@
         (jolt-with-mutex thread-groups-mu
           (vector-set! pst 3 (cons g (vector-ref pst 3))))))
     g))
-(define thread-groups-mu (make-mutex))
+(define-process-local thread-groups-mu (make-mutex))
 (define (thread-group? x) (and (jhost? x) (string=? (jhost-tag x) "thread-group")))
 (define system-thread-group (make-thread-group "system" #f))
 (define main-thread-group (make-thread-group "main" system-thread-group))
@@ -2831,7 +2831,7 @@
 ;; aside rather than in the futures' vectors because three layouts share this
 ;; (j-future, the scheduled future that extends it, FutureTask).
 (define task-runners (make-weak-eq-hashtable))
-(define task-runners-mu (make-mutex))
+(define-process-local task-runners-mu (make-mutex))
 (define (task-runner-set! fut)
   (jolt-with-mutex task-runners-mu (hashtable-set! task-runners fut (current-interrupt-box))))
 (define (task-runner-clear! fut)
@@ -4182,7 +4182,7 @@
 ;; (the one newCachedThreadPool builds), made on first use, whose workers do not
 ;; hold the process open — the commonPool's are daemons too.
 (define cf-default-pool #f)
-(define cf-default-pool-mu (make-mutex))
+(define-process-local cf-default-pool-mu (make-mutex))
 (define (cf-default-executor)
   (jolt-with-mutex cf-default-pool-mu
     ;; daemon workers, as the commonPool's are
@@ -4760,8 +4760,8 @@
 ;; that flag and enqueues under the SAME mutex, so a job can never slip in after
 ;; the pump has left — a losing call runs inline instead of blocking on a dead pump.
 
-(define jolt-main-queue-mu (make-mutex))
-(define jolt-main-queue-cv (make-condition))
+(define-process-local jolt-main-queue-mu (make-mutex))
+(define-process-local jolt-main-queue-cv (make-condition))
 ;; FIFO of jolt-main-job as a front/rear two-list queue, guarded by mu: enqueue
 ;; is one cons where a single list re-copied per (append q (list j)) cost
 ;; O(depth) under the mutex. Callers hold jolt-main-queue-mu for both ops.
@@ -5045,7 +5045,7 @@
 ;; JVM hands back the same Thread object), and is the thunk itself for the
 ;; anonymous jolt.host form.
 (define jolt-shutdown-hooks (box '()))
-(define jolt-shutdown-mutex (make-mutex))
+(define-process-local jolt-shutdown-mutex (make-mutex))
 (define jolt-shutdown-ran (box #f))
 
 (define (jolt-register-shutdown-hook! key thunk)
@@ -5206,7 +5206,7 @@
 ;; Tripping and uninstalling take this mutex, so the watcher cannot read a target,
 ;; lose the race to the uninstall, and then set the REPL thread's interrupt box
 ;; for the NEXT entry. Only the boxes are set under it; the wake is outside.
-(define jolt-sigint-mu (make-mutex))
+(define-process-local jolt-sigint-mu (make-mutex))
 ;; #f when the target was already uninstalled: the signal is then the shutdown.
 (define (jolt-sigint-trip! target)
   (and (jolt-with-mutex jolt-sigint-mu

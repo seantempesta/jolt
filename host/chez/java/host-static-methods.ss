@@ -37,7 +37,7 @@
 ;; Whichever of the two asks first creates it; the entry goes when the thread ends
 ;; (io.ss, jolt-thread-exit-hook).
 (define thread-boxes-by-id (make-eqv-hashtable))
-(define thread-boxes-mu (make-mutex))
+(define-process-local thread-boxes-mu (make-mutex))
 (define (thread-box-for-id! id)
   (jolt-with-mutex thread-boxes-mu
     (or (hashtable-ref thread-boxes-by-id id #f)
@@ -1163,7 +1163,7 @@
 ;; getProperty path stays unlocked (strong general table — see rt.ss's var-table
 ;; note). read-then-write is one step so the returned previous value is the one
 ;; this call actually replaced.
-(define sys-prop-mu (make-mutex))
+(define-process-local sys-prop-mu (make-mutex))
 (define sys-prop-table (make-hashtable string-hash string=?))
 (define (sys-set-property k v)
   (jolt-with-mutex sys-prop-mu

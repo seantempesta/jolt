@@ -46,7 +46,7 @@
 ;; and the memo caches are cleared: a concurrent reader that saw the new epoch
 ;; first could derive from the old graph and stamp the answer as current, which
 ;; revalidation could never catch.
-(define jch-cache-mutex (make-mutex))
+(define-process-local jch-cache-mutex (make-mutex))
 (define jch-graph-epoch 0)
 ;; Runs after a class is registered, OUTSIDE jch-cache-mutex, with its name. The
 ;; class-token interner (host-static-classes.ss) installs it to drop a token it

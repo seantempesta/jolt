@@ -907,7 +907,7 @@
 ;; cell itself is a mutable vector whose slot is written outside the lock, which
 ;; is a whole-value write and needs none — this only has to guarantee that both
 ;; writers reach the SAME cell.
-(define mutable-statics-mu (make-mutex))
+(define-process-local mutable-statics-mu (make-mutex))
 (define mutable-statics-tbl (make-hashtable string-hash string=?))
 (define (mutable-static-cell class member create?)
   (if create?
@@ -1015,7 +1015,7 @@
 ;; and the held-registration list go under this mutex; the load itself does NOT,
 ;; because an install namespace requires others and a nested autoload would
 ;; deadlock on a non-recursive mutex.
-(define lib-claims-mu (make-mutex))
+(define-process-local lib-claims-mu (make-mutex))
 (define (lib-claim-pending! p)
   (for-each (lambda (c) (hashtable-set! lib-pending-claims-tbl c p)) (vector-ref p 2))
   (set! lib-any-pending-claims? #t))
@@ -1561,7 +1561,7 @@
 ;; racing registration can only understamp; a miss is not cached, so the
 ;; autoload and var paths below still run every time they are needed.
 (define host-new-cache (make-weak-eq-hashtable))
-(define host-new-cache-mu (make-mutex))
+(define-process-local host-new-cache-mu (make-mutex))
 (define (host-new-ctor class)
   (let ((e (hashtable-ref host-new-cache class #f)))
     (if (and e (fx= (car e) class-ctor-epoch))

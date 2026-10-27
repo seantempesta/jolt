@@ -25,7 +25,7 @@
 ;; program source in cli-core.ss. A second port on the same descriptor buffers
 ;; ahead on its own, and whichever read first would eat input the other never
 ;; sees. Memoized under a mutex for the same reason across threads.
-(define jolt-stdin-port-mu (make-mutex))
+(define-process-local jolt-stdin-port-mu (make-mutex))
 (define jolt-stdin-port-memo #f)
 (define (jolt-stdin-binary-port)
   (unless jolt-stdin-port-memo
@@ -166,7 +166,7 @@
 ;; closure nothing outside can ask (input-port-ready? on one raises), so each
 ;; custom port jolt builds for a Reader registers how to ask it here.
 (define port-ready-probes (make-weak-eq-hashtable))
-(define port-ready-probes-mu (make-mutex))
+(define-process-local port-ready-probes-mu (make-mutex))
 (define (port-ready-probe! port probe)
   (jolt-with-mutex port-ready-probes-mu (hashtable-set! port-ready-probes port probe))
   port)
