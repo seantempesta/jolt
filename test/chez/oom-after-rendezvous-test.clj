@@ -39,6 +39,12 @@
   (let [[a b] (re-seq #"\d+" r)]
     (when (pos? (parse-long b))
       (check "the limit at a full heap is the OS stack, not 0" (= a b)))))
+;; and a thread that allocates under one of the runtime's own mutexes gets it too: held there, it was
+;; never raised, and the heap was collected at its ceiling for good (the recipe's next test child)
+(def under-runtime-mutex (scm/eval-string "(lambda (thunk) (let ([m (make-mutex)]) (jolt-with-mutex m (thunk))))"))
+(check "an allocation under a runtime mutex gets the OutOfMemoryError"
+       (= :caught (try (under-runtime-mutex (fn [] (loop [held ()] (recur (conj held (long-array 4096))))))
+                       (catch OutOfMemoryError _ :caught))))
 ;; a Jolt catch still takes it as an OutOfMemoryError, and the heap is the program's again
 (check "a catch takes the OutOfMemoryError"
        (= :caught (try (loop [held ()] (recur (conj held (long-array 4096))))

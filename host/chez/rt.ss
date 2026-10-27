@@ -941,10 +941,11 @@
 ;; thread-context mutex to come back from it, stopped both for good (a Seon agent's test child,
 ;; 2026-10-28). So the handler records the error, as a signal handler records its signal, and the
 ;; thread that ran it raises it after the rendezvous, at the safe point the stack check raises from
-;; (jolt-after-collection!), with that mutex released and interrupts on. Not while the thread holds
-;; a counted lock, as the stack check, nor while it builds an overflow's trace: that thread's next
-;; collection raises it. One error is kept, the latest. A target with no rendezvous hook raises it in
-;; the handler, as before.
+;; (jolt-after-collection!), with that mutex released and interrupts on: the same safe point the
+;; handler raised from, so under a counted lock too, as it always was (waiting those out, as the stack
+;; check does, left a thread allocating under one of the runtime's mutexes collecting at the ceiling
+;; for good). Not while it builds an overflow's trace: that thread's next collection raises it. One
+;; error is kept, the latest. A target with no rendezvous hook raises it in the handler, as before.
 (define gc-raise-after-rendezvous? #f)
 (define gc-pending-raise #f)              ; (thread-id . message) the handler recorded, or #f
 (define (gc-raise-after! msg)
@@ -953,7 +954,7 @@
       (error 'jolt msg)))
 (define (jolt-gc-raise-pending!)
   (let ((p gc-pending-raise))
-    (when (and p (eqv? (car p) (get-thread-id)) (fx=? 0 (jolt-locks-held)) (not (jolt-stack-overflowing)))
+    (when (and p (eqv? (car p) (get-thread-id)) (not (jolt-stack-overflowing)))
       (set! gc-pending-raise #f)
       (error 'jolt (cdr p)))))
 ;; After each collection, on each thread that took part (sa-gc-install-after-rendezvous!): the
