@@ -43,6 +43,37 @@
           (neg? pid) pid
           :else (wait-exit pid))))
 
+;; A runtime mutex held, at the fork instant, by a thread the fork does not copy: the timer
+;; thread's timed wait on timeout-mu fires and takes the mutex back, then waits to rejoin the
+;; active threads, which the forking thread's hold on $tc-mutex stops, so the fork counts one
+;; active thread and the child gets timeout-mu held by nobody it has. Made here at will: a
+;; thread takes timeout-mu and sleeps in a collect-safe call (inactive, holding it) while the
+;; parent forks. The child's alarm ends a hang; the answer is its raw wait status (0: exited 0,
+;; 14: killed by SIGALRM, hung).
+(def fork-beside-a-held-timeout-mu
+  (scm/eval-string
+    "(let ([fork (foreign-procedure \"fork\" () int)]
+           [alarm (foreign-procedure \"alarm\" (unsigned) unsigned)]
+           [nap (foreign-procedure __collect_safe \"usleep\" (unsigned) int)]
+           [spin (foreign-procedure \"usleep\" (unsigned) int)]
+           [waitpid (foreign-procedure \"waitpid\" (int uptr int) int)]
+           [exit-now (foreign-procedure \"_exit\" (int) void)])
+       (lambda ()
+         (fork-thread (lambda () (mutex-acquire timeout-mu) (nap 400000) (mutex-release timeout-mu)))
+         (spin 100000)
+         (disable-interrupts)
+         (mutex-acquire #%$tc-mutex)
+         (let ([pid (if (= (#%$top-level-value '$active-threads) 1) (fork) -2)])
+           (mutex-release #%$tc-mutex)
+           (enable-interrupts)
+           (cond ((= pid 0) (alarm 5) (jolt-after-fork-child!)
+                            (jolt-timer-at! 0 (lambda () #t))
+                            (exit-now 0))
+                 ((< pid 0) pid)
+                 (else (let ([b (foreign-alloc 4)])
+                         (waitpid pid b 0)
+                         (let ([st (foreign-ref 'int b 0)]) (foreign-free b) st)))))))"))
+
 (defn parked-go [] (let [c (a/chan) r (a/go (a/<! c))] (a/>!! c 41) (= 41 (a/<!! r))))
 
 (require '[jolt.async.remote :as remote])
@@ -82,6 +113,8 @@
               (in-child-now #(= 1 (count (Thread/getAllStackTraces)))) 0)
     (check-eq "a child that forks again (a double fork) gives a grandchild whose parked go resumes"
               (in-child-now #(= 0 (in-child parked-go))) 0)
+    (check-eq "a child forked while a thread it does not get holds the timer's mutex sets a deadline: its runtime mutexes are its own"
+              (fork-beside-a-held-timeout-mu) 0)
     ;; the parent's fibers are the parent's: one parked on a channel when the parent forked is
     ;; never run in the child, though the child puts to that channel (every fork of a Seon root
     ;; ran root's go loops on its copy of root's state)

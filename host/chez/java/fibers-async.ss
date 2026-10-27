@@ -521,6 +521,17 @@
 ;; thread. Pools made with jolt-fiber-pool-make are not restarted: their carriers
 ;; are gone too, and a spawn onto one parks; a forking program makes them after the fork.
 (define (jolt-after-fork-child!)
+  ;; the runtime's mutexes are made afresh before anything here takes one. A thread fork(2) did
+  ;; not copy may hold one at the fork instant without counting as active: the timer thread whose
+  ;; timed wait on timeout-cv fired takes timeout-mu back, then waits to rejoin the active threads,
+  ;; which the forking thread's hold on $tc-mutex stops. The child got that mutex held by nobody
+  ;; it has, and its first deadline (or the reset below) waited forever (a Seon agent's test child,
+  ;; 2026-10-27)
+  (set! timeout-mu (make-mutex))
+  (set! timeout-cv (make-condition))
+  (set! live-threads-mutex (make-mutex))
+  (set! thread-handles-mutex (make-mutex))
+  (set! jolt-shutdown-mutex (make-mutex))
   (let ((self (get-thread-id)))
     (if jolt-main-thread
         ;; a main-carrier program forked from inside its own fiber: the child keeps carrier 0
