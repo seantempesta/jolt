@@ -768,10 +768,36 @@
 ;; StackOverflowError inside it, which the walk's guard swallows, leaving the
 ;; first with no trace.
 (define jolt-stack-overflowing (make-thread-parameter #f))
+;; A FAILED MEASUREMENT is not an overflow. The hook runs at a safe point of whatever the thread was
+;; doing, so a raise out of the measuring would land in that computation: a fiber that threw out of
+;; it answered nothing to the take waiting on its channel (Datahike's background gc hung one run in
+;; ten with `car: false is not a pair` raised here: 5 runs of 40 with the hook, 0 of 40 with
+;; JOLT_STACK_LIMIT=-1). The measurement is a heuristic whose contract already has "cannot measure"
+;; (sa-current-stack-bytes answers #f), so a failure of it is that: the check enforces nothing this
+;; time, and the failure is KEPT -- count, condition and the frames it was raised in -- for
+;; (jolt-stack-check-failure) and jolt.host/stack-check-failure, so it is read, not lost.
+;; The StackOverflowError below is the one raise the hook exists for and is outside the guard.
+(define jolt-stack-check-failure #f)    ; (count . "condition, frames") of the latest, or #f
+(define (jolt-stack-check-failed! c)
+  (set! jolt-stack-check-failure
+    (cons (fx+ 1 (if jolt-stack-check-failure (car jolt-stack-check-failure) 0))
+          (guard (e (#t "unprintable"))
+            (call-with-string-output-port
+              (lambda (p)
+                (display-condition c p)
+                (when (continuation-condition? c)
+                  (let loop ((o (inspect/object (condition-continuation c))) (n 0))
+                    (when (and o (< n 24) (eq? (o 'type) 'continuation))
+                      (let ((nm (guard (e (#t #f)) ((o 'code) 'name))))
+                        (display "\n  " p) (display (or nm "?") p))
+                      (loop (guard (e (#t #f)) (o 'link)) (fx+ n 1))))))))))
+  #f)
 (define (jolt-stack-check!)
   (let ((limit jolt-stack-limit-bytes))
-    (when (and limit (fx=? 0 (jolt-locks-held)) (not (jolt-stack-overflowing)))
-      (let ((n (sa-current-stack-bytes)))
+    (when limit
+      (let ((n (guard (c (#t (jolt-stack-check-failed! c)))
+                 (and (fx=? 0 (jolt-locks-held)) (not (jolt-stack-overflowing))
+                      (sa-current-stack-bytes)))))
         (when (and n (> n limit))
           (jolt-stack-overflow! limit))))))
 ;; The throwable's trace is resolved here, at the throw, and kept as frames

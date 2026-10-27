@@ -1068,6 +1068,12 @@
 ;; of going through the uncaught reporter. Returns the "  trace:\n<frames>" block
 ;; from the tail-frame HISTORY only — the live continuation in a REPL is just the
 ;; REPL's own machinery — or nil when tracing is off (so a caller can when-let).
+;; The latest failure of the stack-limit hook's own measuring, "<count>: <condition and frames>", or nil
+;; (rt.ss jolt-stack-check!): kept so a failure that enforces nothing is still read.
+(def-var! "jolt.host" "stack-check-failure"
+  (lambda ()
+    (let ((f jolt-stack-check-failure))
+      (if f (string-append (number->string (car f)) ": " (cdr f)) jolt-nil))))
 (def-var! "jolt.host" "backtrace-string"
   (lambda ()
     (let ((bt (jolt-history-backtrace)))

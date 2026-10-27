@@ -143,6 +143,35 @@
 (ok "4f. disabled: a recursion past the old limit completes"
     (= 3000000 (let d ((n 3000000)) (if (= n 0) 0 (+ 1 (d (- n 1)))))))
 
+;; --- 5. the check's own failure -----------------------------------------------
+;; The hook runs after every collection, on every thread that took part, at a safe point of
+;; whatever that thread was doing, and may raise there: that is the StackOverflowError it
+;; exists for. A failure of the MEASUREMENT is not that: measuring a stack is a heuristic, and
+;; it must never throw into the computation it looks at (a fiber that threw out of the hook
+;; answered nothing to the take waiting on it, and Datahike's background gc hung one run in
+;; ten on `car: false is not a pair`, 5 of 40 runs with the hook against 0 of 40 with
+;; JOLT_STACK_LIMIT=-1). A measurement that fails is "cannot measure" (sa-current-stack-bytes'
+;; contract): the check enforces nothing this time, and the failure is kept, with where it
+;; happened, for whoever reads (jolt-stack-check-failure, jolt.host/stack-check-failure).
+(printf "== 5. the check's own failure ==\n")
+(define (search-string s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0)) (and (<= (+ i m) n) (or (string=? (substring s i (+ i m)) sub) (loop (+ i 1)))))))
+(jolt-stack-limit-set! (* 1024 1024 1024))
+(sa-stack-memo 5)                    ; a memo that is no pair: the measurement cannot read it
+(ok "5a. a measurement that fails raises nothing" (begin (jolt-stack-check!) #t))
+(let ((f jolt-stack-check-failure))
+  (ok (format "5b. and is kept, with where it was raised (~s)" f)
+      (and f (eqv? 1 (car f)) (string? (cdr f)) (> (string-length (cdr f)) 0)
+           (let ((s (cdr f))) (and (search-string s "car") (search-string s "jolt-stack-check!"))))))
+(sa-stack-memo #f)
+(jolt-stack-check!)
+(ok "5c. a check that measures leaves the record alone" (eqv? 1 (car jolt-stack-check-failure)))
+(jolt-stack-limit-set! (* 32 1024 1024))
+(ok "5d. and the overflow it exists for still raises"
+    (equal? "java.lang.StackOverflowError" (caught-class (lambda () (runaway 1)))))
+(jolt-stack-limit-set! #f)
+
 (printf "\n~a checks, ~a failed\n" total fails)
 (when (> fails 0) (exit 1))
 (printf "stack-limit gate: PASS\n")
