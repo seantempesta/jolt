@@ -38,6 +38,20 @@
 (ok "(== 1/2 0.5)" (jolt-num-equiv 1/2 0.5))
 (ok "a non-number throws" (eq? 'threw (failure (lambda () (jolt-num-equiv 1 "1")))))
 (ok "a non-number first throws" (eq? 'threw (failure (lambda () (jolt-num-equiv "1" 1)))))
+;; the 2-arity answers what the rest-args body answers, pair by pair: plain
+;; numbers of every kind, NaN, a shim number (BigDecimal) beside a plain one
+(define nan (/ 0.0 0.0))
+(define big3 (jolt-bigdec 3))
+(define (same? a b)
+  (let ((two (guard (e (#t 'threw)) (jolt-num-equiv a b)))
+        (n (guard (e (#t 'threw)) (jolt-num-equiv-n (list a b)))))
+    (equal? two n)))
+(for-each
+  (lambda (p) (ok (format "(== ~s ~s) as the rest-args body" (car p) (cdr p)) (same? (car p) (cdr p))))
+  (list (cons 1 1) (cons 1 2) (cons 3 3.0) (cons 1/3 1/3) (cons 1/3 2/3) (cons 1/2 0.5)
+        (cons nan nan) (cons 1.0 nan) (cons big3 3) (cons 3 big3) (cons big3 3.0) (cons big3 4)
+        (cons 1 "1") (cons "1" 1) (cons 'a 'a)))
+(ok "(== 3M 3)" (jolt-num-equiv big3 3))
 (ok "(== 1 1 1)" (jolt-num-equiv 1 1 1))
 (ok "(== 1 1 2) is false" (not (jolt-num-equiv 1 1 2)))
 (ok "a non-number among three throws" (eq? 'threw (failure (lambda () (jolt-num-equiv 1 1 'a)))))
