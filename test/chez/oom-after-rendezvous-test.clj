@@ -35,7 +35,10 @@
   (scm/eval-string "(lambda () (format \"~a ~a\" (jolt-stack-limit-for (expt 2 40) 65536 100663296 100663296 (jolt-stack-floor)) (jolt-stack-floor)))"))
 (let [r (str (limit-at-a-full-heap))]
   (println "stack limit at a full heap, and the floor:" r)
-  (check "the limit at a full heap is the OS stack, not 0" (let [[a b] (re-seq #"\d+" r)] (and a (= a b) (pos? (parse-long a))))))
+  ;; an unlimited OS stack is no floor (jolt-rlimit-bytes answers none): nothing to check there
+  (let [[a b] (re-seq #"\d+" r)]
+    (when (pos? (parse-long b))
+      (check "the limit at a full heap is the OS stack, not 0" (= a b)))))
 ;; a Jolt catch still takes it as an OutOfMemoryError, and the heap is the program's again
 (check "a catch takes the OutOfMemoryError"
        (= :caught (try (loop [held ()] (recur (conj held (long-array 4096))))
