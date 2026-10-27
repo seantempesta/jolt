@@ -3187,7 +3187,9 @@
 ;; textual port and was read back off the disk for its table: seon.main's "write
 ;; flat.ss" (93 MB over 312 units) took 2.6-3.8 s, and takes 2.0-2.3 s this way
 ;; (2026-10-27, unpaired runs on a loaded machine); a byte port alone writes the
-;; same 93 MB in 165 ms against the textual port's 636.
+;; same 93 MB in 165 ms against the textual port's 636. A unit is held whole in
+;; memory to be written: one namespace's (seon.main's largest is 4 MB), or a
+;; shaken app's one unit, the whole app.
 (define (bld-write-unit! path text nses)
   (let ((table (jolt-marker-table text))
         (out (open-file-output-port path (file-options no-fail))))

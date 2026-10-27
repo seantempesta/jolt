@@ -55,21 +55,13 @@
   (lambda (c)
     (let ((before (string-append dir "/before.ss"))
           (after (string-append dir "/after.ss"))
-          (nses (list "app.a")))
+          ;; two names: a shaken app's one unit registers its table under every namespace
+          (nses (list "app.a" "app.b")))
       (write-unit-before! before (cdr c) nses)
       (bld-write-unit! after (cdr c) nses)
       (check (string-append (car c) ": the same bytes as the textual write and its read-back table")
              (bytevector=? (file-bytes before) (file-bytes after)))))
   cases)
-
-(let ((after (string-append dir "/after.ss")))
-  (bld-write-unit! after (cdr (car cases)) (list "app.a"))
-  (check "a unit with markers carries its table"
-         (let ((s (utf8->string (file-bytes after))))
-           (let loop ((i 0))
-             (and (< (+ i 26) (string-length s))
-                  (or (string=? (substring s i (+ i 26)) "(jolt-register-marker-tabl")
-                      (loop (+ i 1))))))))
 
 (for-each (lambda (f) (delete-file (string-append dir "/" f))) (directory-list dir))
 (delete-directory dir)
