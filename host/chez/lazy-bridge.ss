@@ -359,6 +359,8 @@
                       (lambda () #f)
                       thunk
                       (lambda ()
+                        ;; running until its exit hook has woken its joiners (locks.ss all asleep)
+                        (jolt-asleep-thread-exiting!)
                         ;; live-threads first, the exit hook after: Thread.start
                         ;; registers a handle only while jolt-started-thread?
                         ;; holds, so a hook that ran first could see its entries

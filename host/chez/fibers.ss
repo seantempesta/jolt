@@ -1839,14 +1839,21 @@
     (jolt-ex-info "deadlock: every fiber and thread of this process waits, and nothing can wake one (no fiber queued, no timer, no descriptor awaited)"
                   (jolt-hash-map (keyword "jolt" "deadlock") #t (keyword #f "parked") parked))))
 
-;; Tell each parked fiber not told yet; answers how many it woke.
-(define (jolt-deadlock-tell-fibers! e)
+;; Tell each parked fiber not told yet; answers how many it woke. STILL? (the detector's: the
+;; asleep epoch has not moved since its check) is asked before each tell, so a wake in between
+;; tells no more.
+(define jolt-deadlock-tell-fibers!
+  (case-lambda
+    ((e) (jolt-deadlock-tell-fibers! e (lambda () #t)))
+    ((e still?)
   (fold-left (lambda (n f)
-               (jolt-fiber-deliver-interrupt! f e)
-               (if (eq? 'parked (jolt-fiber-state f)) n (fx+ n 1)))
+               (if (still?)
+                   (begin (jolt-fiber-deliver-interrupt! f e)
+                          (if (eq? 'parked (jolt-fiber-state f)) n (fx+ n 1)))
+                   n))
              0
              (filter (lambda (f) (and (eq? 'parked (jolt-fiber-state f)) (not (jolt-fiber-interrupt f))))
-                     (jolt-fiber-registry-live))))
+                     (jolt-fiber-registry-live))))))
 
 ;; --- all asleep, on threads (locks.ss counts) -----------------------------------
 ;; The detector: one daemon thread, started the first time every counted thread is asleep, waiting
@@ -1904,7 +1911,8 @@
 (define (jolt-asleep-all-ids?)
   (let ((ids (cons jolt-boot-thread-id (live-thread-ids))))
     (jolt-with-mutex jolt-asleep-mu
-      (for-all (lambda (id) (or (eqv? id jolt-asleep-det-id) (hashtable-contains? jolt-asleep-ids id))) ids))))
+      (and (fx=? 0 jolt-asleep-exiting)
+           (for-all (lambda (id) (or (eqv? id jolt-asleep-det-id) (hashtable-contains? jolt-asleep-ids id))) ids)))))
 
 (define (jolt-asleep-check!)
   (let ((e0 (jolt-with-mutex jolt-asleep-mu jolt-asleep-epoch)))
@@ -1914,7 +1922,8 @@
                (not (and jolt-io-awaited (jolt-io-awaited)))
                (eqv? e0 (jolt-with-mutex jolt-asleep-mu jolt-asleep-epoch)))
       (let* ((e (jolt-deadlock-error))
-             (n (+ (jolt-deadlock-tell-fibers! e) (jolt-asleep-tell-threads! e))))
+             (still? (lambda () (eqv? e0 (jolt-with-mutex jolt-asleep-mu jolt-asleep-epoch))))
+             (n (+ (jolt-deadlock-tell-fibers! e still?) (jolt-asleep-tell-threads! e e0))))
         (when (and (fx=? n 0) (not jolt-asleep-said))
           (set! jolt-asleep-said #t)
           (let ((p (current-error-port)))
@@ -1932,6 +1941,8 @@
   (set! jolt-fiber-pool-started? #t)
   (jolt-fiber-ensure-carriers!)
   (set! jolt-main-thread (get-thread-id))
+  ;; its idle wait on carrier 0 is asleep while it is the loop (locks.ss; reset when it leaves)
+  (jolt-asleep-raw-counts #t)
   (set! jolt-thread-end-wake jolt-main-wake-for-timer!)
   ;; physics: a process that forks must never start Chez's parallel-collector sweepers (a
   ;; child of one hangs or faults in its collections). Where this Chez can fix the pool
@@ -1997,6 +2008,7 @@
 (define jolt-main-carrier-pool-n 1)   ; the pool's count before the main carrier set it to one
 (define (jolt-main-carrier-leave! c0)
   (set! jolt-main-thread #f)
+  (jolt-asleep-raw-counts #f)
   (jolt-fiber-carrier-count-set! #f)
   (jolt-fiber-preempt-refresh!)
   (let* ((n jolt-main-carrier-pool-n) (v (make-vector n)))
@@ -2036,6 +2048,8 @@
 ;; checked under the mutex AFTER a drain, so a stopped carrier finishes its
 ;; queue first.
 (define (jolt-fiber-carrier-loop c)
+  ;; its idle wait is asleep (locks.ss): a fiber queued is what wakes it, which the detector reads
+  (jolt-asleep-raw-counts #t)
   (let loop ()
     (jolt-fiber-drain! c)
     (jolt-lock! (jolt-carrier-mu c))

@@ -850,6 +850,9 @@
 (define (timeout-fire! due) (for-each (lambda (fire) (fire)) due))
 
 (define (timeout-thread)
+  ;; its wait with no deadline is asleep (locks.ss): a deadline set is what wakes it, which the
+  ;; detector reads (timeout-pending-count)
+  (jolt-asleep-raw-counts #t)
   (let loop ()
     (for-each (lambda (fire)
                 (guard (e (#t (jolt-thread-uncaught! #f e "Exception in thread \"jolt-timer\":\n")))

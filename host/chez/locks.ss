@@ -480,10 +480,17 @@
              (lambda () (jolt-asleep-while cv mu (lambda () (condition-wait (jolt-cv-cond cv) mu)))))
            (jolt-cv-threads-set! cv (fx- (jolt-cv-threads cv) 1))
            (jolt-asleep-told-check!))
-         ;; a raw condition: the runtime's own waits (a carrier idle, the timer, the main
-         ;; queue, the loader), asleep but never told: their waiters are what is told
+         ;; a raw condition: the runtime's own waits, never told (their waiters are what is told),
+         ;; and asleep only on a carrier, the timer thread or a main carrier's loop
+         ;; (jolt-asleep-raw-counts), whose wakes the detector reads for itself (a queued fiber, a
+         ;; pending timer). The others (the main queue, the tap queue, exit, the loader) are woken
+         ;; by a raw signal nothing marks, so a woken one could still read asleep: they count as
+         ;; running, which can miss a deadlock, never make one up
          (call-with-thread-state 'WAITING
-           (lambda () (jolt-asleep-while #f mu (lambda () (condition-wait cv mu)))))))
+           (lambda ()
+             (if (jolt-asleep-raw-counts)
+                 (jolt-asleep-while #f mu (lambda () (condition-wait cv mu)))
+                 (condition-wait cv mu))))))
     ((cv mu abs-time)
      (when (jolt-current-fiber) (jolt-blocking-refuse 'jolt-condition-wait))
      (if (jolt-cv? cv)
@@ -518,6 +525,8 @@
 (define jolt-asleep-on (make-weak-eq-hashtable)) ; cv -> ids asleep on it, for its waker
 (define jolt-asleep-told (make-eqv-hashtable))  ; thread id -> the error to raise in its wait
 (define jolt-asleep-uncounted (make-thread-parameter #f)) ; the detector's own wait
+(define jolt-asleep-raw-counts (make-thread-parameter #f)) ; a carrier, the timer, a main carrier's loop
+(define jolt-asleep-exiting 0)                  ; threads between leaving live-threads and their end
 (define jolt-asleep-notify (lambda () (void)))  ; fibers.ss: wakes the detector
 
 ;; Run WAIT (a condition-wait on CV, a jolt-cv of a value wait or #f, with MU held) counted asleep.
@@ -529,6 +538,8 @@
           (lambda ()
             (let ((all? (jolt-with-mutex jolt-asleep-mu
                           (set! jolt-asleep-epoch (fx+ jolt-asleep-epoch 1))
+                          ;; a tell left by a wait this thread left by an escape is not this wait's
+                          (hashtable-delete! jolt-asleep-told id)
                           (hashtable-set! jolt-asleep-ids id (if cv (cons cv mu) #t))
                           (when cv
                             (hashtable-set! jolt-asleep-on cv (cons id (hashtable-ref jolt-asleep-on cv '()))))
@@ -550,9 +561,16 @@
   (fx>=? (hashtable-size jolt-asleep-ids)
          (fx- (fx+ 1 (hashtable-size live-threads)) (if jolt-asleep-det-id 1 0))))
 
-;; A thread ended (lazy-bridge.ss, in its own exit, holding nothing): the rest can be all asleep.
+;; A thread is ending (lazy-bridge.ss, in its own exit): it leaves live-threads before its exit hook
+;; wakes its joiners, and until then it counts as running (the detector refuses while one is).
+(define (jolt-asleep-thread-exiting!)
+  (jolt-with-mutex jolt-asleep-mu
+    (set! jolt-asleep-exiting (fx+ jolt-asleep-exiting 1))
+    (set! jolt-asleep-epoch (fx+ jolt-asleep-epoch 1))))
+;; A thread ended (its hook has woken its joiners; holding nothing): the rest can be all asleep.
 (define (jolt-asleep-thread-ended!)
   (let ((all? (jolt-with-mutex jolt-asleep-mu
+                (set! jolt-asleep-exiting (fx- jolt-asleep-exiting 1))
                 (set! jolt-asleep-epoch (fx+ jolt-asleep-epoch 1))
                 (jolt-asleep-all-hint?))))
     (when all? (jolt-asleep-notify))))
@@ -581,9 +599,13 @@
 
 ;; Tell each thread in a value wait, not told yet, that nothing can wake it: E is raised in its
 ;; wait (jolt-asleep-told-check!). Its condition is woken under its own mu, taken with no other
-;; lock held. Answers how many were told.
-(define (jolt-asleep-tell-threads! e)
+;; lock held. Only while the asleep epoch is still E0, the one the detector's check read: the pick
+;; is made under the mu that every entry, leaving and wake moves it under, so a thread that woke or
+;; entered since is no reason to tell anyone. Answers how many were told.
+(define (jolt-asleep-tell-threads! e e0)
   (let ((waits (jolt-with-mutex jolt-asleep-mu
+                 (if (not (eqv? e0 jolt-asleep-epoch))
+                     '()
                  (let-values (((ids ws) (hashtable-entries jolt-asleep-ids)))
                    (let loop ((i 0) (acc '()))
                      (if (fx=? i (vector-length ids))
@@ -592,7 +614,7 @@
                            (if (or (not (pair? w)) (hashtable-contains? jolt-asleep-told id))
                                (loop (fx+ i 1) acc)
                                (begin (hashtable-set! jolt-asleep-told id e)
-                                      (loop (fx+ i 1) (cons w acc)))))))))))
+                                      (loop (fx+ i 1) (cons w acc))))))))))))
     (for-each (lambda (w) (jolt-with-mutex (cdr w) (condition-broadcast (jolt-cv-cond (car w)))))
               waits)
     (length waits)))
