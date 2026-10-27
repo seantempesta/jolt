@@ -1889,7 +1889,9 @@
 ;; first happened to wait. Answers once the thread has named itself, so a count of the process's
 ;; threads by name made after the start sees it.
 (define (jolt-asleep-detector-start!)
-  (when (box-cas! jolt-asleep-det-started #f #t)
+  ;; the strong claim: box-cas! refuses spuriously on Apple silicon, and a refused claim here
+  ;; started no detector at all (Seon's root, 2026-10-28: 2 runs in 3)
+  (when (sa-box-cas! jolt-asleep-det-started #f #t)
     (fork-thread/daemon #t
       (lambda ()
         (jolt-thread-name-set! (get-thread-id) "jolt-asleep")
