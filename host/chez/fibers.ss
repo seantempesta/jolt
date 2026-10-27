@@ -55,7 +55,9 @@
 
 ;; --- the fiber record -------------------------------------------------------
 ;; state: 'ready (on the run queue) | 'running | 'parked (waiting on
-;; sa-fiber-resume) | 'done | 'dead (raised; error field holds the condition).
+;; sa-fiber-resume) | 'done | 'dead (raised; error field holds the condition)
+;; | 'forked (a fiber of the process this one forked from: never run here, see
+;; jolt-fibers-forget-the-parents!).
 ;; thunk: the fiber body (immutable). k: the one-shot continuation captured at
 ;; the last park (unconsumed while 'parked). result/error: completion payload.
 ;; next: intrusive run-queue link. slice: R2's per-fiber dynamic slice (a
@@ -802,6 +804,23 @@
         (if (box-cas! jolt-fiber-registry old (fold-right weak-cons '() live))
             (set! jolt-fiber-registry-limit (fxmax 1024 (fx* 2 (length live))))
             (retry))))))
+
+;; In a forked child, the fibers it inherited are the parent's: fork(2) copied their records
+;; and the channels, locks and handlers that hold them, but none of them is this process's
+;; work. Each but the forking one is marked 'forked, which no resume acts on (sa-fiber-resume
+;; and the interrupt wake take only a 'parked fiber), so a put to a channel a parent fiber
+;; waits on completes into that waiter's handler, which is the parent's, and the value goes
+;; no further: nothing runs the waiter here. Without it the child ran the parent's code on its copy of the parent's state: the
+;; parent's go loops, root's procs in every fork of a Seon root. Every fiber that could be
+;; resumed is held by what would resume it, so the weak registry lists it. Called by
+;; jolt-after-fork-child!, while the child is its one thread.
+(define (jolt-fibers-forget-the-parents!)
+  (let ((self (jolt-current-fiber)))
+    (for-each (lambda (f)
+                (unless (or (eq? f self) (memq (jolt-fiber-state f) '(done dead)))
+                  (jolt-fiber-state-set! f 'forked)
+                  (jolt-fiber-next-set! f #f)))
+              (jolt-fiber-registry-live))))
 
 ;; up to limit frames of continuation k as (name source-datum-or-#f vars), innermost first,
 ;; and how many were left: the last element is that count, 0 when none. A compiled Clojure

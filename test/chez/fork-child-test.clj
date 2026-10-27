@@ -82,6 +82,15 @@
               (in-child-now #(= 1 (count (Thread/getAllStackTraces)))) 0)
     (check-eq "a child that forks again (a double fork) gives a grandchild whose parked go resumes"
               (in-child-now #(= 0 (in-child parked-go))) 0)
+    ;; the parent's fibers are the parent's: one parked on a channel when the parent forked is
+    ;; never run in the child, though the child puts to that channel (every fork of a Seon root
+    ;; ran root's go loops on its copy of root's state)
+    (let [c (a/chan) ran (atom nil)]
+      (a/go (reset! ran [:the-parents-fiber-ran (a/<! c)]))
+      (a/<!! (a/timeout 5))
+      (check-eq "a fiber parked in the parent is not run in the child when the child wakes it"
+                (in-child-now #(do (a/>!! c :from-the-child) (a/<!! (a/timeout 50)) (nil? @ran))) 0)
+      (a/close! c))
     ;; the parent's shutdown hooks are the parent's: a child that exits through System/exit runs
     ;; none of them (a Seon root's hook stops root; every fork of root ran it on a copy of root's
     ;; state), and runs the ones it registers itself, once

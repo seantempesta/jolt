@@ -2640,7 +2640,7 @@
       (and (jolt-fiber? f)
            (case (jolt-fiber-state f)
              ((parked) (symbol->string (or (jolt-fiber-wstate f) 'WAITING)))
-             ((done dead) "TERMINATED")
+             ((done dead forked) "TERMINATED")
              (else "RUNNABLE"))))))
 ;; A virtual thread's group while it lives, as the JVM's: "VirtualThreads", under
 ;; "system".

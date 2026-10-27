@@ -529,9 +529,11 @@
         ;; fiber parked in the parent is never resumed here
         (let ((c (vector-ref jolt-fiber-carriers 0)))
           (set! jolt-main-thread self)
+          (jolt-fibers-forget-the-parents!)
           (jolt-carrier-head-set! c #f)
           (jolt-carrier-tail-set! c #f))
         (begin
+          (jolt-fibers-forget-the-parents!)
           (set! jolt-fiber-carriers #f)
           (set! jolt-fiber-rr 0)
           (set! jolt-fiber-pool-started? #f)))
