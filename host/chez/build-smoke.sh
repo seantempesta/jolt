@@ -376,7 +376,7 @@ fi
 # whose .build dir was cleaned (or that was copied elsewhere) fell back to defn
 # lines and lost every spliced frame, and so did one built from cached units,
 # which name the directory of the build that first compiled them. The build bakes
-# each unit's table into the unit (build.ss bld-append-marker-table!).
+# each unit's table into the unit (build.ss bld-write-unit!).
 mv "$out.build" "$out.build-away"
 got_if_nodir="$(cd / && "$out" --innerfn 2>&1)"
 mv "$out.build-away" "$out.build"

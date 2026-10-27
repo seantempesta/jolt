@@ -187,7 +187,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   protoret accfix pic narrow directlink mintgate directcall defmetacells staticsite arraymap arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flonumdisp flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost recordshadow emittedheads adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc numequivalloc analyzealloc emitalloc treeseqcost imagefnforms hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
-  gatebootsmoke aotcachesmoke aotcachepathsmoke aotcachesourcepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotcachesourcepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments buildunitwrite compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
   systemstreams closedstdout stderrsplit userdirpaths utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest tickbudget monitorescape windescape threadsafety maskedacquire ioerrno cas flow remotechan
 TEST-GATES := submodules selfhost ci
@@ -1591,6 +1591,12 @@ buildnatives:
 # under a standard chunk; a scanner that loses its place stops the build.
 buildsegments:
 	@$(CHEZ) --script test/chez/build-segments-test.ss
+
+# A split app unit is written once from memory as UTF-8 bytes, its line-marker
+# table read off the text it was assembled from (bld-write-unit!): the same bytes
+# the textual write and its read-back off the disk made.
+buildunitwrite:
+	@$(CHEZ) --script test/chez/build-unit-write-test.ss
 
 # The other half of the same rule: knowing the platform is only useful if the
 # struct stat offsets it selects are the ones this machine actually uses. The

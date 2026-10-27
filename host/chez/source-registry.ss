@@ -211,7 +211,7 @@
 ;; their defn lines and lost every spliced frame, and so did one assembled from
 ;; build-cache units, which name the directory of the build that first compiled
 ;; them. So each unit carries its own table and registers it here as it loads,
-;; under the namespaces it holds (build.ss bld-append-marker-table!); a frame's
+;; under the namespaces it holds (build.ss bld-write-unit!); a frame's
 ;; namespace is its fn's, which the walk already has.
 (define jolt-baked-marker-tables (make-hashtable string-hash string=?))   ; ns -> table
 (define (jolt-register-marker-table! nses table)
