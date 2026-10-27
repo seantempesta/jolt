@@ -1881,21 +1881,39 @@
     (jolt-with-mutex jolt-asleep-det-mu
       (set! jolt-asleep-det-pending #t)
       (condition-signal jolt-asleep-det-cv))
-    (when (box-cas! jolt-asleep-det-started #f #t)
-      (fork-thread/daemon #t
-        (lambda ()
-          (jolt-thread-name-set! (get-thread-id) "jolt-asleep")
+    (jolt-asleep-detector-start!))))
+
+;; The detector's one start, at most once a process: from its first wake, or when a main carrier's
+;; program returns and the process starts its threads (jolt-main-carrier-leave!), so a process that
+;; ran a main carrier has it from then on, as it has its carriers, not from whenever all its threads
+;; first happened to wait. Answers once the thread has named itself, so a count of the process's
+;; threads by name made after the start sees it.
+(define (jolt-asleep-detector-start!)
+  (when (box-cas! jolt-asleep-det-started #f #t)
+    (fork-thread/daemon #t
+      (lambda ()
+        (jolt-thread-name-set! (get-thread-id) "jolt-asleep")
+        (jolt-asleep-uncounted #t)
+        (jolt-with-mutex jolt-asleep-det-mu
           (set! jolt-asleep-det-id (get-thread-id))
-          (jolt-asleep-uncounted #t)
-          (let loop ()
-            (jolt-with-mutex jolt-asleep-det-mu
-              (let wait ()
-                (unless jolt-asleep-det-pending
-                  (jolt-condition-wait jolt-asleep-det-cv jolt-asleep-det-mu)
-                  (wait)))
-              (set! jolt-asleep-det-pending #f))
-            (jolt-asleep-check!)
-            (loop))))))))
+          (condition-broadcast jolt-asleep-det-cv))
+        (let loop ()
+          (jolt-with-mutex jolt-asleep-det-mu
+            (let wait ()
+              (unless jolt-asleep-det-pending
+                (jolt-condition-wait jolt-asleep-det-cv jolt-asleep-det-mu)
+                (wait)))
+            (set! jolt-asleep-det-pending #f))
+          (jolt-asleep-check!)
+          (loop))))
+    ;; uncounted, as the detector's own wait: a start that waited counted asleep could wake the
+    ;; detector it is starting
+    (parameterize ((jolt-asleep-uncounted #t))
+      (jolt-with-mutex jolt-asleep-det-mu
+        (let wait ()
+          (unless jolt-asleep-det-id
+            (jolt-condition-wait jolt-asleep-det-cv jolt-asleep-det-mu)
+            (wait)))))))
 
 (define (jolt-asleep-no-fiber-queued?)
   (let ((cs jolt-fiber-carriers))
@@ -2025,6 +2043,7 @@
                                    (jolt-thread-name-set! (get-thread-id) name)
                                    (jolt-fiber-carrier-loop c)))))))
   (jolt-timer-thread-ensure!)
+  (jolt-asleep-detector-start!)
   (when jolt-main-io-leave (jolt-main-io-leave))
   (set! jolt-main-io-wait #f)
   (set! jolt-main-io-wake #f)
