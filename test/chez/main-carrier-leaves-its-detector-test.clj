@@ -20,5 +20,5 @@
 
 (if (= [0 1] [before after])
   (println "main-carrier-leaves-its-detector-test OK")
-  (do (println "FAIL: jolt-asleep threads [during the program, after its return]: want [0 1], got" [before after])
+  (do (println "FAIL: jolt-asleep threads [during the program (none: the hint cannot fire here), after its return]: want [0 1], got" [before after])
       (System/exit 1)))
