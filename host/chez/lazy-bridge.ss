@@ -323,6 +323,9 @@
 ;; What a thread's end means to its java.lang.Thread object (io.ss): it is no
 ;; longer alive, join returns, and the id-keyed tables let it go.
 (define jolt-thread-exit-hook (lambda (id) (void)))
+;; A thread's end wakes a main carrier that waits for every other thread to park or end before it
+;; reads the program as unable to wake (fibers.ss jolt-main-carrier-run/loop!): fibers.ss sets it.
+(define jolt-thread-end-wake (lambda () (void)))
 ;; The pools behind clojure.core's future/send-off (a cached pool: a worker idles
 ;; 60s after its last task before it exits) and send (a fixed pool: its workers
 ;; never exit). jolt runs that work on threads of its own, so the pool's idle
@@ -369,7 +372,8 @@
                         (jolt-thread-exit-hook id)
                         (jolt-with-mutex live-threads-mutex
                           (hashtable-delete! thread-daemons id))
-                        (unless d (exit-nondaemon-leave!)))))))))))
+                        (unless d (exit-nondaemon-leave!))
+                        (jolt-thread-end-wake))))))))))
          (id (sa-thread-id-of t)))
     (when id
       (jolt-with-mutex live-threads-mutex

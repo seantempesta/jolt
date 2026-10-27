@@ -884,7 +884,14 @@
 (define (timeout-thread-start!/locked)
   (unless timeout-running?
     (set! timeout-running? #t)
-    (fork-thread/daemon #t (lambda () (jolt-thread-name-set! (get-thread-id) "jolt-timer") (timeout-thread)))))
+    (fork-thread/daemon #t (lambda () (jolt-thread-name-set! (get-thread-id) "jolt-timer")
+                                 (set! jolt-timer-thread-id (get-thread-id))
+                                 (timeout-thread)))))
+
+;; The timer thread's id, or #f before it starts: a main carrier's loop reads the same heap for the
+;; deadlines it waits toward (jolt-timers-run-due!), so it never takes this thread's wait (toward a
+;; deadline, cancelled ones too) for work that may wake the program (fibers.ss jolt-other-thread-may-run?).
+(define jolt-timer-thread-id #f)
 
 ;; A main-carrier program's return (fibers.ss, jolt-main-carrier-leave!): the deadlines it left
 ;; pending are the timer thread's from now on, so it starts when any is.

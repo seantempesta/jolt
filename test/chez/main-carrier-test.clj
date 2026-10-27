@@ -114,12 +114,19 @@
                                           (exit-now (do (kill (getppid) sig) 0))
                                           (and (= :signalled (a/<!! ch)) (= 0 (wait-exit pid))))))))
                     0))
-        ;; last: a take no one can ever answer
-        (a/<!! (a/chan))
-        :returned))
+        ;; a wait another thread ends later is never taken for one nothing can end: a future that
+        ;; sleeps (a timed wait), then delivers
+        (let [p (promise)]
+          (future (Thread/sleep 50) (deliver p :late))
+          (check-eq "a deref a sleeping thread delivers later is answered, not told it is stuck" (deref p) :late))
+        ;; last: waits no one can ever answer. Each is told in its own frame (Go's "all goroutines
+        ;; are asleep"), a typed error naming every wait, which its caller catches and goes on
+        [(try (a/<!! (a/chan)) :returned (catch Throwable t (select-keys (ex-data t) [:jolt/deadlock])))
+         (try (deref (promise)) :returned (catch Throwable t (boolean (re-find #"parked" (str (:parked (ex-data t)))))))
+         :went-on]))
     (catch Throwable t (str (ex-message t) " " t))))
-(check-eq "a wait nothing can end raises out of main-carrier-run! instead of hanging"
-          (if (and (string? stuck) (re-find #"stuck" stuck)) true stuck) true)
+(check-eq "a wait nothing can end is told so in its caller, which goes on, instead of hanging or ending the loop"
+          stuck [{:jolt/deadlock true} true :went-on])
 
 (if (empty? @failures)
   (do (println "MAIN-CARRIER-TEST OK") (flush) (System/exit 0))

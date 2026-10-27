@@ -5272,7 +5272,9 @@
           (lambda ()
             (let ((sigbuf (sa-foreign-alloc 8)))
               (let loop ()
-                (if (= 0 (c-sigwait jolt-shutdown-sigset sigbuf))
+                ;; recorded as waiting: a main carrier that reads every other thread asleep before it
+                ;; tells its waiters nothing can wake them (fibers.ss) never takes this one for running
+                (if (= 0 (call-with-thread-state 'WAITING (lambda () (c-sigwait jolt-shutdown-sigset sigbuf))))
                     (let ((sig (sa-foreign-ref 'int sigbuf 0))
                           (target (unbox jolt-sigint-target)))
                       (if (and (= sig 2) target (jolt-sigint-trip! target))

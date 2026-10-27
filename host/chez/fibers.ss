@@ -1805,6 +1805,33 @@
       (thunk)
       (jolt-main-carrier-run/loop! thunk)))
 
+;; Another thread than this one that may still run: not parked in an untimed jolt wait (WAITING
+;; or BLOCKED, locks.ss thread-wait-state). A timed one (TIMED_WAITING: a sleep, a deref with a
+;; timeout) wakes by itself; one in a foreign call or a raw wait reads as running too. None is
+;; ever taken for asleep, so a deadlock it is part of is missed, never one invented. The timer
+;; thread is not one: the loop reads its heap itself (next), so its wait is no work of its own.
+(define (jolt-other-thread-may-run?)
+  (let ((me (get-thread-id)))
+    (exists (lambda (id) (and (not (eqv? id me)) (not (eqv? id jolt-timer-thread-id))
+                              (not (memq (thread-wait-state id) '(WAITING BLOCKED)))))
+            (live-thread-ids))))
+
+;; Nothing can ever wake the program (no fiber queued, no timer, no descriptor awaited, every other
+;; thread parked or gone): each parked fiber not yet told is told once, by a typed error it throws
+;; from its own wait (a deref, a <!!), which unwinds to its caller as any throw does (Go's "all
+;; goroutines are asleep"). The error names every wait (jolt-fiber-dump). Answers how many were
+;; woken: none (each already told, or masked) leaves the caller nothing to wait for.
+(define (jolt-main-carrier-deliver-deadlock!)
+  (let* ((fs (filter (lambda (f) (and (eq? 'parked (jolt-fiber-state f)) (not (jolt-fiber-interrupt f))))
+                     (jolt-fiber-registry-live)))
+         (parked (with-output-to-string (lambda () (jolt-fiber-dump (current-output-port)))))
+         (e (jolt-ex-info "deadlock: every fiber and thread of this process waits, and nothing can wake one (no fiber queued, no timer, no descriptor awaited)"
+                          (jolt-hash-map (keyword "jolt" "deadlock") #t (keyword #f "parked") parked))))
+    (fold-left (lambda (n f)
+                 (jolt-fiber-deliver-interrupt! f e)
+                 (if (eq? 'parked (jolt-fiber-state f)) n (fx+ n 1)))
+               0 fs)))
+
 (define (jolt-main-carrier-run/loop! thunk)
   (when jolt-fiber-pool-started?
     (error 'jolt-main-carrier-run! "fibers already run on carrier threads: call it before the first fiber"))
@@ -1813,6 +1840,7 @@
   (set! jolt-fiber-pool-started? #t)
   (jolt-fiber-ensure-carriers!)
   (set! jolt-main-thread (get-thread-id))
+  (set! jolt-thread-end-wake jolt-main-wake-for-timer!)
   ;; physics: a process that forks must never start Chez's parallel-collector sweepers (a
   ;; child of one hangs or faults in its collections). Where this Chez can fix the pool
   ;; (chez-patches/0008-fixed-sweeper-pool), it is fixed at none; a stock Chez can still
@@ -1852,6 +1880,16 @@
                      (unless (or (jolt-carrier-head c) (jolt-timer-before? next))
                        (jolt-condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c) until))
                      (jolt-unlock! (jolt-carrier-mu c))))
+               ;; another thread may still run (a future that delivers what a fiber waits on): it
+               ;; queues the fiber (enqueue signals this condition) or ends (jolt-thread-end-wake)
+               ((jolt-other-thread-may-run?)
+                (jolt-lock! (jolt-carrier-mu c))
+                ;; read again under the mu its end's wake takes: an end between the two reads is not lost
+                (unless (or (jolt-carrier-head c) (not (jolt-other-thread-may-run?)))
+                  (jolt-condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c)))
+                (jolt-unlock! (jolt-carrier-mu c)))
+               ;; nothing can wake it: each waiter is told and throws in its caller
+               ((fx>? (jolt-main-carrier-deliver-deadlock!) 0) (void))
                (else (error 'jolt-main-carrier
                             "stuck: the program waits, and nothing is queued, no timer is set and no descriptor is awaited, so nothing can ever wake it")))
              (loop))))))))
