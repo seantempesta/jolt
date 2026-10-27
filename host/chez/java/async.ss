@@ -323,7 +323,11 @@
             (let ((h (car (async-chan-alt-takers ch))))
               (async-chan-alt-takers-set! ch (cdr (async-chan-alt-takers ch)))
               (if (alt-claim! h)
-                  (begin (alt-deliver! h (ac-take-head! ch) ch) (set! progress #t))
+                  ;; a promise channel's one value stays for every taker, the parked ones
+                  ;; and the ones after them (it popped, so a taker after the parked one
+                  ;; waited forever)
+                  (begin (alt-deliver! h (if (eq? (async-chan-kind ch) 'promise) (ac-peek ch) (ac-take-head! ch)) ch)
+                         (set! progress #t))
                   (set! progress #t)) ; dead registration — dropped
               (drain-takers)))))
       ;; Step 2: drain alt-putters → capacity

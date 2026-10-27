@@ -2382,6 +2382,9 @@
   ;; a port that is not a channel (a reify implementing ReadPort, delegating to a promise-chan, as
   ;; Datahike's write results do) is read through its take! by every take entry point, and alts
   ;; answers it as the port the caller gave
+  ;; a promise-chan put while a taker is parked delivers to it and still keeps the value: every
+  ;; later take (<!!, a go <!, poll!, a parked alts!) answers it (the put used to pop it)
+  {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a]) (let [p (a/promise-chan) first-took (promise)] (a/take! p (fn [v] (deliver first-took v))) (a/>!! p :v) [(deref first-took 2000 :never) (deref (future (a/<!! p)) 2000 :hung) (deref (future (a/<!! (a/go (a/<! p)))) 2000 :hung) (a/poll! p) (first (a/alts!! [p]))]))" :expected "[:v :v :v :v :v]"}
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a] '[clojure.core.async.impl.protocols :as p]) (let [pc (a/promise-chan) r (reify p/ReadPort (take! [_ h] (p/take! pc h)))] (a/put! pc 42) [(a/<!! r) (a/<!! (a/go (a/<! r))) (a/poll! r) (first (a/alts!! [r])) (identical? r (second (a/alts!! [(a/chan) r] :priority true))) (let [got (promise)] (a/take! r (fn [v] (deliver got v))) @got) (mapv first [(a/alts!! [r r]) (a/alts!! [r (a/chan)] :default :none)]) (let [box (reify p/ReadPort (take! [_ h] (reify clojure.lang.IDeref (deref [_] :boxed))))] [(a/<!! box) (a/poll! box)])]))" :expected "[42 42 42 42 true 42 [42 42] [:boxed :boxed]]"}
   {:suite "core.async alts" :expr "(do (require '[clojure.core.async :as a] '[clojure.core.async.impl.protocols :as p]) (let [pc (a/promise-chan) r (reify p/ReadPort (take! [_ h] (p/take! pc h)))] (let [go-on (promise)] (future @go-on (a/put! pc :later)) (deliver go-on true)) [(a/<!! r) (let [e (a/promise-chan) r2 (reify p/ReadPort (take! [_ h] (p/take! e h)))] (a/close! e) (a/<!! r2))]))" :expected "[:later nil]"}
   ;; clojure.test — instance? in is still reports correctly (instance? is a fn)
