@@ -477,9 +477,7 @@
         has-default (contains? opts :default)
         ;; a take port that is not a channel is read once, as the promise-chan reading it
         ;; (port-chan), for both passes; the answer names the caller's own port
-        chans (if (some (fn [p] (not (or (vector? p) (chan? p)))) ports)
-                (mapv (fn [p] (if (vector? p) p (port-chan p))) ports)
-                ports)
+        chans (clojure.core.async/__ports ports)
         own (fn [[v c :as r]]
               (if (or (identical? chans ports) (= :default c))
                 r

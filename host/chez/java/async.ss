@@ -1418,6 +1418,24 @@
 (define (cca-def! name v) (def-var! "clojure.core.async" name v))
 (cca-def! "__set-port-reader!" (lambda (f) (set! jolt-async-port-reader f) jolt-nil))
 (cca-def! "__port" jolt-async-port)
+;; alts!'s ports with each take port that is not a channel read as the promise-chan reading it
+;; (jolt-async-port): the very vector when every take port is a channel, which is the hot path
+;; and allocates nothing. A [channel value] put spec is a vector and stays as it is. Done here
+;; and not by chan? in the overlay: a bare call of a native var from a go body's cold call site
+;; threw "car: false is not a pair" on a real channel when several fibers reached it at once.
+(define (jolt-async-ports ports)
+  (let ((n (pvec-count ports)))
+    (let scan ((i 0))
+      (cond ((fx=? i n) ports)
+            ((let ((p (pvec-nth-d ports i jolt-nil))) (or (pvec? p) (async-chan? p))) (scan (fx+ i 1)))
+            (else
+             (let loop ((j (fx- n 1)) (acc '()))
+               (if (fx<? j 0)
+                   (apply jolt-vector acc)
+                   (loop (fx- j 1)
+                         (cons (let ((p (pvec-nth-d ports j jolt-nil))) (if (pvec? p) p (jolt-async-port p)))
+                               acc)))))))))
+(cca-def! "__ports" jolt-async-ports)
 (cca-def! "chan" jolt-async-chan)
 ;; (promise-chan) | (promise-chan xform) | (promise-chan xform ex-handler): the
 ;; transducer and handler go through chan, as on the JVM; they were dropped.
