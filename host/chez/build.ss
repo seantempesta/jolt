@@ -2753,17 +2753,17 @@
                   (let loop ((gs groups) (fs group-files) (acc '()))
                     (if (null? gs)
                         acc
-                        (let ((gout (if split? (open-output-file (car fs) 'replace) out)))
+                        ;; a split unit is assembled in memory and written once (bld-write-unit!)
+                        (let ((gout (if split? (open-output-string) out)))
                           (when split?
                             (put-string gout (string-append ";; app unit: " (caar gs) "\n")))
                           (let-values (((decls bodies) (bld-defer-app-strs (cdar gs))))
                             (for-each (lambda (s) (put-string gout s) (put-string gout "\n")) decls)
                             (let ((ns-names (bld-emit-app-chunks gout (bld-unit-tag (caar gs)) bodies)))
                               (when split?
-                                (close-port gout)
                                 ;; a shaken app is one group holding every namespace
-                                (bld-append-marker-table! (car fs)
-                                                          (if tree-shake? (map car ordered) (list (caar gs)))))
+                                (bld-write-unit! (car fs) (get-output-string gout)
+                                                 (if tree-shake? (map car ordered) (list (caar gs)))))
                               (loop (cdr gs) (cdr fs) (append acc ns-names)))))))))
             (when split?
               (close-port out)
@@ -3180,17 +3180,29 @@
 ;; unit edit recompiles that one unit and a cache hit brings its own table. It goes
 ;; AFTER the code, so no offset it records moves. A unit with no markers
 ;; registers nothing.
-(define (bld-append-marker-table! path nses)
-  (let ((table (jolt-marker-table (read-file-string path))))
+;;
+;; The unit's TEXT is the code as emitted, assembled in memory: its table is read
+;; off that string (the offsets are the file's, as it is written as is), and the
+;; unit is written once as UTF-8 bytes. Before, each unit went out through a
+;; textual port and was read back off the disk for its table: seon.main's "write
+;; flat.ss" (93 MB over 312 units) took 2.6-3.8 s, and takes 2.0-2.3 s this way
+;; (2026-10-27, unpaired runs on a loaded machine); a byte port alone writes the
+;; same 93 MB in 165 ms against the textual port's 636. A unit is held whole in
+;; memory to be written: one namespace's (seon.main's largest is 4 MB), or a
+;; shaken app's one unit, the whole app.
+(define (bld-write-unit! path text nses)
+  (let ((table (jolt-marker-table text))
+        (out (open-file-output-port path (file-options no-fail))))
+    (put-bytevector out (string->utf8 text))
     (when (and (pair? nses) (fx>? (vector-length table) 0))
-      (let ((out (open-output-file path 'append)))
-        (put-string out ";; === source line markers ===\n")
-        (put-string out (string-append
-                          "(jolt-register-marker-table! '"
-                          (with-output-to-string (lambda () (write nses)))
-                          " '" (with-output-to-string (lambda () (write table)))
-                          ")\n"))
-        (close-port out)))))
+      (put-bytevector out
+        (string->utf8
+          (string-append ";; === source line markers ===\n"
+                         "(jolt-register-marker-table! '"
+                         (with-output-to-string (lambda () (write nses)))
+                         " '" (with-output-to-string (lambda () (write table)))
+                         ")\n"))))
+    (close-port out)))
 (define (bld-chez-compile-file mode src so)
   (bld-chez-compile-params! (bld-mode-params mode) src so))
 
