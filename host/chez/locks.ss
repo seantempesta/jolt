@@ -475,9 +475,15 @@
      (if (jolt-cv? cv)
          (begin
            (jolt-cv-threads-set! cv (fx+ (jolt-cv-threads cv) 1))
-           (call-with-thread-state 'WAITING (lambda () (condition-wait (jolt-cv-cond cv) mu)))
-           (jolt-cv-threads-set! cv (fx- (jolt-cv-threads cv) 1)))
-         (call-with-thread-state 'WAITING (lambda () (condition-wait cv mu)))))
+           ;; a value wait: asleep, and told when nothing can ever wake the process
+           (call-with-thread-state 'WAITING
+             (lambda () (jolt-asleep-while cv mu (lambda () (condition-wait (jolt-cv-cond cv) mu)))))
+           (jolt-cv-threads-set! cv (fx- (jolt-cv-threads cv) 1))
+           (jolt-asleep-told-check!))
+         ;; a raw condition: the runtime's own waits (a carrier idle, the timer, the main
+         ;; queue, the loader), asleep but never told: their waiters are what is told
+         (call-with-thread-state 'WAITING
+           (lambda () (jolt-asleep-while #f mu (lambda () (condition-wait cv mu)))))))
     ((cv mu abs-time)
      (when (jolt-current-fiber) (jolt-blocking-refuse 'jolt-condition-wait))
      (if (jolt-cv? cv)
@@ -488,6 +494,108 @@
              (jolt-cv-threads-set! cv (fx- (jolt-cv-threads cv) 1))
              r))
          (call-with-thread-state 'TIMED_WAITING (lambda () (condition-wait cv mu abs-time)))))))
+
+;; --- all asleep: a threaded process that nothing can wake ----------------------
+;; A process run on threads (a test shard, the forks runner: not a main carrier, whose loop sees
+;; the same thing itself, fibers.ss jolt-main-carrier-deliver-deadlock!) in which every thread
+;; waits, untimed, with no fiber queued, no timer pending and no descriptor awaited, can never
+;; wake itself (Go's "all goroutines are asleep"). Each thread in an untimed jolt wait is ASLEEP
+;; here: put in jolt-asleep-ids on entry, out on leaving or when a waker wakes it, so it needs no
+;; clock and no scan. A timed wait,
+;; a foreign call or a wait recorded nowhere is awake, so a deadlock with one in it is missed,
+;; never one invented. When as many are asleep as there are jolt threads, the one that took it there
+;; wakes the detector (fibers.ss jolt-asleep-check!), which decides by ids: the boot thread and every
+;; live jolt thread asleep. It checks the rest holding no
+;; lock of its own and tells each waiter, in its own frame, the error a main carrier's waiters get.
+;;
+;; jolt-asleep-mu is the last lock in every order: taken with at most the waiter's own mu held,
+;; and nothing is taken under it.
+(define jolt-asleep-mu (make-mutex))
+(define jolt-asleep-epoch 0)                   ; moves on every enter, leave, thread start and end
+(define jolt-asleep-ids (make-eqv-hashtable))   ; thread id -> while it is asleep: (cv . mu) in a
+                                               ; value wait (to tell), #t in a raw one
+(define jolt-boot-thread-id (get-thread-id))    ; the thread the process started on
+(define jolt-asleep-on (make-weak-eq-hashtable)) ; cv -> ids asleep on it, for its waker
+(define jolt-asleep-told (make-eqv-hashtable))  ; thread id -> the error to raise in its wait
+(define jolt-asleep-uncounted (make-thread-parameter #f)) ; the detector's own wait
+(define jolt-asleep-notify (lambda () (void)))  ; fibers.ss: wakes the detector
+
+;; Run WAIT (a condition-wait on CV, a jolt-cv of a value wait or #f, with MU held) counted asleep.
+(define (jolt-asleep-while cv mu wait)
+  (if (jolt-asleep-uncounted)
+      (wait)
+      (let ((id (get-thread-id)))
+        (dynamic-wind
+          (lambda ()
+            (let ((all? (jolt-with-mutex jolt-asleep-mu
+                          (set! jolt-asleep-epoch (fx+ jolt-asleep-epoch 1))
+                          (hashtable-set! jolt-asleep-ids id (if cv (cons cv mu) #t))
+                          (when cv
+                            (hashtable-set! jolt-asleep-on cv (cons id (hashtable-ref jolt-asleep-on cv '()))))
+                          (jolt-asleep-all-hint?))))
+              (when all? (jolt-asleep-notify))))
+          wait
+          (lambda ()
+            (jolt-with-mutex jolt-asleep-mu
+              (set! jolt-asleep-epoch (fx+ jolt-asleep-epoch 1))
+              (hashtable-delete! jolt-asleep-ids id)
+              (when cv
+                (let ((l (remv id (hashtable-ref jolt-asleep-on cv '()))))
+                  (if (null? l) (hashtable-delete! jolt-asleep-on cv) (hashtable-set! jolt-asleep-on cv l))))))))))
+
+;; As many asleep as there are jolt threads (the boot thread and lazy-bridge.ss's live ones, the
+;; detector aside), read with jolt-asleep-mu held: a hint that wakes the detector, which decides by
+;; ids (fibers.ss jolt-asleep-all-ids?). The table's size is read without its own lock, as a hint.
+(define (jolt-asleep-all-hint?)
+  (fx>=? (hashtable-size jolt-asleep-ids)
+         (fx- (fx+ 1 (hashtable-size live-threads)) (if jolt-asleep-det-id 1 0))))
+
+;; A thread ended (lazy-bridge.ss, in its own exit, holding nothing): the rest can be all asleep.
+(define (jolt-asleep-thread-ended!)
+  (let ((all? (jolt-with-mutex jolt-asleep-mu
+                (set! jolt-asleep-epoch (fx+ jolt-asleep-epoch 1))
+                (jolt-asleep-all-hint?))))
+    (when all? (jolt-asleep-notify))))
+
+;; A waker of CV, with CV's mu held: each thread waiting on it is awake from now, not from when it
+;; is back from its wait (it must first take that mu again), or the detector, which takes no
+;; waiter's mu, could read a woken thread as asleep and tell a wait its value already ended (two
+;; threads handing a token through promises did). A signal wakes one of them, but which one is
+;; not known here, so each is marked awake: one not woken stays awake until its own wait ends,
+;; which can miss a deadlock, never make one up.
+(define (jolt-asleep-woken! cv)
+  (jolt-with-mutex jolt-asleep-mu
+    (for-each (lambda (id) (hashtable-delete! jolt-asleep-ids id)) (hashtable-ref jolt-asleep-on cv '()))
+    (set! jolt-asleep-epoch (fx+ jolt-asleep-epoch 1))))
+
+;; Back from a value wait: the detector told this thread that nothing can wake it. Raised here,
+;; in the wait's own frame, with the waiter's mu held (jolt-with-mutex lets go of it as the
+;; error unwinds), as a fiber's interrupt is (fibers.ss jolt-fiber-check-interrupt!).
+(define (jolt-asleep-told-check!)
+  (let* ((id (get-thread-id))
+         (e (jolt-with-mutex jolt-asleep-mu
+              (let ((e (hashtable-ref jolt-asleep-told id #f)))
+                (when e (hashtable-delete! jolt-asleep-told id))
+                e))))
+    (when e (jolt-throw e))))
+
+;; Tell each thread in a value wait, not told yet, that nothing can wake it: E is raised in its
+;; wait (jolt-asleep-told-check!). Its condition is woken under its own mu, taken with no other
+;; lock held. Answers how many were told.
+(define (jolt-asleep-tell-threads! e)
+  (let ((waits (jolt-with-mutex jolt-asleep-mu
+                 (let-values (((ids ws) (hashtable-entries jolt-asleep-ids)))
+                   (let loop ((i 0) (acc '()))
+                     (if (fx=? i (vector-length ids))
+                         acc
+                         (let ((id (vector-ref ids i)) (w (vector-ref ws i)))
+                           (if (or (not (pair? w)) (hashtable-contains? jolt-asleep-told id))
+                               (loop (fx+ i 1) acc)
+                               (begin (hashtable-set! jolt-asleep-told id e)
+                                      (loop (fx+ i 1) (cons w acc)))))))))))
+    (for-each (lambda (w) (jolt-with-mutex (cdr w) (condition-broadcast (jolt-cv-cond (car w)))))
+              waits)
+    (length waits)))
 
 ;; --- the wait beneath the fiber layer ---------------------------------------
 ;; (jolt-stop-the-world-wait cv mu timeout) -> #t signalled | #f timed out
@@ -586,7 +694,9 @@
 ;; The fiber list is drained as it is read, so a fiber that goes on to wait again
 ;; registers itself afresh and no resume is ever delivered twice.
 (define (jolt-cv-wake! cv)
-  (unless (fx=? 0 (jolt-cv-threads cv)) (condition-broadcast (jolt-cv-cond cv)))
+  (unless (fx=? 0 (jolt-cv-threads cv))
+    (jolt-asleep-woken! cv)
+    (condition-broadcast (jolt-cv-cond cv)))
   (let ((fs (jolt-cv-fibers cv)))
     (unless (null? fs)
       (jolt-cv-fibers-set! cv '())
@@ -621,7 +731,9 @@
 ;; needs for the same work from 134 threads to 7. Reference JVM Clojure dispatches
 ;; the same task in 5.2us.
 (define (jolt-cv-signal-one! cv)
-  (unless (fx=? 0 (jolt-cv-threads cv)) (condition-signal (jolt-cv-cond cv))))
+  (unless (fx=? 0 (jolt-cv-threads cv))
+    (jolt-asleep-woken! cv)
+    (condition-signal (jolt-cv-cond cv))))
 
 ;; A mono-millis deadline -> the time left until it, as the time-duration Chez's
 ;; condition-wait takes for a relative timeout. Relative and not an absolute

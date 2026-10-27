@@ -373,6 +373,7 @@
                         (jolt-with-mutex live-threads-mutex
                           (hashtable-delete! thread-daemons id))
                         (unless d (exit-nondaemon-leave!))
+                        (jolt-asleep-thread-ended!)
                         (jolt-thread-end-wake))))))))))
          (id (sa-thread-id-of t)))
     (when id

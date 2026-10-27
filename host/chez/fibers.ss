@@ -1822,15 +1822,101 @@
 ;; goroutines are asleep"). The error names every wait (jolt-fiber-dump). Answers how many were
 ;; woken: none (each already told, or masked) leaves the caller nothing to wait for.
 (define (jolt-main-carrier-deliver-deadlock!)
-  (let* ((fs (filter (lambda (f) (and (eq? 'parked (jolt-fiber-state f)) (not (jolt-fiber-interrupt f))))
-                     (jolt-fiber-registry-live)))
-         (parked (with-output-to-string (lambda () (jolt-fiber-dump (current-output-port)))))
-         (e (jolt-ex-info "deadlock: every fiber and thread of this process waits, and nothing can wake one (no fiber queued, no timer, no descriptor awaited)"
-                          (jolt-hash-map (keyword "jolt" "deadlock") #t (keyword #f "parked") parked))))
-    (fold-left (lambda (n f)
-                 (jolt-fiber-deliver-interrupt! f e)
-                 (if (eq? 'parked (jolt-fiber-state f)) n (fx+ n 1)))
-               0 fs)))
+  (jolt-deadlock-tell-fibers! (jolt-deadlock-error)))
+
+;; The error each waiter is told: every wait named (jolt-fiber-dump: each fiber and the frames it
+;; will resume; each thread in a value wait by id).
+(define (jolt-deadlock-error)
+  (let ((parked (with-output-to-string
+                  (lambda ()
+                    (jolt-fiber-dump (current-output-port))
+                    (let ((ids (jolt-with-mutex jolt-asleep-mu
+                                 (let-values (((ks vs) (hashtable-entries jolt-asleep-ids)))
+                                   (filter (lambda (id) id)
+                                           (map (lambda (k v) (and (pair? v) k)) (vector->list ks) (vector->list vs)))))))
+                      (unless (null? ids)
+                        (printf "threads in a value wait: ~a~%" ids)))))))
+    (jolt-ex-info "deadlock: every fiber and thread of this process waits, and nothing can wake one (no fiber queued, no timer, no descriptor awaited)"
+                  (jolt-hash-map (keyword "jolt" "deadlock") #t (keyword #f "parked") parked))))
+
+;; Tell each parked fiber not told yet; answers how many it woke.
+(define (jolt-deadlock-tell-fibers! e)
+  (fold-left (lambda (n f)
+               (jolt-fiber-deliver-interrupt! f e)
+               (if (eq? 'parked (jolt-fiber-state f)) n (fx+ n 1)))
+             0
+             (filter (lambda (f) (and (eq? 'parked (jolt-fiber-state f)) (not (jolt-fiber-interrupt f))))
+                     (jolt-fiber-registry-live))))
+
+;; --- all asleep, on threads (locks.ss counts) -----------------------------------
+;; The detector: one daemon thread, started the first time every counted thread is asleep, waiting
+;; on a condition of its own, uncounted. Woken, it reads the asleep epoch, then checks, each under
+;; its own lock and holding none of its own, that no carrier has a fiber queued, no timer is
+;; pending and the poller awaits no descriptor; the epoch unchanged after says nothing woke in
+;; between, and it tells every waiter. A main carrier's loop decides this itself (above), so the
+;; detector runs only on threads. Telling nothing new (every waiter told already, or masked) says
+;; so once on stderr: the process is left as it was, never spun.
+(define jolt-io-awaited #f)        ; () -> true while a descriptor is awaited; jolt.io-poller's
+(define jolt-asleep-det-mu (make-mutex))
+(define jolt-asleep-det-cv (make-condition))
+(define jolt-asleep-det-pending #f)
+(define jolt-asleep-det-started (box #f))
+(define jolt-asleep-said #f)
+
+(define (jolt-asleep-wake-detector!)
+  (unless jolt-main-thread
+    (jolt-with-mutex jolt-asleep-det-mu
+      (set! jolt-asleep-det-pending #t)
+      (condition-signal jolt-asleep-det-cv))
+    (when (box-cas! jolt-asleep-det-started #f #t)
+      (fork-thread/daemon #t
+        (lambda ()
+          (jolt-thread-name-set! (get-thread-id) "jolt-asleep")
+          (set! jolt-asleep-det-id (get-thread-id))
+          (jolt-asleep-uncounted #t)
+          (let loop ()
+            (jolt-with-mutex jolt-asleep-det-mu
+              (let wait ()
+                (unless jolt-asleep-det-pending
+                  (jolt-condition-wait jolt-asleep-det-cv jolt-asleep-det-mu)
+                  (wait)))
+              (set! jolt-asleep-det-pending #f))
+            (jolt-asleep-check!)
+            (loop)))))))
+
+(define (jolt-asleep-no-fiber-queued?)
+  (let ((cs jolt-fiber-carriers))
+    (or (not cs)
+        (let loop ((i 0))
+          (or (fx=? i (vector-length cs))
+              (let ((c (vector-ref cs i)))
+                (and (not (jolt-with-mutex (jolt-carrier-mu c) (jolt-carrier-head c)))
+                     (loop (fx+ i 1)))))))))
+
+(define jolt-asleep-det-id #f)
+;; every jolt thread asleep: the boot thread and each live one, the detector aside
+(define (jolt-asleep-all-ids?)
+  (let ((ids (cons jolt-boot-thread-id (live-thread-ids))))
+    (jolt-with-mutex jolt-asleep-mu
+      (for-all (lambda (id) (or (eqv? id jolt-asleep-det-id) (hashtable-contains? jolt-asleep-ids id))) ids))))
+
+(define (jolt-asleep-check!)
+  (let ((e0 (jolt-with-mutex jolt-asleep-mu jolt-asleep-epoch)))
+    (when (and (jolt-asleep-all-ids?)
+               (jolt-asleep-no-fiber-queued?)
+               (fx=? 0 (jolt-with-mutex timeout-mu (timeout-pending-count)))
+               (not (and jolt-io-awaited (jolt-io-awaited)))
+               (eqv? e0 (jolt-with-mutex jolt-asleep-mu jolt-asleep-epoch)))
+      (let* ((e (jolt-deadlock-error))
+             (n (+ (jolt-deadlock-tell-fibers! e) (jolt-asleep-tell-threads! e))))
+        (when (and (fx=? n 0) (not jolt-asleep-said))
+          (set! jolt-asleep-said #t)
+          (let ((p (current-error-port)))
+            (display "jolt: every thread and fiber waits and nothing can wake one, and each waiter was told already or is masked:\n" p)
+            (jolt-fiber-dump p)
+            (flush-output-port p)))))))
+
+(set! jolt-asleep-notify jolt-asleep-wake-detector!)
 
 (define (jolt-main-carrier-run/loop! thunk)
   (when jolt-fiber-pool-started?

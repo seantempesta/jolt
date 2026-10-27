@@ -529,6 +529,18 @@
   ;; 2026-10-27)
   (set! timeout-mu (make-mutex))
   (set! timeout-cv (make-condition))
+  ;; all asleep (locks.ss): the child is its one thread, waiting on nothing, and its detector is
+  ;; the parent's (not forked); its mutexes are its own for the same reason as the others'
+  (set! jolt-asleep-mu (make-mutex))
+  (hashtable-clear! jolt-asleep-ids)
+  (hashtable-clear! jolt-asleep-on)
+  (set! jolt-boot-thread-id (get-thread-id))
+  (set! jolt-asleep-det-id #f)
+  (hashtable-clear! jolt-asleep-told)
+  (set! jolt-asleep-det-mu (make-mutex))
+  (set! jolt-asleep-det-pending #f)
+  (set-box! jolt-asleep-det-started #f)
+  (set! jolt-asleep-said #f)
   (set! live-threads-mutex (make-mutex))
   (set! thread-handles-mutex (make-mutex))
   (set! jolt-shutdown-mutex (make-mutex))
@@ -590,6 +602,12 @@
     (set! jolt-main-io-wake (lambda () (jolt-invoke wake)))
     (set! jolt-main-io-leave (lambda () (jolt-invoke leave)))
     jolt-nil))
+;; all asleep on threads (locks.ss, fibers.ss jolt-asleep-check!): jolt.io-poller says whether a
+;; descriptor is awaited, and its thread's round is counted asleep while none is
+(def-var! "jolt.host" "io-awaited-set!"
+  (lambda (f) (set! jolt-io-awaited (lambda () (jolt-truthy? (jolt-invoke f)))) jolt-nil))
+(def-var! "jolt.host" "asleep-while"
+  (lambda (f) (jolt-asleep-while #f #f (lambda () (jolt-invoke f)))))
 ;; jolt.io-poller's reset of its table in a forked child, registered when it loads
 (def-var! "jolt.host" "io-after-fork-set!"
   (lambda (f) (set! jolt-io-after-fork (lambda () (jolt-invoke f))) jolt-nil))

@@ -587,12 +587,18 @@
       (Thread/sleep 10))
     (recur)))
 
+(declare awaited?)
 (defn- poller-loop
   "The poller thread's rounds over kq, from the deletes a main carrier's rounds left (none for
   a thread started as the poller)."
   [kq deletes]
   (loop [to-delete deletes]
-    (let [evs (poller-round kq to-delete)]
+    ;; a round with nothing awaited only waits for the wake pipe: asleep (jolt.host/asleep-while),
+    ;; so a process whose every thread waits can be told so; a wait registered meanwhile writes
+    ;; the pipe, which wakes this round and moves the asleep count
+    (let [evs (if (awaited? @state)
+                (poller-round kq to-delete)
+                (jolt.host/asleep-while #(poller-round kq to-delete)))]
       (cond
         ;; nil — the WAIT ITSELF failed, so the changelist may never have reached the
         ;; kernel. Carry the deletes: dropping them would leave retired registrations
@@ -757,6 +763,9 @@
   (doseq [fd (:pipe @state)] (c-close fd))
   (vreset! main-deletes #{})
   (reset! state {:fds {} :pending {} :pipe nil :kq nil :started? false :cancelled #{} :threads {}}))
+
+;; all asleep on threads: the detector asks whether a descriptor is awaited (fibers.ss jolt-asleep-check!)
+(jolt.host/io-awaited-set! #(awaited? @state))
 
 ;; every forked child resets the table (jolt-after-fork-child!): its kqueue and poller thread are the parent's
 (jolt.host/io-after-fork-set! after-fork!)
