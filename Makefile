@@ -379,6 +379,7 @@ fibers:
 	@bin/jolt run test/chez/main-carrier-test.clj
 	@bin/jolt run test/chez/main-carrier-wake-test.clj
 	@bin/jolt run test/chez/main-carrier-returns-test.clj
+	@bin/jolt run test/chez/main-carrier-leaves-its-detector-test.clj
 	@bin/jolt run test/chez/main-carrier-timer-throw-test.clj
 	@bin/jolt run test/chez/timer-throw-test.clj
 	@bin/jolt run test/chez/main-carrier-load-ns-test.clj
