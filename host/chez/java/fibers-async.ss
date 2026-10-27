@@ -403,14 +403,26 @@
 ;; event check of a thread that takes the signal; a main carrier idle in its poller wakes for it.
 (def-var! "jolt.host" "fiber-dump"
   (lambda () (let-values (((port text) (open-string-output-port))) (jolt-fiber-dump port) (text))))
+;; The dump goes to descriptor 2 as it is now, through one unbuffered port kept for the life of the
+;; process (a dropped file port is closed when collected, which would close descriptor 2): never the
+;; error port of the code the signal interrupted (an eval's capture), nor the port chosen at boot,
+;; which for a process started with its two streams on one pipe is stdout's, kept by every fork whose
+;; descriptor 2 was moved since (a Seon agent's dumps went to its root's log, 2026-10-28).
+(define jolt-dump-port #f)
+(define (jolt-dump-port!)
+  (or jolt-dump-port
+      (begin (set! jolt-dump-port (standard-error-port (buffer-mode none) (native-transcoder)))
+             jolt-dump-port)))
 (when (eq? (sa-os-family) 'macos)
   ;; the handler's edge: it runs inside whatever the thread was doing, so a dump that fails
   ;; says so on stderr, with its condition, and the interrupted code goes on
   (register-signal-handler 29
     (lambda (sig)
-      (guard (e (#t (fprintf (current-error-port) "jolt fiber dump failed: ~a~%"
-                             (if (condition? e) (call-with-string-output-port (lambda (p) (display-condition e p))) e))))
-        (jolt-fiber-dump (current-error-port))))))
+      (let ((p (jolt-dump-port!)))
+        (guard (e (#t (fprintf p "jolt fiber dump failed: ~a~%"
+                               (if (condition? e) (call-with-string-output-port (lambda (p) (display-condition e p))) e))))
+          (jolt-fiber-dump p)
+          (flush-output-port p))))))
 ;; The interrupt's throwable is a jolt value, raised as a throw would raise it,
 ;; so the fiber's own try/catch sees exactly what the caller passed.
 (def-var! "jolt.host" "fiber-interrupt!"
