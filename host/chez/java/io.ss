@@ -4367,14 +4367,21 @@
 
 ;; (jolt.host/start-file-reads!) opens a fresh log of the paths announced by every user-facing read
 ;; (io-note-file-read!: slurp, io/reader, input-stream, io/resource, Files/read*, a directory
-;; listing) in this process, on any thread; (jolt.host/take-file-reads!) closes it and answers the
-;; paths, sorted, as a vector (nil when none is open). A second start discards the first's log.
+;; listing) in this process, on any thread; (jolt.host/take-file-reads!) closes the innermost open
+;; log and answers its paths, sorted, as a vector (nil when none is open). Logs nest: a log taken
+;; inside another also counts in it, so a run nested in a run leaves the outer one whole.
+(define io-file-read-logs '())
 (def-var! "jolt.host" "start-file-reads!"
-  (lambda () (set! io-file-read-log (make-hashtable string-hash string=?)) #f))
+  (lambda ()
+    (set! io-file-read-logs (cons (make-hashtable string-hash string=?) io-file-read-logs))
+    (set! io-file-read-log (car io-file-read-logs))
+    jolt-nil))
 (def-var! "jolt.host" "take-file-reads!"
   (lambda ()
-    (let ((log io-file-read-log))
-      (set! io-file-read-log #f)
-      (if log
-          (apply jolt-vector (sort string<? (vector->list (hashtable-keys log))))
-          jolt-nil))))
+    (if (null? io-file-read-logs)
+        jolt-nil
+        (let ((log (car io-file-read-logs)) (rest (cdr io-file-read-logs)))
+          (set! io-file-read-logs rest)
+          (set! io-file-read-log (and (pair? rest) (car rest)))
+          (when (pair? rest) (vector-for-each (lambda (k) (hashtable-set! (car rest) k #t)) (hashtable-keys log)))
+          (apply jolt-vector (sort string<? (vector->list (hashtable-keys log))))))))

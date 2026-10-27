@@ -1,5 +1,5 @@
 ;; jolt.host/start-file-reads! and take-file-reads!: the paths every user-facing read announced
-;; between them, from any thread, sorted; none open answers nil; a second start discards the first.
+;; between them, from any thread, sorted; none open answers nil; logs nest, an inner also counts in the outer.
 (require '[clojure.java.io :as io])
 
 (def failures (atom []))
@@ -25,7 +25,8 @@
 (slurp a)
 (jolt.host/start-file-reads!)
 (slurp b)
-(check-eq "a second start discards the first" (vec (jolt.host/take-file-reads!)) [b])
+(check-eq "a log inside another" (vec (jolt.host/take-file-reads!)) [b])
+(check-eq "is also in the outer one" (vec (jolt.host/take-file-reads!)) [a b])
 (slurp a)
 (check-eq "no log open: reads announce nothing" (jolt.host/take-file-reads!) nil)
 
