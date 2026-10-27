@@ -119,6 +119,13 @@
         (let [p (promise)]
           (future (Thread/sleep 50) (deliver p :late))
           (check-eq "a deref a sleeping thread delivers later is answered, not told it is stuck" (deref p) :late))
+        ;; a thread that sleeps (a timed wait, so it may run) and then waits untimed on something no
+        ;; one can deliver: the loop is woken when it does, and tells (slice 1 waited for an enqueue
+        ;; or a thread's end, neither of which comes)
+        (let [p (promise) q (promise)]
+          (future (Thread/sleep 30) (deref q))
+          (check-eq "a wait the last thread to fall asleep leaves no one to end is told"
+                    (try (deref p) :returned (catch Throwable t (:jolt/deadlock (ex-data t)))) true))
         ;; last: waits no one can ever answer. Each is told in its own frame (Go's "all goroutines
         ;; are asleep"), a typed error naming every wait, which its caller catches and goes on
         [(try (a/<!! (a/chan)) :returned (catch Throwable t (select-keys (ex-data t) [:jolt/deadlock])))

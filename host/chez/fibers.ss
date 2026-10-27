@@ -1864,7 +1864,13 @@
 (define jolt-asleep-said #f)
 
 (define (jolt-asleep-wake-detector!)
-  (unless jolt-main-thread
+  (if jolt-main-thread
+      ;; a main carrier decides itself (jolt-main-carrier-run/loop!): its loop, waiting while another
+      ;; thread may run, reads every thread again when the last one falls asleep. Without this a thread
+      ;; that left a timed wait for an untimed one (a future that sleeps, then derefs a promise no
+      ;; one delivers) neither queued a fiber nor ended, so the loop never looked again
+      (jolt-main-wake-for-timer!)
+    (begin
     (jolt-with-mutex jolt-asleep-det-mu
       (set! jolt-asleep-det-pending #t)
       (condition-signal jolt-asleep-det-cv))
@@ -1882,7 +1888,7 @@
                   (wait)))
               (set! jolt-asleep-det-pending #f))
             (jolt-asleep-check!)
-            (loop)))))))
+            (loop))))))))
 
 (define (jolt-asleep-no-fiber-queued?)
   (let ((cs jolt-fiber-carriers))
