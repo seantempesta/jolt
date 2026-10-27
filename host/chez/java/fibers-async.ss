@@ -553,6 +553,12 @@
         (let ((old (sa-foreign-alloc 128)))
           (c-pthread-sigmask jolt-sig-setmask-how jolt-empty-sigset old)
           (sa-foreign-free old))))
+    ;; the parent's shutdown hooks are the parent's: a child that exits runs only the ones it
+    ;; registers itself, once (a Seon root's hook stops root, and every fork of root ran that stop
+    ;; on its copy of root's state, against the shared store, at its own exit)
+    (jolt-with-mutex jolt-shutdown-mutex
+      (set-box! jolt-shutdown-hooks '())
+      (set-box! jolt-shutdown-ran #f))
     ;; the poller's kqueue and thread are not inherited by fork: its table starts afresh, and
     ;; the child's first wait sets it up for the child (a thread, or a main carrier's rounds).
     ;; Without it, every child of a process whose poller had run waited on a dead kqueue

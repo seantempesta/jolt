@@ -81,7 +81,25 @@
     (check-eq "the reset starts no thread: the child is the one thread it forked as"
               (in-child-now #(= 1 (count (Thread/getAllStackTraces)))) 0)
     (check-eq "a child that forks again (a double fork) gives a grandchild whose parked go resumes"
-              (in-child-now #(= 0 (in-child parked-go))) 0)))
+              (in-child-now #(= 0 (in-child parked-go))) 0)
+    ;; the parent's shutdown hooks are the parent's: a child that exits through System/exit runs
+    ;; none of them (a Seon root's hook stops root; every fork of root ran it on a copy of root's
+    ;; state), and runs the ones it registers itself, once
+    (let [f (java.io.File/createTempFile "fork-hook" ".txt") path (.getPath f)
+          _ (.delete f)
+          hook (Thread. #(spit path "the parent's hook ran"))]
+      (.addShutdownHook (Runtime/getRuntime) hook)
+      (let [pid (fork-alone true)]
+        (if (zero? pid)
+          (do (.addShutdownHook (Runtime/getRuntime) (Thread. #(spit (str path ".child") "the child's hook ran")))
+              (System/exit 0))
+          (do (wait-exit pid)
+              (.removeShutdownHook (Runtime/getRuntime) hook)
+              (check-eq "a child exiting through System/exit runs none of its parent's shutdown hooks"
+                        (.exists (java.io.File. path)) false)
+              (check-eq "and runs the one it registered itself"
+                        (.exists (java.io.File. (str path ".child"))) true)
+              (.delete (java.io.File. path)) (.delete (java.io.File. (str path ".child")))))))))
 
 (if (empty? @failures)
   (do (println "FORK-CHILD-TEST OK") (flush) (System/exit 0))
