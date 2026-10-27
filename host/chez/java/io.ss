@@ -1934,7 +1934,14 @@
 ;; layer must not reference a name those don't have. Unbound (#f) in every
 ;; ordinary run — the cost off the compile path is one thread-parameter read.
 (define io-file-read-sink (make-thread-parameter #f))
+;; A process-wide log of the paths read, for a caller that wants the reads of whatever runs on
+;; any thread or fiber between two points (jolt.host/start-file-reads!, take-file-reads!): a test
+;; run's inputs. #f (a hashtable of path -> #t while one is open): the cost off that path is one
+;; variable read.
+(define io-file-read-log #f)
 (define (io-note-file-read! path)
+  (let ((log io-file-read-log))
+    (when (and log (string? path)) (hashtable-set! log path #t)))
   (let ((sink (io-file-read-sink)))
     (when (and (vector? sink) (string? path)
                (not (member path (vector-ref sink 0))))
@@ -4357,3 +4364,17 @@
 (register-class-arm! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "url"))) (lambda (x) "java.net.URL"))
 (register-class-arm! juuid? (lambda (x) "java.util.UUID"))
 (register-class-arm! jfile? (lambda (x) "java.io.File"))
+
+;; (jolt.host/start-file-reads!) opens a fresh log of the paths announced by every user-facing read
+;; (io-note-file-read!: slurp, io/reader, input-stream, io/resource, Files/read*, a directory
+;; listing) in this process, on any thread; (jolt.host/take-file-reads!) closes it and answers the
+;; paths, sorted, as a vector (nil when none is open). A second start discards the first's log.
+(def-var! "jolt.host" "start-file-reads!"
+  (lambda () (set! io-file-read-log (make-hashtable string-hash string=?)) #f))
+(def-var! "jolt.host" "take-file-reads!"
+  (lambda ()
+    (let ((log io-file-read-log))
+      (set! io-file-read-log #f)
+      (if log
+          (apply jolt-vector (sort string<? (vector->list (hashtable-keys log))))
+          jolt-nil))))
