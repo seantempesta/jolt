@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`java.util.concurrent.Semaphore`.** The constructor, `acquire`, `acquireUninterruptibly`,
+  `tryAcquire` in its four shapes (none, permits, timeout and unit, permits with timeout and
+  unit), `release`, `availablePermits`, `drainPermits` and `isFair`, with a count of
+  permits as on the JDK: an acquire parks (a fiber) or blocks (a thread) until that many are
+  free, and takes them under the semaphore's own lock. Fairness is accepted and ignored.
+  Code that bounds its in-flight work with one (Datahike's background GC test) construction
+  failed with `No matching ctor found`.
+
 ### Changed
 
 - **A required namespace's `:file` is its classpath name (#1410).** A def,

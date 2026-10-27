@@ -2736,6 +2736,68 @@
               (if ms reached jolt-nil)))))
          (cons "getCount" (lambda (self) (vector-ref (jhost-state self) 0)))))
 
+;; --- java.util.concurrent.Semaphore -----------------------------------------
+;; A counting semaphore: #(permits mutex cv). acquire takes n permits (1 by default), waiting
+;; interruptibly until that many are there; the permits are taken inside the wait's decision,
+;; under the mutex, so two acquirers never take the same ones. tryAcquire is the same without
+;; waiting (or waiting at most (timeout, unit)); release adds permits and wakes every waiter.
+;; Fairness is accepted and ignored: waiters are woken together and each re-asks, so a release
+;; goes to whichever runs first, as an unfair semaphore's does. A negative count of permits is
+;; refused as the JDK refuses it.
+(define (sem-check-count! n who)
+  (when (< n 0) (throw-jvm 'IllegalArgumentException (string-append who ": negative permits"))))
+(define (sem-take! st n)
+  ;; with the mutex held: take n permits if they are there
+  (and (>= (vector-ref st 0) n) (begin (vector-set! st 0 (- (vector-ref st 0) n)) #t)))
+(define (sem-acquire! self n who interruptible? . deadline)
+  (let* ((st (jhost-state self))
+         (decide (lambda (timed-out?)
+                   (cond ((sem-take! st n) #t)
+                         (timed-out? #f)
+                         (else jolt-cv-again)))))
+    (if interruptible?
+        (jolt-cv-wait-interruptibly who (vector-ref st 1) (vector-ref st 2)
+                                    (and (pair? deadline) (car deadline)) decide)
+        (jolt-cv-wait (vector-ref st 1) (vector-ref st 2) #f decide))))
+(for-each (lambda (nm) (register-class-ctor! nm (lambda (n . _)
+                                                  (make-jhost "semaphore" (vector (jnum->exact n) (make-mutex) (jolt-make-cv))))))
+          '("Semaphore" "java.util.concurrent.Semaphore"))
+(register-host-methods! "semaphore"
+  (list (cons "acquire" (lambda (self . n)
+          (let ((n (if (pair? n) (jnum->exact (car n)) 1)))
+            (sem-check-count! n "Semaphore.acquire")
+            (sem-acquire! self n "Semaphore.acquire" #t)
+            jolt-nil)))
+        (cons "acquireUninterruptibly" (lambda (self . n)
+          (let ((n (if (pair? n) (jnum->exact (car n)) 1)))
+            (sem-check-count! n "Semaphore.acquireUninterruptibly")
+            (sem-acquire! self n "Semaphore.acquireUninterruptibly" #f)
+            jolt-nil)))
+        ;; tryAcquire() | (n) | (timeout, unit) | (n, timeout, unit)
+        (cons "tryAcquire" (lambda (self . args)
+          (let* ((st (jhost-state self))
+                 (n (if (or (= 1 (length args)) (= 3 (length args))) (jnum->exact (car args)) 1))
+                 (timed (if (= 3 (length args)) (cdr args) (if (= 2 (length args)) args '()))))
+            (sem-check-count! n "Semaphore.tryAcquire")
+            (if (null? timed)
+                (jolt-with-mutex (vector-ref st 1) (sem-take! st n))
+                (let ((ms (tu-args->ms timed)))
+                  (and (sem-acquire! self n "Semaphore.tryAcquire" #t (ms->timeout ms)) #t))))))
+        (cons "release" (lambda (self . n)
+          (let ((st (jhost-state self)) (n (if (pair? n) (jnum->exact (car n)) 1)))
+            (sem-check-count! n "Semaphore.release")
+            (jolt-with-mutex (vector-ref st 1)
+              (vector-set! st 0 (+ (vector-ref st 0) n))
+              (jolt-cv-wake! (vector-ref st 2)))
+            jolt-nil)))
+        (cons "availablePermits" (lambda (self)
+          (let ((st (jhost-state self))) (jolt-with-mutex (vector-ref st 1) (vector-ref st 0)))))
+        (cons "drainPermits" (lambda (self)
+          (let ((st (jhost-state self)))
+            (jolt-with-mutex (vector-ref st 1)
+              (let ((n (vector-ref st 0))) (vector-set! st 0 0) n)))))
+        (cons "isFair" (lambda (self) #f))))
+
 ;; --- java.util.concurrent.ExecutorService / Executors ----------------------
 ;; A real task QUEUE served by a fixed number of worker threads (FIFO). A single
 ;; worker (newSingleThreadExecutor) runs tasks strictly in submission order —

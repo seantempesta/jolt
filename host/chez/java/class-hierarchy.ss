@@ -1236,6 +1236,7 @@
 (jch-register-supers! "java.util.concurrent.locks.ReentrantLock"
                       '("java.util.concurrent.locks.Lock" "java.io.Serializable"))
 (jch-register-supers! "java.util.concurrent.CountDownLatch" '())
+(jch-register-supers! "java.util.concurrent.Semaphore" '("java.io.Serializable"))
 ;; AtomicInteger and AtomicLong extend Number on the JVM; AtomicBoolean and
 ;; AtomicReference extend Object. (instance? Number an-atomic) has to tell them
 ;; apart, which is why the four carry four tags.
@@ -1513,6 +1514,7 @@
     ("atomic-reference" . "java.util.concurrent.atomic.AtomicReference")
     ("reentrant-lock" . "java.util.concurrent.locks.ReentrantLock")
     ("count-down-latch" . "java.util.concurrent.CountDownLatch")
+    ("semaphore" . "java.util.concurrent.Semaphore")
     ("random" . "java.util.Random")
     ("splittable-random" . "java.util.SplittableRandom")
     ("securerandom" . "java.security.SecureRandom")
