@@ -1887,7 +1887,8 @@
 ;; program returns and the process starts its threads (jolt-main-carrier-leave!), so a process that
 ;; ran a main carrier has it from then on, as it has its carriers, not from whenever all its threads
 ;; first happened to wait. Answers once the thread has named itself, so a count of the process's
-;; threads by name made after the start sees it.
+;; threads by name made after the start sees it; what the thread does before that (naming itself,
+;; setting a thread parameter) cannot raise, so the wait always ends.
 (define (jolt-asleep-detector-start!)
   ;; the strong claim: box-cas! refuses spuriously on Apple silicon, and a refused claim here
   ;; started no detector at all (Seon's root, 2026-10-28: 2 runs in 3)
