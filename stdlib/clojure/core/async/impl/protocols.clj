@@ -75,13 +75,18 @@
   is not one of jolt's channels (a reify, as Datahike's write results are): read as
   upstream reads every port, through take!, given a fn of the value (jolt has no
   Handler protocol: a channel's take! calls the fn, so a port that delegates to one
-  works). nil closes the promise-chan. Every take entry point (<!, <!!, take!, poll!,
-  alts!, the go pass's parks) reads such a port through this. A take commits when it
-  is asked, so alts! over such a port takes from it even when another port wins: a
-  promise answers the same value again, and a channel-like port loses that value."
+  works). A take! that answers a deref-able box (upstream's convention for a value
+  ready now) is read from the box; nil closes the promise-chan. Every take entry point
+  (<!, <!!, take!, poll!, alts!, the go pass's parks) reads such a port through this.
+  A take commits when it is asked, so alts! over such a port takes from it once even
+  when another port wins: a promise answers the same value again, and a channel-like
+  port loses that value. poll! and alts!'s ready scan see the value only when the
+  port's take! delivers it at once (a promise-chan's does)."
   [port]
-  (let [c (clojure.core.async/promise-chan)]
-    (take! port (fn [v] (if (nil? v) (clojure.core.async/close! c) (clojure.core.async/put! c v))))
+  (let [c (clojure.core.async/promise-chan)
+        f (fn [v] (if (nil? v) (clojure.core.async/close! c) (clojure.core.async/put! c v)))
+        b (take! port f)]
+    (when (some? b) (f @b))
     c))
 
 (clojure.core.async/__set-port-reader! (fn [x] (if (satisfies? ReadPort x) (read-port x) x)))

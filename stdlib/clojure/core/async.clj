@@ -466,7 +466,7 @@
       (assert (some? v) "Can't put nil on channel")
       (let [r (clojure.core.async/__offer! ch v)]
         (when (some? r) [r ch])))
-    (let [r (clojure.core.async/__poll! (port-chan port))]
+    (let [r (clojure.core.async/__poll! port)]
       (when (not= r ::none) [r port]))))
 
 (defn- do-alts*
@@ -474,7 +474,16 @@
   (assert (pos? (count ports)) "alts must have at least one channel operation")
   (let [ports (vec ports)
         n (count ports)
-        has-default (contains? opts :default)]
+        has-default (contains? opts :default)
+        ;; a take port that is not a channel is read once, as the promise-chan reading it
+        ;; (port-chan), for both passes; the answer names the caller's own port
+        chans (if (some (fn [p] (not (or (vector? p) (chan? p)))) ports)
+                (mapv (fn [p] (if (vector? p) p (port-chan p))) ports)
+                ports)
+        own (fn [[v c :as r]]
+              (if (or (identical? chans ports) (= :default c))
+                r
+                [v (or (some (fn [i] (when (identical? c (nth chans i)) (nth ports i))) (range n)) c)]))]
     ;; Validate every put before the readiness scan can mutate any channel.
     (dotimes [i n]
       (let [port (nth ports i)]
@@ -485,17 +494,13 @@
           hit (loop [k 0]
                 (when (< k n)
                   (let [j (+ start k) i (if (< j n) j (- j n))]
-                    (or (alt-attempt (nth ports i))
+                    (or (alt-attempt (nth chans i))
                         (recur (inc k))))))]
-      (if hit
-        hit
-        (if has-default
-          [(:default opts) :default]
-          ;; a take port that is not a channel is registered as the promise-chan reading
-          ;; it (port-chan); the answer names the caller's own port
-          (let [chans (mapv (fn [p] (if (vector? p) p (port-chan p))) ports)
-                [v c] (clojure.core.async/__do-alts chans (boolean (:priority opts)) blocking?)]
-            [v (or (some (fn [i] (when (identical? c (nth chans i)) (nth ports i))) (range n)) c)]))))))
+      (own (if hit
+             hit
+             (if has-default
+               [(:default opts) :default]
+               (clojure.core.async/__do-alts chans (boolean (:priority opts)) blocking?)))))))
 
 (defn do-alts
   "Returns [val port] for the first ready op among ports. ports is a vector of

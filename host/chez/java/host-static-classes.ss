@@ -2822,7 +2822,8 @@
          (cons "asList" arrays-as-list)
          ;; Arrays.hashCode, the JDK's: 31*h + each element's hash from 1, in int arithmetic, 0 for
          ;; a nil array. An int, short or byte element hashes as itself, a char as its code, a
-         ;; boolean as 1231/1237, anything else as its hashCode (Long's, Double's, an Object's).
+         ;; boolean as 1231/1237, a float as its floatToIntBits, anything else as its hashCode
+         ;; (Long's, Double's, an Object's).
          (cons "hashCode" (lambda (a)
                             (if (jolt-nil? a) 0
                                 (let ((kind (jolt-array-kind a)) (n (ja-len a)))
@@ -2833,6 +2834,7 @@
                                                     ((int short byte) x)
                                                     ((char) (char->integer x))
                                                     ((boolean) (if x 1231 1237))
+                                                    ((float) (jolt-float->int-bits x))
                                                     (else (jolt-java-hashcode x)))))
                                           (loop (fx+ i 1) (i32 (+ (* 31 h) e)))))))))))))
   (register-class-statics! "Arrays" arrays-statics)

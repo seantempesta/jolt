@@ -1431,7 +1431,9 @@
 (cca-def! ">!" jolt-async-give)   (cca-def! ">!!" jolt-async-give!!)
 (cca-def! "timeout" jolt-async-timeout)
 (cca-def! "put!" jolt-async-put!)
-(cca-def! "take!" (lambda (ch cb . rest) (apply jolt-async-take! (jolt-async-port ch) cb rest)))
+(cca-def! "take!" (case-lambda
+                    ((ch cb) (jolt-async-take! (jolt-async-port ch) cb))
+                    ((ch cb on-caller?) (jolt-async-take! (jolt-async-port ch) cb on-caller?))))
 (cca-def! "offer!" jolt-async-offer!)
 (cca-def! "go-spawn" async-go-spawn)
 ;; thread-spawn: always a real OS thread, whatever *go-backend* says (thread
