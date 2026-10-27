@@ -605,6 +605,7 @@
       (set! gc-live-after-full (sa-bytes-allocated))
       (set! gc-log? (jolt-env-flag? "JOLT_GC_LOG"))
       (jolt-gc-stall-setup!)
+      (set! gc-raise-after-rendezvous? (sa-gc-install-after-rendezvous! jolt-after-collection!))
       (unless (sa-gc-install-after-collect!
                 (lambda (collect-full!)
                   ;; The live baseline the nursery bound and the old-generation
@@ -686,7 +687,7 @@
 (define (jolt-stack-limit-set! n)
   (set! jolt-stack-limit-defaulted? #f)
   (set! jolt-stack-limit-bytes
-    (and n (sa-gc-install-after-rendezvous! jolt-stack-check!) n)))
+    (and n (sa-gc-install-after-rendezvous! jolt-after-collection!) n)))
 ;; "-1", "0", "off", "none" (any case) -> 'off; digits with an optional k/m/g suffix -> bytes; anything else #f.
 (define (jolt-stack-limit-parse v)
   (let* ((t (string-downcase v))
@@ -729,6 +730,7 @@
        (guard (e (#t #f))
          (let ((code (case resource
                        ((data) 2)
+                       ((stack) 3)
                        ((as) (if (eq? (sa-os-family) 'macos) 5 9))
                        (else #f)))
                (buf (make-bytevector 16 0)))
@@ -807,12 +809,21 @@
 ;; full collection (gc-live-after-full, less this stack), never more than the heap now: this check
 ;; runs after a young pass, before the policy's full one, when the heap still holds old garbage
 ;; that would make the room look smaller than it is and overflow a recursion that fits.
+;; Never under the stack the OS gives a thread (RLIMIT_STACK, read once): with the heap at its
+;; ceiling the room is nothing, and a limit of 0 threw StackOverflowError from a loop a few frames
+;; deep, where the error is the heap's (the ceiling's OutOfMemoryError test, 1 run in 5).
+(define jolt-stack-floor-bytes #f)
+(define (jolt-stack-floor)
+  (or jolt-stack-floor-bytes
+      (begin (set! jolt-stack-floor-bytes (or (jolt-rlimit-bytes 'stack) 0)) jolt-stack-floor-bytes)))
+(define (jolt-stack-limit-for limit n ceiling other-live floor)
+  (if ceiling
+      (let ((other (max 0 (- other-live n))))
+        (min limit (max floor (quotient (* 4 (max 0 (- ceiling other))) 5))))
+      limit))
 (define (jolt-stack-limit-in-force limit n)
-  (let ((ceiling jolt-heap-ceiling-bytes))
-    (if ceiling
-        (let ((other (max 0 (- (min (sa-bytes-allocated) gc-live-after-full) n))))
-          (min limit (quotient (* 4 (max 0 (- ceiling other))) 5)))
-        limit)))
+  (jolt-stack-limit-for limit n jolt-heap-ceiling-bytes (min (sa-bytes-allocated) gc-live-after-full)
+                        (jolt-stack-floor)))
 (define (jolt-stack-check!)
   (let ((limit jolt-stack-limit-bytes))
     (when limit
@@ -907,7 +918,7 @@
     (set! gc-live-after-full (sa-bytes-allocated))
     (set! gc-total-stuck? (> (sa-total-memory-bytes) hard))
     (when (> (sa-bytes-allocated) hard)
-      (error 'jolt
+      (gc-raise-after!
              (string-append
                "out of memory: the heap ceiling of "
                (number->string hard)
@@ -921,6 +932,32 @@
            (set! gc-tight? #t) (sa-gc-tight! #t))
           ((and gc-tight? (< pressure (quotient (* 3 hard) 4)))
            (set! gc-tight? #f) (sa-gc-tight! #f)))))
+;; --- a policy's error is raised after the collection ----------------------------
+;; The ceiling's and the overhead limit's OutOfMemoryError are decided in the collect-request
+;; handler, which runs inside the collection's rendezvous: the thread running it holds Chez's
+;; thread-context mutex with interrupts off. A raise there runs the handlers that act before anything
+;; unwinds (a fiber's report, a channel's close, a timer's cancel), and they take Jolt's locks. One
+;; held by a thread that its own collect-safe pause had converted, and that waits for the
+;; thread-context mutex to come back from it, stopped both for good (a Seon agent's test child,
+;; 2026-10-28). So the handler records the error, as a signal handler records its signal, and the
+;; thread that ran it raises it after the rendezvous, at the safe point the stack check raises from
+;; (jolt-after-collection!), with that mutex released and interrupts on. Not while the thread holds
+;; a counted lock, as the stack check: its next collection raises it. A target with no rendezvous
+;; hook raises it in the handler, as before.
+(define gc-raise-after-rendezvous? #f)
+(define gc-pending-raise #f)              ; (thread-id . message) the handler recorded, or #f
+(define (gc-raise-after! msg)
+  (if gc-raise-after-rendezvous?
+      (set! gc-pending-raise (cons (get-thread-id) msg))
+      (error 'jolt msg)))
+(define (jolt-gc-raise-pending!)
+  (let ((p gc-pending-raise))
+    (when (and p (eqv? (car p) (get-thread-id)) (fx=? 0 (jolt-locks-held)))
+      (set! gc-pending-raise #f)
+      (error 'jolt (cdr p)))))
+;; After each collection, on each thread that took part (sa-gc-install-after-rendezvous!): the
+;; policy's pending error, then the stack check.
+(define (jolt-after-collection!) (jolt-gc-raise-pending!) (jolt-stack-check!))
 ;; --- the GC overhead limit ----------------------------------------------------
 ;; The JVM's answer to a heap that fits but only just (UseGCOverheadLimit, on by
 ;; default; G1CollectedHeap::update_gc_overhead_counter in the JDK): after each
@@ -958,7 +995,7 @@
           (set! gc-overhead-count 0))
       (when (>= gc-overhead-count gc-overhead-threshold)
         (set! gc-overhead-count 0)
-        (error 'jolt
+        (gc-raise-after!
                (string-append
                  "out of memory: GC overhead limit exceeded: "
                  (number->string (exact (round (* 100 gc-share-long))))
