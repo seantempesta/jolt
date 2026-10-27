@@ -680,11 +680,13 @@
 ;; On Windows neither getrlimit nor sysconf is there, so there is no default
 ;; and the stack is unbounded unless JOLT_STACK_LIMIT sets one.
 (define jolt-stack-limit-bytes #f)       ; #f = no limit (or not installed)
+(define jolt-stack-floor-bytes 0)        ; RLIMIT_STACK, read when a limit is set (jolt-stack-limit-for)
 (define jolt-stack-limit-defaulted? #f)  ; the limit is the default, not the env's
 (define (jolt-stack-limit) jolt-stack-limit-bytes)
 ;; N bytes, or #f for none. Without the hook nothing would enforce a limit, so
 ;; then it reads back as none rather than as one that is not there.
 (define (jolt-stack-limit-set! n)
+  (set! jolt-stack-floor-bytes (or (jolt-rlimit-bytes 'stack) 0))
   (set! jolt-stack-limit-defaulted? #f)
   (set! jolt-stack-limit-bytes
     (and n (sa-gc-install-after-rendezvous! jolt-after-collection!) n)))
@@ -809,13 +811,12 @@
 ;; full collection (gc-live-after-full, less this stack), never more than the heap now: this check
 ;; runs after a young pass, before the policy's full one, when the heap still holds old garbage
 ;; that would make the room look smaller than it is and overflow a recursion that fits.
-;; Never under the stack the OS gives a thread (RLIMIT_STACK, read once): with the heap at its
-;; ceiling the room is nothing, and a limit of 0 threw StackOverflowError from a loop a few frames
-;; deep, where the error is the heap's (the ceiling's OutOfMemoryError test, 1 run in 5).
-(define jolt-stack-floor-bytes #f)
-(define (jolt-stack-floor)
-  (or jolt-stack-floor-bytes
-      (begin (set! jolt-stack-floor-bytes (or (jolt-rlimit-bytes 'stack) 0)) jolt-stack-floor-bytes)))
+;; Never under the stack the OS gives a thread (RLIMIT_STACK): with the heap at its ceiling the room
+;; is nothing, and a limit of 0 threw StackOverflowError from a loop a few frames deep, where the
+;; error is the heap's (the ceiling's OutOfMemoryError test, 1 run in 5). Read when a limit is set,
+;; never in the hook: the check runs at any safe point of any thread, and a first read there is a
+;; foreign call that takes the FFI's locks, which another thread may hold (forkheldlocks hung).
+(define (jolt-stack-floor) jolt-stack-floor-bytes)
 (define (jolt-stack-limit-for limit n ceiling other-live floor)
   (if ceiling
       (let ((other (max 0 (- other-live n))))
