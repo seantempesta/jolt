@@ -42,7 +42,7 @@
            (let ([pid (let retry ()
                         (disable-interrupts)
                         (mutex-acquire #%$tc-mutex)
-                        (let ([pid (if (= (#%$top-level-value '$active-threads) 1) (fork) -2)])
+                        (let ([pid (if (= (jolt-active-threads) 1) (fork) -2)])
                           (mutex-release #%$tc-mutex)
                           (enable-interrupts)
                           (if (= pid -2) (begin (yield) (retry)) pid)))])

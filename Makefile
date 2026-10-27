@@ -1601,6 +1601,7 @@ threadeddeadlock:
 # makes each process-wide lock afresh (locks.ss define-process-local, jolt-after-fork-child!).
 forkheldlocks:
 	@bin/jolt run test/chez/fork-held-locks-test.clj
+# On the built jolt: from source (bin/jolt) no collector policy is installed, so no ceiling holds.
 # The heap ceiling's OutOfMemoryError is raised after the collection's rendezvous, with Chez's
 # thread-context mutex released and interrupts on, never in the collect-request handler
 # (rt.ss gc-raise-after!): a raise there took Jolt's locks under that mutex and deadlocked a
@@ -1610,8 +1611,8 @@ forkheldlocks:
 # 2 joined to 1, as such a process is.
 siginfodump:
 	@JOLT_NO_USER_DEPS=1 perl -e 'alarm 60; exec @ARGV' bin/jolt run test/chez/siginfo-dump-test.clj 2>&1
-oomafterrendezvous:
-	@JOLT_NO_USER_DEPS=1 JOLT_MAX_HEAP=96m perl -e 'alarm 120; exec @ARGV' bin/jolt run test/chez/oom-after-rendezvous-test.clj
+oomafterrendezvous: testbin
+	@JOLT_NO_USER_DEPS=1 JOLT_MAX_HEAP=96m perl -e 'alarm 120; exec @ARGV' target/release/jolt run test/chez/oom-after-rendezvous-test.clj
 # A split app unit is written once from memory as UTF-8 bytes, its line-marker
 # table read off the text it was assembled from (bld-write-unit!): the same bytes
 # the textual write and its read-back off the disk made.

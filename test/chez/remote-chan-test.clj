@@ -42,7 +42,7 @@
          (let loop ()
            (disable-interrupts)
            (mutex-acquire #%$tc-mutex)
-           (if (= (#%$top-level-value '$active-threads) 1)
+           (if (= (jolt-active-threads) 1)
                (let ([pid (fork)]) (mutex-release #%$tc-mutex) (enable-interrupts) pid)
                (begin (mutex-release #%$tc-mutex) (enable-interrupts)
                       (sleep (make-time 'time-duration 50000 0)) (loop))))))"))

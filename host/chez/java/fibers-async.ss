@@ -512,6 +512,23 @@
       (jolt-fiber-preempt-ticks-set! n)
       jolt-nil)))
 
+;; --- the one thread a fork may run beside none of ----------------------------------
+;; (jolt-active-threads), called with Chez's $tc-mutex held: the threads running Scheme, as a fork that
+;; must be the only one reads them. Under our Chez's lock-free activation a thread in a collect-safe
+;; call stays counted in $active-threads until a converter deactivates it, and every reader converts
+;; first (thread.c, S_convert_native_threads: collect and compute-size-increments do); one that read
+;; the count bare saw a thread parked in a read as running, and a fork waiting for 1 waited for good
+;; (forkheldlocks on our Chez) or refused (seon.lib/fork!). Converting also sends that thread's return
+;; through the tc mutex the forker holds, so it cannot start running Scheme beside the fork. On a Chez
+;; without the entry the count needs no conversion.
+(define jolt-convert-native-threads
+  (if (foreign-entry? "(cs)convert_native_threads")
+      (foreign-procedure "(cs)convert_native_threads" () iptr)
+      (lambda () 0)))
+(define (jolt-active-threads)
+  (jolt-convert-native-threads)
+  (#%$top-level-value '$active-threads))
+
 ;; --- a process fork's child ------------------------------------------------------
 ;; fork(2) copies the calling thread only. Every thread jolt started (the fiber
 ;; carriers, the timer, the shutdown watcher) is gone in the child, but its

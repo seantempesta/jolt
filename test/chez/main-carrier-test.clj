@@ -17,7 +17,7 @@
        (lambda ()
          (disable-interrupts)
          (mutex-acquire #%$tc-mutex)
-         (let ([pid (if (= (#%$top-level-value '$active-threads) 1) (fork) -2)])
+         (let ([pid (if (= (jolt-active-threads) 1) (fork) -2)])
            (mutex-release #%$tc-mutex)
            (enable-interrupts)
            (when (= pid 0) (jolt-after-fork-child!))
