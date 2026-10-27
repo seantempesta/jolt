@@ -11,15 +11,20 @@
 (def raised-where
   (scm/eval-string
     "(lambda ()
+       ;; the data is held in a box the handler empties before it escapes: the raise's continuation is
+       ;; kept (the throw's record), and holding the data through it, the next form's collection met
+       ;; the ceiling again (1 run in 10)
+       (define held (box '()))
        (call/cc
          (lambda (k)
            (with-exception-handler
              (lambda (c)
+               (set-box! held '())
                (k (format \"~a|~a|~a\"
                           (if (#%$top-level-value '$collect-request-pending) \"inside-the-collection\" \"after-it\")
                           (#3%$tc-field 'disable-count (#3%$tc))
                           (if (message-condition? c) (condition-message c) \"no message\"))))
-             (lambda () (let loop ([held '()]) (loop (cons (make-vector 4096 0) held))))))))"))
+             (lambda () (let loop () (set-box! held (cons (make-vector 4096 0) (unbox held))) (loop)))))))"))
 
 (defn check [what ok?] (when-not ok? (println "FAIL oom-after-rendezvous:" what) (System/exit 1)))
 
