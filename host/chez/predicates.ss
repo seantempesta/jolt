@@ -106,7 +106,21 @@
          (= (exact->inexact a) (exact->inexact b))
          (= a b)))
     (else (throw-jvm (quote ClassCastException) "== requires numbers"))))
-(define (jolt-num-equiv . xs)
+;; Two plain numbers, the call a comparator makes through the var ((== 0 c) where
+;; the numeric pass cannot type c), compare with no rest list: the all-plain
+;; branch below, for two (32 bytes a call before; test/chez/num-equiv-alloc-test.ss).
+(define jolt-num-equiv
+  (case-lambda
+    ((a b)
+     (cond ((and (fixnum? a) (fixnum? b)) (fx= a b))
+           ((and (flonum? a) (flonum? b)) (fl= a b))
+           ((and (number? a) (number? b))
+            (if (or (inexact? a) (inexact? b))
+                (= (exact->inexact a) (exact->inexact b))
+                (= a b)))
+           (else (jolt-num-equiv-n (list a b)))))
+    (xs (jolt-num-equiv-n xs))))
+(define (jolt-num-equiv-n xs)
   ;; 1-arity short-circuits to true for ANY value (Clojure's == 1-arg returns true
   ;; before the number check); 2+ args must all be numbers.
   (define (numeric? x) (or (number? x) (jolt-num-slow? x)))
