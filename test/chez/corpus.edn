@@ -2607,6 +2607,7 @@
   ;; reduce-kv: in-place fold, reduced stops it, IPersistentMap fallback for records
   {:suite "maps / insertion order" :label "reduce-kv stops at reduced" :expected "1" :actual "(reduce-kv (fn [a k v] (if (= k :b) (reduced a) (+ a v))) 0 (array-map :a 1 :b 2 :c 3))" :portability :common}
   {:suite "maps / insertion order" :label "reduce-kv over a vector stops at reduced" :expected "10" :actual "(reduce-kv (fn [a i v] (if (= i 1) (reduced a) (+ a v))) 0 [10 20 30])" :portability :common}
+  {:suite "seqs / reduce" :label "reduce over a lazy seq realizes nothing past reduced" :expected "[[1 2] 3]" :actual "(let [n (atom 0)] [(into [] (take-while some?) (repeatedly #(do (swap! n inc) (when (< @n 3) @n)))) @n])" :portability :common}
   {:suite "maps / insertion order" :label "reduce-kv over a vector indexes" :expected "8" :actual "(reduce-kv (fn [a i v] (+ a (* i v))) 0 [1 2 3])" :portability :common}
   {:suite "maps / insertion order" :label "reduce-kv over nil is init" :expected "7" :actual "(reduce-kv (fn [a k v] (+ a v)) 7 nil)" :portability :common}
   {:suite "maps / insertion order" :label "reduce-kv over a hash map" :expected "(quote (0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32 34 36 38))" :actual "(sort (reduce-kv (fn [a k v] (conj a (+ k v))) [] (zipmap (range 20) (range 20))))" :portability :common}

@@ -1873,8 +1873,12 @@
            (cond ((jolt-reduced? acc2) (jolt-reduced-val acc2))
                  ((cseq-crest s) (rec acc2 (jolt-seq (cseq-crest s))))
                  (else acc2))))
-        (else (rec (if direct? (f acc (seq-first s)) (jolt-invoke f acc (seq-first s)))
-                   (jolt-seq (seq-more s))))))))
+        ;; the step's answer is tested BEFORE the rest of the seq is realized: forcing (seq-more s)
+        ;; first calls a lazy seq's producer once past a `reduced` (JVM: seq-reduce asks reduced? before next)
+        (else (let ((acc2 (if direct? (f acc (seq-first s)) (jolt-invoke f acc (seq-first s)))))
+                (if (jolt-reduced? acc2)
+                    (jolt-reduced-val acc2)
+                    (rec acc2 (jolt-seq (seq-more s))))))))))
 (define jolt-reduce
   (case-lambda
     ((f coll)
