@@ -110,6 +110,8 @@
      :enotconn       (case os :macos 57 :windows 10057 107)
      :eaddrinuse     (case os :macos 48 :windows 10048 98)
      :eaddrnotavail  (case os :macos 49 :windows 10049 99)
+     ;; the kernel is short of buffers for a send now: wait until it can take bytes
+     :enobufs        (case os :macos 55 :windows 10055 105)
      ;; whether accept() hands the new socket the listener's non-blocking mode:
      ;; the BSDs and Winsock do, Linux does not
      :accept-inherits-nonblocking? bsd?
@@ -159,6 +161,7 @@
 (def enotconn       (:enotconn consts))
 (def eaddrinuse     (:eaddrinuse consts))
 (def eaddrnotavail  (:eaddrnotavail consts))
+(def enobufs        (:enobufs consts))
 
 (def accept-inherits-nonblocking?
   "Whether accept() on a non-blocking listener answers a non-blocking socket:
@@ -264,6 +267,11 @@
   "Whether error e means the call would block: EAGAIN/EWOULDBLOCK, or
   WSAEWOULDBLOCK."
   [e] (= e eagain))
+
+(defn enobufs?
+  "Whether error e means the kernel is short of buffers for a send now: ENOBUFS, or
+  WSAENOBUFS. Like EAGAIN, the send goes on once the socket can take bytes."
+  [e] (= e enobufs))
 
 (defn eintr?
   "Whether error e is an interrupted call, to be retried as is."

@@ -321,6 +321,16 @@
          (await-until 5000 #(= 3 (last @seen))) @seen)
   (flow/stop g))
 
+;; ---- 8. a failed send: a busy kernel's ENOBUFS waits, only a gone peer is :dead ------
+;; Seon's agent a2 lost a ~3 MB answer when the kernel refused its write and the writer read
+;; the errno as a gone peer. ENOBUFS cannot be made on demand, so the errno's class is checked
+;; as data; the wait itself is EAGAIN's, which back-pressure (section 2) proves.
+(check "ENOBUFS waits for the socket, as EAGAIN does" (= [:wait :wait] [(r/write-step native/enobufs) (r/write-step native/eagain)]))
+(check "EPIPE and ECONNRESET: the peer is gone" (= [:dead :dead] [(r/write-step native/epipe) (r/write-step native/econnreset)]))
+(check "EINTR retries" (= :retry (r/write-step native/eintr)))
+(check "any other errno is a defect, thrown with it (EBADF, 9)"
+       (= {:errno 9} (try (r/write-step 9) nil (catch clojure.lang.ExceptionInfo e (ex-data e)))))
+
 (if (empty? @failures)
   (println "REMOTE-CHAN-TEST OK")
   (do (println "REMOTE-CHAN-TEST FAILED" (count @failures))

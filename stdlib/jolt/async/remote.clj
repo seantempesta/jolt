@@ -226,18 +226,32 @@
           (and (= pump :fiber) (native/eagain? e)) (do (poller/wait-ready fd :read) (recur))
           :else :eof)))))
 
+(defn write-step
+  "What a send that answered errno e does next: :retry (interrupted), :wait (the kernel cannot
+  take the bytes now: EAGAIN on a non-blocking end, ENOBUFS when it is short of buffers; go on
+  once the socket can take them), :dead (EPIPE, ECONNRESET: the peer is gone). Any other errno
+  is a defect, thrown with it: the pump closes both halves and rethrows on its own thread. Before
+  it every errno but these two read as :dead, so a busy kernel's ENOBUFS ended a live peer's end."
+  [e]
+  (cond (native/eintr? e) :retry
+        (or (native/eagain? e) (native/enobufs? e)) :wait
+        (or (= e native/epipe) (= e native/econnreset)) :dead
+        :else (throw (ex-info (str "jolt.async.remote: a send failed, errno " e) {:errno e}))))
+
 (defn- write-all!
-  "Write n bytes at p. Answers true, or :dead (the peer is gone)."
+  "Write n bytes at p. Answers true, or :dead (the peer is gone); write-step classifies a
+  failed send. A :wait parks on the poller (:fiber) or polls for POLLOUT (:thread)."
   [fd p n pump]
   (loop [off 0]
     (if (= off n)
       true
       (let [[r e] (native/c-send fd (+ p off) (- n off) native/msg-nosignal)]
-        (cond
-          (pos? r) (recur (+ off r))
-          (and (neg? r) (native/eintr? e)) (recur off)
-          (and (neg? r) (= pump :fiber) (native/eagain? e)) (do (poller/wait-ready fd :write) (recur off))
-          :else :dead)))))
+        (if (pos? r)
+          (recur (+ off r))
+          (case (write-step e)
+            :retry (recur off)
+            :wait (do (if (= pump :fiber) (poller/wait-ready fd :write) (native/poll-one fd native/pollout -1)) (recur off))
+            :dead :dead))))))
 
 ;; ---- an end -------------------------------------------------------------------
 
