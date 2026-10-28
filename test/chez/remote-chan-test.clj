@@ -328,6 +328,12 @@
 (check "ENOBUFS waits for the socket, as EAGAIN does" (= [:wait :wait] [(r/write-step native/enobufs) (r/write-step native/eagain)]))
 (check "EPIPE and ECONNRESET: the peer is gone" (= [:dead :dead] [(r/write-step native/epipe) (r/write-step native/econnreset)]))
 (check "EINTR retries" (= :retry (r/write-step native/eintr)))
+(let [[x fd] (r/remote-pair {:pump :fiber :sock-buf 8192}) y (r/open fd {:pump :fiber})
+      v {:op :tests :reports (vec (for [i (range 60)] {:var (str "#'t/x" i) :trace (apply str (repeat 50000 "x"))}))}]
+  (a/>!! (:out x) v)
+  (check "a :fiber end sends a 3 MB value through an 8 KB socket to a peer that takes it later: it arrives whole (the :wait path)"
+         (= v (take-within 30000 (:in y))))
+  (r/close! x) (r/close! y))
 (check "any other errno is a defect, thrown with it (EBADF, 9)"
        (= {:errno 9} (try (r/write-step 9) nil (catch clojure.lang.ExceptionInfo e (ex-data e)))))
 

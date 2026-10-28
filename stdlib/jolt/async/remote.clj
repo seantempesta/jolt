@@ -246,8 +246,11 @@
     (if (= off n)
       true
       (let [[r e] (native/c-send fd (+ p off) (- n off) native/msg-nosignal)]
-        (if (pos? r)
-          (recur (+ off r))
+        (cond
+          (pos? r) (recur (+ off r))
+          ;; a send of n > 0 bytes that took none: the socket is done
+          (zero? r) :dead
+          :else
           (case (write-step e)
             :retry (recur off)
             :wait (do (if (= pump :fiber) (poller/wait-ready fd :write) (native/poll-one fd native/pollout -1)) (recur off))
