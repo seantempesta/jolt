@@ -57,5 +57,33 @@
            (jolt-run-interruptible (jolt-make-interrupt) (lambda () (let loop () (loop))) budget))))
   (ok "a second run spends its own budget" (let ((n (ticks-spent r))) (and n (< n (+ budget 100000))))))
 
+;; 7. a byte budget: a body that allocates in a loop is stopped under a small byte limit,
+;; one that allocates nothing with the same limit finishes (and a byte budget alone, no ticks)
+(define (bytes-spent e)
+  (let ((d (ex-data-of e))) (and d (jolt-get d jolt-kw-bytes-spent #f))))
+(define byte-limit 1000000)
+(let ((r (guard (e (#t e))
+           (jolt-run-interruptible (jolt-make-interrupt)
+                                   (lambda () (let loop ((acc '())) (loop (cons (make-vector 100 0) (if (> (length acc) 10) '() acc)))))
+                                   #f byte-limit))))
+  (ok "an allocating loop is stopped by its byte budget" (bytes-spent r))
+  (ok "it allocated its limit and not unboundedly more"
+      (let ((n (bytes-spent r))) (and n (>= n byte-limit) (< n (* 100 byte-limit)))))
+  (ok "the byte stop is an interrupt and names its budget"
+      (and (eq? #t (jolt-get (ex-data-of r) jolt-kw-interrupted #f))
+           (eqv? byte-limit (jolt-get (ex-data-of r) jolt-kw-bytes-budget #f))))
+  (ok "it is not a tick stop" (not (ticks-spent r))))
+(ok "a body that allocates nothing finishes under the same byte limit"
+    (eqv? 3000000 (jolt-run-interruptible (jolt-make-interrupt)
+                                          (lambda () (let loop ((i 0)) (if (= i 3000000) i (loop (+ i 1)))))
+                                          #f byte-limit)))
+(ok "bytes 0 is no byte budget"
+    (eqv? 7 (jolt-run-interruptible (jolt-make-interrupt)
+                                    (lambda () (make-vector 200000 0) 7) #f 0)))
+;; both budgets: the tick one still stops a non-allocating loop
+(ok "ticks and bytes together: ticks stop a loop that allocates nothing"
+    (ticks-spent (guard (e (#t e))
+                   (jolt-run-interruptible (jolt-make-interrupt) (lambda () (let loop () (loop))) budget byte-limit))))
+
 (printf "tick-budget: ~a/~a passed~n" (- total fails) total)
 (exit (if (zero? fails) 0 1))

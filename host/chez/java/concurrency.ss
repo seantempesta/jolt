@@ -2003,6 +2003,8 @@
     (if (and (pair? state) (eqv? (car state) owner)) (cdr state) '())))
 ;; --- a tick budget: runaway work bounded by the work it does ---------------------
 ;;
+;; (jolt.host/run-interruptible token thunk ticks bytes) also ends the body once it has
+;; allocated `bytes` bytes (see the byte budget below); ticks or bytes nil or 0: no such bound.
 ;; (jolt.host/run-interruptible token thunk ticks) also ends the body once it has
 ;; run `ticks` engine ticks (procedure calls and loop back-edges: work done, never
 ;; time). A budget is (start, limit): start is the running thread's or fiber's
@@ -2018,12 +2020,31 @@
 (define ticks-sentinel (cons 'jolt 'ticks-spent))
 (define jolt-kw-ticks-spent (keyword "jolt" "ticks-spent"))
 (define jolt-kw-ticks-budget (keyword "jolt" "ticks-budget"))
-;; A budget is #(start limit k fiber): fiber the one (or #f, a thread) whose count start is
+;; --- a byte budget: the same poll, the allocation counted ------------------------
+;; A budget may also carry a byte limit: the bytes the running THREAD has allocated since
+;; the body began (the per-thread counter, (cs)thread_bytes_allocated, read in about 3 ns;
+;; counted, never sampled; a collection does not lower it). It is read only when a budget has
+;; a byte limit, at the polls the ticks already take (every interrupt-check-ticks), so the
+;; stop lands up to one poll's allocation past the limit. Past it the body escapes as a
+;; tick budget does and throws
+;; {:jolt/interrupted true :jolt/bytes-spent n :jolt/bytes-budget b}.
+;; Known caveat: the counter is the carrier thread's, so a fiber that parks and resumes on
+;; another carrier under-counts (or reads a difference of two threads' counters); the byte
+;; budget is exact for a body that stays on one thread, and a bound, not a meter, otherwise.
+;; On a Chez without the counter the process-wide (bytes-allocated) stands in.
+(define bytes-sentinel (cons 'jolt 'bytes-spent))
+(define jolt-kw-bytes-spent (keyword "jolt" "bytes-spent"))
+(define jolt-kw-bytes-budget (keyword "jolt" "bytes-budget"))
+(define jolt-thread-bytes
+  (if (foreign-entry? "(cs)thread_bytes_allocated")
+      (foreign-procedure "(cs)thread_bytes_allocated" () uptr)
+      (lambda () (bytes-allocated))))
+;; A budget is #(start limit k fiber bytes-start bytes-limit): fiber the one (or #f, a thread) whose count start is
 ;; on. Only a budget of the running fiber (or thread) is read against now: a park's
 ;; unwind runs with no fiber current, on the carrier's count, and a fiber's budget read
 ;; against that is nonsense (it armed 1 tick and escaped from the scheduler mid-switch).
 (define (jolt-budget-current? b f)
-  (and (vector-ref b 0) (vector-ref b 1) (eq? (vector-ref b 3) f)))
+  (and (vector-ref b 0) (or (vector-ref b 1) (vector-ref b 5)) (eq? (vector-ref b 3) f)))
 ;; The count is read only when a budget is bounded and current, so runs with no budget
 ;; never read it (an interrupt token alone costs no read).
 ;; The nearest of budgets' remainders now, or #f when none is bounded.
@@ -2033,7 +2054,7 @@
       (if (null? bs)
           best
           (let ((b (car bs)))
-            (if (jolt-budget-current? b f)
+            (if (and (vector-ref b 1) (jolt-budget-current? b f))
                 (let* ((now (or now (jolt-ticks)))
                        (left (- (vector-ref b 1) (- now (vector-ref b 0)))))
                   (loop (cdr bs) (if best (min best left) left) now))
@@ -2047,15 +2068,19 @@
           (let ((b (car bs)))
             (if (jolt-budget-current? b f)
                 (let ((now (or now (jolt-ticks))))
-                  (if (>= (- now (vector-ref b 0)) (vector-ref b 1)) b (loop (cdr bs) now)))
+                  (if (or (and (vector-ref b 1) (>= (- now (vector-ref b 0)) (vector-ref b 1)))
+                          (and (vector-ref b 5) (>= (- (jolt-thread-bytes) (vector-ref b 4)) (vector-ref b 5))))
+                      b
+                      (loop (cdr bs) now)))
                 (loop (cdr bs) now)))))))
 (define jolt-run-interruptible
   (case-lambda
-    ((token thunk) (jolt-run-interruptible* token thunk #f))
-    ((token thunk ticks)
-     (jolt-run-interruptible* token thunk
-                              (and (number? ticks) (exact? ticks) (positive? ticks) ticks)))))
-(define (jolt-run-interruptible* token thunk budget)
+    ((token thunk) (jolt-run-interruptible* token thunk #f #f))
+    ((token thunk ticks) (jolt-run-interruptible token thunk ticks #f))
+    ((token thunk ticks bytes)
+     (let ((limit (lambda (n) (and (number? n) (exact? n) (positive? n) n))))
+       (jolt-run-interruptible* token thunk (limit ticks) (limit bytes))))))
+(define (jolt-run-interruptible* token thunk budget bytes)
   ;; Captured ONCE, outside the wind: a before-thunk that re-read it would, on a
   ;; resume, save the handler the SCHEDULER had put back and restore that on the
   ;; real exit — the borrow would hand the carrier its own handler a second time
@@ -2087,7 +2112,7 @@
          ;; This borrow's budget, its entry on the poll stack: #(start limit k fiber),
          ;; start the tick count at the body's first entry, on fiber's count (#f: the
          ;; thread's), k where its escape lands.
-         (self (vector #f budget #f #f))
+         (self (vector #f budget #f #f #f bytes))
          (budgets (cons self outer-stack))
          ;; What the borrow last armed, for the quantum (borrowed). It arms
          ;; the TIGHTER of the two demands, so a quantum shorter than the poll
@@ -2117,8 +2142,9 @@
                   (lambda ()
                     (set! borrowed 0)
                     ;; the body's first entry starts its budget; a resume continues it
-                    (when (and budget (not (vector-ref self 0)))
+                    (when (and (or budget bytes) (not (vector-ref self 0)))
                       (vector-set! self 3 (jolt-current-fiber))
+                      (vector-set! self 4 (jolt-thread-bytes))
                       (vector-set! self 0 (jolt-ticks)))
                     (let ((handler
                            (lambda ()
@@ -2145,7 +2171,11 @@
                                 ;; leave to it as an interrupt leaves, and on the same
                                 ;; test (not while a counted lock is held)
                                 (if (fx=? 0 (jolt-locks-held))
-                                    ((vector-ref b 2) ticks-sentinel)
+                                    ((vector-ref b 2)
+                                     (if (and (vector-ref b 1)
+                                              (>= (- (jolt-ticks) (vector-ref b 0)) (vector-ref b 1)))
+                                         ticks-sentinel
+                                         bytes-sentinel))
                                     (begin (set! armed (jolt-fiber-preempt-retry-ticks))
                                            (jolt-set-timer! armed)))))
                           (else
@@ -2212,6 +2242,12 @@
                                  (jolt-hash-map jolt-kw-interrupted #t
                                                 jolt-kw-ticks-spent (- (jolt-ticks) (vector-ref self 0))
                                                 jolt-kw-ticks-budget budget))))
+      ((eq? r bytes-sentinel)
+       (dyn-binding-stack outer-bindings)
+       (jolt-throw (jolt-ex-info "Evaluation spent its byte budget"
+                                 (jolt-hash-map jolt-kw-interrupted #t
+                                                jolt-kw-bytes-spent (- (jolt-thread-bytes) (vector-ref self 4))
+                                                jolt-kw-bytes-budget bytes))))
       ((eq? r interrupt-sentinel)
         (begin
           ;; The bindings the interrupted body left. Its winds are masked at their
