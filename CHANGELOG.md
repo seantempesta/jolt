@@ -19,6 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A built app's namespace init holds data, not code.** `jolt build` emitted each
+  namespace's init as code that ran once at boot and stayed in the image: a call, its
+  return point and its inspector data for every registered call site, every keyword, var
+  cell and call-site cache cell, and every constant collection literal (var metadata,
+  schema vectors). Now a def's call-site registrations are one quoted table
+  (`jolt-register-callsites!`), a constant collection literal is one quoted datum read
+  back with the same constructors (`jolt-datum`), and a def's keywords, var cells, seed
+  roots and call-site cache cells are made by one call over a table (`jolt-consts`). The
+  values, their order and every frame's name and file:line are unchanged; the Chez target
+  only (the seed mint and the Gambit seed emit as before). On a 13,000-var app: the
+  image's peak footprint at start fell 17% (350 to 283 MB), its file 20%, and start-up
+  took 0.21 s against 0.24 s.
+
 - **A required namespace's `:file` is its classpath name (#1410).** A def,
   `*file*`, `:clojure.error/source` and trace frames used to carry the path as
   the root spelled it: `./src/mylib/where.clj`, an absolute path, or a

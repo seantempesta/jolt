@@ -177,15 +177,15 @@
 ;; A NAMED fn whose body ends in a native-op tail call: exactly one jolt-site!
 ;; store, carrying the static ('fn . line) pair (sited-tail-call), and the def
 ;; wrapper registers the site's static callee for the reporter's staleness
-;; validator (jolt-register-callsite!). A dynamic-callee NON-tail site registers
+;; validator (jolt-register-callsites!, a quoted table per def). A dynamic-callee NON-tail site registers
 ;; nothing; a dynamic TAIL site registers "?" so a live stack read can tell its
 ;; pair went somewhere and returned (source-registry jolt-site-exited?).
 (define dyn-src "(def ddemo (fn ddemo [f x]\n  (let [a (f x)]\n    (f a))))")
 (let ((e (emit-num dyn-src)))
   (gate-check "(10b) dynamic tail site registers ?"
-              (gate-sub? e "(jolt-register-callsite! \"ddemo\" 3 \"?\" #t)") #t)
+              (gate-sub? e "#(\"ddemo\" 3 \"?\" #t)") #t)
   (gate-check "(10b) dynamic non-tail site registers nothing"
-              (gate-sub? e "(jolt-register-callsite! \"ddemo\" 2 ") #f))
+              (gate-sub? e " 2 \"") #f))
 (define sited-src "(def sdemo (fn sdemo [x]\n  (+ x 1)))")
 (let ((e (emit-num sited-src)))
   (gate-check "(10b) native tail site stores the pair" (gate-sub? e "(jolt-site! '(") #t)
@@ -196,12 +196,12 @@
   ;; #t is the tail? flag (R4) — chain reconstruction follows tail edges only.
   ;; + is $R+: munge-name renames it, as the back end emits + bare.
   (gate-check "(10b) callsite registered with its static callee"
-              (gate-sub? e "(jolt-register-callsite! \"sdemo\" 2 \"$R+\" #t)") #t))
+              (gate-sub? e "#(\"sdemo\" 2 \"$R+\" #t)") #t))
 (set-trace-frames! #f)
 (let ((e (emit-num sited-src)))
   (gate-check "(10b) tracing off: no site store" (gate-sub? e "(jolt-site! ") #f)
   (gate-check "(10b) tracing off: no callsite registration"
-              (gate-sub? e "(jolt-register-callsite! ") #f))
+              (gate-sub? e "(jolt-register-callsites! ") #f))
 (set-trace-frames! #t)
 
 ;; --- (11) clj-line lookup: nearest preceding #|L<n>|# marker --------------------

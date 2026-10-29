@@ -1764,6 +1764,23 @@
           (jolt-table-add! jolt-tail-exits fqn (cons line callee))
           (jolt-table-add! jolt-tail-entries callee (cons fqn line)))))
   jolt-nil)
+;; A def's registrations as ONE quoted table (the back end's trace-callsite-reg):
+;; a vector of groups, one per traced fn, each #("ns/f" line "callee" tail? line
+;; "callee" tail? ...). Registering is the same call per entry, in the same order,
+;; so the tables hold exactly what one jolt-register-callsite! per entry made;
+;; what changes is the emitted code, which is one call and one constant per def
+;; instead of a call (and its return point's inspector data) per call site.
+(define (jolt-register-callsites! groups)
+  (let ((ng (vector-length groups)))
+    (let gloop ((g 0))
+      (when (fx<? g ng)
+        (let* ((v (vector-ref groups g)) (n (vector-length v)) (fqn (vector-ref v 0)))
+          (let eloop ((i 1))
+            (when (fx<? i n)
+              (jolt-register-callsite! fqn (vector-ref v i) (vector-ref v (fx+ i 1)) (vector-ref v (fx+ i 2)))
+              (eloop (fx+ i 3)))))
+        (gloop (fx+ g 1)))))
+  jolt-nil)
 ;; The lines of a fn's dynamic tail calls, or '().
 (define (jolt-callsite-dynamic-tail-lines fqn)
   (and (string? fqn) (hashtable-ref jolt-dynamic-tail-lines fqn '())))
@@ -2206,6 +2223,67 @@
     (hashtable-contains? var-redefined-set (string-append ns "/" name))))
 (define (var-redefined-clear!)
   (jolt-with-mutex var-table-mu (hashtable-clear! var-redefined-set)))
+;; --- a constant collection literal as one quoted datum -----------------------------
+;; The back end (backend_scheme.clj const-datum) writes a literal made only of
+;; constants as data this reads back, instead of the nested constructor calls
+;; that build it: each call is code plus a return point and its inspector data,
+;; the datum is a constant. A built value is what the constructors made, with the
+;; same constructor for the same shape:
+;;   Chez symbol "ns/name" or "name"  a keyword        ()  nil
+;;   #(v item ...)  vector   #(l item ...)  list   #(y ns name)  symbol
+;;   #(a k v ...)   amap-slots->pmap (an all-keyword-key map literal)
+;;   #(h k v ...)   jolt-hash-map    #(c k v ...)  jolt-hash-map-checked
+;;   #(t item ...)  jolt-hash-set    #(u item ...) jolt-hash-set-checked
+;; and a string, number or boolean is itself. A keyword symbol never has a "/" in
+;; its name without a namespace: the back end leaves such a literal as code.
+;; A def's constants made by a call over literal arguments, as one table (the back end's
+;; emit-with-scope): (jolt-consts n #(tag arg ... tag arg ...)), answered as a vector of
+;; the n constants in order. k ns name: keyword; v ns name: var cell (jolt-var); s ns name:
+;; seed root of a var; w, h, j, i, t: a fresh call-site cache cell of jolt-kw-site,
+;; jolt-host-site-make, jrec-field-site-make, jolt-instance-site-make, host-static-site-make.
+;; Each is the call the back end used to emit apiece, so the values are the same.
+(define (jolt-consts n tbl)
+  (let ((out (make-vector n)) (len (vector-length tbl)))
+    (let loop ((i 0) (j 0))
+      (when (fx<? i len)
+        (let ((tag (vector-ref tbl i)))
+          (case tag
+            ((k) (vector-set! out j (keyword (vector-ref tbl (fx+ i 1)) (vector-ref tbl (fx+ i 2)))) (loop (fx+ i 3) (fx+ j 1)))
+            ((v) (vector-set! out j (jolt-var (vector-ref tbl (fx+ i 1)) (vector-ref tbl (fx+ i 2)))) (loop (fx+ i 3) (fx+ j 1)))
+            ((s) (vector-set! out j (jolt-seed-root (jolt-var (vector-ref tbl (fx+ i 1)) (vector-ref tbl (fx+ i 2))))) (loop (fx+ i 3) (fx+ j 1)))
+            ((w) (vector-set! out j (jolt-kw-site)) (loop (fx+ i 1) (fx+ j 1)))
+            ((h) (vector-set! out j (jolt-host-site-make)) (loop (fx+ i 1) (fx+ j 1)))
+            ((j) (vector-set! out j (jrec-field-site-make)) (loop (fx+ i 1) (fx+ j 1)))
+            ((i) (vector-set! out j (jolt-instance-site-make)) (loop (fx+ i 1) (fx+ j 1)))
+            (else (vector-set! out j (host-static-site-make)) (loop (fx+ i 1) (fx+ j 1)))))))
+    out))
+(define (jolt-datum-kw s)
+  (let* ((str (symbol->string s)) (n (string-length str)))
+    (let loop ((i 0))
+      (cond ((fx=? i n) (keyword #f str))
+            ((char=? (string-ref str i) #\/)
+             (keyword (substring str 0 i) (substring str (fx+ i 1) n)))
+            (else (loop (fx+ i 1)))))))
+(define (jolt-datum d)
+  (cond
+    ((symbol? d) (jolt-datum-kw d))
+    ((vector? d)
+     (let* ((n (vector-length d)) (m (fx- n 1)) (out (make-vector m)))
+       (let loop ((i 1))
+         (when (fx<? i n)
+           (vector-set! out (fx- i 1) (jolt-datum (vector-ref d i)))
+           (loop (fx+ i 1))))
+       (case (vector-ref d 0)
+         ((v) (make-pvec out))
+         ((l) (apply jolt-list (vector->list out)))
+         ((a) (amap-slots->pmap out))
+         ((h) (apply jolt-hash-map (vector->list out)))
+         ((c) (apply jolt-hash-map-checked (vector->list out)))
+         ((t) (apply jolt-hash-set (vector->list out)))
+         ((u) (apply jolt-hash-set-checked (vector->list out)))
+         (else (jolt-symbol (vector-ref out 0) (vector-ref out 1))))))
+    ((null? d) jolt-nil)
+    (else d)))
 ;; --- one object per literal site, however many copies of it run ------------------
 ;; A literal that builds an object with identity -- a quoted list or symbol, a
 ;; regex, a constant collection literal -- is ONE object per source site on the

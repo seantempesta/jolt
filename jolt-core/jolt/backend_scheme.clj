@@ -652,7 +652,7 @@
 ;; reports; :local — a known procedure (self / an enclosing named fn): the site
 ;; its frame carries (*known-procs*), or the enclosing fn's *trace-site* for a
 ;; self-call; :keyword / :coll / computed callees — nil.
-(declare munge-name chez-str-lit)
+(declare munge-name chez-str-lit emit-const)
 (defn- static-callee [fnode]
   (case (:op fnode)
     ;; The registered name must be the SAME form the callee's own *trace-site*
@@ -674,12 +674,26 @@
 ;; call is emitted after its operands, so its callee wins a shared line).
 (defn- trace-callsite-reg []
   (if (and (trace-frames?) *callsites* (seq @*callsites*))
-    (str/join ""
-      (for [[site sites] (sort-by key @*callsites*)
-            [line callees] (sort-by key sites)
-            [callee tail?] (sort-by (fn [e] (nth e 0)) callees)]
-        (str " (jolt-register-callsite! " (chez-str-lit site) " " line " "
-             (chez-str-lit callee) " " (if tail? "#t" "#f") ")")))
+    (if (and (= :chez (target)) (not (seed-mint?)))
+      ;; one call over one quoted table, a group per traced fn (rt.ss
+      ;; jolt-register-callsites!): the same registrations in the same order, as a
+      ;; constant instead of a call and its return point per call site
+      (str " (jolt-register-callsites! '#("
+           (str/join " "
+             (for [[site sites] (sort-by key @*callsites*)]
+               (str "#(" (chez-str-lit site)
+                    (apply str
+                      (for [[line callees] (sort-by key sites)
+                            [callee tail?] (sort-by (fn [e] (nth e 0)) callees)]
+                        (str " " line " " (chez-str-lit callee) " " (if tail? "#t" "#f"))))
+                    ")")))
+           "))")
+      (str/join ""
+        (for [[site sites] (sort-by key @*callsites*)
+              [line callees] (sort-by key sites)
+              [callee tail?] (sort-by (fn [e] (nth e 0)) callees)]
+          (str " (jolt-register-callsite! " (chez-str-lit site) " " line " "
+               (chez-str-lit callee) " " (if tail? "#t" "#f") ")"))))
     ""))
 
 (defn- fresh-label [prefix] (str prefix (swap! (:gensym-counter (cur)) inc)))
@@ -757,6 +771,25 @@
             nm))
       expr)))
 
+;; A constant built by a call over literal arguments only (a keyword, a var cell, a
+;; seed root, a call-site cache cell): hoist-const's pool entry, marked with its spec
+;; [tag arg ...] so emit-with-scope can make a def's such constants by ONE call over a
+;; table (rt.ss jolt-consts), each bound by a vector-ref, instead of one call, and its
+;; return point and inspector data, apiece.
+(defn- hoist-spec [expr spec]
+  (let [pool *const-pool*]
+    (if pool
+      (or (first (get @pool expr))
+          (let [nm (fresh-label "_kc$")]
+            (swap! pool assoc expr [nm (count @pool) expr spec])
+            nm))
+      expr)))
+(defn- hoist-keyword [kns knm]
+  (hoist-spec (if kns
+                (str "(keyword " (chez-str-lit kns) " " (chez-str-lit knm) ")")
+                (str "(keyword #f " (chez-str-lit knm) ")"))
+              [:k (if kns (chez-str-lit kns) "#f") (chez-str-lit knm)]))
+
 ;; Hoist a constant construction WITHOUT sharing it between sites: each call gets
 ;; its own binding, keyed by a token no other call can produce.
 ;;
@@ -772,11 +805,15 @@
 ;;
 ;; Keywords keep using the interning hoist-const above: they are interned already,
 ;; so sharing one across sites changes nothing observable.
+(def ^:private site-maker-tags
+  {"(jolt-kw-site)" :w "(jolt-host-site-make)" :h "(jrec-field-site-make)" :j
+   "(jolt-instance-site-make)" :i "(host-static-site-make)" :t})
 (defn- hoist-const-per-site [expr]
   (let [pool *const-pool*]
     (if pool
-      (let [nm (fresh-label "_kc$")]
-        (swap! pool assoc [::site nm] [nm (count @pool) expr])
+      (let [nm (fresh-label "_kc$")
+            tag (get site-maker-tags expr)]
+        (swap! pool assoc [::site nm] (if tag [nm (count @pool) expr [tag]] [nm (count @pool) expr]))
         nm)
       expr)))
 
@@ -887,6 +924,68 @@
       (and (every? (fn [k] (= :const (:op k))) ks)
            (apply distinct? (map :val ks)))))
 
+;; --- constant literals as one quoted datum ----------------------------------------
+;; A literal made only of constants (const-coll-node?) used to be emitted as the nested
+;; constructor calls that build it (jolt-vector (jolt-vector kw kw) ...), each call code
+;; plus a return point and its inspector data, kept in the image for as long as it runs.
+;; It is now one call over one quoted datum that rt.ss jolt-datum reads back with the
+;; SAME constructors (the datum's tag names which: see the encoding there), so the value
+;; is what the calls made. A shape the encoding does not carry (a char, a ratio, a regex,
+;; a symbol with metadata, an odd keyword name) makes the whole literal stay code.
+(defn- datum-on? [] (and (= :chez (target)) (not (seed-mint?))))
+
+(defn- datum-name-char? [c]
+  (let [n (int c)]
+    (or (and (>= n 97) (<= n 122)) (and (>= n 65) (<= n 90)) (and (>= n 48) (<= n 57))
+        (contains? #{45 95 46 42 43 33 63 60 62 61 38 37 36 94 126 64 58} n))))
+(defn- datum-kw [k]
+  (let [ns (namespace k) nm (name k)]
+    (when (and (every? datum-name-char? nm)
+               (or (nil? ns) (every? datum-name-char? ns))
+               (if ns (not (str/includes? ns "/")) (not (str/includes? nm "/"))))
+      (str "|" (when ns (str ns "/")) nm "|"))))
+(defn- datum-scalar [v]
+  (cond
+    (nil? v) "()"
+    (boolean? v) (if v "#t" "#f")
+    (number? v) (when (or (int? v) (float? v)) (emit-const v))
+    (string? v) (chez-str-lit v)
+    (keyword? v) (datum-kw v)))
+(defn- datum-vec [tag ds] (str "#(" tag (apply str (map #(str " " %) ds)) ")"))
+(defn- datum-seq
+  ([tag items f] (datum-seq tag items f identity))
+  ([tag items f ord]
+   (let [ds (mapv f items)]
+     (when (every? some? ds) (datum-vec tag (ord ds))))))
+(defn- datum-form [form]
+  (cond
+    (form-char? form) nil
+    (form-literal? form) (datum-scalar form)
+    (form-sym? form) (let [m (form-sym-meta form) sns (form-sym-ns form)]
+                       (when-not (and m (pos? (count m)))
+                         (datum-vec "y" [(if sns (chez-str-lit sns) "#f") (chez-str-lit (form-sym-name form))])))
+    (form-set? form) (datum-seq "t" (form-set-items form) datum-form sort)
+    (form-list? form) (datum-seq "l" (form-elements form) datum-form)
+    (form-vec? form) (datum-seq "v" (form-vec-items form) datum-form)
+    (form-map? form) (datum-seq "h" (mapcat (fn [p] [(nth p 0) (nth p 1)]) (form-map-pairs form)) datum-form)))
+(defn- datum-node [n top?]
+  (when (or top? (not (:site-id n)))
+    (case (:op n)
+      :const (datum-scalar (:val n))
+      :quote (datum-form (:form n))
+      :vector (datum-seq "v" (:items n) #(datum-node % false))
+      :set (datum-seq (if (distinct-const-keys? (:items n)) "t" "u") (:items n) #(datum-node % false))
+      :map (datum-seq (cond (unique-keyword-key-literal? n) "a"
+                            (distinct-const-keys? (map first (:pairs n))) "h"
+                            :else "c")
+                      (mapcat (fn [p] [(nth p 0) (nth p 1)]) (:pairs n))
+                      #(datum-node % false))
+      nil)))
+;; The call that builds a constant collection node, or nil when it stays code.
+(defn- node-datum-call [node]
+  (when (and (datum-on?) (const-coll-node? node) (not (#{:const :regex} (:op node))))
+    (when-let [d (datum-node node true)] (str "(jolt-datum '" d ")"))))
+
 ;; The pool's bindings as flat `let` layers by dependency depth: layer 0 holds the
 ;; constants that reference no other constant, layer k those whose deepest
 ;; reference is in layer k-1. A pool is mostly keywords, symbols and var cells
@@ -939,14 +1038,31 @@
         ;; interned after it; see hoist-const. Deterministic for a given emit,
         ;; which is what the seed fixpoint needs.
         consts (map val (sort-by (comp second val) @pool))
+        ;; a def's constants that are calls over literals (three or more) are made by ONE call over
+        ;; a table, each binding a vector-ref: a call and its return point apiece are gone
+        specd (filter #(nth % 3 nil) consts)
+        kt (when (and (>= (count specd) 3) (= :chez (target)) (not (seed-mint?)))
+             (fresh-label "_kt$"))
+        consts (if kt
+                 (let [idx (volatile! -1)]
+                   (map (fn [c] (if (nth c 3 nil)
+                                  [(nth c 0) (nth c 1) (str "(" (unsafe-prefix) "vector-ref " kt " " (vswap! idx inc) ")")]
+                                  c))
+                        consts))
+                 consts)
         layers (pool-layers consts)
         layers (if (and cells (seq @cells))
                  (update layers 0 (fnil into []) (map (fn [c] (str "(" c " #f)")) @cells))
                  layers)]
     (if (seq layers)
-      (reduce (fn [inner layer] (str "(let (" (str/join " " layer) ") " inner ")"))
-              raw
-              (rseq layers))
+      (let [body (reduce (fn [inner layer] (str "(let (" (str/join " " layer) ") " inner ")"))
+                         raw
+                         (rseq layers))]
+        (if kt
+          (str "(let ((" kt " (jolt-consts " (count specd) " '#("
+               (str/join " " (map (fn [c] (str/join " " (map #(if (keyword? %) (name %) %) (nth c 3)))) specd))
+               ")))) " body ")")
+          body))
       raw)))
 (defn- emit-with-cells [emit-thunk] (emit-with-scope true emit-thunk))
 
@@ -1387,12 +1503,16 @@
         (str "(or " c " (let ((_d " lookup ")) (set! " c " _d) _d))"))
       lookup)))
 (defn- hoist-var-cell [ns nm]
-  (str "(var-cell-deref " (hoist-const (str "(jolt-var " (chez-str-lit ns) " " (chez-str-lit nm) ")")) ")"))
+  (str "(var-cell-deref "
+       (hoist-spec (str "(jolt-var " (chez-str-lit ns) " " (chez-str-lit nm) ")")
+                   [:v (chez-str-lit ns) (chez-str-lit nm)])
+       ")"))
 ;; A direct-linked SEED var: the def binds the var's root procedure once, at
 ;; load (jolt-seed-root checks it is one), and the site calls it like any Scheme
 ;; procedure. Only where jolt.host/seed-callable? said so — see emit-invoke.
 (defn- hoist-seed-root [ns nm]
-  (hoist-const (str "(jolt-seed-root (jolt-var " (chez-str-lit ns) " " (chez-str-lit nm) "))")))
+  (hoist-spec (str "(jolt-seed-root (jolt-var " (chez-str-lit ns) " " (chez-str-lit nm) "))")
+              [:s (chez-str-lit ns) (chez-str-lit nm)]))
 
 (defn- emit-const [v]
   (cond
@@ -1412,10 +1532,7 @@
     ;; intern lookup runs once per def rather than at every use site — a keyword
     ;; in a hot path ((:left node), a cond's :else, a map key) was re-interned on
     ;; every evaluation, ~25% of the cost of a keyword-keyed lookup.
-    (keyword? v) (hoist-const
-                   (if-let [kns (namespace v)]
-                     (str "(keyword " (chez-str-lit kns) " " (chez-str-lit (name v)) ")")
-                     (str "(keyword #f " (chez-str-lit (name v)) ")")))
+    (keyword? v) (hoist-keyword (namespace v) (name v))
     ;; char literal -> (integer->char <codepoint>). Get the codepoint via the host
     ;; contract (form-char-code), NOT (get v :ch): on Chez (the self-hosted spine)
     ;; a char is a native char, so a struct-field read returns nil and would emit
@@ -4142,13 +4259,17 @@
      ;; jolt-hash-map / jolt-hash-set over the same elements. A literal with a
      ;; non-constant element (a local, a call) still constructs per evaluation,
      ;; since its value is not fixed at emit time.
-     :vector (let [s (emit-ordered "jolt-vector" (:items node))]
-               (if (const-coll-node? node) (hoist-const-per-site (site-const node s)) s))
-     :set (let [s (emit-ordered (if (distinct-const-keys? (:items node))
-                                  "jolt-hash-set"
-                                  "jolt-hash-set-checked")
-                                (:items node))]
-            (if (const-coll-node? node) (hoist-const-per-site (site-const node s)) s))
+     :vector (if-let [d (node-datum-call node)]
+               (hoist-const-per-site (site-const node d))
+               (let [s (emit-ordered "jolt-vector" (:items node))]
+                 (if (const-coll-node? node) (hoist-const-per-site (site-const node s)) s)))
+     :set (if-let [d (node-datum-call node)]
+            (hoist-const-per-site (site-const node d))
+            (let [s (emit-ordered (if (distinct-const-keys? (:items node))
+                                    "jolt-hash-set"
+                                    "jolt-hash-set-checked")
+                                  (:items node))]
+              (if (const-coll-node? node) (hoist-const-per-site (site-const node s)) s)))
      ;; A map literal whose keys are all constant keywords hands its slots to the
      ;; array map as one vector: the reader has already refused a repeated
      ;; literal key, so there is nothing for jolt-hash-map's duplicate scan over
@@ -4157,7 +4278,9 @@
      ;; limit — past it the literal is hash mode, which the checked constructor
      ;; still decides. The slot vector is built through ordered-call like any
      ;; operand list, so values with effects still evaluate left to right.
-     :map (let [kvs (mapcat (fn [p] [(nth p 0) (nth p 1)]) (:pairs node))
+     :map (if-let [d (node-datum-call node)]
+            (hoist-const-per-site (site-const node d))
+            (let [kvs (mapcat (fn [p] [(nth p 0) (nth p 1)]) (:pairs node))
                 s (if (unique-keyword-key-literal? node)
                     (ordered-call kvs (mapv emit kvs)
                       (fn [strs] (str "(amap-slots->pmap (vector " (str/join " " strs) "))")))
@@ -4165,7 +4288,7 @@
                                     "jolt-hash-map"
                                     "jolt-hash-map-checked")
                                   kvs))]
-            (if (const-coll-node? node) (hoist-const-per-site (site-const node s)) s))
+            (if (const-coll-node? node) (hoist-const-per-site (site-const node s)) s)))
     ;; A quoted scalar (form-char?/form-literal?) emits as an immediate constant
     ;; via emit-const — nothing to hoist. Every other quoted form (symbol, list,
     ;; vector, map, set, regex/inst/uuid/tagged) is a CONSTRUCTION rebuilt per
@@ -4177,7 +4300,10 @@
     ;; its expansion gets one constant rather than one per mention. See
     ;; hoist-const-for.
     :quote (let [f (:form node)
-                 s (emit-quoted f)]
+                 d (when-not (or (form-char? f) (form-literal? f) (form-sym? f))
+                     (when (datum-on?)
+                       (when-let [dd (datum-form f)] (str "(jolt-datum '" dd ")"))))
+                 s (or d (emit-quoted f))]
              (if (or (form-char? f) (form-literal? f))
                s
                (hoist-const-for f (site-const node s))))
