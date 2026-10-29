@@ -282,6 +282,18 @@
          (cond ((eq? n 'all) (jolt-seq coll))
                ((fx<=? n 0) jolt-empty-list)    ; (take 0 coll) must not seq its source
                (else (take-walk n (jolt-seq coll)))))))))
+;; The producers that call no user code: a descriptor of one run twice by two racing
+;; threads builds two equal cells and nothing observable differs (what they force is
+;; itself once-only), so a cell holding one needs no claim among threads -- the
+;; forcer runs it and compare-and-swaps the answer in, and a forcer that lost takes
+;; the winner's (cell-run-pure!). A claim costs a record, a dynamic-wind and its two
+;; closures per cell (~190 B, measured), which made a char seq 80 B a step single-
+;; threaded and 272 B once any thread had been forked. map, filter, iterate,
+;; take-while and the like call a user function, which must run once, and stay
+;; claimed. take is not here: it seqs an arbitrary coll (user code) on its first step.
+(define pure-lazy-src-fns
+  (list lz-str-seq lz-range-from lz-range lz-repeat lz-repeat-val lz-empty lz-take-walk lz-cycle lz-rest))
+(define (lazy-src-pure? t) (and (memq (lazy-src-fn t) pure-lazy-src-fns) #t))
 ;; clojure.core/list? — Clojure's (instance? IPersistentList x), which among the
 ;; seq flavors only PersistentList is.
 (define (cseq-list? s) (fx=? (cseq-kind s) sk-list))
@@ -409,9 +421,11 @@
 ;; that is not this process's claim is stale and is cleared on the way to
 ;; claiming.
 ;;
-;; (force-claimed! cell get-lock L get-tail body): body re-reads the cell and
-;; either delivers its published tail or, holding the claim, runs the thunk and
-;; publishes. L is the lock field's index (sa-record-cas!).
+;; (force-claimed! lazy-seq-node body): body re-reads the node and either delivers
+;; its published tail or, holding the claim, runs the thunk and publishes. Its only
+;; users are lazy seq nodes, so their lock field's index and accessors are named
+;; here, not passed: a parameter the after-thunk captures is a word in its closure
+;; on every force.
 ;; force-walking marks a lazy seq whose own thunk has run while its walk is
 ;; still going (lazy-bridge.ss lazyseq-realize!): pending to everyone but the
 ;; walker, who reaches it only by reentry, so another forcer waits on the claim.
@@ -419,12 +433,12 @@
 (define (force-pending? t) (or (procedure? t) (lazy-src? t) (jolt-lazyseq? t) (tail-claim? t) (eq? t force-walking)))
 (define force-claim-token (list 'forcing))
 (define (force-owner) (or (jolt-current-fiber) (get-thread-id)))
-(define (force-claimed! cell get-lock L get-tail body)
+(define (force-claimed! cell body)
   (let ((me (force-owner)))
     (let retry ((spins 0))
-      (let ((c (get-lock cell)))
+      (let ((c (jolt-lazyseq-lock cell)))
         (cond
-          ((not (force-pending? (get-tail cell))) (body))
+          ((not (force-pending? (jolt-lazyseq-thunk cell))) (body))
           ((not c)
            ;; Masked from before the claim until the wind holds it, and from the
            ;; body's return until it is released (jolt-wind*, locks.ss): an
@@ -432,7 +446,7 @@
            ;; other forcer of the cell waited on it for good.
            (let ((claim (cons force-claim-token me)) (lv (jolt-locks-held)))
              (jolt-locks-enter!)
-             (if (sa-record-cas! cell L #f claim)
+             (if (sa-record-cas! cell jolt-lazyseq-lock-index #f claim)
                  ;; A compare-and-swap orders nothing but its own word: the acquire
                  ;; makes every store the previous holder released visible to this
                  ;; owner's re-read of the tail, and the release orders the
@@ -444,13 +458,13 @@
                    (dynamic-wind
                      jolt-finally-in
                      (jolt-masked-body body)
-                     (jolt-masked-after lv (memory-order-release) (sa-record-cas! cell L claim #f))))
+                     (jolt-masked-after lv (memory-order-release) (sa-record-cas! cell jolt-lazyseq-lock-index claim #f))))
                  (begin (jolt-locks-exit!) (retry spins)))))
           ((and (pair? c) (eq? (car c) force-claim-token))
            (if (eqv? (cdr c) me)
                (body)                                   ; this owner's own claim: recursion
                (begin (force-wait! spins (cdr c)) (retry (fx+ spins 1)))))
-          (else (sa-record-cas! cell L c #f) (retry spins)))))))
+          (else (sa-record-cas! cell jolt-lazyseq-lock-index c #f) (retry spins)))))))
 ;; One round of waiting on a cell OWNER is running.
 (define (force-wait! spins owner)
   (unless (jolt-fiber-wait-turn! spins)
@@ -502,7 +516,12 @@
        (cseq-tail-set! s r) r))
     ((not t)
      (let ((r (cseq-cvec-more s #t))) (cseq-publish-tail! s r) r))
+    ((and (lazy-src? t) (lazy-src-pure? t)) (cell-run-pure! s t))
     (else (cell-force-claimed! s))))
+(define (cell-run-pure! s t)
+  (let ((r (lazy-src-force t)))
+    (memory-order-release)
+    (if (sa-record-cas! s cseq-tail-index t r) r (seq-more s))))
 ;; Run a cell's pending tail once, among threads: the word itself is the claim. A
 ;; forcer compare-and-swaps the pending word for a tail-claim carrying it, runs
 ;; it, and swaps the answer in; a forcer that finds another's claim waits in the
@@ -535,8 +554,10 @@
            (let ((claim (make-tail-claim w me force-claim-token)))
              (jolt-locks-enter!)
              (if (sa-record-cas! s cseq-tail-index w claim)
-                 (let ((done #f))
+                 (begin
                    (memory-order-acquire)
+                   ;; the after-thunk puts the pending word back only if the claim is still
+                   ;; the word: once the answer is in, it is not, and no flag is needed
                    (dynamic-wind
                      jolt-finally-in
                      (lambda ()
@@ -544,9 +565,8 @@
                        (let ((r (cseq-run-tail w)))
                          (memory-order-release)
                          (sa-record-cas! s cseq-tail-index claim r)
-                         (set! done #t)
                          r))
-                     (lambda () (unless done (sa-record-cas! s cseq-tail-index claim w)))))
+                     (lambda () (when (eq? (cseq-tail s) claim) (sa-record-cas! s cseq-tail-index claim w)))))
                  (begin (jolt-locks-exit!) (retry spins))))))))))
 
 ;; The empty seq (Clojure's empty list ()), distinct from nil; the empty-list-t

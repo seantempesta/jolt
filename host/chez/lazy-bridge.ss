@@ -105,7 +105,7 @@
     ((lazyseq-fail? t) (raise (lazyseq-fail-condition t)))
     ((not jolt-mt?) (lazyseq-realize! x))
     (else
-     (force-claimed! x jolt-lazyseq-lock jolt-lazyseq-lock-index jolt-lazyseq-thunk
+     (force-claimed! x
        (lambda ()
          (let ((t (jolt-lazyseq-thunk x)))
            (cond ((or (cseq? t) (jolt-nil? t)) t)
@@ -217,8 +217,7 @@
     (cond ((or (cseq? t) (jolt-nil? t)) t)
           ((jolt-lazyseq? t) t)
           ((not jolt-mt?) (settled-or-run))
-          (else (force-claimed! node jolt-lazyseq-lock jolt-lazyseq-lock-index
-                                jolt-lazyseq-thunk settled-or-run)))))
+          (else (force-claimed! node settled-or-run)))))
 ;; The answer into the word, behind a fence on the multi-threaded path so the
 ;; answer's own fields are visible before the word that points to them. val lets
 ;; go of the rerun thunk, as the reference nulls fn once invoke has returned.

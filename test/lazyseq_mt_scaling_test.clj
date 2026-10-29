@@ -75,6 +75,17 @@
   (let [s (map inc (vec (range n)))
         sums (run-walkers #(reduce + 0 s))]
     (when-not (apply = sums) (fail (str "walkers disagree over a chunked chain: " sums))))
+  ;; producers that call no user code run claim-free (seq.ss cell-run-pure!): 8 walkers
+  ;; race the same unforced char seq, range and cycle, agree on every value, and
+  ;; leave one shared tail on each cell
+  (let [str-s (seq (apply str (repeat n \x)))
+        rng (seq (range 0 (* 2 n) 2))
+        cyc (take n (cycle [1 2 3]))]
+    (doseq [[nm s] [["str seq" str-s] ["range" rng] ["cycle" cyc]]]
+      (let [sums (run-walkers #(reduce + 0 (map hash s)))]
+        (when-not (apply = sums) (fail (str "walkers disagree over a " nm ": " sums)))
+        (when-not (identical? (next (next s)) (next (next s)))
+          (fail (str "a " nm " cell's tail is not one shared cell after the race"))))))
   ;; a failing producer: every racing walker gets the exception, none hangs on
   ;; the claim the failed force leaves behind, and none sees an empty seq. The
   ;; body runs again for each force, as the reference's LazySeq keeps fn until
