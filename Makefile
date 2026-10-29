@@ -187,7 +187,7 @@ CI-GATES := submodules values recordinline corpus unit documented grenadine clis
   protoret accfix pic narrow directlink mintgate directcall defmetacells staticsite arraymap arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flonumdisp flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost recordshadow emittedheads adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc numequivalloc analyzealloc emitalloc treeseqcost imagefnforms hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
-  gatebootsmoke aotcachesmoke aotcachepathsmoke aotcachesourcepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments buildunitwrite threadeddeadlock forkheldlocks oomafterrendezvous siginfodump compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotcachesourcepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments buildunitwrite threadeddeadlock forkheldlocks oomafterrendezvous heaphistogram siginfodump compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
   systemstreams closedstdout stderrsplit userdirpaths utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest tickbudget monitorescape windescape threadsafety maskedacquire ioerrno cas flow remotechan
 TEST-GATES := submodules selfhost ci
@@ -1619,6 +1619,10 @@ siginfodump:
 # On the built jolt: from source (bin/jolt) no collector policy is installed, so no ceiling holds.
 oomafterrendezvous: testbin
 	@JOLT_NO_USER_DEPS=1 JOLT_MAX_HEAP=96m perl -e 'alarm 120; exec @ARGV' target/release/jolt run test/chez/oom-after-rendezvous-test.clj
+# The ceiling's OutOfMemoryError carries the heap by type (:jolt/heap in its ex-data), and
+# jolt.host/heap-histogram answers it on demand (test/chez/heap-histogram-test.clj).
+heaphistogram: testbin
+	@JOLT_NO_USER_DEPS=1 JOLT_MAX_HEAP=256m perl -e 'alarm 120; exec @ARGV' target/release/jolt run test/chez/heap-histogram-test.clj
 # A split app unit is written once from memory as UTF-8 bytes, its line-marker
 # table read off the text it was assembled from (bld-write-unit!): the same bytes
 # the textual write and its read-back off the disk made.

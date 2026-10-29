@@ -130,6 +130,12 @@
 (define (sa-reset-max-memory-bytes!)
   #f)
 
+;; (sa-with-object-counts thunk top-n) -> list
+;; Permitted degradation: Gambit keeps no per-type object counts; run THUNK and answer an empty histogram.
+(define (sa-with-object-counts thunk top-n)
+  (thunk)
+  (list 0 0 '()))
+
 ;; (sa-gc-install-after-collect! maintain observe) -> boolean
 ;; Permitted degradation: Gambit exposes no hook equivalent to Chez's
 ;; collect-request-handler, so answer #f and install nothing. The heap is then

@@ -927,7 +927,11 @@
                " bytes was exceeded (live "
                (number->string (sa-bytes-allocated))
                "). Raise or disable it with JOLT_MAX_HEAP=<n>[k|m|g] or "
-               "JOLT_MAX_HEAP=off."))))
+               "JOLT_MAX_HEAP=off.")
+             ;; what holds it, from one more full collection with the per-type counts on: only the
+             ;; collection that decides the error pays for them, and in place like the one before
+             (sa-with-object-counts (lambda () (collect-full! (max 0 (- hard (sa-bytes-allocated)))))
+                                    gc-histogram-top))))
   (gc-fit-reserve! hard)
   (let ((pressure (+ (sa-total-memory-bytes) (sa-bytes-allocated))))
     (cond ((and (not gc-tight?) (> pressure hard))
@@ -948,17 +952,54 @@
 ;; check does, left a thread allocating under one of the runtime's mutexes collecting at the ceiling
 ;; for good). Not while it builds an overflow's trace: that thread's next collection raises it. One
 ;; error is kept, the latest. A target with no rendezvous hook raises it in the handler, as before.
+;; --- what holds the heap: the histogram an OutOfMemoryError carries ------------------------------
+;; The ceiling's error says how much was live, never what. So the collection that decides it is followed
+;; by one more with Chez's per-type object counts on (sa-with-object-counts, only then), and the error
+;; carries the top types by bytes as its data, :jolt/heap, the way the JVM's HeapDumpOnOutOfMemoryError
+;; leaves a dump: {:live :static :dynamic :ceiling :top [{:type :count :bytes :gens} ...]}, bytes
+;; descending, :gens a map of generation to bytes. jolt.host/heap-histogram answers the same shape on
+;; demand.
+(define gc-histogram-top 20)
+(define (heap-histogram->jolt h)
+  (let ((m (lambda (kvs) (jolt-hash-map-build kvs)))
+        (kw (lambda (n) (keyword #f n))))
+    (m (list (kw "live") (sa-bytes-allocated)
+             (kw "static") (sa-static-bytes)
+             (kw "dynamic") (car h)
+             (kw "ceiling") (or jolt-heap-ceiling-bytes jolt-nil)
+             (kw "top")
+             (apply jolt-vector
+                    (map (lambda (e)
+                           (m (list (kw "type") (car e)
+                                    (kw "count") (cadr e)
+                                    (kw "bytes") (caddr e)
+                                    (kw "gens") (m (apply append
+                                                          (map (lambda (g) (list (car g) (cddr g)))
+                                                               (cadddr e)))))))
+                         (caddr h)))))))
+;; The histogram on demand: one full collection with the counts on.
+(define (jolt-heap-histogram n)
+  (heap-histogram->jolt (sa-with-object-counts sa-gc-collect n)))
+
 (define gc-raise-after-rendezvous? #f)
-(define gc-pending-raise #f)              ; (thread-id . message) the handler recorded, or #f
-(define (gc-raise-after! msg)
+(define gc-pending-raise #f)              ; (thread-id message . histogram) the handler recorded, or #f
+(define (gc-raise-after! msg . hist)
   (if gc-raise-after-rendezvous?
-      (set! gc-pending-raise (cons (get-thread-id) msg))
+      (set! gc-pending-raise (cons (get-thread-id) (cons msg (and (pair? hist) (car hist)))))
       (error 'jolt msg)))
 (define (jolt-gc-raise-pending!)
   (let ((p gc-pending-raise))
     (when (and p (eqv? (car p) (get-thread-id)) (not (jolt-stack-overflowing)))
       (set! gc-pending-raise #f)
-      (error 'jolt (cdr p)))))
+      (if (cddr p)
+          ;; the same class host-faults.ss gives the message, with the data. Its capture is set (to no
+          ;; frames) so the throw keeps no continuation on it, as the stack overflow's: the continuation
+          ;; holds the heap that filled, and a caught error holding it left the ceiling raising again
+          (let ((t (make-jolt-ex-info-record "java.lang.OutOfMemoryError" (cadr p) jolt-nil
+                                             (jolt-hash-map-build (list (keyword "jolt" "heap") (heap-histogram->jolt (cddr p)))) 0)))
+            (jolt-ex-info-record-capture-set! t (cons 'resolved '()))
+            (jolt-throw t))
+          (error 'jolt (cadr p))))))
 ;; After each collection, on each thread that took part (sa-gc-install-after-rendezvous!): the
 ;; policy's pending error, then the stack check.
 (define (jolt-after-collection!) (jolt-gc-raise-pending!) (jolt-stack-check!))
@@ -2534,6 +2575,10 @@
 ;; maximum minus the total at the reset; and the collector's trip threshold,
 ;; which bounds how far work that holds nothing can raise the footprint.
 (def-var! "jolt.host" "reset-maximum-memory-bytes!" (lambda () (sa-reset-max-memory-bytes!) jolt-nil))
+;; The heap by type, the shape an OutOfMemoryError carries as :jolt/heap (jolt-heap-histogram): FORCES ONE
+;; FULL COLLECTION with Chez's per-type object counts on, then answers {:live :static :dynamic :ceiling
+;; :top [{:type :count :bytes :gens}]} with the N types holding the most collectable bytes.
+(def-var! "jolt.host" "heap-histogram" (lambda (n) (jolt-heap-histogram n)))
 (def-var! "jolt.host" "gc-trip-bytes" (lambda () (sa-gc-trip-bytes)))
 ;; and how far the older generations may grow past the live set before they are
 ;; collected (rt.ss gc-collect-old-when-grown!): the rest of that bound.

@@ -152,7 +152,8 @@ system
 # collector cannot be asked not to move one, and sa-pin-for-owner! and
 # sa-unpin-for-owner! may BOTH no-op for the same reason; sa-gc-trip-bytes may answer 0 where no trip threshold exists (the
 # apply-scaling gate floors a footprint reading at it, and 0 is no floor);
-# sa-gc-install-after-collect! may answer
+# sa-with-object-counts may answer (list 0 0 '()) where the collector keeps no per-type counts
+# (the OutOfMemoryError then carries an empty histogram); sa-gc-install-after-collect! may answer
 # #f without installing anything, which leaves the heap unbounded as it was
 # before 0.8.5 and the nursery fixed — a target with no collection hook cannot enforce a ceiling,
 # and the caller then reports maxMemory as unbounded rather than promising a
@@ -171,6 +172,7 @@ sa-run-process
 sa-environment-pairs
 sa-os-release
 sa-gc-collect
+sa-with-object-counts
 sa-gc-max-generation
 sa-bytes-allocated
 sa-static-bytes
