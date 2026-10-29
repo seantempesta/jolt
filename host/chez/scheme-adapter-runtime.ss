@@ -776,11 +776,12 @@
 ;; continuation. Degradation: '() when sa-introspect-enabled? is #f or the
 ;; target has no inspector — the backtrace then renders from the compile-time
 ;; tables alone (jolt-backwalk) or reports no frames.
+(define jolt-trace-raw-cap 10000)   ; raw continuation frames one trace walks; a frame costs ~1 us
 (define (sa-continuation-frames k)
   (guard (e (#t '()))
     (if (sa-introspect-enabled?)
         (let loop ((io (inspect/object k)) (n 0) (acc '()))
-          (if (or (not io) (fx>=? n 400))
+          (if (or (not io) (fx>=? n jolt-trace-raw-cap))
               (reverse acc)
               (loop (guard (e (#t #f)) (io 'link)) (fx+ n 1) (cons io acc))))
         '())))

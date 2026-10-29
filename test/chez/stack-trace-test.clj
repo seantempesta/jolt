@@ -303,6 +303,28 @@
      ["stack_trace_test$tail_into_host" "stack_trace_test$calls_tail_into_host"]
      "a tail call into a throwing host fn keeps the erased frame")
 
+;; A deep recursion through one fn is one frame of the trace, not a spend of its
+;; room: the frames outside it stay. (Once the walk stopped at 400 raw frames, so a
+;; throw 1000 deep through one fn showed that fn alone and nothing below it.)
+(defn- deep-throw [n] (if (zero? n) (throw (ex-info "deep" {})) (let [r (deep-throw (dec n))] r)))
+(defn- deep-caller [n] (let [r (deep-throw n)] r))
+(defn- deep-top [n] (let [r (deep-caller n)] r))
+(let [e (try (deep-top 5000) (catch Exception x x))
+      st (.getStackTrace e)]
+  (ok= (mapv first (own-frames st))
+       ["stack_trace_test$deep_throw" "stack_trace_test$deep_caller" "stack_trace_test$deep_top"]
+       "a 5000-deep recursion keeps the frames outside it")
+  (ok= (< (count st) 50) true "...and its repeats are one frame, not 5000"))
+;; a long trace of distinct frames keeps both ends
+(declare alt-b)
+(defn- alt-a [n] (if (zero? n) (throw (ex-info "alt" {})) (let [r (alt-b (dec n))] r)))
+(defn- alt-b [n] (let [r (alt-a n)] r))
+(defn- alt-top [n] (let [r (alt-a n)] r))
+(let [st (.getStackTrace (try (alt-top 1500) (catch Exception x x)))]
+  (ok= (count st) 1024 "a trace past 1024 frames is capped at the JVM's depth")
+  (ok= (.getClassName (last st)) "stack_trace_test$alt_top"
+       "...keeping its outermost frame as well as its innermost"))
+
 (let [n @passes f @fails]
   (doseq [m f] (println "stack-trace FAIL " m))
   (println "STACK-TRACE-RESULT pass" n "fail" (count f))

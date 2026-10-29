@@ -292,7 +292,7 @@
                       ;; so each is consed IN ORDER — a left fold, not a recursive
                       ;; cons, which would put them on backwards.
                       (let add ((fs (srcreg-entry-frames nm src entry)) (a acc))
-                        (if (null? fs) a (add (cdr fs) (cons (car fs) a))))))))))))
+                        (if (null? fs) a (add (cdr fs) (srcreg-push-frame (car fs) a))))))))))))
 
 ;; --- clj-line lookup for generated .scm offsets ---------------------------------
 ;;
@@ -645,6 +645,20 @@
 (define (srcreg-frame-nm f) (vector-ref f 0))
 (define (srcreg-frame-rec f) (vector-ref f 1))
 (define (srcreg-frame-line f) (vector-ref f 2))
+;; A run of the same frame at the same line (deep recursion through one fn) is
+;; kept as ONE frame holding its count in a fourth slot, so a run never spends
+;; the trace's room: the frames outside it stay in the trace.
+(define (srcreg-frame-count f) (if (fx>? (vector-length f) 3) (vector-ref f 3) 1))
+(define (srcreg-push-frame f acc)
+  (if (and (pair? acc)
+           (let ((p (car acc)))
+             (and (string=? (srcreg-frame-nm p) (srcreg-frame-nm f))
+                  (eqv? (srcreg-frame-line p) (srcreg-frame-line f)))))
+      (let ((p (car acc)))
+        (cons (vector (srcreg-frame-nm p) (srcreg-frame-rec p) (srcreg-frame-line p)
+                      (fx+ (srcreg-frame-count p) (srcreg-frame-count f)))
+              (cdr acc)))
+      (cons f acc)))
 
 (define (jolt-render-recs recs)
   (let ((port (open-output-string)))
@@ -653,9 +667,9 @@
           (get-output-string port)
           (let* ((f (car rs)) (frame-name (srcreg-frame-nm f)) (r (srcreg-frame-rec f)))
             ;; count a maximal run of the same frame-name
-            (let run ((tail (cdr rs)) (cnt 1))
+            (let run ((tail (cdr rs)) (cnt (srcreg-frame-count f)))
               (if (and (pair? tail) (string=? (srcreg-frame-nm (car tail)) frame-name))
-                  (run (cdr tail) (fx+ cnt 1))
+                  (run (cdr tail) (fx+ cnt (srcreg-frame-count (car tail))))
                   (begin
                     (put-string port "    ")
                     (if (vector? r)
@@ -1022,7 +1036,18 @@
 (define (jolt-stack-trace-list k)
   (guard (e (#t '()))
     (jolt-recs->stack-trace (jolt-continuation-recs k #t))))
+;; The elements of a trace, capped as the JVM caps one (1024) but keeping BOTH ends
+;; when it is longer: the innermost 768 say where it failed, the outermost 256 say
+;; who asked. Equal runs are one frame already (srcreg-push-frame).
+(define jolt-trace-keep-inner 768)
+(define jolt-trace-keep-outer 256)
 (define (jolt-recs->stack-trace recs)
+  (let* ((all (jolt-recs->stack-trace* recs)) (n (length all)))
+    (if (fx<=? n (fx+ jolt-trace-keep-inner jolt-trace-keep-outer))
+        all
+        (append (list-head all jolt-trace-keep-inner)
+                (list-tail all (fx- n jolt-trace-keep-outer))))))
+(define (jolt-recs->stack-trace* recs)
   (let loop ((fs recs) (acc '()))
     (cond ((null? fs) (reverse acc))
           ((ste-of-frame (car fs)) => (lambda (e) (loop (cdr fs) (cons e acc))))
