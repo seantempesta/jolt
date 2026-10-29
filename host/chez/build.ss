@@ -3205,6 +3205,26 @@
     (close-port out)))
 (define (bld-chez-compile-file mode src so)
   (bld-chez-compile-params! (bld-mode-params mode) src so))
+;; The release app half keeps Chez's inspector information, so a frame prints its
+;; name and file:line, but not the expanded source that information also holds
+;; (each procedure's expression and free list, each return point's expression):
+;; measured on Seon's 303 app units, that source and what only it references is
+;; 213 MB of the 1,199 MB idle footprint (986 MB with it dropped, 917 -> 647 MB of
+;; static heap, a 250 -> 111 MB binary, `./seon ports` 0.47 -> 0.28 s) and a
+;; frame loses only its expression. Every other mode keeps its row: "optimized"
+;; has no inspector information to drop, dev keeps Chez's defaults. The drop is
+;; part of the unit's cache key, so a cached unit is never the other kind.
+(define (bld-app-drops-expressions? mode) (equal? mode "release"))
+
+;; Compile app unit SRC to SO under MODE's parameters, then drop its expanded
+;; source when MODE does (bld-app-drops-expressions?). A unit that will not
+;; strip ships as compiled.
+(define (bld-chez-compile-app-file mode src so)
+  (bld-chez-compile-file mode src so)
+  (when (bld-app-drops-expressions? mode)
+    (let ((out (string-append so ".stripped")))
+      (when (sa-drop-inspector-expressions! so out)
+        (rename-file out so)))))
 
 ;; --- runtime-half fasl cache -------------------------------------------------
 ;; The runtime half of the flat source (rt.ss + the clojure.core prelude +
@@ -3641,6 +3661,7 @@
   (bld-text-key
     (string-append (scheme-version) " " (sa-host-tag) " " (or (aot-runtime-fingerprint) "") "\n"
                    (bld-params-bindings (or (bld-mode-params mode) '()) "\n") "\n"
+                   (if (bld-app-drops-expressions? mode) "inspector-expressions\n" "")
                    text)))
 
 ;; so path -> cache key, for the vfasl step to find the unit's cached image
@@ -3721,7 +3742,7 @@
   (let ((src (vector-ref job 0)) (so (vector-ref job 1)) (vso (vector-ref job 2))
         (mode (vector-ref job 3)) (codec (vector-ref job 4)))
     (let ((so-part (string-append so ".part")))
-      (bld-chez-compile-file mode src so-part)
+      (bld-chez-compile-app-file mode src so-part)
       (rename-file so-part so))
     (when vso
       (let ((vso-part (string-append vso ".part")))
@@ -3807,7 +3828,7 @@
         (lambda (k)
           (let ((u (car k)))
             (unless (and exe (file-exists? (cadr u)))
-              (bld-chez-compile-file mode (car u) (cadr u)))
+              (bld-chez-compile-app-file mode (car u) (cadr u)))
             (when cache?
               (bld-cache-store! (cadr u) (bld-unit-cache-so (cadr k)))
               (let ((vso (string-append (cadr u) ".vfasl")))

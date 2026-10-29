@@ -1183,6 +1183,18 @@
                                                 source-annotations profile-source))
     #t))
 
+;; (sa-drop-inspector-expressions! in out) -> boolean
+;; Copy the compiled object file IN to OUT without the expanded source its
+;; inspector information holds (each procedure's expression and free list, each
+;; return point's expression), keeping the rest: procedure and frame names, source
+;; objects (so file and line), live masks. Contract: OUT loads and runs as IN does,
+;; and a frame still prints its name and file:line. Degradation: #f (OUT not
+;; written), and the caller ships IN.
+(define (sa-drop-inspector-expressions! in out)
+  (guard (e (#t (sa-delete-partial! out) #f))
+    (strip-fasl-file in out (fasl-strip-options inspector-expressions))
+    #t))
+
 ;; (sa-gc-install-after-collect! maintain observe) -> boolean
 ;; Hook every collection: the target performs its normal collection, then calls
 ;; (MAINTAIN collect-full!) -- collect-full! collects EVERY generation now, the
