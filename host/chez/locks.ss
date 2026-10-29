@@ -51,8 +51,9 @@
 ;; in mutex_acquire, its main idle). Re-made in the child rather than taken before the fork (POSIX's
 ;; atfork prepare): taking every lock from the forking thread is a lock-order deadlock against a
 ;; thread holding one and wanting another, while the child is its one thread, where making a lock
-;; anew takes nothing. jolt-after-fork-child! runs (jolt-process-locals-remake!) first. A lock inside
-;; an object (a monitor, a promise's condition, a carrier) is that object's, and is not covered.
+;; anew takes nothing. jolt-after-fork-child! runs (jolt-process-locals-remake!) first. An object's monitor is reset
+;; by monitor-reset-after-fork! (java/concurrency.ss), which jolt-after-fork-child! calls next; a lock inside
+;; any other object (a promise's condition, a carrier, a ReentrantLock) is that object's, and is not covered.
 (define-syntax define-process-local
   (syntax-rules ()
     ((_ name expr)

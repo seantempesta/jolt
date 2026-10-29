@@ -555,6 +555,8 @@
   ;; counting as active, as the timer thread whose timed wait fired holds timeout-mu while it waits
   ;; to rejoin the active threads (a Seon agent's test child, 2026-10-27)
   (jolt-process-locals-remake!)
+  ;; the objects' monitors are made afresh too, which the locks above do not reach (concurrency.ss)
+  (monitor-reset-after-fork!)
   ;; all asleep (locks.ss): the child is its one thread, waiting on nothing, and its detector is
   ;; the parent's (not forked)
   (hashtable-clear! jolt-asleep-ids)

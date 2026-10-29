@@ -1331,6 +1331,36 @@
         (let ((m (make-monitor)))
           (hashtable-set! monitor-table obj m) m))))
 
+;; A forked child's monitors are its own (jolt-after-fork-child!, which calls this once, first, on
+;; the child's one thread). fork(2) copies the forking thread alone, so a monitor's state names
+;; threads the child does not have: an owner word that is a thread's box (the owner never exits it),
+;; a waiter counted on the condition (a phantom the condition keeps), the bookkeeping mutex held by a
+;; thread in the middle of a decision. A thread waiting for a monitor a vanished thread held waited
+;; forever or, where the condition returned at once, spun in monitor-enter-slow! (~470,000
+;; jolt-lock-wait calls a second, ~1 GB of garbage in 3.5 s: a Seon agent's two reader threads
+;; entering the poller's monitor after its parent had waited on it, 2026-10-29). Each monitor gets a
+;; fresh mutex and conditions, no fiber or thread waiters, and no owner unless the forking context
+;; itself holds it (a fork from inside a `locking` body keeps that monitor held, its count and its
+;; exit), the contended mark dropped since nobody waits. Taken from the table, which holds every
+;; object's monitor; a ReentrantLock's monitor is its own record, held by its object, and is not
+;; reached. Nothing is locked: the child is its one thread, and making a lock anew takes nothing.
+(define (monitor-reset-after-fork!)
+  (let ((me (monitor-self)))
+    (vector-for-each
+      (lambda (m)
+        (let ((id (monitor-owner-id m)))
+          (vector-set! m monitor-i-bk (make-mutex))
+          (vector-set! m monitor-i-cv (jolt-make-cv))
+          (vector-set! m monitor-i-wcv (jolt-make-cv))
+          (vector-set! m monitor-i-fibers '())
+          (vector-set! m monitor-i-waiters '())
+          (if (and id (eq? id me))
+              (vector-set! m monitor-i-owner id)
+              (begin (vector-set! m monitor-i-owner #f)
+                     (vector-set! m monitor-i-box #f)
+                     (vector-set! m monitor-i-count 0)))))
+      (hashtable-values monitor-table))))
+
 ;; Who is asking. The FIBER when there is one, and this is the field that decides
 ;; reentrancy, so it is also what stopped a sibling fiber walking into a held
 ;; section: two fibers on one carrier share a thread and therefore shared the old
