@@ -1007,13 +1007,15 @@
                   (line (srcreg-frame-line f)))
               (ste-make (string-append (cls (car p) (cadr p)) "$fn__" (caddr p)) "invoke"
                         (file-of (vector-ref rec 2)) (if (fixnum? line) line -1)))))
-      ;; A named frame whose def nothing registered (compiled app code carries no
+      ;; A Clojure fn's frame whose def nothing registered (compiled app code carries no
       ;; source registry): the frame is real and its name is known, so it is an
       ;; element with no file or line, as the JVM prints a frame without debug info
       ;; (Unknown Source). Left out it hid the whole app from a caught throwable's
       ;; trace while printStackTrace showed it.
-      ((string? (srcreg-frame-nm f))
-       (ste-make (ste-unmapped-class (srcreg-display-name (srcreg-frame-nm f))) "invoke" jolt-nil -1))
+      ;; Only a Clojure fn's frame (jfn$ns/def$n/name): the runtime's own frames
+      ;; (na-chunk-map-first, map-seq, an anonymous eval form) are not the program's.
+      ((and (string? (srcreg-frame-nm f)) (srcreg-literal-display (srcreg-frame-nm f)))
+       => (lambda (disp) (ste-make (ste-unmapped-class disp) "invoke" jolt-nil -1)))
       (else #f))))
 ;; ns/def/inner as ns$def$inner, each part munged like a class name.
 (define (ste-unmapped-class disp)
