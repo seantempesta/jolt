@@ -30,7 +30,12 @@ include $M/init.mk
 # provision the pinned versions.
 JOLT-CHEZ-FLOOR ?= 10.4.1
 JOLT_SYSTEM_CHEZ ?= 1
-JOLT-CHEZ := $(or $(CHEZ),$(CHEZSCHEME))
+# Seon's checkout builds a patched Chez (chez-patches, bin/build chez) into
+# target/chez of the repository that holds this one at reference-code/jolt. The
+# gates run on it when present: the stock Chez lacks the sweeper-pool patch the
+# fibers tests rely on, so a gate there tests a different program. CHEZ= wins.
+PATCHED-CHEZ ?= $(wildcard $(CURDIR)/../../target/chez/bin/scheme)
+JOLT-CHEZ := $(or $(CHEZ),$(CHEZSCHEME),$(PATCHED-CHEZ))
 ifeq (,$(JOLT-CHEZ))
 ifeq (1,$(JOLT_SYSTEM_CHEZ))
 JOLT-CHEZ := $(shell \
