@@ -665,6 +665,10 @@ gcpolicy: testbin
 	 [ "$$light" = "$$floor" ] || { echo "FAIL gcpolicy: a light program left the floor ($$light)"; exit 1; }; \
 	 [ "$$pinned" = "33554432" ] || { echo "FAIL gcpolicy: JOLT_GC_TRIP_BYTES did not pin the nursery ($$pinned)"; exit 1; }; \
 	 [ -n "$$capped" ] && [ "$$capped" -le 25165824 ] || { echo "FAIL gcpolicy: JOLT_MAX_NEW_SIZE=24m did not cap the nursery ($$capped)"; exit 1; }; \
+	 rdef=$$(JOLT_NO_USER_DEPS=1 $$j run $$t reserve 2>&1 | sed -n 's/^reserve //p'); \
+	 rten=$$(JOLT_NO_USER_DEPS=1 JOLT_MAX_HEAP_FREE_RATIO=10 $$j run $$t reserve 2>&1 | sed -n 's/^reserve //p'); \
+	 echo "gcpolicy: free kept after a full collection, as a ratio of the heap in use: default $$rdef, JOLT_MAX_HEAP_FREE_RATIO=10 $$rten"; \
+	 awk -v d="$$rdef" -v t="$$rten" 'BEGIN { exit !(d != "" && t != "" && d <= 1.0 && t <= 10/90 + 1e-9) }' || { echo "FAIL gcpolicy: JOLT_MAX_HEAP_FREE_RATIO=10 kept $$rten of the heap free after a full collection (at most 10/90), default $$rdef (at most 1)"; exit 1; }; \
 	 full=$$(JOLT_NO_USER_DEPS=1 $$j -e '(print (.maxMemory (Runtime/getRuntime)))'); \
 	 tenth=$$(JOLT_NO_USER_DEPS=1 JOLT_MAX_RAM_PERCENTAGE=10 $$j -e '(print (.maxMemory (Runtime/getRuntime)))'); \
 	 [ $$((tenth * 25 / 10)) -le $$((full + 1)) ] && [ $$((tenth * 25 / 10)) -ge $$((full - 4)) ] || { echo "FAIL gcpolicy: JOLT_MAX_RAM_PERCENTAGE=10 gave $$tenth against $$full at the default 25"; exit 1; }; \

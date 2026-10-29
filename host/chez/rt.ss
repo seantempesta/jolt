@@ -593,6 +593,7 @@
                ". Give it at least twice that, or JOLT_MAX_HEAP=off for no ceiling.")))
     (set! jolt-heap-ceiling-bytes ceiling)
     (gc-nursery-setup! ceiling)
+    (sa-gc-reserve-ratio! (min 1 (gc-reserve-cap)))
     (gc-overhead-setup!)
     ;; The hook itself is target-specific, so it goes through the adapter
     ;; (sa-gc-install-after-collect!): this file is portable and the natives that
@@ -1011,10 +1012,16 @@
 (define gc-total-stuck? #f)                ; the last forced full left the total over
 ;; Keep only the free memory that fits: half the room over the heap in use, as a
 ;; ratio of it, never more than Chez's own 1:1.
+;; The free memory a full collection keeps is at most JOLT_MAX_HEAP_FREE_RATIO's
+;; share of the heap, as -XX:MaxHeapFreeRatio bounds the JVM's: P% free is
+;; P/(100-P) of the memory in use, 1x at the default 50 (Chez's own 1.0). Under
+;; a ceiling it is fitted to the room left, and never over that bound: fitted
+;; alone, a 1.2GB-live process under a 4GB ceiling kept 1x, 300-450MB free.
+(define (gc-reserve-cap) (/ gc-free-ratio (- 100 gc-free-ratio)))
 (define (gc-fit-reserve! hard) (gc-fit-reserve-to! hard (sa-bytes-allocated)))
 (define (gc-fit-reserve-to! hard used)
   (let ((used (max 1 used)))
-    (sa-gc-reserve-ratio! (max 0 (min 1 (/ (max 0 (- hard used)) (* 2 used)))))))
+    (sa-gc-reserve-ratio! (max 0 (min (gc-reserve-cap) (/ (max 0 (- hard used)) (* 2 used)))))))
 
 ;; --- the nursery ---------------------------------------------------------------
 ;; How much a program allocates between two collections (the trip threshold)
@@ -1032,7 +1039,8 @@
 ;;     collection is 1/(1+N), 10%. Above it the nursery doubles; under a quarter of
 ;;     it the nursery halves back.
 ;;   JOLT_MAX_HEAP_FREE_RATIO=P (-XX:MaxHeapFreeRatio, default 50): at most P% of
-;;     the heap may be nursery headroom over the live data -- the heap live after
+;;     the heap is kept free after a full collection (gc-reserve-cap), and at most
+;;     P% may be nursery headroom over the live data -- the heap live after
 ;;     the last full collection, less the static generation (gc-collectable) --
 ;;     so the nursery grows to live*P/(100-P), 1x the live set by default. This is the footprint bound: a nursery is memory held
 ;;     on top of the program's data, and without it a loop with 40MB live ran in

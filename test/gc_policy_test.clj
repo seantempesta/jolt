@@ -76,9 +76,18 @@
            (gc-size-nursery! 400000 500000)
            (for-each (lambda (i) (gc-size-nursery! 120000 6000000)) '(1 2 3 4 5 6)))"))
 
+;; For the reserve: with ~100MB held, the free memory a full collection keeps
+;; (Chez's heap-reserve-ratio) is what JOLT_MAX_HEAP_FREE_RATIO allows, P/(100-P)
+;; of the heap in use: a ceiling far above the heap fitted it at 1x whatever P said.
+(defn- reserve []
+  (reset! held (vec (map (fn [i] {:i i :s (str "held-" i)}) (range 600000))))
+  (System/gc)
+  (println "reserve" (jolt.host/scheme-eval-string "(heap-reserve-ratio)")))
+
 (defn -main [mode]
   (case mode
     "refresh" (refresh)
+    "reserve" (reserve)
     "churn" (churn)
     "light" (reduce + (range 1000))
     "walk" (walk)
