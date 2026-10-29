@@ -7,6 +7,15 @@
 ;; main-carrier-run! instead of hanging.
 (require '[clojure.core.async :as a] '[jolt.scheme :as scm] '[jolt.async.remote :as remote] '[jolt.io-poller])
 
+;; A Chez without chez-patches/0008-fixed-sweeper-pool starts its parallel-collector sweepers beside the
+;; main carrier's one thread, and a run of this file then hangs about 1 in 5 (measured 2026-10-29: 11 of 60
+;; runs on Homebrew's stock chez 10, 0 of 40 on the patched one, each hung at 0% CPU with the sweepers in
+;; S_mutex_acquire). A verdict from it would be a coin flip, so it says so and does not run.
+(when-not (scm/eval-string "(and (foreign-entry? \"(cs)collect_sweepers\") #t)")
+  (println "MAIN-CARRIER-TEST SKIPPED: this Chez lacks chez-patches/0008-fixed-sweeper-pool (its sweepers hang the fork cases)")
+  (flush)
+  (System/exit 0))
+
 (def failures (atom []))
 (defn check-eq [what got want]
   (when-not (= got want) (swap! failures conj (str what ": got " (pr-str got) ", want " (pr-str want)))))
