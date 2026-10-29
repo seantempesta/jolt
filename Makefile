@@ -377,6 +377,7 @@ fibers:
 	@bin/jolt run test/chez/async-callback-test.clj
 	@bin/jolt run test/chez/fork-child-test.clj
 	@bin/jolt run test/chez/main-carrier-test.clj
+	@bin/jolt run test/chez/main-carrier-throw-test.clj
 	@bin/jolt run test/chez/main-carrier-wake-test.clj
 	@bin/jolt run test/chez/main-carrier-returns-test.clj
 	@bin/jolt run test/chez/main-carrier-leaves-its-detector-test.clj

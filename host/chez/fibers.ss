@@ -1998,20 +1998,21 @@
                ;; signals it (jolt-fiber-enqueue!/locked), so it runs then, not at the timer
                (ms (let* ((secs (exact (floor (/ ms 1000))))
                           (until (make-time 'time-duration (min 999999999 (exact (round (* 1000000 (- ms (* 1000 secs)))))) secs)))
-                     (jolt-lock! (jolt-carrier-mu c))
-                     ;; nor when another thread set a deadline earlier than next since it was read
-                     ;; (jolt-timer-at!, which signals this condition after it): read again under the mu
-                     (unless (or (jolt-carrier-head c) (jolt-timer-before? next))
-                       (jolt-condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c) until))
-                     (jolt-unlock! (jolt-carrier-mu c))))
+                     ;; held with jolt-with-mutex: a throw in the region (the deadline read, the
+                     ;; wait) releases the mu and its count, so it surfaces as itself and not as a
+                     ;; later wait's "mutex is recursively locked" (test/chez/main-carrier-throw-test.clj)
+                     (jolt-with-mutex (jolt-carrier-mu c)
+                       ;; nor when another thread set a deadline earlier than next since it was read
+                       ;; (jolt-timer-at!, which signals this condition after it): read again under the mu
+                       (unless (or (jolt-carrier-head c) (jolt-timer-before? next))
+                         (jolt-condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c) until)))))
                ;; another thread may still run (a future that delivers what a fiber waits on): it
                ;; queues the fiber (enqueue signals this condition) or ends (jolt-thread-end-wake)
                ((jolt-other-thread-may-run?)
-                (jolt-lock! (jolt-carrier-mu c))
                 ;; read again under the mu its end's wake takes: an end between the two reads is not lost
-                (unless (or (jolt-carrier-head c) (not (jolt-other-thread-may-run?)))
-                  (jolt-condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c)))
-                (jolt-unlock! (jolt-carrier-mu c)))
+                (jolt-with-mutex (jolt-carrier-mu c)
+                  (unless (or (jolt-carrier-head c) (not (jolt-other-thread-may-run?)))
+                    (jolt-condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c)))))
                ;; nothing can wake it: each waiter is told and throws in its caller
                ((fx>? (jolt-main-carrier-deliver-deadlock!) 0) (void))
                (else (error 'jolt-main-carrier
