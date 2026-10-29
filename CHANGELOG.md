@@ -43,6 +43,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A stack frame is named for the var whose procedure it is.** The source registry
+  was keyed by the short procedure name, so a runtime procedure in a built binary's trace
+  (`clojure.core/map`'s lazy step, `map-seq`) took the name, file and line of an app var that
+  shares it (`rewrite-clj.zip.seqz/map-seq`), and two app vars sharing a short name lost
+  theirs. Each def now records its procedure's code object when it registers, and a frame
+  maps to the def whose code it runs; a frame no def owns is the runtime's. An anonymous
+  fn of a def nothing registered (eval'd code) is an element named `ns$def$fn__n`, as the
+  JVM names it. `build-smoke` pins it on a built app.
+
 - **A warm AOT cache replayed the first load's source path (#1404, #1405).** The
   same source reached through another root, or from another directory, reported
   the `:file` and `*file*` of the load that filled the cache, which could name a

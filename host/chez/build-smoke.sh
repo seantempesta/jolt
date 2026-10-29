@@ -114,6 +114,24 @@ do
 done
 
 # --- release now defaults to direct-linking + whole-program inference ------------
+# A frame is named for the var whose procedure it is. The registry is keyed by the
+# short procedure name, so a runtime procedure (clojure.core/map's lazy step,
+# map-seq) used to take the name of an app var that shares it (fa.lib/map-seq) in a
+# caught throwable's trace. The frame's code object is the identity.
+echo "build smoke: a frame is named for its own var, not another with the same procedure name"
+fapp="$root/test/chez/frame-app"
+fout="$(dirname "$out")/frame-bin"
+if ! JOLT_PWD="$fapp" "$jolt" build -m fa.core -o "$fout" >/dev/null 2>&1; then
+  echo "  FAIL: jolt build of the frame app exited non-zero"; exit 1
+fi
+fgot="$(cd / && "$fout" 2>&1)"
+fwant='("fa.core$top")
+nil'
+if [ "$fgot" != "$fwant" ]; then
+  echo "  FAIL: a runtime frame took an app var's name"
+  echo "  want: $fwant"; echo "  got:  $fgot"; exit 1
+fi
+
 # A plain `jolt build` (release, no flags) must direct-link app->app calls (the
 # throughput lever the perf audit identified) AND run wp-infer — both were opt-in
 # (--direct-link / --opt) before. $out is still the plain release build here.
