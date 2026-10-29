@@ -1007,7 +1007,26 @@
                   (line (srcreg-frame-line f)))
               (ste-make (string-append (cls (car p) (cadr p)) "$fn__" (caddr p)) "invoke"
                         (file-of (vector-ref rec 2)) (if (fixnum? line) line -1)))))
+      ;; A named frame whose def nothing registered (compiled app code carries no
+      ;; source registry): the frame is real and its name is known, so it is an
+      ;; element with no file or line, as the JVM prints a frame without debug info
+      ;; (Unknown Source). Left out it hid the whole app from a caught throwable's
+      ;; trace while printStackTrace showed it.
+      ((string? (srcreg-frame-nm f))
+       (ste-make (ste-unmapped-class (srcreg-display-name (srcreg-frame-nm f))) "invoke" jolt-nil -1))
       (else #f))))
+;; ns/def/inner as ns$def$inner, each part munged like a class name.
+(define (ste-unmapped-class disp)
+  (let ((n (string-length disp)))
+    (let loop ((i 0) (start 0) (acc '()))
+      (cond
+        ((fx=? i n)
+         (let ((parts (reverse (cons (class-munge-name (substring disp start n)) acc))))
+           (let join ((ps (cdr parts)) (out (car parts)))
+             (if (null? ps) out (join (cdr ps) (string-append out "$" (car ps)))))))
+        ((char=? (string-ref disp i) #\/)
+         (loop (fx+ i 1) (fx+ i 1) (cons (class-munge-name (substring disp start i)) acc)))
+        (else (loop (fx+ i 1) start acc))))))
 
 ;; A throwable's own frames as a StackTraceElement array, or an empty one for a
 ;; throwable that was never thrown (the JVM fills one in at construction; jolt
