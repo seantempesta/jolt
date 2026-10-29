@@ -376,6 +376,7 @@ fibers:
 	@$(CHEZ) --script test/chez/async-io-thread-test.ss
 	@bin/jolt run test/chez/async-callback-test.clj
 	@bin/jolt run test/chez/fork-child-test.clj
+	@perl -e 'alarm 120; exec @ARGV' bin/jolt run test/chez/main-carrier-monitor-test.clj
 	@bin/jolt run test/chez/main-carrier-test.clj
 	@bin/jolt run test/chez/main-carrier-throw-test.clj
 	@bin/jolt run test/chez/main-carrier-wake-test.clj
@@ -1604,9 +1605,11 @@ buildsegments:
 threadeddeadlock:
 	@bin/jolt run test/chez/threaded-deadlock-test.clj
 # A child forked while another thread of its parent holds the runtime's locks runs: the child
-# makes each process-wide lock afresh (locks.ss define-process-local, jolt-after-fork-child!).
+# makes each process-wide lock afresh (locks.ss define-process-local, jolt-after-fork-child!), and each
+# object's monitor (java/concurrency.ss monitor-reset-after-fork!).
 forkheldlocks:
 	@bin/jolt run test/chez/fork-held-locks-test.clj
+	@bin/jolt run test/chez/fork-held-monitors-test.clj
 # The heap ceiling's OutOfMemoryError is raised after the collection's rendezvous, with Chez's
 # thread-context mutex released and interrupts on, never in the collect-request handler
 # (rt.ss gc-raise-after!): a raise there took Jolt's locks under that mutex and deadlocked a

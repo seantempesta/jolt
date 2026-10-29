@@ -1391,9 +1391,12 @@
         (begin
           ;; BLOCKED, as the JVM reports a thread entering a monitor; a
           ;; ReentrantLock's acquire says WAITING instead (thread-enter-state)
-          (call-with-thread-state (thread-enter-state)
-            (lambda ()
-              (jolt-condition-wait (vector-ref m monitor-i-cv) (vector-ref m monitor-i-bk))))
+          ;; counted asleep, but silent (locks.ss jolt-asleep-silent): the wake a main carrier makes
+          ;; when the last thread sleeps is itself a monitor entry
+          (parameterize ((jolt-asleep-silent #t))
+            (call-with-thread-state (thread-enter-state)
+              (lambda ()
+                (jolt-condition-wait (vector-ref m monitor-i-cv) (vector-ref m monitor-i-bk)))))
           #f))))
 ;; What a thread waiting in monitor-wait! is: BLOCKED for a monitor (locking), and
 ;; WAITING for a ReentrantLock, which parks on the JVM rather than blocking.

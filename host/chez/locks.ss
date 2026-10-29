@@ -549,6 +549,17 @@
 (define jolt-asleep-told (make-eqv-hashtable))  ; thread id -> the error to raise in its wait
 (define jolt-asleep-uncounted (make-thread-parameter #f)) ; the detector's own wait
 (define jolt-asleep-raw-counts (make-thread-parameter #f)) ; a carrier, the timer, a main carrier's loop
+;; A wait that is counted asleep but never tells the loop it fell asleep (jolt-asleep-while's notify):
+;; a thread waiting to enter a monitor. The notify of a main carrier is jolt.io-poller's
+;; `(locking pm (pipe-write!))`, itself a monitor entry, so a thread waiting for pm's monitor made the
+;; wake that needs pm from inside its own wait (bk held), which waited for pm and made the wake
+;; again, one nested call deeper each time (10 frames and ~1 KB a pass, ~470,000 passes a second until
+;; the heap ceiling; a wakeup the innermost pass consumed was gone for the ones beneath, which waited
+;; for good): a Seon agent reading a child's two pipes with two futures did it at the child's exit,
+;; 2026-10-29, ~1.5 GB of garbage in 3.5 s. A monitor's waiter stays counted, so the next thread to
+;; sleep or end tells the loop with it asleep; only the deadlock in which this wait is the last to
+;; begin is missed, as the other waits that cannot be seen are (never one invented).
+(define jolt-asleep-silent (make-thread-parameter #f))
 (define jolt-asleep-exiting 0)                  ; threads between leaving live-threads and their end
 (define jolt-asleep-notify (lambda () (void)))  ; fibers.ss: wakes the detector
 
@@ -567,7 +578,7 @@
                           (when cv
                             (hashtable-set! jolt-asleep-on cv (cons id (hashtable-ref jolt-asleep-on cv '()))))
                           (jolt-asleep-all-hint?))))
-              (when all? (jolt-asleep-notify))))
+              (when (and all? (not (jolt-asleep-silent))) (jolt-asleep-notify))))
           wait
           (lambda ()
             (jolt-with-mutex jolt-asleep-mu
