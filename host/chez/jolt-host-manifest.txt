@@ -183,6 +183,7 @@ map-entry
 mark-spliced!
 maximum-memory-bytes
 reset-maximum-memory-bytes!
+heap-histogram
 gc-trip-bytes
 gc-old-growth-bytes
 mkdirs!

@@ -104,6 +104,42 @@
 (define (sa-static-bytes)
   (bytes-allocated 'static))
 
+;; (sa-with-object-counts thunk top-n) -> (list dynamic-bytes static-bytes entries)
+;; Run THUNK (a collection) with Chez's per-type object counts on, and answer what
+;; the heap held by type: DYNAMIC-BYTES / STATIC-BYTES the totals (static is the
+;; boot image the collector never frees), ENTRIES the TOP-N types by collectable
+;; bytes, each (name count bytes gens), NAME a string (a record type by its record
+;; name) and GENS a list of (generation count . bytes). The counts are gathered
+;; only while THUNK runs, so no other collection pays for them; THUNK's collection
+;; is the one they describe. Contract: counts of the objects that collection
+;; found. Degradation: (list 0 0 '()) for a collector with no per-type counts.
+(define (sa-object-type-name t)
+  (cond ((symbol? t) (symbol->string t))
+        ((record-type-descriptor? t)
+         (let ((n (record-type-name t)))
+           (if (symbol? n) (symbol->string n) (call-with-string-output-port (lambda (p) (write n p))))))
+        (else (call-with-string-output-port (lambda (p) (write t p))))))
+(define (sa-with-object-counts thunk top-n)
+  (dynamic-wind
+    (lambda () (enable-object-counts #t))
+    thunk
+    (lambda () (enable-object-counts #f)))
+  (let loop ((counts (object-counts)) (dyn 0) (static 0) (acc '()))
+    (if (null? counts)
+        (let ((sorted (list-sort (lambda (a b) (> (caddr a) (caddr b))) acc)))
+          (list dyn static
+                (let take ((l sorted) (n top-n))
+                  (if (or (null? l) (<= n 0)) '() (cons (car l) (take (cdr l) (- n 1)))))))
+        (let* ((e (car counts))
+               (gens (filter (lambda (g) (not (eq? (car g) 'static))) (cdr e)))
+               (st (fold-left + 0 (map cddr (filter (lambda (g) (eq? (car g) 'static)) (cdr e)))))
+               (c (fold-left + 0 (map cadr gens)))
+               (b (fold-left + 0 (map cddr gens))))
+          (loop (cdr counts) (+ dyn b) (+ static st)
+                (if (> b 0)
+                    (cons (list (sa-object-type-name (car e)) c b gens) acc)
+                    acc))))))
+
 ;; (sa-total-memory-bytes) -> exact integer
 ;; Total process heap bytes — what the collector has reserved from the OS
 ;; (the JVM's totalMemory; Runtime.freeMemory is the difference against

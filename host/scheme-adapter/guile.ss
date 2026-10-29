@@ -79,6 +79,7 @@
 ;;   sa-os-release          UNIMPLEMENTED  Guile: (utsname:release (uname)) — posix; #f
 ;;                                        permitted by contract.
 ;;   sa-gc-collect          UNIMPLEMENTED  Guile: (gc) — may no-op (contract allows).
+;;   sa-with-object-counts  UNIMPLEMENTED  (list 0 0 '()) permitted by contract (no per-type counts).
 ;;   sa-gc-max-generation   UNIMPLEMENTED  ?? Guile uses Boehm GC — no generations.
 ;;   sa-bytes-allocated     UNIMPLEMENTED  ?? (gc-stats) candidate; must verify field/shape.
 ;;   sa-static-bytes        UNIMPLEMENTED  0 permitted by contract (Boehm GC has no static generation).
