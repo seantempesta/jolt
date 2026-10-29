@@ -3211,7 +3211,9 @@
 ;; measured on Seon's 303 app units, that source and what only it references is
 ;; 213 MB of the 1,199 MB idle footprint (986 MB with it dropped, 917 -> 647 MB of
 ;; static heap, a 250 -> 111 MB binary, `./seon ports` 0.47 -> 0.28 s) and a
-;; frame loses only its expression. Every other mode keeps its row: "optimized"
+;; frame loses only its expression. The names of a frame's variables (the live
+;; vectors and masks, and the return points with no source object) go too, as
+;; nothing reads them: Chez fork option inspector-variables. Every other mode keeps its row: "optimized"
 ;; has no inspector information to drop, dev keeps Chez's defaults. The drop is
 ;; part of the unit's cache key, so a cached unit is never the other kind.
 (define (bld-app-drops-expressions? mode) (equal? mode "release"))
@@ -3661,7 +3663,7 @@
   (bld-text-key
     (string-append (scheme-version) " " (sa-host-tag) " " (or (aot-runtime-fingerprint) "") "\n"
                    (bld-params-bindings (or (bld-mode-params mode) '()) "\n") "\n"
-                   (if (bld-app-drops-expressions? mode) "inspector-expressions\n" "")
+                   (if (bld-app-drops-expressions? mode) "inspector-expressions inspector-variables\n" "")
                    text)))
 
 ;; so path -> cache key, for the vfasl step to find the unit's cached image
