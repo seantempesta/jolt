@@ -39,16 +39,39 @@
   (and (string? fqn) (hashtable-ref source-registry-by-fqn fqn #f)))
 (define (jolt-register-source! procname ns nm file line)
   (jolt-with-mutex source-registry-mu
-    (let ((rec (vector ns nm file line))
-          (existing (hashtable-ref source-registry procname #f)))
+    (let* ((cell (hashtable-ref var-table (string-append ns "/" nm) #f))
+           (root (and cell (var-cell-root cell)))
+           ;; The def's procedure is the var's root at this point (the back end
+           ;; emits the registration right after binding it): its CODE object is
+           ;; the identity a frame carries, which a short name is not.
+           (code (and (procedure? root) (#%$closure-code root)))
+           (rec (vector ns nm file line code))
+           (existing (hashtable-ref source-registry procname #f)))
       (hashtable-set! source-registry-by-fqn (string-append ns "/" nm) rec)
+      (when code (eq-hashtable-set! source-registry-by-code code rec))
       (cond
         ((not existing) (hashtable-set! source-registry procname rec))
         ((and (vector? existing)
               (or (not (equal? (vector-ref existing 0) ns))
                   (not (equal? (vector-ref existing 1) nm))))
-         (hashtable-set! source-registry procname 'ambiguous)))))
+         (hashtable-set! source-registry procname 'ambiguous))
+        ((vector? existing) (hashtable-set! source-registry procname rec)))))
   jolt-nil)
+;; The record of the var whose procedure has this code object, or #f. A frame's
+;; code is its procedure's identity: two vars (or a runtime procedure) that share
+;; a short name never share code, so a frame is named for its own var only.
+(define source-registry-by-code (make-eq-hashtable))
+(define (srcreg-frame-code io)
+  (guard (e (#t #f))
+    (let ((c (io 'code))) (and c (c 'value)))))
+;; The record a frame maps to: by code identity when its def recorded one, else
+;; (a def whose root was no procedure when registered) by short name.
+(define (srcreg-frame-record io nm)
+  (let ((code (srcreg-frame-code io)))
+    (or (and code (jolt-with-mutex source-registry-mu
+                    (hashtable-ref source-registry-by-code code #f)))
+        (let ((src (hashtable-ref source-registry nm #f)))
+          (and (vector? src) (not (vector-ref src 4)) src)))))
 (def-var! "jolt.host" "register-source!" jolt-register-source!)
 
 ;; The continuation to walk for an uncaught value: the one jolt-throw captured for
@@ -83,9 +106,17 @@
                               ((char=? (string-ref body i) #\$) i)
                               (else (loop (fx- i 1))))))
               (fqn (if dollar (substring body 0 dollar) body))
-              (rec (srcreg-record-for-fqn fqn)))
-         (and (vector? rec)
-              (list (vector-ref rec 0) (vector-ref rec 1)
+              (rec (srcreg-record-for-fqn fqn))
+              (slash (let loop ((i 0))
+                       (cond ((fx>=? i (string-length fqn)) #f)
+                             ((char=? (string-ref fqn i) #\/) i)
+                             (else (loop (fx+ i 1)))))))
+         ;; A def nothing registered (eval'd code) still names its anonymous fn:
+         ;; the label is jfn$<ns>/<def>$<n>, so ns and def are in it.
+         (and (or (vector? rec) (and slash (fx>? slash 0)))
+              (list (if (vector? rec) (vector-ref rec 0) (substring fqn 0 slash))
+                    (if (vector? rec) (vector-ref rec 1)
+                        (substring fqn (fx+ slash 1) (string-length fqn)))
                     (if dollar (substring body (fx+ dollar 1) n) "0"))))))
 
 ;; A frame inspector's procedure name as a string, or #f for a non-frame / unnamed.
@@ -266,7 +297,7 @@
           (reverse acc)
           (let* ((io (car ios))
                  (nm (srcreg-frame-name io))
-                 (src (and nm (hashtable-ref source-registry nm #f)))
+                 (src (and nm (srcreg-frame-record io nm)))
                  ;; keep a frame that maps, or any named frame that isn't plumbing
                  (keep? (and nm (or src (not (srcreg-plumbing-name? nm)))))
                  ;; the marker entry at the offset this frame is stopped at (only
@@ -1006,7 +1037,8 @@
             (let ((rec (srcreg-record-for-fqn (string-append (car p) "/" (cadr p))))
                   (line (srcreg-frame-line f)))
               (ste-make (string-append (cls (car p) (cadr p)) "$fn__" (caddr p)) "invoke"
-                        (file-of (vector-ref rec 2)) (if (fixnum? line) line -1)))))
+                        (if (vector? rec) (file-of (vector-ref rec 2)) jolt-nil)
+                        (if (fixnum? line) line -1)))))
       ;; A Clojure fn's frame whose def nothing registered (compiled app code carries no
       ;; source registry): the frame is real and its name is known, so it is an
       ;; element with no file or line, as the JVM prints a frame without debug info
