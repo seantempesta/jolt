@@ -94,11 +94,13 @@
       `(let* [or# ~(first exprs)] (if or# or# (or ~@(rest exprs)))))))
 
 ;; :else (any truthy value) is just a test, so no special case — (if :else e ...)
-;; takes e.
+;; takes e. An odd count is the reference's own error, raised at expansion.
 (defmacro cond [& clauses]
   (if (empty? clauses)
     nil
-    `(if ~(first clauses) ~(nth clauses 1) (cond ~@(drop 2 clauses)))))
+    (if (odd? (count clauses))
+      (throw (new IllegalArgumentException "cond requires an even number of forms"))
+      `(if ~(first clauses) ~(nth clauses 1) (cond ~@(drop 2 clauses))))))
 
 ;; ns is sugar over the namespace-op fns (in-ns/require/use/import/refer-clojure,
 ;; all ctx-capturing clojure.core fns) — matching Clojure, where require is a fn and
