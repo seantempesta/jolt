@@ -1407,6 +1407,12 @@
     (if (null? kvs) m (loop (pmap-put-hash m (car kvs) (cadr kvs)) (cddr kvs)))))
 (define (odd-kvs-error who)
   (throw-jvm (quote IllegalArgumentException) (string-append "odd number of " who)))
+;; hash-map and array-map name the key that has no value, as the JVM's
+;; PersistentHashMap.create and PersistentArrayMap.createAsIfByAssoc do.
+(define (no-value-for-key-error kvs)
+  (throw-jvm (quote IllegalArgumentException)
+             (string-append "No value supplied for key: "
+                            (jolt-str-render-one (car (list-tail kvs (fx- (length kvs) 1)))))))
 ;; The one- and two-entry shapes are fixed arities so a dynamic literal of that
 ;; size ({:a x :b y}, the commonest) builds without a rest list.
 (define jolt-hash-map
@@ -1426,11 +1432,11 @@
 ;; Never promotes — an explicit array-map stays an array map at any size.
 (define (jolt-array-map-build kvs)
   (let ((n2 (length kvs)))
-    (when (fxodd? n2) (odd-kvs-error "map entries"))
+    (when (fxodd? n2) (no-value-for-key-error kvs))
     (if (fx=? n2 0) empty-pmap (amap-slots->pmap (amap-from-kvs kvs (fxsra n2 1))))))
 ;; hash-map-build: CL function hash-map — always hash-ordered (JVM PersistentHashMap).
 (define (jolt-hash-map-build kvs)
-  (when (fxodd? (length kvs)) (odd-kvs-error "map entries"))
+  (when (fxodd? (length kvs)) (no-value-for-key-error kvs))
   (hash-from-kvs kvs))
 
 ;; The pset record (m hasheq meta, chez-pset-v3) is defined in values.ss with
@@ -1812,11 +1818,18 @@
                            (string-append "class " (guard (e (#t "?")) (jolt-class-name coll))
                                           " cannot be cast to class clojure.lang.Associative"))))))
 (define (jolt-assoc coll . kvs)
-  (meta-carry coll
-    (let loop ((coll coll) (kvs kvs))
-      (cond ((null? kvs) coll)
-            ((null? (cdr kvs)) (throw-jvm (quote IllegalArgumentException) "assoc expects an even number of key/vals"))
-            (else (loop (jolt-assoc1 coll (car kvs) (cadr kvs)) (cddr kvs)))))))
+  ;; Clojure's wording: (assoc m k) is an arity error and (assoc m k v x) an
+  ;; odd-argument error; (assoc m) is not checked here. The even check is on the
+  ;; first step only, which keeps the walk linear.
+  (cond ((null? kvs) coll)
+        ((null? (cdr kvs)) (throw-jvm (quote ArityException) "Wrong number of args (2) passed to: clojure.core/assoc"))
+        ((odd? (length kvs)) (throw-jvm (quote IllegalArgumentException) "assoc expects even number of arguments after map/vector, found odd number"))
+        (else
+         (meta-carry coll
+           (let loop ((coll coll) (kvs kvs))
+             (if (null? kvs)
+                 coll
+                 (loop (jolt-assoc1 coll (car kvs) (cadr kvs)) (cddr kvs))))))))
 (define jolt-assoc3 (lambda (coll k v) (meta-carry coll (jolt-assoc1 coll k v))))
 
 (define (jolt-dissoc coll . ks)

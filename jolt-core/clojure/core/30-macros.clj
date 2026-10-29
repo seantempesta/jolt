@@ -193,6 +193,7 @@
 ;; write. The frame is scoped like `binding`'s, so leaving the form — by a throw as
 ;; much as by returning — unbinds them again.
 (defmacro with-local-vars [bindings & body]
+  (check-bindings &form bindings)
   (let [ps (partition 2 bindings)
         binds (reduce (fn [acc p] (conj (conj acc (first p)) `(__local-var))) [] ps)
         pairs (reduce (fn [acc p] (conj (conj acc (first p)) (second p))) [] ps)]
@@ -204,6 +205,7 @@
 ;; Canonical recursive expansion; closing goes through the host seam __close
 ;; (a map-like value's :close fn or a host file — no .close interop here).
 (defmacro with-open [bindings & body]
+  (check-bindings &form bindings)
   (if (zero? (count bindings))
     `(do ~@body)
     `(let [~(first bindings) ~(second bindings)]
@@ -280,8 +282,7 @@
 ;; auto-gensym temp# tests the value; the else/empty branch sees the surrounding
 ;; scope). temp# is a single template-local gensym — referenced twice, same symbol.
 (defmacro if-let [bindings then & [else]]
-  (when-not (= 2 (count bindings))
-    (throw (new IllegalArgumentException "if-let requires exactly 2 forms in binding vector")))
+  (check-binding-pair "if-let" bindings)
   (let [form (bindings 0) tst (bindings 1)]
     `(let [temp# ~tst]
        (if temp# (let [~form temp#] ~then) ~else))))
@@ -306,6 +307,8 @@
   `(loop [] (when ~test ~@body (recur))))
 
 (defmacro dotimes [bindings & body]
+  (when-not (vector? bindings) (macro-requires &form "a vector for its binding"))
+  (when-not (= 2 (count bindings)) (macro-requires &form "exactly 2 forms in binding vector"))
   (let [i (bindings 0) n (bindings 1)]
     `(let [n# ~n]
        (loop [~i 0]
@@ -317,6 +320,8 @@
 ;; Lazy-safe: take only the head via first (Clojure uses (seq coll), but Jolt's
 ;; eager seq would realize an infinite coll like (repeat nil) and hang).
 (defmacro when-first [bindings & body]
+  (when-not (vector? bindings) (macro-requires &form "a vector for its binding"))
+  (when-not (= 2 (count bindings)) (macro-requires &form "exactly 2 forms in binding vector"))
   (let [[x xs] bindings]
     `(when-let [xs# (seq ~xs)]
        (let [~x (first xs#)]
@@ -350,6 +355,8 @@
     `(let [~g ~expr ~@(thread-binds g steps)] ~(if (empty? steps) g (last steps)))))
 
 (defmacro cond->> [expr & clauses]
+  (when (odd? (count clauses))
+    (throw (new AssertionError "Assert failed: (even? (count clauses))")))
   (let [g (fresh-sym)
         steps (map (fn [pair] `(if ~(first pair) (->> ~g ~(second pair)) ~g))
                    (partition 2 clauses))]
@@ -385,6 +392,7 @@
 ;; Dynamic binding: install a thread-binding frame of var->value (array-map keeps
 ;; var-get happy, unlike a phm), restore on exit.
 (defmacro binding [bindings & body]
+  (check-bindings &form bindings)
   (let [pairs (reduce (fn [acc p] (conj (conj acc `(var ~(first p))) (second p)))
                       [] (partition 2 bindings))]
     `(let* [frame# (array-map ~@pairs)]

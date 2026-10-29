@@ -210,6 +210,78 @@
 ;; def+fn* (not defn) because the defn macro is not defined until later in the tier.
 ;; pr-str (20-coll) builds its error messages.
 (declare pr-str)
+
+;; The errors a malformed macro form raises, in the reference's words and classes.
+;; The reference's `assert-args` macros (loop, doseq, for, binding, with-open,
+;; dotimes, ...) throw IllegalArgumentException "NAME requires WHAT in NS:LINE";
+;; the macros it checks with clojure.spec (let, if-let, when-let, fn, defn) throw
+;; ExceptionInfo "Call to clojure.core/NAME did not conform to spec." and keep the
+;; reasons in ex-data. Jolt has no core specs, so these name the failed predicate
+;; in the text clojure.main prints for the common cases, after the reference's
+;; own first line, and keep the analyzer's :jolt.error/kind so the report is
+;; still an analysis error at the form. Written with special forms only: they
+;; load before let, loop and the rest exist, and run only when a form is bad.
+(def macro-requires
+  (fn* macro-requires [form what]
+    (throw (new IllegalArgumentException
+                (str (first form) " requires " what " in " *ns* ":" (get (meta form) :line))))))
+
+;; the check every binding-vector macro starts with: a vector, of an even count.
+(def check-bindings
+  (fn* check-bindings [form bindings]
+    (if (vector? bindings)
+      (if (even? (count bindings))
+        nil
+        (macro-requires form "an even number of forms in binding vector"))
+      (macro-requires form "a vector for its binding"))))
+
+;; One explain-data problem: VAL failed PRED (a symbol or form) or, when the
+;; second argument is a string, that reason ("Insufficient input"), at PATH
+;; inside spec VIA (nil for none).
+(def spec-problem
+  (fn* spec-problem [val pred path via]
+    (let* [p {:path path :val val :via (if via [via] []) :in []}]
+      (if (string? pred) (assoc p :reason pred) (assoc p :pred pred)))))
+
+;; The spec failure the reference raises from a macro's own expansion: its first
+;; line, then one line a problem as clojure.main prints them (`val - failed: pred
+;; at: path spec: spec`), so a reader of the message alone (the report, clojure.main's
+;; err->msg) sees what failed. The problems are also data, under
+;; :jolt.error/problems and in explain-data's shape; they are not
+;; :clojure.spec.alpha/problems, which clojure.main would hand to a spec library
+;; Jolt does not ship.
+(def spec-fail
+  (fn* spec-fail [macro-name kind problems]
+    (throw (ex-info (str "Call to clojure.core/" macro-name " did not conform to spec."
+                         ((fn* lines [ps acc]
+                            (if (seq ps)
+                              (let* [p (first ps)]
+                                (lines (next ps)
+                                       (str acc "\n" (pr-str (get p :val)) " - failed: "
+                                            (if (get p :reason) (get p :reason) (pr-str (get p :pred)))
+                                            (if (seq (get p :path)) (str " at: " (pr-str (get p :path))) "")
+                                            (if (seq (get p :via)) (str " spec: " (pr-str (nth (get p :via) 0))) ""))))
+                              acc))
+                          problems ""))
+                    {:jolt.error/problems problems
+                     :jolt.error/kind kind
+                     :jolt.error/type :analysis-error}))))
+
+;; if-let and when-let's binding vector: exactly one [form init-expr] pair.
+(def check-binding-pair
+  (fn* check-binding-pair [macro-name bindings]
+    (if (vector? bindings)
+      (if (= 2 (count bindings))
+        nil
+        (spec-fail macro-name :analyze/invalid-binding
+                   [(if (< (count bindings) 2)
+                      (if (= 0 (count bindings))
+                        (spec-problem '() "Insufficient input" [:bindings :form] :clojure.core.specs.alpha/binding-form)
+                        (spec-problem '() "Insufficient input" [:bindings :init-expr] :clojure.core.specs.alpha/binding))
+                      (spec-problem (drop 2 bindings) "Extra input" [:bindings] :clojure.core.specs.alpha/binding))]))
+      (spec-fail macro-name :analyze/invalid-binding
+                 [(spec-problem bindings 'vector? [:bindings] nil)]))))
+
 (def destructure
  (fn* destructure [bindings]
   (let* [amp? (fn* [x] (and (symbol? x) (= "&" (name x))))
@@ -453,6 +525,13 @@
 ;; a later init can reference an earlier destructured name. Splice via [~@..] so the
 ;; binding vector is a tuple form (destructure returns a pvec), not a pvec literal.
 (defmacro let [bindings & body]
+  (if (vector? bindings)
+    (if (even? (count bindings))
+      nil
+      (spec-fail "let" :analyze/invalid-binding
+                 [(spec-problem bindings 'even-number-of-forms? [:bindings] :clojure.core.specs.alpha/bindings)]))
+    (spec-fail "let" :analyze/invalid-binding
+               [(spec-problem bindings 'vector? [:bindings] :clojure.core.specs.alpha/bindings)]))
   `(let* [~@(destructure bindings)] ~@body))
 
 ;; loop binds destructuring forms like let, but recur must target the loop* vars,
@@ -461,6 +540,7 @@
 ;; let establishes the destructured names so later inits can see them. Plain loops
 ;; (no patterns) pass straight through to loop*.
 (defmacro loop [bindings & body]
+  (check-bindings &form bindings)
   (let [d (destructure bindings)]
     (if (= d bindings)
       `(loop* ~bindings ~@body)
@@ -554,6 +634,19 @@
                    (if (empty? (nth r 1))
                      `(~pv ~@body)
                      `(~pv (let ~lv ~@body)))))))]
+    ;; the reference checks these with clojure.core.specs.alpha (see spec-fail)
+    (if (empty? aftn)
+      (spec-fail "fn" :analyze/invalid-fn-parameters
+                 [(spec-problem '() "Insufficient input" [:fn-tail] nil)]))
+    (let [p1 (unhint (first aftn))]
+      (if (not (if (vector? p1) true (seq? p1)))
+        (spec-fail "fn" :analyze/invalid-fn-parameters
+                   [(spec-problem p1 'vector? [:fn-tail :arity-1 :params] :clojure.core.specs.alpha/param-list)
+                    (spec-problem p1 '(or (nil? %) (sequential? %)) [:fn-tail :arity-n] :clojure.core.specs.alpha/params+body)])
+        (if (if (vector? p1) (if (> (count p1) 0) (= '& (nth p1 (dec (count p1)))) false) false)
+          (spec-fail "fn" :analyze/invalid-fn-parameters
+                     [(spec-problem '() "Insufficient input" [:fn-tail :arity-1 :params :var-params :var-form] :clojure.core.specs.alpha/binding-form)
+                      (spec-problem (nth p1 0) 'vector? [:fn-tail :arity-n :params] :clojure.core.specs.alpha/param-list)]))))
     (if (vector? (unhint (first aftn)))
       (let [a (mk aftn)]
         (if nm `(fn* ~nm ~@a) `(fn* ~@a)))
@@ -581,6 +674,9 @@
         attr-map (when (and (seq body) (next body) (map? (first body)) (not (symbol? (first body))))
                    (first body))
         body (if attr-map (rest body) body)
+        _ (when (empty? body)
+            (spec-fail "defn" :analyze/invalid-fn-parameters
+                       [(spec-problem '() "Insufficient input" [:fn-tail] :clojure.core.specs.alpha/defn-args)]))
         ;; A TRAILING attr-map after the arity clauses — (defn f ([x] …) ([x y] …)
         ;; {:k v}) — also merges into the var metadata. Only a clause-list body
         ;; can carry one: the JVM wraps a single-arity `[params] body` into one
@@ -682,6 +778,8 @@
 ;; this body runs at expansion time (like `ns` above), so `let` and `loop` from
 ;; earlier in this file are what it has.
 (defmacro cond-> [expr & clauses]
+  (when (odd? (count clauses))
+    (throw (new AssertionError "Assert failed: (even? (count clauses))")))
   (let [g (fresh-sym)
         steps (loop [cs (seq clauses) acc []]
                 (if cs
@@ -870,6 +968,7 @@
 (defn- for-bad-keyword [k]
   (throw (IllegalArgumentException. (str "Invalid 'for' keyword " k))))
 (defmacro for [bindings body]
+  (check-bindings &form bindings)
   (if (< (count bindings) 2)
     body
     (let [groups (for-parse-groups bindings 0 [])
@@ -945,6 +1044,7 @@
 ;; :when skips one element, :while stops the coll — same source-order semantics
 ;; as for.
 (defmacro doseq [bindings & body]
+  (check-bindings &form bindings)
   (let [build (fn build [idx groups]
                 (let [g (nth groups idx)
                       my-bind (nth g 0)
@@ -969,8 +1069,7 @@
 ;; name binds only in the taken branch (temp# tests the value); via `let` so the
 ;; binding form may itself destructure, matching Clojure.
 (defmacro when-let [bindings & body]
-  (when (not= 2 (count bindings))
-    (throw (new IllegalArgumentException "when-let requires exactly 2 forms in binding vector")))
+  (check-binding-pair "when-let" bindings)
   (let [form (bindings 0) tst (bindings 1)]
     `(let [temp# ~tst]
        (if temp# (let [~form temp#] ~@body) nil))))

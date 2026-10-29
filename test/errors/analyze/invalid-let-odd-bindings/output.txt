@@ -1,4 +1,5 @@
-error[analyze/invalid-binding]: Bad binding form, expected matched symbol expression pairs
+error[analyze/invalid-binding]: Call to clojure.core/let did not conform to spec.
+[a 1 b] - failed: even-number-of-forms? at: [:bindings] spec: :clojure.core.specs.alpha/bindings
   --> ./test/errors/analyze/invalid-let-odd-bindings/input.clj:4:3
    |
  2 | 
