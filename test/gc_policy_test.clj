@@ -10,15 +10,23 @@
 ;; is the same: a working set rebuilt constantly, retained just long enough.
 (ns gc-policy-test)
 
+(def ^:private settled (atom nil))
+
 (defn churn []
   ;; a working set of 200k small maps, rebuilt from scratch each round and kept
   ;; until the next is built: a fixed ~40MB live, several GB allocated in all.
   ;; (Built from the index, not from the previous round's values, so it cannot
   ;; grow: a (str x) of the previous element doubles every round.)
-  (loop [i 0 window []]
+  ;; The policy's growth probe jumps the nursery to 8x for eight collections
+  ;; before it settles (rt.ss gc-check-growth!), so the figure at the instant
+  ;; the loop ends can be that transient. The settled size is the median of the
+  ;; trip read after each of the last 30 rounds.
+  (loop [i 0 window [] seen []]
     (if (< i 60)
-      (recur (inc i) (mapv (fn [j] {:i j :s (str j "-" i)}) (range 200000)))
-      (count window))))
+      (let [w (mapv (fn [j] {:i j :s (str j "-" i)}) (range 200000))]
+        (recur (inc i) w (if (>= i 30) (conj seen (jolt.host/gc-trip-bytes)) seen)))
+      (do (reset! settled (nth (vec (sort seen)) (quot (count seen) 2)))
+          (count window)))))
 
 ;; For the ceiling: 600k small maps held (~100MB, promoted through the
 ;; generations by scheduled collections, which is what copies them) while the
@@ -96,8 +104,10 @@
     ;; the heap ceiling bounds the TOTAL heap, as -Xmx does: live data, nursery
     ;; and the free memory kept (the gate reads the high-water mark and the GC log)
     "ceiling" (hold-and-churn))
-  (println "trip" (jolt.host/gc-trip-bytes))
+  (println "trip" (or @settled (jolt.host/gc-trip-bytes)))
   (when (= mode "ceiling")
-    (println "peak" (jolt.host/maximum-memory-bytes) "max" (.maxMemory (Runtime/getRuntime)))))
+    ;; one write of the whole line: println of several args writes each piece
+    ;; separately, and the GC log (another thread, 2>&1) landed between them.
+    (print (str "peak " (jolt.host/maximum-memory-bytes) " max " (.maxMemory (Runtime/getRuntime)) "\n"))))
 
 (apply -main *command-line-args*)

@@ -6,7 +6,12 @@
 (def failures (atom []))
 (defn check-eq [what got want]
   (when-not (= got want) (swap! failures conj (str what ": got " (pr-str got) ", want " (pr-str want)))))
-(defn nthreads [] (count (Thread/getAllStackTraces)))
+;; The threads a callback or delivery holds. The asleep detector ("jolt-asleep",
+;; fibers.ss jolt-asleep-detector-start!) is the process's own, started once at
+;; its first wake, which can fall anywhere in this file; it is not a thread any
+;; put!, take! or delivery holds, so it is left out of the count.
+(defn nthreads []
+  (count (remove #(= "jolt-asleep" (.getName %)) (keys (Thread/getAllStackTraces)))))
 (defn await-until [ms pred]
   (let [end (+ (System/currentTimeMillis) ms)]
     (loop [] (cond (pred) true (> (System/currentTimeMillis) end) false :else (do (Thread/sleep 1) (recur))))))
