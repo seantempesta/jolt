@@ -1705,35 +1705,103 @@
 ;; with-in-str is the only way to feed read-line. Both differences are supersets:
 ;; on the JVM, mixing the two loses input and redirecting read-line is impossible.
 ;;
-;; Waits in a nap, NOT inside the read. Chez's blocking read holds the whole
+;; Waits for readiness, NOT inside the read. Chez's blocking read holds the whole
 ;; Scheme world while it waits: no other thread runs at all, so a future stopped
 ;; ticking and an agent stopped draining the moment the main thread reached a
 ;; prompt, and the SIGTERM watcher (concurrency.ss) could not wake to run the
 ;; shutdown hooks either. On the JVM those all keep running while a thread sits in
-;; System.in.read(). The nap is collect-safe, so parking THERE and reading only
-;; once the port has something leaves every other thread alive (jolt-p9ua). Backs
-;; off 1ms -> 20ms, the shape proc-wait-blocking uses.
+;; System.in.read(). poll(2) on the port's descriptor with no timeout is the same
+;; wait without that hold: the call is collect-safe, so every other thread and the
+;; collector run while it blocks, and the kernel wakes it when input arrives,
+;; the descriptor hangs up, or a signal lands (jolt-p9ua). Nothing wakes in
+;; between, where the nap this replaced woke 50 times a second for as long as
+;; nothing came (an idle Seon root: ~67 context switches/s). A fiber parks on the
+;; descriptor with jolt.io-poller, the one mechanism jolt.socket and the process
+;; pipes use, and gives its carrier up. A signal is not input: EINTR polls again
+;; after the port is asked once more. Where there is no poll(2) (Windows) or no
+;; poller to park on, the old nap stands, backing off 1ms -> 20ms, the shape
+;; proc-wait-blocking uses.
 ;;
-;; Whether a port can answer input-port-ready? at all is settled ONCE per port
-;; rather than under a guard per line — the guard was most of the cost when this
-;; was measured. A port that cannot answer (a custom port, e.g. a pipe) reads the
-;; blocking way. input-port-ready? and not char-ready?, which is textual only.
+;; Whether a port can answer input-port-ready? at all, and which descriptor
+;; stands behind it, is settled ONCE per port rather than under a guard per line
+;; -- the guard was most of the cost when this was measured. A port that cannot
+;; answer (a custom port, e.g. a pipe) reads the blocking way. input-port-ready?
+;; and not char-ready?, which is textual only.
 (define jolt-stdin-poll-step0 1)              ; 1ms
 (define jolt-stdin-poll-step-max 20)          ; 20ms
-(define jolt-stdin-poll-port (box #f))        ; the port the answer below is about
+(define jolt-stdin-poll-port (box #f))        ; the port the answers below are about
 (define jolt-stdin-poll-ok (box #f))
+(define jolt-stdin-poll-fd (box #f))          ; its descriptor, or #f
+(define jolt-stdin-waits (box 0))             ; times a wait went to sleep: the work count
+(def-var! "jolt.host" "stdin-waits" (lambda () (unbox jolt-stdin-waits)))
+(define jolt-poll-fn (jolt-foreign-proc-blocking "poll" '(void* unsigned-long int) 'int))
+(define jolt-poll-eintr 4)
+;; Sleeps until fd has something to read, hangs up or errors, or the thread is
+;; interrupted; -> #t for the port to be asked again (a signal is not input, and
+;; an interrupt is raised by the caller), #f for the read to go ahead. A wake pipe
+;; sits beside the descriptor in the poll set and the thread's interrupt box
+;; carries a waker that writes to it (locks.ss jolt-interrupt-wait-add!), so a
+;; sleep with no timeout is still something an interrupt can end. The pipe is
+;; this wait's own, closed under the waker's mutex so a late waker never writes to
+;; a descriptor number another open has been handed.
+(define (jolt-stdin-poll-wait! fd)
+  (let ((b (current-interrupt-box)) (pipe (sa-foreign-alloc 8)))
+    (cond
+      ((unbox b) (sa-foreign-free pipe) #t)
+      ;; no descriptor for a wake pipe: wait on the port alone, uninterruptibly
+      ((not (= 0 (proc-c-pipe pipe)))
+       (sa-foreign-free pipe)
+       (let ((pfd (sa-foreign-alloc 8)))
+         (sa-foreign-set! 'int pfd 0 fd) (sa-foreign-set! 'short pfd 4 1)
+         (sa-foreign-set! 'short pfd 6 0)
+         (let ((rc (jolt-poll-fn pfd 1 -1)))
+           (sa-foreign-free pfd)
+           (and (< rc 0) (= (proc-errno) jolt-poll-eintr)))))
+      (else
+        (let* ((rd (sa-foreign-ref 'int pipe 0)) (wr (sa-foreign-ref 'int pipe 4))
+               (pfds (sa-foreign-alloc 16)) (byte (sa-foreign-alloc 1))
+               (mu (make-mutex)) (open? #t)
+               (waker (lambda ()
+                        (jolt-with-mutex mu (when open? (proc-c-write wr byte 1))))))
+          (sa-foreign-free pipe)
+          (sa-foreign-set! 'unsigned-8 byte 0 0)
+          (sa-foreign-set! 'int pfds 0 fd) (sa-foreign-set! 'short pfds 4 1)
+          (sa-foreign-set! 'short pfds 6 0)
+          (sa-foreign-set! 'int pfds 8 rd) (sa-foreign-set! 'short pfds 12 1)
+          (sa-foreign-set! 'short pfds 14 0)
+          (jolt-interrupt-wait-add! b waker)
+          (let* ((rc (if (unbox b) 1 (jolt-poll-fn pfds 2 -1)))
+                 (eintr? (and (< rc 0) (= (proc-errno) jolt-poll-eintr))))
+            (jolt-interrupt-wait-remove! b waker)
+            (jolt-with-mutex mu (set! open? #f) (proc-c-close rd) (proc-c-close wr))
+            (sa-foreign-free pfds) (sa-foreign-free byte)
+            (or eintr? (and (unbox b) #t))))))))
+
 (define (jolt-stdin-wait-ready! in)
   (unless (eq? (unbox jolt-stdin-poll-port) in)
     (set-box! jolt-stdin-poll-ok (guard (_ (#t #f)) (input-port-ready? in) #t))
+    (set-box! jolt-stdin-poll-fd
+              (and (not (eq? (sa-os-family) 'windows)) jolt-poll-fn
+                   (guard (_ (#t #f)) (port-file-descriptor in))))
     (set-box! jolt-stdin-poll-port in))
   (when (unbox jolt-stdin-poll-ok)
-    (let loop ((step jolt-stdin-poll-step0))
-      (unless (input-port-ready? in)
-        ;; jolt-pause-ms and not (sleep): on a fiber this parks for the step and
-        ;; gives the carrier up, so (read-line) from a go block no longer stops
-        ;; every other fiber placed on that carrier until input arrives.
-        (jolt-pause-ms step)
-        (loop (min jolt-stdin-poll-step-max (* step 2)))))))
+    (let ((fd (unbox jolt-stdin-poll-fd)))
+      (let loop ((step jolt-stdin-poll-step0))
+        (unless (input-port-ready? in)
+          (set-box! jolt-stdin-waits (+ (unbox jolt-stdin-waits) 1))
+          (cond
+            ((and fd (jolt-current-fiber) (proc-poller-wait-ready fd (jolt-keyword "read")))
+             (void))                            ; woken by readiness: the read sees it
+            ((and fd (not (jolt-current-fiber)))
+             (when (jolt-stdin-poll-wait! fd)
+               (jolt-interrupt-poll-check! "read-line")
+               (loop step)))
+            (else
+             ;; jolt-pause-ms and not (sleep): on a fiber this parks for the step and
+             ;; gives the carrier up, so (read-line) from a go block no longer stops
+             ;; every other fiber placed on that carrier until input arrives.
+             (jolt-pause-ms step)
+             (loop (min jolt-stdin-poll-step-max (* step 2))))))))))
 
 ;; readLine ends a line on \n, on \r, or on \r\n. A \r ends the line at once; the
 ;; \n that may follow is taken then and there when the stream already has it, and

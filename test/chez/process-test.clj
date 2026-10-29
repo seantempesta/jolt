@@ -660,6 +660,36 @@
   (.destroyForcibly (:proc proc))
   (fs/delete-if-exists tickf))
 
+;; The wait must be ONE sleep in the kernel, not a nap that wakes again and again
+;; for as long as nothing comes (an idle Seon root made ~67 context switches a
+;; second at its stdin read). jolt.host/stdin-waits counts the times a read went to
+;; sleep for want of input: a wait that polls grows with the time it waits; one
+;; poll(2) with no timeout is 1 however long it sleeps. A work count, not a time.
+;; While the main thread is there another thread still allocates and a collection
+;; completes, and a line written later is the line read (jolt-p9ua).
+(let [countf (str (fs/create-temp-file {:prefix "jp-waits-" :suffix ".txt"}))
+      gcf    (str (fs/create-temp-file {:prefix "jp-waits-gc-" :suffix ".txt"}))
+      nested (str "(let [line (promise)]"
+                  "  (future (deliver line (read-line)))"
+                  "  (Thread/sleep 600)"
+                  "  (spit \"" countf "\" (str (jolt.host/stdin-waits)))"
+                  "  (dotimes [_ 3] (System/gc))"
+                  "  (spit \"" gcf "\" \"GC\")"
+                  "  (println (str \"got:\" @line)))")
+      proc (process [jolt-bin "-e" nested] {:out :pipe :err :inherit})
+      waits (fn [] (let [s (str/trim (slurp countf))] (when-not (str/blank? s) (parse-long s))))]
+  (loop [n 0] (when (and (< n 400) (str/blank? (slurp gcf))) (Thread/sleep 50) (recur (inc n))))
+  (check-eq "a collection completes while a thread waits on stdin" (slurp gcf) "GC")
+  (check-eq "a wait on stdin sleeps once, however long it waits" (waits) 1)
+  (let [w (java.io.OutputStreamWriter. (:in proc))]
+    (.write w "hello\n")
+    (.flush w)
+    (.close w))
+  (check-eq "and the line written afterwards is the line read"
+            (str/trim (slurp (:out proc))) "got:hello")
+  (fs/delete-if-exists countf)
+  (fs/delete-if-exists gcf))
+
 ;; A child must be interruptible by ^C, on every spawn path. Chez's fork leaves
 ;; SIGINT set to SIG_IGN in the child — the system(3) leak the convention exists
 ;; to avoid, not the convention — so a child spawned the default way could not be
