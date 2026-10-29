@@ -1314,6 +1314,28 @@
           (put-string out ")\n")
           (loop after (fx+ k 1) (cons nm names))))))
 
+;; Init unit: BODIES as the top-level forms of the file PATH (marker table baked in, as
+;; for any unit), so loading the compiled file runs them and keeps nothing of them but what
+;; their results reference. Answers the one launcher call that loads it, in a list like
+;; bld-emit-app-chunks'.
+(define (bld-emit-app-init-unit path ns bodies nses)
+  (let ((o (open-output-string)))
+    (put-string o (string-append ";; init unit: " ns "\n"))
+    (for-each (lambda (s) (put-string o s) (put-string o "\n")) bodies)
+    (bld-write-unit! path (get-output-string o) nses)
+    (list (string-append "jolt-load-init-unit "
+                         (ei-str-lit (string-append (path-last path) ".so"))))))
+
+;; The launcher side: load the compiled init unit NAME from <this executable>.build/ (running
+;; its forms) and drop it. The file stays beside the binary, as the build directory does.
+(define bld-load-init-unit-text
+  (string-append
+    "(define (jolt-load-init-unit name)\n"
+    "  (let ((p (open-file-input-port\n"
+    "           (string-append (or (aot-self-exe) (error 'jolt-load-init-unit \"cannot find this executable\"))\n"
+    "                          \".build/\" name))))\n"
+    "    (dynamic-wind void (lambda () (load-compiled-from-port p)) (lambda () (close-port p)))))\n"))
+
 (define (bld-ns-prelude ns-name src)
   (let ((acc (list (string-append "(set-chez-ns! " (ei-str-lit ns-name) ")")))
         ;; read up to the ns form, not the whole file: it is nearly always first,
@@ -2660,19 +2682,36 @@
                                 (loop (+ i 1) (cdr gs)
                                       (cons (string-append builddir "/app-" (number->string i) ".ss") acc)))))
              (post-ss (string-append builddir "/app-post.ss"))
+             ;; Init units (JOLT_INIT_UNITS=1, self-contained link only): each app unit's
+             ;; top-level forms, the whole of its namespace's code, in a file of their own
+             ;; that is compiled but not put in the boot. The launcher loads each one when
+             ;; jolt-app-init! runs and lets it go, so what runs once at start (the forms'
+             ;; own code) is not kept in the boot's static generation, which no collection
+             ;; frees (bld-emit-app-init-units).
+             (init-split? (and split? (not library?) (not (bld-cross?)) (not (bld-signable))
+                               (jolt-embedded-bytes "stub/launcher")
+                               (equal? (getenv "JOLT_INIT_UNITS") "1")))
+             (init-files (map (lambda (f) (string-append builddir "/init-"
+                                                         (substring f (+ (string-length builddir) 5)
+                                                                    (string-length f))))
+                              group-files))
              ;; flat.ss is the app's prologue (natives, embedded resources, roots,
              ;; namespace registration), then one unit per namespace, then the
              ;; init entry + launcher — each compiled, and cached, on its own.
              (app-units (append (list (list flat-ss flat-so 'app))
                                 (map (lambda (f) (list f (string-append f ".so") 'app)) group-files)
                                 (list (list post-ss (string-append post-ss ".so") 'app))))
+             (init-units (if init-split?
+                             (map (lambda (f) (list f (string-append f ".so") 'init)) init-files)
+                             '()))
              (units (cond ((not split?) (list (list flat-ss flat-so 'whole)))
-                          (core-strs (cons (list rt-ss rt-so 'runtime-shaken) app-units))
-                          (else (cons (list rt-ss rt-so 'runtime) app-units)))))
+                          (core-strs (cons (list rt-ss rt-so 'runtime-shaken) (append app-units init-units)))
+                          (else (cons (list rt-ss rt-so 'runtime) (append app-units init-units))))))
         (bld-mkdir-p builddir)
         ;; a unit file left by an earlier build of this output (one with more
         ;; namespaces) is not this build's, and the smokes read every app-N.ss
-        (for-each (lambda (f) (when (and (> (string-length f) 4) (string=? (substring f 0 4) "app-"))
+        (for-each (lambda (f) (when (and (> (string-length f) 5) (or (string=? (substring f 0 4) "app-")
+                                                                      (string=? (substring f 0 5) "init-")))
                                 (guard (e (#t #f)) (delete-file (string-append builddir "/" f)))))
                   (directory-list builddir))
         ;; 3. flat source = runtime + app + launcher. When split, runtime.ss holds
@@ -2750,7 +2789,7 @@
           ;; declarations.
           (put-string out "\n;; === app (declarations; the bodies run at scheme-start) ===\n")
           (let ((names
-                  (let loop ((gs groups) (fs group-files) (acc '()))
+                  (let loop ((gs groups) (fs group-files) (ifs init-files) (acc '()))
                     (if (null? gs)
                         acc
                         ;; a split unit is assembled in memory and written once (bld-write-unit!)
@@ -2759,16 +2798,21 @@
                             (put-string gout (string-append ";; app unit: " (caar gs) "\n")))
                           (let-values (((decls bodies) (bld-defer-app-strs (cdar gs))))
                             (for-each (lambda (s) (put-string gout s) (put-string gout "\n")) decls)
-                            (let ((ns-names (bld-emit-app-chunks gout (bld-unit-tag (caar gs)) bodies)))
+                            (let* ((nses (if tree-shake? (map car ordered) (list (caar gs))))
+                                   (ns-names
+                                     (if init-split?
+                                         (bld-emit-app-init-unit (car ifs) (caar gs) bodies nses)
+                                         (bld-emit-app-chunks gout (bld-unit-tag (caar gs)) bodies))))
                               (when split?
                                 ;; a shaken app is one group holding every namespace
                                 (bld-write-unit! (car fs) (get-output-string gout)
-                                                 (if tree-shake? (map car ordered) (list (caar gs)))))
-                              (loop (cdr gs) (cdr fs) (append acc ns-names)))))))))
+                                                 (if init-split? '() nses)))
+                              (loop (cdr gs) (cdr fs) (cdr ifs) (append acc ns-names)))))))))
             (when split?
               (close-port out)
               (set! out (open-output-file post-ss 'replace))
               (put-string out ";; app init entry + launcher\n"))
+            (when init-split? (put-string out bld-load-init-unit-text))
             (bld-emit-app-init-main out names
                                     (list (bld-startup-profile-form "app namespaces begin"))))
           ;; The launcher runs as Chez's scheme-start (so argv reaches -main —
@@ -3816,7 +3860,7 @@
     (let ((exe (and (pair? misses) (pair? (cdr misses)) (> (bld-build-jobs) 1) (bld-self-exe)))
           (job (lambda (k) (let ((u (car k)))
                              (vector (car u) (cadr u)
-                                     (and vfasl? (string-append (cadr u) ".vfasl"))
+                                     (and vfasl? (not (eq? (caddr u) 'init)) (string-append (cadr u) ".vfasl"))
                                      mode codec)))))
       (when exe
         (for-each (lambda (k) (let ((so (cadr (car k)))) (when (file-exists? so) (delete-file so))))
@@ -4057,15 +4101,17 @@
           (case kind
             ((runtime) (set! rt-key (bld-compile-runtime! src so #t)))
             ((runtime-shaken) (bld-compile-runtime! src so #f))
-            ((app) #f)                  ; together, below
+            ((app init) #f)             ; together, below
             (else
              (bld-prepend-prologue! src)
              (ei-mark! "kernel prologue + hash")
              (bld-chez-compile-file mode src so)
              (ei-mark! "Chez compile-file")))))
       units)
-    (bld-compile-app-units! builddir mode (filter (lambda (u) (eq? (caddr u) 'app)) units)
+    (bld-compile-app-units! builddir mode (filter (lambda (u) (memq (caddr u) '(app init))) units)
                             (not (or (bld-cross?) (bld-vfasl-disabled?))))
+    ;; init units are loaded from their files at start, not put in the boot
+    (set! units (filter (lambda (u) (not (eq? (caddr u) 'init))) units))
     (when petite-only? (set! units (bld-strip-runtime-units units)))
     ;; A compiler-dropped binary (no runtime eval) boots from petite alone —
     ;; scheme.boot is the Chez compiler, ~5 MB of heap and ~1 MB of binary it
