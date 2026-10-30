@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A `jolt.async.remote` end carries a descriptor with a value.** A value put on `:out` with `:jolt.async.remote/fd` in its metadata arrives on the peer's `:in` with the peer's own descriptor for the same file in its metadata (SCM_RIGHTS with the frame's first bytes, in order among the values around it; the frame's length word is flagged). The reader reads with `recvmsg` and closes any descriptor no frame took when it ends. So a process that receives sockets in its messages (a Seon agent: a clone's socket) can be an end instead of reading its socket by hand.
+
 - **`java.util.concurrent.Semaphore`.** The constructor, `acquire`, `acquireUninterruptibly`,
   `tryAcquire` in its four shapes (none, permits, timeout and unit, permits with timeout and
   unit), `release`, `availablePermits`, `drainPermits` and `isFair`, with a count of

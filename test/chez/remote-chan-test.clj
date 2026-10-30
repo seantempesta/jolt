@@ -334,6 +334,29 @@
   (check "a :fiber end sends a 3 MB value through an 8 KB socket to a peer that takes it later: it arrives whole (the :wait path)"
          (= v (take-within 30000 (:in y))))
   (r/close! x) (r/close! y))
+;; a descriptor travels with its value: put on :out with ::r/fd in its metadata, it arrives on the
+;; peer's :in with ::r/fd naming the peer's own descriptor for it, in order among values batched
+;; around it (SCM_RIGHTS with the frame's first bytes), on both pumps
+(doseq [pump [:fiber :thread]]
+  (let [[x fd] (r/remote-pair {:pump pump}) y (r/open fd {:pump pump})
+        [p q] (r/socketpair {})]
+    (a/>!! (:out x) {:i 0})
+    (a/>!! (:out x) (with-meta {:i 1 :op :fd} {::r/fd p}))
+    (a/>!! (:out x) {:i 2})
+    (a/>!! (:out x) (with-meta {:i 3 :op :fd} {::r/fd q}))
+    (let [vs (vec (repeatedly 4 #(take-within 5000 (:in y))))
+          [got-p got-q] (map (comp ::r/fd meta) [(vs 1) (vs 3)])]
+      (check (str "a " pump " end: the values arrive in order") (= [0 1 2 3] (mapv :i vs)) vs)
+      (check (str "a " pump " end: a value sent with a descriptor arrives holding one, the others none")
+             (and (int? got-p) (int? got-q) (nil? (::r/fd (meta (vs 0)))) (nil? (::r/fd (meta (vs 2)))))
+             (mapv meta vs))
+      (check (str "a " pump " end: each descriptor is the peer's own for what was sent (bytes written to it reach its pair)")
+             (and (int? got-p) (int? got-q)
+                  (= 1 (write-bytes! got-p (.getBytes "a"))) (= "a" (String. ^bytes (read-bytes! q 1)))
+                  (= 1 (write-bytes! got-q (.getBytes "b"))) (= "b" (String. ^bytes (read-bytes! p 1))))
+             [got-p got-q])
+      (doseq [f [p q got-p got-q] :when (int? f)] (r/close-fd! f)))
+    (r/close! x) (r/close! y)))
 (check "any other errno is a defect, thrown with it (EBADF, 9)"
        (= {:errno 9} (try (r/write-step 9) nil (catch clojure.lang.ExceptionInfo e (ex-data e)))))
 

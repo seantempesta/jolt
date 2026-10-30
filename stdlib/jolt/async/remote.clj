@@ -27,6 +27,13 @@
 ;;   - Fork: this process's end of the socket is FD_CLOFORK (macOS), so a child forked
 ;;     later (a test child, a clone) never holds it: it cannot read this end's frames,
 ;;     write into its stream, or keep the peer from seeing this process die.
+;;   - A descriptor travels with a value: put a value whose metadata holds ::fd (an
+;;     open descriptor of this process) on :out, and it arrives on the peer's :in with
+;;     ::fd in its metadata naming the peer's own descriptor for the same file
+;;     (SCM_RIGHTS, sent with that value's frame's first bytes, so it keeps its place
+;;     among the values around it). The sender may close its own once the value is put;
+;;     the receiver owns the one it got. A value that carries one must take metadata (a
+;;     map, a vector): its frame is written alone, flagged in its length word.
 ;;   - A raw descriptor (the second value of remote-pair) is inherited by a child that
 ;;     is forked next, or handed to any process with send-fd!; that process calls open.
 ;;
@@ -82,6 +89,8 @@
 (def ^:private FD-CLOFORK (when macos? 2))
 (def ^:private SCM-RIGHTS 1)
 (def ^:private END 0xFFFFFFFF)          ; the length word of an end frame
+(def ^:private CARRIES 0x80000000)      ; a length word's flag: this frame carries one descriptor
+(def ^:private LENGTH 0x7FFFFFFF)       ; a length word's length
 
 ;; ---- the codec seam -----------------------------------------------------------
 
@@ -200,25 +209,59 @@
         (aset st 0 nb) (aset st 1 ncap)))))
 
 (defn- rd-frame
-  "The next whole frame in the buffer: a byte-array, ::end, or nil (not all there)."
+  "The next whole frame in the buffer: a byte-array, [::fd byte-array] for one that carries a
+  descriptor, ::end, or nil (not all there)."
   [^longs st]
   (let [lo (aget st 2) avail (- (aget st 3) lo)]
     (when (>= avail 4)
-      (let [buf (aget st 0) n (ffi/read (+ buf lo) :uint32)]
-        (cond
-          (= n END) (do (aset st 2 (+ lo 4)) ::end)
-          (>= avail (+ 4 n)) (let [b (ffi/read-array (+ buf lo 4) n)] (aset st 2 (+ lo 4 n)) b))))))
+      (let [buf (aget st 0) w (ffi/read (+ buf lo) :uint32)]
+        (if (= w END)
+          (do (aset st 2 (+ lo 4)) ::end)
+          (let [n (bit-and w LENGTH)]
+            (when (>= avail (+ 4 n))
+              (let [b (ffi/read-array (+ buf lo 4) n)]
+                (aset st 2 (+ lo 4 n))
+                (if (zero? (bit-and w CARRIES)) b [::fd b])))))))))
+
+;; the reader's recvmsg: a msghdr over the buffer's free room, and control room for up to
+;; ctl-fds descriptors (they arrive with the first bytes of the frame that carries each)
+(def ^:private ctl-fds 8)
+(def ^:private ctl-room 64)
+
+(defn- received-fds
+  "The descriptors in a recvmsg's control data of len bytes at ctl (each SCM_RIGHTS message's)."
+  [ctl len]
+  (loop [off 0 acc []]
+    (if (> (+ off cmsg-hdr) len)
+      acc
+      (let [clen (if macos? (ffi/read (+ ctl off) :uint32) (ffi/read (+ ctl off) :uint64))
+            acc (if (= SCM-RIGHTS (ffi/read (+ ctl off) :int (- cmsg-hdr 4)))
+                  (into acc (for [i (range (quot (- clen cmsg-hdr) 4))] (ffi/read (+ ctl off) :int (+ cmsg-hdr (* 4 i)))))
+                  acc)
+            step (let [a (if macos? 4 8)] (* a (quot (+ clen (dec a)) a)))]
+        (if (pos? step) (recur (+ off step) acc) acc)))))
 
 (defn- rd-fill!
-  "One recv into the buffer: bytes read (> 0), or :eof (EOF or a terminal error).
-  :thread blocks in recv; :fiber parks on the poller while the socket is empty."
-  [fd ^longs st pump]
+  "One recvmsg into the buffer: bytes read (> 0), or :eof (EOF or a terminal error); a
+  descriptor that came with them joins fds (a volatile vector), oldest first. m is the
+  reader's msghdr and control room. :thread blocks in recvmsg; :fiber parks on the poller
+  while the socket is empty."
+  [fd ^longs st pump m fds]
   (let [lo (aget st 2) avail (- (aget st 3) lo)
         need (if (< avail 4) 4 (let [n (ffi/read (+ (aget st 0) lo) :uint32)] (if (= n END) 4 (+ 4 n))))]
     (when (or (> (+ lo need) (aget st 1)) (= (aget st 3) (aget st 1))) (rd-room! st need))
     (loop []
       (let [hi (aget st 3)
-            [r e] (native/c-recv fd (+ (aget st 0) hi) (- (aget st 1) hi) 0)]
+            iov (+ m 48) ctl (+ m 64)
+            _ (do (ffi/write iov :uint64 (+ (aget st 0) hi) 0) (ffi/write iov :uint64 (- (aget st 1) hi) 8)
+                  (ffi/write m :uint64 0 0) (ffi/write m :uint32 0 8)
+                  (ffi/write m :uint64 iov 16) (if macos? (ffi/write m :int 1 24) (ffi/write m :uint64 1 24))
+                  (ffi/write m :uint64 ctl 32) (if macos? (ffi/write m :uint32 ctl-room 40) (ffi/write m :uint64 ctl-room 40))
+                  (ffi/write m :int 0 (if macos? 44 48)))
+            [r e] (c-recvmsg fd m 0)]
+        (when (pos? r)
+          (let [clen (if macos? (ffi/read m :uint32 40) (ffi/read m :uint64 40))]
+            (when (pos? clen) (vswap! fds into (received-fds ctl clen)))))
         (cond
           (pos? r) (do (aset st 3 (+ hi r)) r)
           (zero? r) :eof
@@ -281,19 +324,55 @@
   (a/close! out))
 
 (defn- reader [{:keys [fd in decode pump close-in?] :as end}]
-  (let [st (rd-new)]
+  (let [st (rd-new)
+        ;; msghdr @0 (48 bytes; 56 on Linux, whose controllen is a size_t), iovec @48, control @64
+        m (let [a (ffi/address (ffi/alloc (+ 64 ctl-room)))] (dotimes [i (+ 64 ctl-room)] (ffi/write a :uint8 0 i)) a)
+        fds (volatile! [])]
     (try
       (loop []
         (let [f (rd-frame st)]
           (cond
             (identical? f ::end) (when close-in? (a/close! in))
+            ;; a frame that carries a descriptor takes the oldest received: it came with the
+            ;; frame's first bytes, so it is here once the frame is whole
+            (vector? f) (let [d (first @fds) v (decode (second f))]
+                          (vswap! fds #(vec (rest %)))
+                          (a/>!! in (vary-meta v assoc ::fd d))
+                          (recur))
             ;; a put to an :in its consumer closed answers false: the value is dropped
             (some? f) (do (a/>!! in (decode f)) (recur))
-            :else (if (= :eof (rd-fill! fd st pump))
+            :else (if (= :eof (rd-fill! fd st pump m fds))
                     (dead! end)       ; a partial frame at EOF is discarded with the peer
                     (recur)))))
       (catch Throwable t (dead! end) (throw t))
-      (finally (ffi/free (aget st 0)) (finish! end)))))
+      (finally (ffi/free (aget st 0)) (ffi/free m)
+               ;; descriptors no frame took are this process's to close
+               (run! close-fd! @fds)
+               (finish! end)))))
+
+(defn- send-with-fd!
+  "Write the n bytes at p as one sendmsg carrying descriptor d (SCM_RIGHTS: it goes with the
+  first byte the kernel takes), the rest as write-all! writes them. Answers true or :dead."
+  [fd p n d pump]
+  (let [m (ffi/alloc (+ 48 16 cmsg-space)) mp (ffi/address m) iov (+ mp 48) ctl (+ iov 16)]
+    (try
+      (dotimes [i (+ 48 16 cmsg-space)] (ffi/write m :uint8 0 i))
+      (ffi/write iov :uint64 p 0) (ffi/write iov :uint64 n 8)
+      (if macos? (ffi/write ctl :uint32 (+ cmsg-hdr 4) 0) (ffi/write ctl :uint64 (+ cmsg-hdr 4) 0))
+      (ffi/write ctl :int native/sol-socket (- cmsg-hdr 8)) (ffi/write ctl :int SCM-RIGHTS (- cmsg-hdr 4))
+      (ffi/write ctl :int d cmsg-hdr)
+      (ffi/write m :uint64 iov 16) (ffi/write m :int 1 24)
+      (ffi/write m :uint64 ctl 32) (if macos? (ffi/write m :uint32 cmsg-space 40) (ffi/write m :uint64 cmsg-space 40))
+      (loop []
+        (let [[r e] (c-sendmsg fd m native/msg-nosignal)]
+          (cond
+            (pos? r) (if (= r n) true (write-all! fd (+ p r) (- n r) pump))
+            (zero? r) :dead
+            :else (case (write-step e)
+                    :retry (recur)
+                    :wait (do (if (= pump :fiber) (poller/wait-ready fd :write) (native/poll-one fd native/pollout -1)) (recur))
+                    :dead :dead))))
+      (finally (ffi/free m)))))
 
 (defn- writer [{:keys [fd out encode pump] :as end}]
   (let [scratch (volatile! [(ffi/address (ffi/alloc start-bytes)) start-bytes])
@@ -304,23 +383,35 @@
                     (let [nc (loop [c cap] (if (< c need) (recur (* 2 c)) c)) np (ffi/address (ffi/alloc nc))]
                       (ffi/copy p np cap) (ffi/free p) (vreset! scratch [np nc]) np))))]
     (try
-      (loop []
-        (let [v (a/<!! out)]
-          (if (nil? v)
+      (loop [held nil]
+        (let [v (or held (a/<!! out))]
+          (cond
             ;; :out closed here: the end frame follows every value put before the close
-            (let [p (room! 4)] (ffi/write p :uint32 END 0) (write-all! fd p 4 pump))
-            ;; this value, then whatever else is already queued, as one write
-            (let [n (loop [v v off 0]
-                      (let [^bytes b (encode v) len (alength b)
-                            p (room! (+ off 4 len))]
-                        (ffi/write p :uint32 len off)
-                        (ffi/write-array (+ p off 4) b 0 len)
-                        (let [off (+ off 4 len)]
-                          (if (< off batch-bytes)
-                            (let [nv (a/poll! out)] (if (some? nv) (recur nv off) off))
-                            off))))]
+            (nil? v) (let [p (room! 4)] (ffi/write p :uint32 END 0) (write-all! fd p 4 pump))
+            ;; a value carrying a descriptor (::fd in its metadata) is a write of its own, the
+            ;; descriptor with its frame's first bytes
+            (::fd (meta v))
+            (let [^bytes b (encode v) len (alength b) p (room! (+ 4 len))]
+              (ffi/write p :uint32 (bit-or CARRIES len) 0)
+              (ffi/write-array (+ p 4) b 0 len)
+              (if (true? (send-with-fd! fd (first @scratch) (+ 4 len) (::fd (meta v)) pump)) (recur nil) (dead! end)))
+            ;; this value, then whatever else is already queued, as one write, up to the next
+            ;; value that carries a descriptor (held for its own)
+            :else
+            (let [[n held] (loop [v v off 0]
+                             (let [^bytes b (encode v) len (alength b)
+                                   p (room! (+ off 4 len))]
+                               (ffi/write p :uint32 len off)
+                               (ffi/write-array (+ p off 4) b 0 len)
+                               (let [off (+ off 4 len)]
+                                 (if (< off batch-bytes)
+                                   (let [nv (a/poll! out)]
+                                     (cond (nil? nv) [off nil]
+                                           (::fd (meta nv)) [off nv]
+                                           :else (recur nv off)))
+                                   [off nil]))))]
               (if (true? (write-all! fd (first @scratch) n pump))
-                (recur)
+                (recur held)
                 (dead! end))))))
       (catch Throwable t (dead! end) (throw t))
       (finally (ffi/free (first @scratch)) (finish! end)))))
