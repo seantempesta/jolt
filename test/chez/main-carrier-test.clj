@@ -113,6 +113,19 @@
                                         (if (zero? pid)
                                           (exit-now (do (kill (getppid) sig) 0))
                                           (and (= :signalled (a/<!! ch)) (= 0 (wait-exit pid))))))))
+                    0)
+          ;; a second call adds its signals to the wake (Seon asks for its interrupt, then its
+          ;; socket's SIGIO); a signal of the first call still wakes after it
+          (check-eq "a second call's signal wakes, and the first call's still does"
+                    (in-child #(let [ch (a/chan 2) sig2 12]
+                                 (on-sig sig (fn [] (a/put! ch :first)))
+                                 (on-sig sig2 (fn [] (a/put! ch :second)))
+                                 (and (jolt.io-poller/wake-on-signals! [sig])
+                                      (jolt.io-poller/wake-on-signals! [sig2])
+                                      (let [pid (fork-alone)]
+                                        (if (zero? pid)
+                                          (exit-now (do (kill (getppid) sig2) (kill (getppid) sig) 0))
+                                          (and (= #{:second :first} (set [(a/<!! ch) (a/<!! ch)])) (= 0 (wait-exit pid))))))))
                     0))
         ;; a wait another thread ends later is never taken for one nothing can end: a future that
         ;; sleeps (a timed wait), then delivers

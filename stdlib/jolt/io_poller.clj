@@ -101,6 +101,13 @@
 (ffi/defcfn c-epoll-ctl "epoll_ctl" [:int :int :int :pointer] :int)
 (ffi/defcfn c-epoll-wait "epoll_wait" [:int :pointer :int :int] :int :blocking)
 (ffi/defcfn c-eventfd "eventfd" [:uint :int] :int)
+;; Linux: a signal as a readable descriptor (wake-on-signals!). The signals must be blocked in
+;; the thread that would take them, so they stay pending for the descriptor to read.
+(ffi/defcfn c-signalfd "signalfd" [:int :pointer :int] :int)
+(ffi/defcfn c-sigemptyset "sigemptyset" [:pointer] :int)
+(ffi/defcfn c-sigaddset "sigaddset" [:pointer :int] :int)
+(ffi/defcfn c-pthread-sigmask "pthread_sigmask" [:int :pointer :pointer] :int)
+(ffi/defcfn c-raise "raise" [:int] :int)
 
 ;; -- fd helpers (the socket layer's syscall surface) ---------------------------
 (defn errno [] (ffi/errno))
@@ -144,6 +151,11 @@
 (def ^:private NOTE-TRIGGER 0x01000000)
 (def ^:private EFD-NONBLOCK 0x800)
 (def ^:private EFD-CLOEXEC 0x80000)
+(def ^:private SFD-NONBLOCK 0x800)
+(def ^:private SFD-CLOEXEC 0x80000)
+(def ^:private SIG-BLOCK 0)         ; <signal.h> on Linux
+(def ^:private SIG-UNBLOCK 1)
+(def ^:private SIGINFO-SIZE 128)    ; struct signalfd_siginfo; ssi_signo is its first u32
 (def ^:private KEVENT-SIZE 32)      ; struct kevent: uptr ident @0, i16 filter @8, u16 flags @10, u32 fflags @12, iptr data @16, ptr udata @24
 (def ^:private EPOLLIN 0x1)
 (def ^:private EPOLLOUT 0x4)
@@ -371,6 +383,37 @@
 ;; failed, which is a different thing from an empty list and poller-loop treats it
 ;; as one: empty means the kernel processed the changelist and reported nothing
 ;; usable, nil means it may never have seen it.
+;; Linux: signals for a main carrier's loop (wake-on-signals!). A signalfd reports only signals
+;; that are pending, so they are blocked in the thread that asked (and in every thread it makes
+;; later); when the descriptor is readable the loop takes each one, unblocks it for an instant
+;; and raises it in this thread, which runs the handler that was registered for it (Chez's, at its
+;; next event check) just as a signal delivered on macOS runs it beside EVFILT_SIGNAL's wake.
+(defn- sigset
+  "A sigset_t holding sigs, for the caller to free."
+  [sigs]
+  (let [set (ffi/alloc 128)]
+    (c-sigemptyset set)
+    (doseq [sig sigs] (c-sigaddset set sig))
+    set))
+
+(defn- sigmask! [how sigs]
+  (let [set (sigset sigs)]
+    (try (c-pthread-sigmask how set ffi/null)
+         (finally (ffi/free set)))))
+
+(defn- redeliver-signals!
+  "Take the signals pending on signalfd fd and deliver each in this thread."
+  [fd]
+  (let [buf (ffi/alloc (* 8 SIGINFO-SIZE))]
+    (try
+      (let [n (c-read fd buf (* 8 SIGINFO-SIZE))]
+        (when (pos? n)
+          (doseq [sig (distinct (for [i (range (quot n SIGINFO-SIZE))] (ffi/read buf :uint (* i SIGINFO-SIZE))))]
+            (sigmask! SIG-UNBLOCK [sig])
+            (c-raise sig)
+            (sigmask! SIG-BLOCK [sig]))))
+      (finally (ffi/free buf)))))
+
 (declare timespec ceil-long)
 (defn- poller-round
   ([kq to-delete] (poller-round kq to-delete nil))
@@ -445,7 +488,8 @@
             (c-epoll-ctl kq EPOLL-DEL fd ffi/null)
             (when (seq filts) (ep-ctl-mask! kq EPOLL-ADD fd filts))))
         (swap! waits inc)
-        (let [evbuf (ffi/alloc (if macos? (* 256 KEVENT-SIZE) (* 256 EPOLL-EVENT-SIZE)))]
+        (let [evbuf (ffi/alloc (if macos? (* 256 KEVENT-SIZE) (* 256 EPOLL-EVENT-SIZE)))
+              sigfd (:sigfd @state)]
           (try
             (let [ts (when (and macos? timeout-ms) (timespec timeout-ms))
                   n (try (if macos? (c-kevent kq (or chbuf ffi/null) nch evbuf 256 (or ts ffi/null))
@@ -483,6 +527,10 @@
                   (loop [i 0 acc []]
                     (if (< i n)
                       (cond
+                        ;; Linux: the descriptor wake-on-signals! made. Its signals are delivered
+                        ;; now, in this thread, and it is no readiness a fiber waits for
+                        (and sigfd (= sigfd (ev-fd evbuf i)))
+                        (do (redeliver-signals! sigfd) (recur (inc i) acc))
                         (ev-error? evbuf i)
                         (do (swap! ev-errors inc) (recur (inc i) acc))
                         ;; a signal a main carrier waits for (wake-on-signals!): its ident is the
@@ -739,13 +787,18 @@
 
 (declare ensure-started!)
 (defn wake-on-signals!
-  "A main carrier's loop also wakes when any of signals sigs arrives (kqueue's EVFILT_SIGNAL,
-  which records a delivery its handler also takes), so a program whose only wake source is a
-  signal (an interrupt from its parent) waits for it instead of being stuck. macOS only;
-  answers false elsewhere (Linux would need a signalfd)."
+  "A main carrier's loop also wakes when any of signals sigs arrives, so a program whose only
+  wake source is a signal (an interrupt from its parent) waits for it instead of being stuck.
+  macOS: kqueue's EVFILT_SIGNAL, which records a delivery its handler also takes. Linux: a
+  signalfd in the epoll set, with the signals blocked in the calling thread (and so in the
+  threads it makes afterwards; a thread that already exists keeps them unblocked, and a
+  delivery there runs the handler without waking the loop): when it is readable the loop
+  raises each signal in its own thread, so the handler runs there. Answers true, or false
+  when the kernel refuses (no signalfd, a signal that cannot be blocked)."
   [sigs]
-  (if-not macos?
-    false
+  (cond
+    poll-backend? false
+    macos?
     (locking pm
       (ensure-started!)
       (let [ch (ffi/alloc (* (count sigs) KEVENT-SIZE))]
@@ -754,13 +807,32 @@
           (c-kevent (:kq @state) ch (count sigs) ffi/null 0 ffi/null)
           (finally (ffi/free ch))))
       (swap! state update :signals (fnil into #{}) sigs)
-      true)))
+      true)
+    :else
+    (locking pm
+      (ensure-started!)
+      (let [all (into (or (:signals @state) #{}) sigs)
+            set (sigset all)]
+        (try
+          (sigmask! SIG-BLOCK sigs)
+          (let [old (:sigfd @state)
+                fd (c-signalfd (or old -1) set (bit-or SFD-NONBLOCK SFD-CLOEXEC))]
+            (cond
+              (neg? fd) (do (sigmask! SIG-UNBLOCK sigs) false)
+              :else (do (when-not old (ep-ctl! (:kq @state) EPOLL-ADD fd :read))
+                        (swap! state assoc :sigfd fd :signals all)
+                        true)))
+          (finally (ffi/free set)))))))
 
 (defn- after-fork!
   "In a forked child: the kqueue is not inherited, so the table starts afresh (the next wait
-  makes a new one); the parent's pipe descriptors are closed."
+  makes a new one); the parent's pipe descriptors are closed, and so is the signalfd, whose
+  signals the child takes by their handlers again until it asks (wake-on-signals!) once more."
   []
   (doseq [fd (:pipe @state)] (c-close fd))
+  (when-let [fd (:sigfd @state)]
+    (c-close fd)
+    (sigmask! SIG-UNBLOCK (:signals @state)))
   (vreset! main-deletes #{})
   (reset! state {:fds {} :pending {} :pipe nil :kq nil :started? false :cancelled #{} :threads {}}))
 
