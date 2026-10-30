@@ -939,6 +939,31 @@
             [(count err) (str/includes? err "Broken pipe")])
           [100000 false])
 
+;; A child's exit is a value on a channel (jolt.io-poller/exit-chan: kqueue's NOTE_EXIT on
+;; macOS, a pidfd in epoll on Linux), beside the readiness of a descriptor, so one alts! waits
+;; on both. The pid is not reaped by it; a pid already gone is answered at once.
+(require '[clojure.core.async :as a] '[jolt.async.remote :as remote] '[jolt.ffi :as ffi]
+         '[jolt.socket.native :as native])
+(let [pr (.start (java.lang.ProcessBuilder. ["sh" "-c" "sleep 0.5"]))
+      pid (.pid pr)
+      ex (jolt.io-poller/exit-chan pid)
+      [x y] (remote/socketpair)
+      ready (jolt.io-poller/ready-chan x :read)
+      b (ffi/alloc 1)]
+  (ffi/write b :uint8 65)
+  (native/c-send y b 1 native/msg-nosignal)
+  (let [[v1 p1] (a/alts!! [ready ex (a/timeout 5000)])
+        t0 (System/nanoTime)
+        [v2 p2] (a/alts!! [ex (a/timeout 5000)])]
+    (check-eq "an alts! over a descriptor's input and a child's exit takes the input first"
+              [(= p1 ready) v1] [true x])
+    (check-eq "then the exit, as the child's pid" [(= p2 ex) v2] [true pid])
+    (check-eq "the channel closes after the exit" (a/<!! ex) nil)
+    (check-eq "the pid was not reaped: waitFor still answers the exit" (.waitFor pr) 0)
+    (check-eq "a pid already gone is answered at once"
+              (first (a/alts!! [(jolt.io-poller/exit-chan pid) (a/timeout 5000)])) pid))
+  (remote/close-fd! x) (remote/close-fd! y) (ffi/free b))
+
 (if (empty? @failures)
   (println "PROCESS-TEST OK")
   (do (doseq [f @failures] (println "FAIL:" f))

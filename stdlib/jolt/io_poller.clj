@@ -49,6 +49,8 @@
 (ns jolt.io-poller
   (:require [jolt.ffi :as ffi]
             [jolt.socket.native :as native]
+            [clojure.core.async :as a]
+            [jolt.fibers]
             [clojure.string :as str]))
 
 (ffi/load-library)
@@ -101,6 +103,9 @@
 (ffi/defcfn c-epoll-ctl "epoll_ctl" [:int :int :int :pointer] :int)
 (ffi/defcfn c-epoll-wait "epoll_wait" [:int :pointer :int :int] :int :blocking)
 (ffi/defcfn c-eventfd "eventfd" [:uint :int] :int)
+;; Linux: a process's exit as a readable descriptor (exit-chan); syscall because older glibc has
+;; no pidfd_open wrapper
+(ffi/defcfn c-syscall "syscall" [:long :varargs :long :long] :long)
 ;; Linux: a signal as a readable descriptor (wake-on-signals!). The signals must be blocked in
 ;; the thread that would take them, so they stay pending for the descriptor to read.
 (ffi/defcfn c-signalfd "signalfd" [:int :pointer :int] :int)
@@ -151,6 +156,11 @@
 (def ^:private NOTE-TRIGGER 0x01000000)
 (def ^:private EFD-NONBLOCK 0x800)
 (def ^:private EFD-CLOEXEC 0x80000)
+(def ^:private SYS-PIDFD-OPEN 434)  ; the same number on x86_64 and arm64
+(def ^:private EVFILT-PROC -5)
+(def ^:private EV-ONESHOT 0x10)
+(def ^:private NOTE-EXIT 0x80000000)
+(def ^:private ESRCH 3)
 (def ^:private SFD-NONBLOCK 0x800)
 (def ^:private SFD-CLOEXEC 0x80000)
 (def ^:private SIG-BLOCK 0)         ; <signal.h> on Linux
@@ -1107,3 +1117,57 @@
      (<= (remaining-ms deadline) 0) :timeout
      (jolt.host/fiber?) (wait-fiber-until fd filt deadline)
      :else (wait-thread fd filt deadline))))
+
+
+;; -- a process's exit, and readiness, as values on channels --------------------------
+;; The same wait a fiber makes with wait-ready, for a caller that waits on several things with
+;; alts!: a child's exit beside its pipe's input. The platform's difference is in exit-watch.
+
+(defn- exit-watch
+  "A descriptor that is readable once process pid has exited (macOS: a kqueue holding
+  EVFILT_PROC/NOTE_EXIT; Linux: a pidfd), or :gone when pid has exited and is not waiting to be
+  reaped or never was. Throws when the kernel refuses for another reason."
+  [pid]
+  (if macos?
+    (let [kq (c-kqueue)
+          ch (ffi/alloc KEVENT-SIZE)]
+      (try
+        (kevent-put! ch 0 pid EVFILT-PROC (bit-or EV-ADD EV-ONESHOT) NOTE-EXIT)
+        (if (neg? (c-kevent kq ch 1 ffi/null 0 ffi/null))
+          (let [e (errno)]
+            (c-close kq)
+            (if (= e ESRCH) :gone (throw (ex-info "jolt.io-poller/exit-chan: kevent refused the watch" {:pid pid :errno e}))))
+          kq)
+        (finally (ffi/free ch))))
+    (let [fd (c-syscall SYS-PIDFD-OPEN pid 0)]
+      (if (neg? fd)
+        (let [e (errno)]
+          (if (= e ESRCH) :gone (throw (ex-info "jolt.io-poller/exit-chan: pidfd_open refused the watch" {:pid pid :errno e}))))
+        fd))))
+
+(defn ready-chan
+  "A channel that gets fd once fd is ready for filt (:read or :write), then closes: wait-ready
+  as a value, for alts!. The wait is a fiber's, parked on the poller. A channel nobody takes
+  leaves its fiber parked until fd is ready or its owner calls forget!/cancel! on it."
+  [fd filt]
+  (let [ch (a/chan 1)]
+    (jolt.fibers/spawn (fn [] (wait-ready fd filt) (a/>!! ch fd) (a/close! ch)))
+    ch))
+
+(defn- put-exit! [ch pid close?]
+  (a/>!! ch pid)
+  (when close? (a/close! ch)))
+
+(defn exit-chan
+  "A channel that gets pid once process pid has exited, then closes; with ch given, pid is put on
+  ch instead and ch stays open (one channel for the exits of many children). pid is not reaped:
+  the caller waitpids exactly that pid. A pid that is gone already is answered at once. macOS's
+  kqueue NOTE_EXIT and Linux's pidfd are one wait on the poller, beside any other readiness."
+  ([pid] (exit-chan pid (a/chan 1) true))
+  ([pid ch] (exit-chan pid ch false))
+  ([pid ch close?]
+   (let [w (exit-watch pid)]
+     (if (= w :gone)
+       (put-exit! ch pid close?)
+       (jolt.fibers/spawn (fn [] (wait-ready w :read) (forget! w) (c-close w) (put-exit! ch pid close?))))
+     ch)))

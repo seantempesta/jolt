@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`jolt.io-poller/exit-chan` and `ready-chan`: a process's exit and a descriptor's readiness as values on channels.** `(exit-chan pid)` gets `pid` once that process has exited (kqueue `NOTE_EXIT` on macOS, a pidfd in epoll on Linux; a pid already gone is answered at once, and it is not reaped), `(ready-chan fd :read)` gets `fd` once it is ready, so one `alts!` waits on both. A caller that waited with a platform's own native wait (kqueue in C) takes the same on either.
+
 - **`jolt.io-poller/wake-on-signals!` works on Linux.** A main carrier's loop wakes on the signals asked through a signalfd in its epoll set (the signals are blocked in the calling thread, and the loop raises each in its own thread so the registered handler runs there), as on macOS through kqueue's `EVFILT_SIGNAL`. It answered `false` on Linux.
 
 - **A forked child closes the `jolt.async.remote` ends it inherited, on Linux.** macOS marks an end's descriptor `FD_CLOFORK`; Linux has no such flag, so a child forked later (a test child, a clone) held its parent's socket, read its frames and kept the peer from seeing the parent die. `jolt.host/after-fork-add!` registers a function that `after-fork-child!` runs last; `jolt.async.remote` registers one that closes every end (and `clofork!` descriptor) the child inherited. The reader's and `send-with-fd!`'s msghdr put the iovec past Linux's 56-byte struct (it overlapped the flags word, so every `recvmsg` answered EFAULT).
