@@ -2658,6 +2658,73 @@
 ;; :top [{:type :count :bytes :gens}]} with the N types holding the most collectable bytes.
 (def-var! "jolt.host" "heap-histogram" (lambda (n) (jolt-heap-histogram n)))
 (def-var! "jolt.host" "gc-trip-bytes" (lambda () (sa-gc-trip-bytes)))
+;; --- the host, as the platform answers it ---------------------------------------------------------
+;; What differs between macOS and Linux lives here, behind one name each; a program that asks the
+;; host never branches on the platform itself.
+
+;; jolt.host/process-footprint-bytes: this process's memory as the platform CHARGES it, one call
+;; and no walk of the address space. macOS: task_info(TASK_VM_INFO)'s phys_footprint (what Activity
+;; Monitor and jetsam charge: private dirty pages, compressed ones included, never a page it only
+;; shares copy-on-write). Linux: the proportional set size of /proc/self/smaps_rollup (every page
+;; the process maps, a shared page divided among the processes mapping it). Both are per process:
+;; a forked child is charged what it touches, and its parent keeps its own. #f when the platform
+;; refuses (task_info's failure; no /proc).
+(define jolt-mach-task-self (and (eq? (sa-os-family) 'macos) (jolt-foreign-proc-safe "mach_task_self" '() 'unsigned-32)))
+(define jolt-task-info (and (eq? (sa-os-family) 'macos) (jolt-foreign-proc-safe "task_info" '(unsigned-32 int void* void*) 'int)))
+(define (jolt-process-footprint-bytes)
+  (case (sa-os-family)
+    ((macos)
+     (and jolt-task-info jolt-mach-task-self
+          (let ((buf (foreign-alloc 1024)) (cnt (foreign-alloc 4)))
+            (foreign-set! 'unsigned-32 cnt 0 256)
+            (let ((kr (jolt-task-info (jolt-mach-task-self) 22 buf cnt)))   ; TASK_VM_INFO
+              (let ((r (and (= kr 0) (>= (foreign-ref 'unsigned-32 cnt 0) 37)   ; REV1: phys_footprint @144
+                            (foreign-ref 'unsigned-64 buf 144))))
+                (foreign-free buf) (foreign-free cnt)
+                r)))))
+    ((linux)
+     (guard (e (#t #f))
+       (call-with-port (open-input-file "/proc/self/smaps_rollup")
+         (lambda (in)
+           (let loop ()
+             (let ((line (get-line in)))
+               (cond ((eof-object? line) #f)
+                     ((and (> (string-length line) 4) (string=? (substring line 0 4) "Pss:"))
+                      (let ((kb (string->number (let skip ((i 4)) (if (char=? (string-ref line i) #\space) (skip (+ i 1))
+                                                                       (let take ((j i)) (if (char-numeric? (string-ref line j)) (take (+ j 1)) (substring line i j))))))))
+                        (and kb (* kb 1024))))
+                     (else (loop)))))))))
+    (else #f)))
+(def-var! "jolt.host" "process-footprint-bytes" (lambda () (or (jolt-process-footprint-bytes) jolt-nil)))
+
+;; jolt.host/signal-number: a signal's number on this platform, by its name without the SIG
+;; ("USR1"), or nil when the platform has no such signal (INFO, Linux). The numbers differ
+;; between macOS and Linux for USR1, USR2, CHLD, STOP, TSTP, CONT and IO.
+(define jolt-signal-numbers
+  '(("HUP" 1 1) ("INT" 2 2) ("QUIT" 3 3) ("KILL" 9 9) ("PIPE" 13 13) ("ALRM" 14 14) ("TERM" 15 15)
+    ("WINCH" 28 28) ("USR1" 30 10) ("USR2" 31 12) ("CHLD" 20 17) ("IO" 23 29) ("INFO" 29 #f)
+    ("STOP" 17 19) ("TSTP" 18 20) ("CONT" 19 18)))
+(def-var! "jolt.host" "signal-number"
+  (lambda (name)
+    (let ((e (assoc name jolt-signal-numbers)))
+      (or (and e (if (eq? (sa-os-family) 'macos) (cadr e) (caddr e))) jolt-nil))))
+
+;; jolt.host/monotonic-ns and thread-cpu-ns: the clocks a profiler reads, by name. The monotonic
+;; clock is the one that does not count time asleep and is not set (macOS CLOCK_UPTIME_RAW,
+;; Linux CLOCK_MONOTONIC_RAW); thread-cpu-ns is the calling thread's CPU time (CLOCK_THREAD_CPUTIME_ID).
+;; Scheme code calls jolt-monotonic-ns and jolt-thread-cpu-ns directly.
+(define jolt-clock-nsec-np (and (eq? (sa-os-family) 'macos) (jolt-foreign-proc-safe "clock_gettime_nsec_np" '(int) 'unsigned-64)))
+(define jolt-clock-gettime (and (not (eq? (sa-os-family) 'macos)) (jolt-foreign-proc-safe "clock_gettime" '(int u8*) 'int)))
+(define (jolt-clock-ns macos-id linux-id)
+  (if jolt-clock-nsec-np
+      (jolt-clock-nsec-np macos-id)
+      (let ((bv (make-bytevector 16)))
+        (jolt-clock-gettime linux-id bv)
+        (+ (* 1000000000 (bytevector-u64-native-ref bv 0)) (bytevector-u64-native-ref bv 8)))))
+(define (jolt-monotonic-ns) (jolt-clock-ns 8 4))
+(define (jolt-thread-cpu-ns) (jolt-clock-ns 16 3))
+(def-var! "jolt.host" "monotonic-ns" (lambda () (jolt-monotonic-ns)))
+(def-var! "jolt.host" "thread-cpu-ns" (lambda () (jolt-thread-cpu-ns)))
 ;; and how far the older generations may grow past the live set before they are
 ;; collected (rt.ss gc-collect-old-when-grown!): the rest of that bound.
 (def-var! "jolt.host" "gc-old-growth-bytes" (lambda () (gc-old-growth-bytes)))

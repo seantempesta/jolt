@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`jolt.host` answers the platform's differences by name.** `process-footprint-bytes` is this process's memory as the platform charges it (macOS `phys_footprint` from `task_info`; Linux the proportional set size of `/proc/self/smaps_rollup`), `signal-number` a signal's number from its name (`"USR1"` is 30 on macOS, 10 on Linux; nil where the platform has none), and `monotonic-ns` and `thread-cpu-ns` the monotonic and calling-thread CPU clocks (Scheme code calls `jolt-monotonic-ns` and `jolt-thread-cpu-ns`).
+
 - **`jolt.io-poller/exit-chan` and `ready-chan`: a process's exit and a descriptor's readiness as values on channels.** `(exit-chan pid)` gets `pid` once that process has exited (kqueue `NOTE_EXIT` on macOS, a pidfd in epoll on Linux; a pid already gone is answered at once, and it is not reaped), `(ready-chan fd :read)` gets `fd` once it is ready, so one `alts!` waits on both. A caller that waited with a platform's own native wait (kqueue in C) takes the same on either.
 
 - **`jolt.io-poller/wake-on-signals!` works on Linux.** A main carrier's loop wakes on the signals asked through a signalfd in its epoll set (the signals are blocked in the calling thread, and the loop raises each in its own thread so the registered handler runs there), as on macOS through kqueue's `EVFILT_SIGNAL`. It answered `false` on Linux.

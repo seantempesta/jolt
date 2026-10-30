@@ -964,6 +964,30 @@
               (first (a/alts!! [(jolt.io-poller/exit-chan pid) (a/timeout 5000)])) pid))
   (remote/close-fd! x) (remote/close-fd! y) (ffi/free b))
 
+;; The host answers what differs by platform (rt.ss, jolt.host): this process's memory as the
+;; platform charges it (macOS phys_footprint, Linux the proportional set of smaps_rollup), signal
+;; numbers by name, and the monotonic and thread-CPU clocks.
+(let [fp0 (jolt.host/process-footprint-bytes)
+      big (byte-array 200000000)
+      _ (java.util.Arrays/fill big (byte 1))
+      fp1 (jolt.host/process-footprint-bytes)]
+  (check-eq "the footprint is bytes in a believable range" (and (integer? fp0) (< 1000000 fp0 68719476736)) true)
+  (check-eq "a touched 200 MB array shows in the footprint (at least 150 MB)" (>= (- fp1 fp0) 150000000) true)
+  (check-eq "the array is still live" (aget big 0) 1))
+(check-eq "signal numbers agree with the platform's own kill -l"
+          (for [n ["HUP" "INT" "USR1" "USR2" "CHLD" "IO"]]
+            (str/trim (:out (sh ["sh" "-c" (str "kill -l " (jolt.host/signal-number n))] {:out :string}))))
+          ["HUP" "INT" "USR1" "USR2" "CHLD" "IO"])
+(check-eq "INFO is a signal on macOS only"
+          (jolt.host/signal-number "INFO") (when (str/starts-with? (System/getProperty "os.name") "Mac") 29))
+(check-eq "an unknown signal name has no number" (jolt.host/signal-number "NOPE") nil)
+(let [m0 (jolt.host/monotonic-ns) _ (Thread/sleep 100) m1 (jolt.host/monotonic-ns)
+      c0 (jolt.host/thread-cpu-ns) _ (Thread/sleep 100) c1 (jolt.host/thread-cpu-ns)
+      c2 (jolt.host/thread-cpu-ns) _ (loop [i 0 a 0] (if (< i 30000000) (recur (inc i) (+ a i)) a)) c3 (jolt.host/thread-cpu-ns)]
+  (check-eq "the monotonic clock counts a 100 ms sleep" (>= (- m1 m0) 90000000) true)
+  (check-eq "the thread's CPU clock does not count a sleep" (< (- c1 c0) 50000000) true)
+  (check-eq "the thread's CPU clock counts work" (> (- c3 c2) 0) true))
+
 (if (empty? @failures)
   (println "PROCESS-TEST OK")
   (do (doseq [f @failures] (println "FAIL:" f))

@@ -11,6 +11,7 @@ add-immutable-roots!
 add-reader-features!
 add-shutdown-hook
 after-fork-add!
+after-fork-add!
 agent-threads-daemon!
 allow-unresolved-vars?
 aot-compile-worker
@@ -183,6 +184,8 @@ make-thread-local
 map-entry
 mark-spliced!
 maximum-memory-bytes
+monotonic-ns
+process-footprint-bytes
 reset-maximum-memory-bytes!
 heap-histogram
 gc-trip-bytes
@@ -240,6 +243,7 @@ set-static-field!
 set-var!
 sh
 sh-out
+signal-number
 slice
 sorted-seq
 sorted-seq-from
@@ -251,6 +255,7 @@ stop-main-pump
 symlink?
 table?
 tagged-table
+thread-cpu-ns
 thread-id
 throwable
 timer-at!
