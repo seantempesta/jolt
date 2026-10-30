@@ -139,7 +139,8 @@
 (defn close-fd! "Close a raw descriptor (one handed on to another process)." [fd] (first (native/c-close fd)))
 
 ;; struct msghdr (LP64): name @0, namelen @8, iov @16, iovlen @24, control @32,
-;; controllen @40, flags @44 (48 bytes); iovec: base @0, len @8; one cmsghdr with one
+;; controllen @40, flags @44 (48 bytes; on Linux iovlen and controllen are size_t, flags is  and the
+;; struct is 56 bytes, so the iovec that follows it starts at 56 on both); iovec: base @0, len @8; one cmsghdr with one
 ;; int: len @0, level @4, type @8, fd @12 (CMSG_SPACE(4) = 16 on both platforms'
 ;; LP64 ABIs: darwin aligns to 4, glibc to 8 with a 16-byte header — see cmsg-*).
 (def ^:private cmsg-hdr (if macos? 12 16))
@@ -252,7 +253,7 @@
     (when (or (> (+ lo need) (aget st 1)) (= (aget st 3) (aget st 1))) (rd-room! st need))
     (loop []
       (let [hi (aget st 3)
-            iov (+ m 48) ctl (+ m 64)
+            iov (+ m 56) ctl (+ m 72)
             _ (do (ffi/write iov :uint64 (+ (aget st 0) hi) 0) (ffi/write iov :uint64 (- (aget st 1) hi) 8)
                   (ffi/write m :uint64 0 0) (ffi/write m :uint32 0 8)
                   (ffi/write m :uint64 iov 16) (if macos? (ffi/write m :int 1 24) (ffi/write m :uint64 1 24))
@@ -325,8 +326,9 @@
 
 (defn- reader [{:keys [fd in decode pump close-in?] :as end}]
   (let [st (rd-new)
-        ;; msghdr @0 (48 bytes; 56 on Linux, whose controllen is a size_t), iovec @48, control @64
-        m (let [a (ffi/address (ffi/alloc (+ 64 ctl-room)))] (dotimes [i (+ 64 ctl-room)] (ffi/write a :uint8 0 i)) a)
+        ;; msghdr @0 (48 bytes; 56 on Linux, whose controllen is a size_t and which has a flags word
+        ;; at 48 to match), iovec @56, control @72: past the larger msghdr on both
+        m (let [a (ffi/address (ffi/alloc (+ 72 ctl-room)))] (dotimes [i (+ 72 ctl-room)] (ffi/write a :uint8 0 i)) a)
         fds (volatile! [])]
     (try
       (loop []
@@ -354,9 +356,9 @@
   "Write the n bytes at p as one sendmsg carrying descriptor d (SCM_RIGHTS: it goes with the
   first byte the kernel takes), the rest as write-all! writes them. Answers true or :dead."
   [fd p n d pump]
-  (let [m (ffi/alloc (+ 48 16 cmsg-space)) mp (ffi/address m) iov (+ mp 48) ctl (+ iov 16)]
+  (let [m (ffi/alloc (+ 56 16 cmsg-space)) mp (ffi/address m) iov (+ mp 56) ctl (+ iov 16)]
     (try
-      (dotimes [i (+ 48 16 cmsg-space)] (ffi/write m :uint8 0 i))
+      (dotimes [i (+ 56 16 cmsg-space)] (ffi/write m :uint8 0 i))
       (ffi/write iov :uint64 p 0) (ffi/write iov :uint64 n 8)
       (if macos? (ffi/write ctl :uint32 (+ cmsg-hdr 4) 0) (ffi/write ctl :uint64 (+ cmsg-hdr 4) 0))
       (ffi/write ctl :int native/sol-socket (- cmsg-hdr 8)) (ffi/write ctl :int SCM-RIGHTS (- cmsg-hdr 4))
