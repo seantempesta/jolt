@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A forked child closes the `jolt.async.remote` ends it inherited, on Linux.** macOS marks an end's descriptor `FD_CLOFORK`; Linux has no such flag, so a child forked later (a test child, a clone) held its parent's socket, read its frames and kept the peer from seeing the parent die. `jolt.host/after-fork-add!` registers a function that `after-fork-child!` runs last; `jolt.async.remote` registers one that closes every end (and `clofork!` descriptor) the child inherited. The reader's and `send-with-fd!`'s msghdr put the iovec past Linux's 56-byte struct (it overlapped the flags word, so every `recvmsg` answered EFAULT).
+
 - **A `jolt.async.remote` end carries a descriptor with a value.** A value put on `:out` with `:jolt.async.remote/fd` in its metadata arrives on the peer's `:in` with the peer's own descriptor for the same file in its metadata (SCM_RIGHTS with the frame's first bytes, in order among the values around it; the frame's length word is flagged). The reader reads with `recvmsg` and closes any descriptor no frame took when it ends. So a process that receives sockets in its messages (a Seon agent: a clone's socket) can be an end instead of reading its socket by hand.
 
 - **`java.util.concurrent.Semaphore`.** The constructor, `acquire`, `acquireUninterruptibly`,

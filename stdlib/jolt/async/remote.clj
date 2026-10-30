@@ -24,9 +24,11 @@
 ;;   - alts!: both halves are local channels, so alts! is the runtime's own. The limit
 ;;     is stated plainly: a put to :out commits when the value enters :out's buffer,
 ;;     not when the peer takes it. There is no two-phase protocol across processes.
-;;   - Fork: this process's end of the socket is FD_CLOFORK (macOS), so a child forked
-;;     later (a test child, a clone) never holds it: it cannot read this end's frames,
-;;     write into its stream, or keep the peer from seeing this process die.
+;;   - Fork: this process's end of the socket is not held by a child forked later (a test
+;;     child, a clone): it cannot read this end's frames, write into its stream, or keep the
+;;     peer from seeing this process die. macOS marks the descriptor FD_CLOFORK; Linux has no
+;;     such flag, so the child's jolt.host/after-fork-child! closes every end it inherited
+;;     (clofork! registers the descriptor for it).
 ;;   - A descriptor travels with a value: put a value whose metadata holds ::fd (an
 ;;     open descriptor of this process) on :out, and it arrives on the peer's :in with
 ;;     ::fd in its metadata naming the peer's own descriptor for the same file
@@ -84,8 +86,8 @@
 (def ^:private F-GETFL 3)
 (def ^:private F-SETFL 4)
 (def ^:private O-NONBLOCK (if macos? 0x4 0x800))
-;; macOS's close-on-fork. Linux has no such flag: there a child must close the
-;; descriptors it inherited itself (forget! below).
+;; macOS's close-on-fork. Linux has no such flag: there the child closes the descriptors it
+;; inherited itself, in jolt.host/after-fork-child! (close-held! below).
 (def ^:private FD-CLOFORK (when macos? 2))
 (def ^:private SCM-RIGHTS 1)
 (def ^:private END 0xFFFFFFFF)          ; the length word of an end frame
@@ -103,16 +105,26 @@
 
 (defn- fcntl [fd cmd arg] (first (native/c-fcntl fd cmd arg)))
 
+(def ^:private held
+  "Where there is no FD_CLOFORK: the descriptors marked close-on-fork, which a forked child
+  closes (close-held!). Until close-fd! or the end's finish! closes one."
+  (atom #{}))
+
 (defn clofork!
-  "Mark fd close-on-fork: no child forked from now on inherits it. Answers fd."
+  "Mark fd close-on-fork: no child forked from now on holds it (macOS: the flag; Linux: the
+  child's after-fork-child! closes it, until this process closes fd with close-fd!).
+  Answers fd."
   [fd]
-  (when FD-CLOFORK (fcntl fd F-SETFD (bit-or FD-CLOFORK (fcntl fd F-GETFD 0))))
+  (if FD-CLOFORK
+    (fcntl fd F-SETFD (bit-or FD-CLOFORK (fcntl fd F-GETFD 0)))
+    (swap! held conj fd))
   fd)
 
 (defn clofork?
-  "Is fd close-on-fork? (nil where the platform has no such flag.)"
+  "Is fd close-on-fork in this process? (In a child forked on Linux the inherited ends are
+  closed, so it answers false for them there.)"
   [fd]
-  (when FD-CLOFORK (pos? (bit-and FD-CLOFORK (fcntl fd F-GETFD 0)))))
+  (if FD-CLOFORK (pos? (bit-and FD-CLOFORK (fcntl fd F-GETFD 0))) (contains? @held fd)))
 
 (defn- set-int-opt! [fd opt v]
   (let [b (ffi/alloc 4)]
@@ -136,7 +148,18 @@
            fds))
        (finally (ffi/free sv))))))
 
-(defn close-fd! "Close a raw descriptor (one handed on to another process)." [fd] (first (native/c-close fd)))
+(defn close-fd! "Close a raw descriptor (one handed on to another process)." [fd]
+  (swap! held disj fd)
+  (first (native/c-close fd)))
+
+(defn- close-held!
+  "In a forked child: close every end this process held (Linux, which has no FD_CLOFORK), so the
+  child holds none of its parent's sockets. The end's pumps are the parent's threads: gone."
+  []
+  (let [fds @held]
+    (reset! held #{})
+    (doseq [fd fds] (native/c-close fd))))
+(when-not FD-CLOFORK (jolt.host/after-fork-add! close-held!))
 
 ;; struct msghdr (LP64): name @0, namelen @8, iov @16, iovlen @24, control @32,
 ;; controllen @40, flags @44 (48 bytes; on Linux iovlen and controllen are size_t, flags is  and the

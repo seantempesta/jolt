@@ -89,6 +89,8 @@
    :fork-a (fn [[fd rep-fd]]
              (let [c (r/open fd)]
                (when (zero? (qfork))
+                 ;; a forked child's runtime hook: on Linux it closes the ends it inherited
+                 (jolt.host/after-fork-child!)
                  (write-bytes! rep-fd (frame-bytes {:fd-flags (c-fcntl (:fd c) 1 0)}))
                  (Thread/sleep 3000)
                  (c-exit 0))

@@ -10,6 +10,7 @@
 add-immutable-roots!
 add-reader-features!
 add-shutdown-hook
+after-fork-add!
 agent-threads-daemon!
 allow-unresolved-vars?
 aot-compile-worker

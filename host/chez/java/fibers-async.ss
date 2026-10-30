@@ -549,6 +549,7 @@
 ;; one held at the fork by a thread the fork did not copy is held by nobody here.
 ;; Pools made with jolt-fiber-pool-make are not restarted: their carriers are gone
 ;; too, and a spawn onto one parks; a forking program makes them after the fork.
+(define jolt-after-fork-hooks '())   ; jolt.host/after-fork-add!: (thunk ...), newest first
 (define (jolt-after-fork-child!)
   ;; the process's locks are made afresh before anything here takes one (locks.ss,
   ;; define-process-local): a thread fork(2) did not copy may hold one at the fork instant without
@@ -610,8 +611,15 @@
     ;; the poller's kqueue and thread are not inherited by fork: its table starts afresh, and
     ;; the child's first wait sets it up for the child (a thread, or a main carrier's rounds).
     ;; Without it, every child of a process whose poller had run waited on a dead kqueue
-    (when jolt-io-after-fork (jolt-io-after-fork))))
+    (when jolt-io-after-fork (jolt-io-after-fork))
+    ;; then the hooks a library registered for what it holds across a fork (jolt.async.remote
+    ;; closes the ends it inherited), oldest first
+    (for-each (lambda (h) (h)) (reverse jolt-after-fork-hooks))))
 (def-var! "jolt.host" "after-fork-child!" (lambda () (jolt-after-fork-child!) jolt-nil))
+;; (jolt.host/after-fork-add! f): f, a fn of no arguments, runs in every forked child that calls
+;; after-fork-child!, after the runtime has reset itself. For a library's own state across a fork
+(def-var! "jolt.host" "after-fork-add!"
+  (lambda (f) (set! jolt-after-fork-hooks (cons (lambda () (jolt-invoke f)) jolt-after-fork-hooks)) jolt-nil))
 
 ;; The main carrier (fibers.ss): this process's fibers, timers and I/O on its one thread.
 (def-var! "jolt.host" "main-carrier-run!" (lambda (f) (jolt-main-carrier-run! (lambda () (jolt-invoke f)))))
