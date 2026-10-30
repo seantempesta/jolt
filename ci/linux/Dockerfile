@@ -8,4 +8,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential git ca-certificates file xxd perl rsync procps psmisc \
       liblz4-dev zlib1g-dev libncurses-dev uuid-dev \
     && rm -rf /var/lib/apt/lists/*
+# Not root: root ignores file permissions, which several gates (io-file-perms, read-only
+# directories) assert. The directories are made here so the named volumes mounted on them
+# start owned by this user.
+ENV LC_ALL=C.UTF-8
+RUN useradd -m -u 1000 jolt && mkdir /opt/chez /work && chown jolt /opt/chez /work
+USER jolt
 WORKDIR /work
