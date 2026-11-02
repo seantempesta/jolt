@@ -137,6 +137,14 @@
 ;; jolt.loader binds it while evaluating a context's source, so `require` and
 ;; its kin carry the loader that owns the code, whoever calls the fn later.
 ;; Its cell found once, as *unchecked-math*'s above.
+(define resolve-unresolved-cell #f)
+;; jolt.host/*resolve-unresolved* read at compile time: a REPL's fallback for a
+;; symbol nothing resolves (jolt.analyzer/resolve-fallback). nil by default.
+(define (hc-unresolved-resolver)
+  (unless resolve-unresolved-cell (set! resolve-unresolved-cell (jolt-var "jolt.host" "*resolve-unresolved*")))
+  (let ((f (var-cell-deref resolve-unresolved-cell)))
+    (if (or (not f) (jolt-nil? f)) #f f)))
+
 (define invoke-rewrite-cell #f)
 (define (hc-invoke-rewriter)
   (unless invoke-rewrite-cell (set! invoke-rewrite-cell (jolt-var "jolt.host" "*invoke-rewrite*")))
@@ -1227,6 +1235,8 @@
   (def-var! "jolt.host" "allow-unresolved-vars?" hc-allow-unresolved-vars?)
   (def-dynvar! "jolt.host" "*invoke-rewrite*" jolt-nil)
   (def-var! "jolt.host" "invoke-rewriter" hc-invoke-rewriter)
+  (def-dynvar! "jolt.host" "*resolve-unresolved*" jolt-nil)
+  (def-var! "jolt.host" "unresolved-resolver" hc-unresolved-resolver)
   (def-var! "jolt.host" "form-bigdec?" hc-bigdec?)
   (def-var! "jolt.host" "form-bigdec-source" hc-bigdec-source)
   (def-var! "jolt.host" "form-float-value?" hc-float-value?)

@@ -266,6 +266,7 @@ tz-backend
 tz-offset-seconds
 site-const-salt
 unchecked-math?
+unresolved-resolver
 var-dynamic?
 protocol-method-var?
 var-linked?

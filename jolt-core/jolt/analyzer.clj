@@ -33,7 +33,7 @@
                                form-var-value? form-var-value-ns form-var-value-name
                                form-class-value? form-class-value-name
                                form-tagged? form-tag-name
-                               unchecked-math? allow-unresolved-vars? invoke-rewriter
+                               unchecked-math? allow-unresolved-vars? invoke-rewriter unresolved-resolver
                                form-macro? form-expand-1 form-holds-set-form? resolve-global resolvable-names
                                form-sym-meta form-coll-meta host-intern! form-syntax-quote-lower
                                form-syntax-quote-expand
@@ -2038,6 +2038,18 @@
 ;; report names where the unknown name is WRITTEN. The reporter otherwise falls
 ;; back to the loader's per-top-level-form position, which in a long defn is its
 ;; opening line and says nothing about the offending expression.
+
+;; The REPL's fallback for a symbol nothing resolves (jolt.host/unresolved-resolver,
+;; nil unless something bound jolt.host/*resolve-unresolved*): (f sym) answers the
+;; symbol to analyze in its place, or nil for the error as before. Consulted only
+;; after locals and the namespace's own mappings, so a local of the same name is
+;; never taken for it, and nothing is written into any namespace: a REPL makes its
+;; helpers work in every namespace with no refer. One deref per unresolved symbol.
+(defn- resolve-fallback [ctx form env]
+  (when-let [f (unresolved-resolver)]
+    (let [s (f form)]
+      (when (and s (not= s form)) (analyze ctx s env)))))
+
 (defn- resolve-error [ctx nm env]
   (let [sugg (suggestions-for nm (candidate-pool ctx env))
         base (str "Unable to resolve symbol: " nm " in this context")
@@ -2173,11 +2185,12 @@
              ;; `point/create` a static call however lowercase the name, as the
              ;; JVM's macroexpand1 finds the class before resolveIn ever runs.
              (if (and (ns-shaped-name? ns) (not (namespace-for ctx ns)) (not (host-class-name? ns)))
+               (or (resolve-fallback ctx form env)
                (analysis-error :analyze/unknown-namespace
                 (str "No such namespace: " ns)
                 {:jolt.error/symbol (str ns "/" nm)
                  :jolt.error/namespace ns
-                 :jolt.error/ns (compile-ns ctx)})
+                 :jolt.error/ns (compile-ns ctx)}))
                (host-static ns nm))))
       :else (let [r (resolve-global ctx form)]
               (case (:kind r)
@@ -2210,7 +2223,7 @@
                 ;; later eval needs a declare.
                 (if (allow-unresolved-vars?)
                   (var-ref (compile-ns ctx) nm)
-                  (resolve-error ctx nm env)))))))
+                  (or (resolve-fallback ctx form env) (resolve-error ctx nm env))))))))
 
 ;; The wrapping unchecked-* name a core arithmetic op rewrites to under
 ;; *unchecked-math*, or nil. n is the full item count (head + args); unary - is a

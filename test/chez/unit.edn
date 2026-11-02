@@ -2696,6 +2696,20 @@
    :expr "(eval '(defn auv-strict [] auv-missing))"}
   {:suite "resolution / allow-unresolved-vars" :label "a qualified symbol is unaffected" :expected :throws
    :expr "(binding [*allow-unresolved-vars* true] (eval 'no.such.ns/auv-q))"}
+  ;; jolt.host/*resolve-unresolved* is a REPL's fallback for a symbol nothing resolves: (f sym) answers the
+  ;; symbol analyzed in its place, after locals and the namespace's mappings, and nothing is written into the ns
+  {:suite "resolution / resolve-unresolved" :label "an unresolved symbol is the fallback's" :expected "\"a,b\""
+   :expr "(binding [jolt.host/*resolve-unresolved* {'rru-join 'clojure.string/join}] (eval '(rru-join \",\" [\"a\" \"b\"])))"}
+  {:suite "resolution / resolve-unresolved" :label "an alias the namespace lacks" :expected "\"A\""
+   :expr "(binding [jolt.host/*resolve-unresolved* {'rru/upper-case 'clojure.string/upper-case}] (eval '(rru/upper-case \"a\")))"}
+  {:suite "resolution / resolve-unresolved" :label "a local of the same name is the local" :expected "1"
+   :expr "(binding [jolt.host/*resolve-unresolved* {'rru-x 'clojure.core/inc}] (eval '(let [rru-x 1] rru-x)))"}
+  {:suite "resolution / resolve-unresolved" :label "the namespace's own var wins" :expected "7"
+   :expr "(def rru-own 7) (binding [jolt.host/*resolve-unresolved* {'rru-own 'clojure.core/inc}] (eval 'rru-own))"}
+  {:suite "resolution / resolve-unresolved" :label "nothing is written into the namespace" :expected "nil"
+   :expr "(binding [jolt.host/*resolve-unresolved* {'rru-left 'clojure.core/inc}] (eval '(rru-left 1))) (get (ns-map *ns*) 'rru-left)"}
+  {:suite "resolution / resolve-unresolved" :label "unbound, the error as before" :expected :throws
+   :expr "(eval '(rru-unbound 1))"}
   ;; clojure.core/compile writes the namespace's compiled artifact under
   ;; *compile-path* and returns the lib, like core.clj's compile; a nil
   ;; *compile-path* raises "*compile-path* not set", like Compiler.compile.
