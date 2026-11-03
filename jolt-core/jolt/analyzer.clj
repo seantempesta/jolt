@@ -2050,6 +2050,14 @@
     (let [s (f form)]
       (when (and s (not= s form)) (analyze ctx s env)))))
 
+(defn- fallback-head
+  "The symbol a call's head that nothing resolves is analyzed as (`resolve-fallback`'s
+  hook), or nil: asked before macro dispatch, so a REPL's macro (doc, source) works too."
+  [ctx head]
+  (when-let [f (unresolved-resolver)]
+    (when (= :unresolved (:kind (resolve-global ctx head)))
+      (let [s (f head)] (when (and s (not= s head)) s)))))
+
 (defn- resolve-error [ctx nm env]
   (let [sugg (suggestions-for nm (candidate-pool ctx env))
         base (str "Unable to resolve symbol: " nm " in this context")
@@ -2298,6 +2306,9 @@
                                    (contains? handled (form-sym-name head)))
                           (form-sym-name head)))
             shadowed (and hname (local? env hname))
+            ;; a head nothing resolves, which a REPL's fallback names (one deref when unbound)
+            fallback (when (and (form-sym? head) (not shadowed) (not (contains? handled sf-name)))
+                       (fallback-head ctx head))
             ;; Does this head actually resolve to the clojure.core var it is named
             ;; after? `shadowed` sees only LOCALS, so it cannot answer that: a
             ;; namespace-level (defn byte …) or (defn + …) owns the name in call
@@ -2341,6 +2352,7 @@
           ;; *unchecked-math* rewrite, before macro/special dispatch (these are
           ;; ordinary core fns). The unchecked-* form re-analyzes normally.
           unm (analyze ctx (cons (symbol unm) (rest items)) env)
+          fallback (analyze ctx (cons fallback (rest items)) env)
           ;; Canonical order (Clojure/CLJS analyze-seq): macroexpand FIRST, then
           ;; dispatch special forms / interop / invoke. A local shadows the macro.
           ;; A true special form is NOT shadowable by a same-named macro, matching

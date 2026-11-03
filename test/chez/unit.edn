@@ -2708,6 +2708,8 @@
    :expr "(def rru-own 7) (binding [jolt.host/*resolve-unresolved* {'rru-own 'clojure.core/inc}] (eval 'rru-own))"}
   {:suite "resolution / resolve-unresolved" :label "nothing is written into the namespace" :expected "[2 false]"
    :expr "[(binding [jolt.host/*resolve-unresolved* {'rru-left 'clojure.core/inc}] (eval '(rru-left 1))) (contains? (ns-map *ns*) 'rru-left)]"}
+  {:suite "resolution / resolve-unresolved" :label "a macro's head, before macro dispatch" :expected "3"
+   :expr "(binding [jolt.host/*resolve-unresolved* {'rru-when 'clojure.core/when}] (eval '(rru-when true 3)))"}
   {:suite "resolution / resolve-unresolved" :label "unbound, the error as before" :expected :throws
    :expr "(eval '(rru-unbound 1))"}
   ;; clojure.core/compile writes the namespace's compiled artifact under
