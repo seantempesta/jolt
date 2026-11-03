@@ -12,11 +12,13 @@ add-reader-features!
 add-shutdown-hook
 after-fork-add!
 after-fork-add!
+after-fork-child!
 agent-threads-daemon!
 allow-unresolved-vars?
 aot-compile-worker
 as-subvec
 array-value?
+asleep-while
 available-processors
 backtrace-string
 block-sigint
@@ -61,6 +63,7 @@ extension-has?
 extension-value
 fiber-carrier-count
 fiber-carrier-count-set!
+fiber-dump
 fiber-instance?
 fiber-interrupt!
 fiber-kill!
@@ -169,6 +172,8 @@ interpolate-parts
 interrupt!
 interrupted?
 invoke-rewriter
+io-after-fork-set!
+io-awaited-set!
 java-hashcode
 jolt-class-for
 jolt-version
@@ -179,6 +184,9 @@ list?
 load-namespace
 locale-name
 machine-type
+main-carrier-run!
+main-carrier?
+main-io-wait-set!
 make-interrupt
 make-thread-local
 map-entry
@@ -229,6 +237,7 @@ resolve-global
 run-expr-string
 run-interruptible
 run-main-pump
+runtime-fingerprint
 scheme-eval-string
 scheme-proc
 scheme-version
@@ -248,9 +257,11 @@ slice
 sorted-seq
 sorted-seq-from
 source-roots
+stack-check-failure
 stack-limit
 stash-inline!
 static-member
+stdin-waits
 stop-main-pump
 symlink?
 table?
@@ -258,6 +269,8 @@ tagged-table
 thread-cpu-ns
 thread-id
 throwable
+ticks
+ticks-of
 timer-at!
 timer-cancel!
 transient-associative?
