@@ -1469,7 +1469,9 @@
                       *warn-on-reflection* *warn-on-reflection*
                       *assert* *assert*
                       *unchecked-math* *unchecked-math*
-                      jolt.host/*invoke-rewrite* (context-rewriter (:id l) ns-name)]
+                      jolt.host/*invoke-rewrite* (context-rewriter (:id l) ns-name)
+                      ;; a source file resolves as written: a REPL's fallback is the REPL's forms' alone
+                      jolt.host/*resolve-unresolved* nil]
               (letfn [(eval-form [f]
                         (try
                           (eval f)
@@ -1853,7 +1855,9 @@
                            *assert* *assert*
                            *unchecked-math* *unchecked-math*
                            jolt.host/*invoke-rewrite*
-                           (context-rewriter (:id l) ns-name)]
+                           (context-rewriter (:id l) ns-name)
+                           ;; a source resolves as written, never through a REPL's fallback
+                           jolt.host/*resolve-unresolved* nil]
                    (let [result (eval-source-forms r prefix ns-name)
                          ;; the ns link and its var links, as a source load
                          ;; installs them: the value is the handle map the code
