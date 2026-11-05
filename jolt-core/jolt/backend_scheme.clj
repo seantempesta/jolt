@@ -4231,7 +4231,7 @@
     :host (throw (ex-info (str "emit: unsupported host ref `" (:name node) "`") {}))
     ;; a static field read (Long/MIN_VALUE); cached per site like the call above
     :host-static (if (:written node)
-                   (str "(host-late-var-ref " (chez-str-lit (:class node)) " " (chez-str-lit (:member node)) " " (chez-str-lit (:written node)) ")")
+                   (str "(host-late-var-ref " (chez-str-lit (:class node)) " " (chez-str-lit (:member node)) " " (chez-str-lit (:written node)) (if (:own? node) " #t)" " #f)"))
                  (if (and *const-pool* (var-cache?))
                    (str "(host-static-ref-site " (hoist-const-per-site "(host-static-site-make)") " "
                         (chez-str-lit (:class node)) " " (chez-str-lit (:member node)) ")")

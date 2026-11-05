@@ -114,10 +114,10 @@
 ;; (Chez caches in them: host/chez/java/host-static.ss). Here they answer through
 ;; the uncached lookups, which is the same answer.
 ;; a var the compiler could not see when it read the name: found once defined (host/chez's twin)
-(define (host-late-var-ref ns member written)
+(define (host-late-var-ref ns member written own?)
   (let ((c (var-cell-lookup ns member)))
     (if (and c (var-cell-defined? c))
-        (var-cell-root c)
+        (var-cell-deref c)
         (jolt-throw (jolt-host-throwable "java.lang.IllegalArgumentException" (string-append "No such var: " written "/" member))))))
 (define (host-static-site-make) (vector #f))
 (define (host-static-ref-site site class member) (host-static-ref class member))

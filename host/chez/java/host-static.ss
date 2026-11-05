@@ -1445,12 +1445,18 @@
 
 ;; A var the compiler could not see when it read the name (the analyzer's :written): its namespace
 ;; as the compile ns named it and the spelling as written. Read at each use, so it is found once it
-;; is defined, with whichever namespace is current; until then "No such var", as written.
-(define (host-late-var-ref ns member written)
+;; is defined, with whichever namespace is current; until then "No such var", as written. It reads as
+;; a var reference does (var-cell-deref: a thread's binding, an unbound root), and refuses what the
+;; analyzer would have, had the var been there: a macro's value, another namespace's private var.
+(define (host-late-var-ref ns member written own?)
   (let ((c (var-cell-lookup ns member)))
-    (if (and c (var-cell-defined? c))
-        (var-cell-root c)
-        (throw-jvm (quote IllegalArgumentException) (string-append "No such var: " written "/" member)))))
+    (cond ((not (and c (var-cell-defined? c)))
+           (throw-jvm (quote IllegalArgumentException) (string-append "No such var: " written "/" member)))
+          ((macro-var? c)
+           (throw-jvm (quote IllegalArgumentException) (string-append "Can't take value of a macro: #'" ns "/" member)))
+          ((and (not own?) (var-private? c))
+           (throw-jvm (quote IllegalStateException) (string-append "var: " written "/" member " is not public")))
+          (else (var-cell-deref c)))))
 
 (define (host-static-call class member . args)
   ;; the registry's one rule: a procedure is a method to call, anything else is

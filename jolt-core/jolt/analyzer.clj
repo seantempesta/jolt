@@ -2207,7 +2207,7 @@
                ;; host contract's late binding, which the seed relies on.
                (let [target (namespace-for ctx ns)]
                  (if (and target (not (host-class-name? ns)) (not= "jolt." (subs target 0 (min 5 (count target)))))
-                   (assoc (host-static target nm) :written ns)
+                   (assoc (host-static target nm) :written ns :own? (= target (compile-ns ctx)))
                    (host-static ns nm))))))
       :else (let [r (resolve-global ctx form)]
               (case (:kind r)

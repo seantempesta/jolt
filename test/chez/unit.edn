@@ -246,6 +246,10 @@
   {:suite "errors" :expr "(do (create-ns (quote late.a)) (in-ns (quote late.b)) (clojure.core/alias (quote a) (quote late.a)) (clojure.core/def f (clojure.core/fn [] (a/g 1))) (clojure.core/in-ns (quote user)) (try (late.b/f) (catch Throwable e (ex-message e))))" :expected "\"No such var: a/g\""}
   ;; and a call compiled before the var existed finds it once it does, as a value or called
   {:suite "errors" :expr "(do (create-ns (quote late.c)) (in-ns (quote late.d)) (clojure.core/alias (quote c) (quote late.c)) (clojure.core/def f (clojure.core/fn [] [(c/g 1) (clojure.core/map c/g [2])])) (clojure.core/in-ns (quote user)) (intern (quote late.c) (quote g) inc) (late.d/f))" :expected "[2 (3)]"}
+  ;; it reads as a var reference does: a thread's binding, and an unbound root is no "No such var"
+  {:suite "errors" :expr "(do (create-ns (quote late.e)) (in-ns (quote late.f)) (clojure.core/alias (quote e) (quote late.e)) (clojure.core/def f (clojure.core/fn [] e/x)) (clojure.core/in-ns (quote user)) (intern (quote late.e) (with-meta (quote x) {:dynamic true}) 1) (.setDynamic (find-var (quote late.e/x))) [(late.f/f) (binding [late.e/x 2] (late.f/f))])" :expected "[1 2]"}
+  ;; and refuses what the analyzer refuses: another namespace's private var, a macro's value
+  {:suite "errors" :expr "(do (create-ns (quote late.g)) (in-ns (quote late.h)) (clojure.core/alias (quote g) (quote late.g)) (clojure.core/def f (clojure.core/fn [] g/p)) (clojure.core/in-ns (quote user)) (intern (quote late.g) (with-meta (quote p) {:private true}) 1) (try (late.h/f) (catch Throwable e (ex-message e))))" :expected "\"var: g/p is not public\""}
   ;; A hyphen munges to an underscore in a JVM package name, so a record literal or
   ;; a (munge (str *ns*)) lookup names the class my_app.core.Foo where jolt calls it
   ;; my-app.core.Foo. forName demunges to find it. Not certifiable on the JVM: its
