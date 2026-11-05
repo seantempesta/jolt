@@ -2199,7 +2199,16 @@
                 {:jolt.error/symbol (str ns "/" nm)
                  :jolt.error/namespace ns
                  :jolt.error/ns (compile-ns ctx)}))
-               (host-static ns nm))))
+               ;; A namespace the compile ns can see, whether by its name or an alias of it,
+               ;; whose var is not there yet: the node names the namespace itself, so whoever
+               ;; reads the IR reads what was meant and a call finds the var once it is defined,
+               ;; whichever namespace is current when it runs. :written keeps the spelling for
+               ;; "No such var", as the JVM says it. jolt.* stays on the static arm above: the
+               ;; host contract's late binding, which the seed relies on.
+               (let [target (namespace-for ctx ns)]
+                 (if (and target (not (host-class-name? ns)) (not= "jolt." (subs target 0 (min 5 (count target)))))
+                   (assoc (host-static target nm) :written ns)
+                   (host-static ns nm))))))
       :else (let [r (resolve-global ctx form)]
               (case (:kind r)
                 ;; :num-ret (a ^double/^long declared return) rides on the var node so

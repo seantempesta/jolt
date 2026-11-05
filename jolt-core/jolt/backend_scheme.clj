@@ -1232,7 +1232,7 @@
                   "dynamic-wind" "jolt-finally-in"
                   ;; host interop (emit-invoke static call, :host-new,
                   ;; :host-static field ref).
-                  "host-new" "host-static-call" "host-static-ref"
+                  "host-new" "host-static-call" "host-static-ref" "host-late-var-ref"
                   ;; per-site caches: the static member site and the instance?
                   ;; site, each with the constructor its hoisted cell calls
                   "jolt-once-tag" "jolt-once-clear!" "host-static-ref-site" "host-static-proc-site" "host-static-site-make"
@@ -3772,7 +3772,8 @@
       ;; call applies, so a warm call is one epoch compare and a plain application
       ;; instead of three string-keyed lookups and a rest list. Gated like the
       ;; instance? site, so the seed mint stays byte-identical.
-      (= :host-static (:op fnode))
+      ;; a var named before it is defined (:written) is called as a value; jolt-invoke takes any IFn
+      (and (= :host-static (:op fnode)) (not (:written fnode)))
       (if (do (note-tail-call! tail?) (and *const-pool* (var-cache?)))
         (let [site (hoist-const-per-site "(host-static-site-make)")]
           (order-args (fn [as]
@@ -4229,11 +4230,13 @@
                    (chez-str-lit (:name node)) ") jolt-nil)")
     :host (throw (ex-info (str "emit: unsupported host ref `" (:name node) "`") {}))
     ;; a static field read (Long/MIN_VALUE); cached per site like the call above
-    :host-static (if (and *const-pool* (var-cache?))
+    :host-static (if (:written node)
+                   (str "(host-late-var-ref " (chez-str-lit (:class node)) " " (chez-str-lit (:member node)) " " (chez-str-lit (:written node)) ")")
+                 (if (and *const-pool* (var-cache?))
                    (str "(host-static-ref-site " (hoist-const-per-site "(host-static-site-make)") " "
                         (chez-str-lit (:class node)) " " (chez-str-lit (:member node)) ")")
                    (str "(host-static-ref " (chez-str-lit (:class node)) " "
-                        (chez-str-lit (:member node)) ")"))
+                        (chez-str-lit (:member node)) ")")))
     :host-new (str "(host-new " (chez-str-lit (:class node))
                    (let [args (map emit (:args node))]
                      (if (empty? args) "" (str " " (str/join " " args)))) ")")

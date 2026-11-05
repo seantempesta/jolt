@@ -1443,6 +1443,15 @@
                   (host-static-ref class member)
                   (throw-jvm (quote IllegalArgumentException) (static-miss-message class member))))))))
 
+;; A var the compiler could not see when it read the name (the analyzer's :written): its namespace
+;; as the compile ns named it and the spelling as written. Read at each use, so it is found once it
+;; is defined, with whichever namespace is current; until then "No such var", as written.
+(define (host-late-var-ref ns member written)
+  (let ((c (var-cell-lookup ns member)))
+    (if (and c (var-cell-defined? c))
+        (var-cell-root c)
+        (throw-jvm (quote IllegalArgumentException) (string-append "No such var: " written "/" member)))))
+
 (define (host-static-call class member . args)
   ;; the registry's one rule: a procedure is a method to call, anything else is
   ;; a field value — which answers a zero-argument access and nothing more.
