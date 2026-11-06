@@ -679,6 +679,15 @@
                 (doseq [f woken] (jolt.host/fiber-resume f))
                 (recur new-del))))))
 
+;; The last wait leaving, a parked fiber or a :pending registration, wakes the poller's round: one already in its wait would stay there, a
+;; running thread to the all-asleep detector (fibers.ss jolt-asleep-check!), and a process with
+;; nothing left to wake it would wait for good instead of being told (5 runs in 20 of
+;; threadeddeadlock). The next round finds nothing awaited and counts asleep. Under pm, after
+;; the state moved, so that round reads what left. kqueue and epoll only need this; WSAPoll's
+;; set is woken by its own callers.
+(defn- wake-if-none-awaited! []
+  (when-not (awaited? @state) (pipe-write!)))
+
 ;; Wake one thread waiter (wait-thread). Under pm: a waiter unregisters under pm
 ;; before it closes its kqueue/eventfd, so the number named here is still its.
 (defn- thread-wake! [h]
@@ -714,6 +723,7 @@
                                            (update :fds dissoc fd))))
                   (doseq [h (get-in @state [:threads fd])] (thread-wake! h))
                   (when (and poll-backend? e) (pipe-write!))
+                  (wake-if-none-awaited!)
                   (into (vec (:waiters (:read e))) (:waiters (:write e)))))]
     (doseq [f woken] (jolt.host/fiber-resume f))))
 
@@ -736,6 +746,7 @@
                                            (update :cancelled disj fd)
                                            (update :pending dissoc fd)
                                            (update :fds dissoc fd))))
+                  (wake-if-none-awaited!)
                   (into (vec (:waiters (:read e))) (:waiters (:write e)))))]
     (doseq [f woken] (jolt.host/fiber-resume f))))
 
@@ -990,6 +1001,7 @@
                             (swap! w assoc :expired? true)
                             (when (unpark-waiter! fd filt f)
                               (swap! w assoc :timed-out? true)
+                              (wake-if-none-awaited!)
                               true)))
                     (jolt.host/fiber-resume f))))
         park? (locking pm (if (:expired? @w) :expired (commit-wait! fd filt)))]

@@ -39,6 +39,15 @@
               [v (told #(deref (promise)))]))
           [7 true])
 
+;; 5 runs in 20 of the check above hung here: a poller already in its wait kept waiting when its last waiter left, and read as a running thread
+(check-eq "a wait begun while a descriptor is awaited is told once the last one leaves: the poller's round is woken, so it counts asleep"
+          (let [[fa fb] (remote/socketpair) ea (remote/open fa {:pump :fiber}) eb (remote/open fb {:pump :fiber})]
+            (a/>!! (:out ea) 7)
+            (a/<!! (:in eb))
+            (.start (Thread. (fn [] (Thread/sleep 100) (remote/close! ea) (remote/close! eb))))
+            (told #(deref (promise))))
+          true)
+
 ;; last: a future's worker idles afterwards in a timed wait, which counts as running
 (check-eq "a deref a sleeping thread delivers later is answered, never told"
           (let [p (promise)] (future (Thread/sleep 50) (deliver p :late)) (told #(deref p)))

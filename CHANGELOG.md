@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A process whose every thread waits is told so after its last descriptor leaves.** `jolt.io-poller`'s
+  `cancel!`, `forget!` and a timed wait's expiry left the poller's round in `kevent`/`epoll_wait` when no wait remained, so the all-asleep detector read its thread as running and the process waited for good; a stray signal freed it. `threadeddeadlock` hung in 9 of 29 runs at the pin; 0 of 30 with the round woken.
+
 ### Added
 
 - **`jolt.host` answers the platform's differences by name.** `process-footprint-bytes` is this process's memory as the platform charges it (macOS `phys_footprint` from `task_info`; Linux the proportional set size of `/proc/self/smaps_rollup`), `signal-number` a signal's number from its name (`"USR1"` is 30 on macOS, 10 on Linux; nil where the platform has none), and `monotonic-ns` and `thread-cpu-ns` the monotonic and calling-thread CPU clocks (Scheme code calls `jolt-monotonic-ns` and `jolt-thread-cpu-ns`).
