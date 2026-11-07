@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`SimpleDateFormat` prints milliseconds.** `S` had no case, so `.SSS` came out as letters, and a `java.util.Date` printed through `print-method` was an `#inst` no reader would take.
+
 - **A process whose every thread waits is told so after its last descriptor leaves.** `jolt.io-poller`'s
   `cancel!`, `forget!` and a timed wait's expiry left the poller's round in `kevent`/`epoll_wait` when no wait remained, so the all-asleep detector read its thread as running and the process waited for good; a stray signal freed it. `threadeddeadlock` hung in 9 of 29 runs at the pin; 0 of 30 with the round woken.
 

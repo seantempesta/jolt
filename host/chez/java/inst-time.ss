@@ -182,6 +182,12 @@
               ((char=? c #\E)
                (display (vector-ref (if (>= k 4) days days-short) dow-mon) out)
                (loop (+ i k)))
+              ;; milliseconds, padded to the letters' count (SimpleDateFormat's S): a Date prints through clojure.core's
+              ;; print-method as .SSS, and the letters left as they were made every #inst unreadable at the other end
+              ((char=? c #\S)
+               (let ((ms-str (number->string (list-ref f 6))))
+                 (display (string-append (make-string (max 0 (- k (string-length ms-str))) #\0) ms-str) out))
+               (loop (+ i k)))
               ((char=? c #\H) (display (if (= k 1) (number->string hh) (pad2 hh)) out) (loop (+ i k)))
               ((char=? c #\h)
                (let ((h12 (let ((h (modulo hh 12))) (if (= h 0) 12 h))))
