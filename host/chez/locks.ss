@@ -616,10 +616,18 @@
 ;; threads handing a token through promises did). A signal wakes one of them, but which one is
 ;; not known here, so each is marked awake: one not woken stays awake until its own wait ends,
 ;; which can miss a deadlock, never make one up.
+;; The same for thread-wait-state, which a main carrier's loop reads (fibers.ss jolt-other-thread-may-run?): a woken thread that
+;; still read WAITING until the scheduler ran it let the loop find nothing could wake it, and die stuck or tell a wait about to be answered, under load only.
 (define (jolt-asleep-woken! cv)
-  (jolt-with-mutex jolt-asleep-mu
-    (for-each (lambda (id) (hashtable-delete! jolt-asleep-ids id)) (hashtable-ref jolt-asleep-on cv '()))
-    (set! jolt-asleep-epoch (fx+ jolt-asleep-epoch 1))))
+  (let ((ids (jolt-with-mutex jolt-asleep-mu
+               (let ((ids (hashtable-ref jolt-asleep-on cv '())))
+                 (for-each (lambda (id) (hashtable-delete! jolt-asleep-ids id)) ids)
+                 (set! jolt-asleep-epoch (fx+ jolt-asleep-epoch 1))
+                 ids))))
+    (for-each (lambda (id)
+                (let ((b (jolt-with-mutex thread-state-mu (hashtable-ref thread-state-boxes id #f))))
+                  (when b (set-box! b #f))))
+              ids)))
 
 ;; Back from a value wait: the detector told this thread that nothing can wake it. Raised here,
 ;; in the wait's own frame, with the waiter's mu held (jolt-with-mutex lets go of it as the

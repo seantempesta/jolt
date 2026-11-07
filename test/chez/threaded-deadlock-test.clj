@@ -48,6 +48,21 @@
             (told #(deref (promise))))
           true)
 
+;; a thread its waker has woken but the scheduler has not run yet is no longer waiting: read as asleep, a main carrier found nothing could wake it and
+;; died stuck, or told a wait that was about to be answered, under load only (the window is how long the woken thread waits for a core)
+(check-eq "a thread notified, not yet run, no longer reads as waiting"
+          (let [o (Object.)
+                in (promise)
+                t (Thread. (fn [] (locking o (deliver in true) (.wait o))))]
+            (.start t)
+            @in
+            ;; the monitor is free only once t is inside its wait
+            (locking o
+              (.notify o)
+              ;; o is held here, so t cannot have run: what it reads is what the waker left
+              (not= "WAITING" (str (.getState t)))))
+          true)
+
 ;; last: a future's worker idles afterwards in a timed wait, which counts as running
 (check-eq "a deref a sleeping thread delivers later is answered, never told"
           (let [p (promise)] (future (Thread/sleep 50) (deliver p :late)) (told #(deref p)))

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A woken thread no longer reads as waiting.** A thread its waker had woken read `WAITING` until the scheduler ran it, so under load a main carrier found nothing could wake it, and died stuck or told a wait about to be answered. The waker clears it, as it already did for the all-asleep detector.
+
 - **`SimpleDateFormat` prints milliseconds.** `S` had no case, so `.SSS` came out as letters, and a `java.util.Date` printed through `print-method` was an `#inst` no reader would take.
 
 - **A process whose every thread waits is told so after its last descriptor leaves.** `jolt.io-poller`'s
