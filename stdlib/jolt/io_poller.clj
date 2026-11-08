@@ -1135,26 +1135,51 @@
 ;; The same wait a fiber makes with wait-ready, for a caller that waits on several things with
 ;; alts!: a child's exit beside its pipe's input. The platform's difference is in exit-watch.
 
+(def ^:private EXIT-WATCH-ATTEMPTS
+  "How many times exit-watch asks the kernel for one watch when it answers EAGAIN (a refusal
+  that is transient: a just-forked child under load). The last refusal throws with its errno."
+  16)
+
+(defn- ask-while-eagain
+  "Calls (attempt) until it answers a non-negative value, which is returned, or a negative -errno
+  other than EAGAIN, which is returned; EAGAIN is asked again, at most EXIT-WATCH-ATTEMPTS times
+  in all, the last answer returned. Between attempts the thread yields the CPU (sched_yield, so
+  the child's setup can run), with no sleep and no clock."
+  [attempt]
+  (loop [n 1]
+    (let [r (attempt)]
+      (if (and (neg? r) (= (- r) EAGAIN) (< n EXIT-WATCH-ATTEMPTS))
+        (do (Thread/yield) (recur (inc n)))
+        r))))
+
 (defn- exit-watch
   "A descriptor that is readable once process pid has exited (macOS: a kqueue holding
   EVFILT_PROC/NOTE_EXIT; Linux: a pidfd), or :gone when pid has exited and is not waiting to be
-  reaped or never was. Throws when the kernel refuses for another reason."
+  reaped or never was. EAGAIN is asked again (ask-while-eagain); throws when the kernel refuses
+  for another reason, or EAGAIN persists, with the errno."
   [pid]
   (if macos?
-    (let [kq (c-kqueue)
-          ch (ffi/alloc KEVENT-SIZE)]
-      (try
-        (kevent-put! ch 0 pid EVFILT-PROC (bit-or EV-ADD EV-ONESHOT) NOTE-EXIT)
-        (if (neg? (c-kevent kq ch 1 ffi/null 0 ffi/null))
-          (let [e (errno)]
-            (c-close kq)
-            (if (= e ESRCH) :gone (throw (ex-info "jolt.io-poller/exit-chan: kevent refused the watch" {:pid pid :errno e}))))
-          kq)
-        (finally (ffi/free ch))))
-    (let [fd (c-syscall SYS-PIDFD-OPEN pid 0)]
+    (let [kq (c-kqueue)]
+      (when (neg? kq)
+        (throw (ex-info "jolt.io-poller/exit-chan: kqueue refused" {:pid pid :errno (errno)})))
+      (let [ch (ffi/alloc KEVENT-SIZE)]
+        (try
+          (kevent-put! ch 0 pid EVFILT-PROC (bit-or EV-ADD EV-ONESHOT) NOTE-EXIT)
+          (let [r (ask-while-eagain
+                    #(let [rc (c-kevent kq ch 1 ffi/null 0 ffi/null)] (if (neg? rc) (- (errno)) rc)))]
+            (if (neg? r)
+              (do (c-close kq)
+                  (if (= (- r) ESRCH)
+                    :gone
+                    (throw (ex-info "jolt.io-poller/exit-chan: kevent refused the watch" {:pid pid :errno (- r)}))))
+              kq))
+          (finally (ffi/free ch)))))
+    (let [fd (ask-while-eagain
+               #(let [rc (c-syscall SYS-PIDFD-OPEN pid 0)] (if (neg? rc) (- (errno)) rc)))]
       (if (neg? fd)
-        (let [e (errno)]
-          (if (= e ESRCH) :gone (throw (ex-info "jolt.io-poller/exit-chan: pidfd_open refused the watch" {:pid pid :errno e}))))
+        (if (= (- fd) ESRCH)
+          :gone
+          (throw (ex-info "jolt.io-poller/exit-chan: pidfd_open refused the watch" {:pid pid :errno (- fd)})))
         fd))))
 
 (defn ready-chan

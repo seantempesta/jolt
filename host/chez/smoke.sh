@@ -848,6 +848,18 @@ else
   fails=$((fails + 1))
 fi
 
+# exit-watch asks again on EAGAIN (a just-forked child under load answered the kernel's
+# transient refusal and one agent in fifty died of it); the answers are injected, the real
+# watch is run on a live child and a reaped pid.
+ew_out="$($jolt run test/chez/exit-watch-eagain.clj 2>&1)"
+if printf '%s' "$ew_out" | grep -q 'EXIT-WATCH-EAGAIN OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: exit-watch did not ask again on EAGAIN"
+  printf '%s\n' "$ew_out" | tail -3 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
 # One monitor, contended by a real thread and by fibers at once (jolt-dfuo). This
 # case lives HERE rather than in `make fibers` because a regression wedges every
 # thread in the process, so the report has to come from outside it: the per-case
