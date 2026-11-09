@@ -17,8 +17,14 @@
 ;; ctx is opaque to the analyzer (only ever threaded to these contract fns); we
 ;; make it a box carrying the compile namespace. The var/ns registry it consults
 ;; is the global var-table (rt.ss).
-(define-record-type chez-actx (fields (mutable cns)) (nongenerative chez-actx-v1))
-(define (make-analyze-ctx ns) (make-chez-actx ns))
+;; priv: the analysis env's optional :private? function, or #f. resolve-global asks it (var ns, var name) before a var's own
+;; :private meta: :private or :public is its answer, nil leaves the meta to answer (see hc-private-var?).
+(define-record-type chez-actx (fields (mutable cns) (mutable priv)) (nongenerative chez-actx-v2))
+(define (make-analyze-ctx ns . opts)
+  (make-chez-actx ns
+    (and (pair? opts)
+         (let ((f (jolt-get (car opts) hc-kw-private?)))
+           (and (not (jolt-nil? f)) f)))))
 
 ;; Interned keywords reused for form tags + resolve-global's result map.
 (define hc-kw-jolt-type (keyword "jolt" "type"))
@@ -32,6 +38,8 @@
 (define hc-kw-name  (keyword #f "name"))
 (define hc-kw-var   (keyword #f "var"))
 (define hc-kw-private (keyword #f "private"))
+(define hc-kw-public (keyword #f "public"))
+(define hc-kw-private? (keyword #f "private?"))
 (define hc-kw-macro (keyword #f "macro"))
 (define hc-kw-unresolved (keyword #f "unresolved"))
 (define hc-kw-class (keyword #f "class"))
@@ -656,6 +664,15 @@
   (let ((target (or (chez-resolve-alias (chez-actx-cns ctx) nm) nm)))
     (and (chez-ns-exists? target) target)))
 
+;; Whether the var cell is private for this analysis: its env's :private? function's answer (:private / :public) when it gives one, else
+;; the var's own meta. A caller analyzing a tree whose definitions differ from the running image's passes the tree's.
+(define (hc-private-var? ctx cell)
+  (let* ((f (chez-actx-priv ctx))
+         (a (and f (f (var-cell-ns cell) (var-cell-name cell)))))
+    (cond ((eq? a hc-kw-private) #t)
+          ((eq? a hc-kw-public) #f)
+          (else (var-private? cell)))))
+
 (define (hc-resolve-global ctx sym)
   (let* ((nm (symbol-t-name sym))
          (cell (hc-resolve-cell ctx sym)))
@@ -672,7 +689,7 @@
           ;; refuses to reference ("var: a/hidden is not public"), as the JVM's
           ;; Compiler.resolveIn / isMacro do. (var a/hidden) still takes it.
           (if (and (not (string=? (var-cell-ns cell) (chez-actx-cns ctx)))
-                   (var-private? cell))
+                   (hc-private-var? ctx cell))
               (jolt-assoc base hc-kw-private #t)
               base))
         (cond
@@ -1267,7 +1284,7 @@
   ;; was compiled in (jolt-5n2p): its free symbols resolve there and not at the
   ;; site the value was spliced into, which is the same reason the image restore
   ;; path compiles its wrapper in (image-fnsrc-ns x).
-  (def-var! "jolt.host" "ctx-for-ns" (lambda (ns) (make-analyze-ctx ns)))
+  (def-var! "jolt.host" "ctx-for-ns" (lambda (ns . opts) (apply make-analyze-ctx ns opts)))
   (def-var! "jolt.host" "late-bind?" hc-late-bind?)
   (def-var! "jolt.host" "form-macro?" hc-macro?)
   (def-var! "jolt.host" "form-expand-1" hc-expand-1)
