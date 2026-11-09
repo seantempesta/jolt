@@ -1817,12 +1817,19 @@
             (live-thread-ids))))
 
 ;; Nothing can ever wake the program (no fiber queued, no timer, no descriptor awaited, every other
-;; thread parked or gone): each parked fiber not yet told is told once, by a typed error it throws
-;; from its own wait (a deref, a <!!), which unwinds to its caller as any throw does (Go's "all
-;; goroutines are asleep"). The error names every wait (jolt-fiber-dump). Answers how many were
-;; woken: none (each already told, or masked) leaves the caller nothing to wait for.
-(define (jolt-main-carrier-deliver-deadlock!)
-  (jolt-deadlock-tell-fibers! (jolt-deadlock-error)))
+;; thread parked or gone, all read together under carrier C's mu): each parked fiber not yet told
+;; is told once, by a typed error it throws from its own wait (a deref, a <!!), which unwinds to
+;; its caller as any throw does (Go's "all goroutines are asleep"). The error names every wait
+;; (jolt-fiber-dump). Each tell queues its fiber on C, and is made only while the last fiber
+;; queued there is one this telling woke (C's mu: a fiber another thread queued stops it). Answers
+;; how many were woken: none (each already told, or masked) leaves the caller nothing to wait for.
+(define (jolt-main-carrier-deliver-deadlock! c)
+  (let ((e (jolt-deadlock-error)))
+    (jolt-deadlock-tell-fibers! e
+      (lambda ()
+        (jolt-with-mutex (jolt-carrier-mu c)
+          (let ((t (jolt-carrier-tail c)))
+            (or (not t) (eq? e (jolt-fiber-interrupt t)))))))))
 
 ;; The error each waiter is told: every wait named (jolt-fiber-dump: each fiber and the frames it
 ;; will resume; each thread in a value wait by id).
@@ -1838,6 +1845,14 @@
                         (printf "threads in a value wait: ~a~%" ids)))))))
     (jolt-ex-info "deadlock: every fiber and thread of this process waits, and nothing can wake one (no fiber queued, no timer, no descriptor awaited)"
                   (jolt-hash-map (keyword "jolt" "deadlock") #t (keyword #f "parked") parked))))
+
+;; What a main carrier's loop raises when nothing can wake its program and no waiter was left to
+;; tell: every wait named, as the deadlock error does, so the program's own wait is in it.
+(define (jolt-main-carrier-stuck-error)
+  (jolt-ex-info "jolt-main-carrier: stuck: the program waits, and nothing is queued, no timer is set and no descriptor is awaited, so nothing can ever wake it"
+                (jolt-hash-map (keyword "jolt" "stuck") #t
+                               (keyword #f "parked") (with-output-to-string
+                                                       (lambda () (jolt-fiber-dump (current-output-port)))))))
 
 ;; Tell each parked fiber not told yet; answers how many it woke. STILL? (the detector's: the
 ;; asleep epoch has not moved since its check) is asked before each tell, so a wake in between
@@ -2006,17 +2021,25 @@
                        ;; (jolt-timer-at!, which signals this condition after it): read again under the mu
                        (unless (or (jolt-carrier-head c) (jolt-timer-before? next))
                          (jolt-condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c) until)))))
-               ;; another thread may still run (a future that delivers what a fiber waits on): it
-               ;; queues the fiber (enqueue signals this condition) or ends (jolt-thread-end-wake)
-               ((jolt-other-thread-may-run?)
-                ;; read again under the mu its end's wake takes: an end between the two reads is not lost
-                (jolt-with-mutex (jolt-carrier-mu c)
-                  (unless (or (jolt-carrier-head c) (not (jolt-other-thread-may-run?)))
-                    (jolt-condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c)))))
+               ;; "nothing can run" was read above at different moments (the queue, then the
+               ;; poller, then each thread), and a thread can queue a fiber and end between two of
+               ;; them: so the queue, the deadlines and every thread are read again together, under
+               ;; the mu each of their wakers takes (an enqueue, jolt-timer-at!'s wake, a thread's
+               ;; end, jolt-thread-end-wake). A fiber queued or a deadline set runs on the next
+               ;; pass; another thread that may still run (a future that delivers what a fiber
+               ;; waits on) queues the fiber or ends, and either signals this condition
+               ((jolt-with-mutex (jolt-carrier-mu c)
+                  (cond ((or (jolt-carrier-head c) (jolt-timer-before? next)) #t)
+                        ((jolt-other-thread-may-run?)
+                         (jolt-condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c))
+                         #t)
+                        (else #f)))
+                (void))
                ;; nothing can wake it: each waiter is told and throws in its caller
-               ((fx>? (jolt-main-carrier-deliver-deadlock!) 0) (void))
-               (else (error 'jolt-main-carrier
-                            "stuck: the program waits, and nothing is queued, no timer is set and no descriptor is awaited, so nothing can ever wake it")))
+               ((fx>? (jolt-main-carrier-deliver-deadlock! c) 0) (void))
+               ;; none told because another thread queued a fiber meanwhile: it runs
+               ((jolt-with-mutex (jolt-carrier-mu c) (jolt-carrier-head c)) (void))
+               (else (raise (jolt-main-carrier-stuck-error))))
              (loop))))))))
 
 ;; The program returned: from here the process is an ordinary one, so its fibers, timers and

@@ -385,6 +385,8 @@ fibers:
 	@bin/jolt run test/chez/main-carrier-test.clj
 	@bin/jolt run test/chez/main-carrier-throw-test.clj
 	@bin/jolt run test/chez/main-carrier-wake-test.clj
+	@perl -e 'alarm 120; exec @ARGV' bin/jolt run test/chez/main-carrier-stuck-test.clj
+	@perl -e 'alarm 120; exec @ARGV' bin/jolt run test/chez/main-carrier-sh-test.clj
 	@bin/jolt run test/chez/main-carrier-returns-test.clj
 	@bin/jolt run test/chez/main-carrier-leaves-its-detector-test.clj
 	@bin/jolt run test/chez/main-carrier-timer-throw-test.clj

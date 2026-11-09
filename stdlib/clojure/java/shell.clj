@@ -11,7 +11,7 @@
     :doc "Conveniently launch a sub-process providing its stdin and
 collecting its stdout"}
   clojure.java.shell
-  (:require [clojure.java.io :refer [as-file copy]])
+  (:require [clojure.java.io :refer [as-file copy]] [jolt.fibers :as fibers])
   (:import (java.io OutputStream InputStream
                     ByteArrayOutputStream StringWriter)
            (java.nio.charset Charset)))
@@ -66,6 +66,28 @@ collecting its stdout"}
     (stream-to-bytes stream)
     (stream-to-string stream enc)))
 
+;; Jolt: a sh called from a fiber runs its stdin, stdout and stderr copies on fibers and waits for
+;; the child's exit event, so it starts no thread: each copy parks its fiber on its pipe's readiness
+;; (the process ports wait on jolt.io-poller), and the exit is jolt.io-poller/exit-chan's. On a main
+;; carrier (jolt.host/main-carrier-run!) that is all its one loop's work. Called from a thread, it
+;; copies on futures and polls waitFor, as the JVM's does.
+(defn- beside
+  "Run (f) beside the caller, derefable for its value: on a fiber of its own when the caller is a
+  fiber, else on a future."
+  [f]
+  (if (fibers/in-fiber?)
+    (let [fib (fibers/spawn f)] (delay (fibers/join fib)))
+    (future (f))))
+
+(defn- wait-for
+  "proc's exit status. On a fiber (where the child's exit is an event: kqueue's NOTE_EXIT, a pidfd)
+  it parks until the child has exited, then reaps it; else .waitFor."
+  [^Process proc]
+  (when (and (fibers/in-fiber?) (not (.startsWith (str (System/getProperty "os.name")) "Windows")))
+    ((requiring-resolve 'clojure.core.async/<!!)
+     ((requiring-resolve 'jolt.io-poller/exit-chan) (.pid proc))))
+  (.waitFor proc))
+
 (defn sh
   "Passes the given strings to Runtime.exec() to launch a sub-process.
 
@@ -105,15 +127,15 @@ collecting its stdout"}
                     (as-env-strings env)
                     (as-file dir))]
     (if in
-      (future
-       (with-open [os (.getOutputStream proc)]
-         (copy in os :encoding in-enc)))
+      (beside
+       #(with-open [os (.getOutputStream proc)]
+          (copy in os :encoding in-enc)))
       (.close (.getOutputStream proc)))
     (with-open [stdout (.getInputStream proc)
                 stderr (.getErrorStream proc)]
-      (let [out (future (stream-to-enc stdout out-enc))
-            err (future (stream-to-string stderr))
-            exit-code (.waitFor proc)]
+      (let [out (beside #(stream-to-enc stdout out-enc))
+            err (beside #(stream-to-string stderr))
+            exit-code (wait-for proc)]
         {:exit exit-code :out @out :err @err}))))
 
 (defmacro with-sh-dir
