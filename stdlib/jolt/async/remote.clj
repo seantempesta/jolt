@@ -57,8 +57,13 @@
 ;;
 ;; The codec is a seam: {:encode (fn [v] byte-array) :decode (fn [byte-array] v)}.
 ;; The default is EDN (edn-codec); a faster binary codec plugs in with :codec. A
-;; value the codec cannot encode or decode is a defect: the pump that met it closes
-;; both halves and rethrows on its own thread.
+;; value the codec cannot decode is a defect: the reader that met it closes both halves
+;; and rethrows on its own thread. A value it cannot ENCODE is answered, not fatal: the
+;; writer sends (encode-error v t) in its place, in its place in the order, and the end
+;; stays open (the peer is alive and the frames after it are fine). The :encode-error
+;; option is that function of the value and the throwable (default: unencodable-error,
+;; a map holding the message); an asker's keys (an id, a tag) are the caller's to carry.
+;; A replacement that cannot be encoded either is a defect, as before.
 (ns jolt.async.remote
   (:require [clojure.core.async :as a]
             [clojure.edn :as edn]
@@ -341,6 +346,11 @@
       (when (= pump :fiber) (poller/forget! fd))
       (close-fd! fd))))
 
+(defn unencodable-error
+  "The value the writer sends in place of v when the codec threw t encoding it."
+  [v t]
+  {::unencodable (or (ex-message t) (str t))})
+
 (defn- dead!
   "The peer is gone: both halves close locally (a take drains :in, then nil)."
   [{:keys [in out close-in?]}]
@@ -399,7 +409,7 @@
                     :dead :dead))))
       (finally (ffi/free m)))))
 
-(defn- writer [{:keys [fd out encode pump] :as end}]
+(defn- writer [{:keys [fd out encode encode-error pump] :as end}]
   (let [scratch (volatile! [(ffi/address (ffi/alloc start-bytes)) start-bytes])
         room! (fn [need]
                 (let [[p cap] @scratch]
@@ -416,15 +426,19 @@
             ;; a value carrying a descriptor (::fd in its metadata) is a write of its own, the
             ;; descriptor with its frame's first bytes
             (::fd (meta v))
-            (let [^bytes b (encode v) len (alength b) p (room! (+ 4 len))]
-              (ffi/write p :uint32 (bit-or CARRIES len) 0)
-              (ffi/write-array (+ p 4) b 0 len)
-              (if (true? (send-with-fd! fd (first @scratch) (+ 4 len) (::fd (meta v)) pump)) (recur nil) (dead! end)))
+            (let [r (try (encode v) (catch Throwable t t))]
+              (if (instance? Throwable r)
+                (recur (encode-error v r))     ; no descriptor travels with the answer
+                (let [^bytes b r len (alength b) p (room! (+ 4 len))]
+                  (ffi/write p :uint32 (bit-or CARRIES len) 0)
+                  (ffi/write-array (+ p 4) b 0 len)
+                  (if (true? (send-with-fd! fd (first @scratch) (+ 4 len) (::fd (meta v)) pump)) (recur nil) (dead! end)))))
             ;; this value, then whatever else is already queued, as one write, up to the next
             ;; value that carries a descriptor (held for its own)
             :else
             (let [[n held] (loop [v v off 0]
-                             (let [^bytes b (encode v) len (alength b)
+                             (let [^bytes b (try (encode v) (catch Throwable t (encode (encode-error v t))))
+                                   len (alength b)
                                    p (room! (+ off 4 len))]
                                (ffi/write p :uint32 len off)
                                (ffi/write-array (+ p off 4) b 0 len)
@@ -457,17 +471,19 @@
     :in       a channel to deliver into instead of a new one (a Flow in-chan, a shared
               fan-in); with :close-in? false, the peer's end and death leave it open
     :codec    {:encode :decode} over byte-arrays (default edn-codec)
+    :encode-error  (fn [v t]) the value to send in place of v when the codec threw t
+              encoding it (default unencodable-error); the end stays open
     :pump     :thread (default) or :fiber"
   ([fd] (open fd {}))
-  ([fd {:keys [buf in-buf out-buf in close-in? codec pump]
-        :or {buf 16 close-in? true codec edn-codec pump :thread}}]
+  ([fd {:keys [buf in-buf out-buf in close-in? codec pump encode-error]
+        :or {buf 16 close-in? true codec edn-codec pump :thread encode-error unencodable-error}}]
    (clofork! fd)
    (when (= pump :fiber) (fcntl fd F-SETFL (bit-or O-NONBLOCK (fcntl fd F-GETFL 0))))
    (let [end {:fd fd
               :in (or in (a/chan (or in-buf buf)))
               :out (a/chan (or out-buf buf))
               :close-in? close-in?
-              :encode (:encode codec) :decode (:decode codec)
+              :encode (:encode codec) :decode (:decode codec) :encode-error encode-error
               :pump pump ::lock (Object.) ::live (volatile! 2)}]
      (spawn pump #(reader end))
      (spawn pump #(writer end))

@@ -359,6 +359,23 @@
              [got-p got-q])
       (doseq [f [p q got-p got-q] :when (int? f)] (r/close-fd! f)))
     (r/close! x) (r/close! y)))
+;; a value the codec cannot encode is answered in its place, and the end stays open
+(doseq [pump [:fiber :thread]]
+  (let [bad? #(contains? % :bad)
+        codec {:encode (fn [v] (if (and (map? v) (bad? v)) (throw (ex-info "no stable encoding" {})) (.getBytes ^String (pr-str v) "UTF-8")))
+               :decode (fn [^bytes b] (read-string (String. b "UTF-8")))}
+        errv (fn [v t] {:id (:id v) :error (ex-message t)})
+        [x fd] (r/remote-pair {:pump pump :codec codec :encode-error errv}) y (r/open fd {:pump pump :codec codec})]
+    (a/>!! (:out x) {:id 1})
+    (a/>!! (:out x) {:id 2 :bad true})
+    (a/>!! (:out x) (with-meta {:id 3 :bad true} {::r/fd 0}))
+    (a/>!! (:out x) {:id 4})
+    (let [vs (vec (repeatedly 4 #(take-within 5000 (:in y))))]
+      (check (str "a " pump " end: a value the codec cannot encode arrives as its answer, in its place in the order, and the end carries the next")
+             (= [{:id 1} {:id 2 :error "no stable encoding"} {:id 3 :error "no stable encoding"} {:id 4}] vs) vs)
+      (check (str "a " pump " end: the end is still open both ways after it")
+             (do (a/>!! (:out y) {:id 5}) (= {:id 5} (take-within 5000 (:in x)))) nil))
+    (r/close! x) (r/close! y)))
 (check "any other errno is a defect, thrown with it (EBADF, 9)"
        (= {:errno 9} (try (r/write-step 9) nil (catch clojure.lang.ExceptionInfo e (ex-data e)))))
 
