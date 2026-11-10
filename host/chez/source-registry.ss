@@ -476,9 +476,17 @@
             ;; was spliced into it. They come back innermost first, and acc is
             ;; reversed on return, so each is consed IN ORDER — a left fold, not
             ;; a recursive cons, which would put them on backwards.
+            ;; A frame jolt.debug read locals for is its own element: a run of
+            ;; recursion has a value per frame, and folding the run (srcreg-push-frame)
+            ;; would keep one frame and lose the rest's locals, keyed by frame.
             (loop (cdr ios)
-                  (let add ((fs fs) (a acc))
-                    (if (null? fs) a (add (cdr fs) (srcreg-push-frame (car fs) a)))))))))))
+                  (let ((sink (jolt-debug-locals-sink)))
+                    (let add ((fs fs) (a acc))
+                      (cond ((null? fs) a)
+                            ((and sink (or (eq-hashtable-contains? sink (car fs))
+                                           (and (pair? a) (eq-hashtable-contains? sink (car a)))))
+                             (add (cdr fs) (cons (car fs) a)))
+                            (else (add (cdr fs) (srcreg-push-frame (car fs) a)))))))))))))
 
 ;; --- clj-line lookup for generated .scm offsets ---------------------------------
 ;;
