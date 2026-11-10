@@ -1950,6 +1950,10 @@
                (jolt-asleep-no-fiber-queued?)
                (fx=? 0 (jolt-with-mutex timeout-mu (timeout-pending-count)))
                (not (and jolt-io-awaited (jolt-io-awaited)))
+               ;; ^C interrupts the evaluation while a token is installed
+               ;; (concurrency.ss jolt-interrupt-on-sigint!): a wake source, as an
+               ;; awaited descriptor is, so a REPL's wait on a promise is no deadlock
+               (not (jolt-with-mutex jolt-sigint-mu (unbox jolt-sigint-target)))
                (eqv? e0 (jolt-with-mutex jolt-asleep-mu jolt-asleep-epoch)))
       (let* ((e (jolt-deadlock-error))
              (still? (lambda () (eqv? e0 (jolt-with-mutex jolt-asleep-mu jolt-asleep-epoch))))
