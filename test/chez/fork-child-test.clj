@@ -13,18 +13,9 @@
 (defn check-eq [what got want]
   (when-not (= got want) (swap! failures conj (str what ": got " (pr-str got) ", want " (pr-str want)))))
 
-;; fork only while this is the one active Chez thread, as a forking program must
-(def fork-alone
-  (scm/eval-string
-    "(let ([fork (foreign-procedure \"fork\" () int)])
-       (lambda (reset?)
-         (disable-interrupts)
-         (mutex-acquire #%$tc-mutex)
-         (let ([pid (if (= (jolt-active-threads) 1) (fork) -2)])
-           (mutex-release #%$tc-mutex)
-           (enable-interrupts)
-           (when (and (= pid 0) reset?) (jolt-after-fork-child!))
-           pid)))"))
+;; the one way to fork: jolt.host/fork-alone counts the active threads and forks under Chez's
+;; $tc-mutex, and the child has reset itself before interrupts return
+(defn fork-alone [_reset?] (jolt.host/fork-alone))
 (def wait-exit
   (scm/eval-string
     "(let ([waitpid (foreign-procedure \"waitpid\" (int uptr int) int)])

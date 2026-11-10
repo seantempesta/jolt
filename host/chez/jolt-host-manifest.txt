@@ -96,6 +96,7 @@ file-exists?
 file-mtime
 find-var
 fn-form-parse
+fork-alone
 form-bigdec-source
 form-bigdec-value-source
 form-bigdec-value?
