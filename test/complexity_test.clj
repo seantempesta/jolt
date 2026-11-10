@@ -492,6 +492,40 @@
              #(String. b4 (int 1000) (int 30) "UTF-8")
              "(String. bytes off len) copies the whole array before cutting its slice (java/host-static-classes.ss bytes-slice-for-string)"))
 
+    ;; remove on a HashMap / HashSet is O(1) as the JDK's is. The key-order list
+    ;; was rebuilt without the key on every removal, so taking one key out of a
+    ;; 20k map cost ~112us (jolt-lfm8p). Each arm removes a middle key and puts
+    ;; it back, so the map keeps its size; the order is still insertion order.
+    (let [hm-of (fn [n] (let [m (java.util.HashMap.)] (dotimes [i n] (.put m i i)) m))
+          hs-of (fn [n] (let [s (java.util.HashSet.)] (dotimes [i n] (.add s i)) s))
+          lhm-of (fn [n] (let [m (java.util.LinkedHashMap.)] (dotimes [i n] (.put m i i)) m))
+          m1 (hm-of n1) m4 (hm-of n2) s1 (hs-of n1) s4 (hs-of n2) l1 (lhm-of n1) l4 (lhm-of n2)
+          churn-map (fn [m k] (.remove m k) (.put m k k))
+          churn-set (fn [s k] (.remove s k) (.add s k))
+          k1 (quot n1 2) k4 (quot n2 2)
+          probe (doto (java.util.HashMap.) (.put :a 1) (.put :b 2) (.put :c 3))]
+      (churn-map probe :a) (.remove probe :b) (.put probe :d 4) (churn-map probe :c)
+      (when-not (and (= [:a :d :c] (vec (.keySet probe)))
+                     (= 3 (.size probe))
+                     (do (churn-map m1 k1) (= n1 (.size m1)))
+                     (= k1 (last (.keySet m1)))
+                     (do (churn-set s1 k1) (= n1 (.size s1)))
+                     (do (churn-map l1 k1) (= k1 (last (.keySet l1)))))
+        (println "FAIL complexity hashmap-remove: wrong values before timing")
+        (System/exit 1))
+      (judge "HashMap remove"
+             #(churn-map m1 k1)
+             #(churn-map m4 k4)
+             "HashMap.remove rebuilds the key-order list instead of leaving a stale entry (java/host-static-classes.ss hm-drop-key!)")
+      (judge "HashSet remove"
+             #(churn-set s1 k1)
+             #(churn-set s4 k4)
+             "HashSet.remove rebuilds the key-order list instead of leaving a stale entry (java/host-static-classes.ss hm-drop-key!)")
+      (judge "LinkedHashMap remove"
+             #(churn-map l1 k1)
+             #(churn-map l4 k4)
+             "LinkedHashMap.remove is linear in the map (java/linked-hash.ss)"))
+
     (if (pos? @failures)
       (do (println (str "complexity: " @failures " section(s) failed"))
           (System/exit 1))

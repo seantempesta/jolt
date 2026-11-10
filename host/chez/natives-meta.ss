@@ -187,7 +187,7 @@
     ;; a reify shares its (read-only) method table + protos but gets a fresh
     ;; identity, so attaching meta leaves the original's meta untouched. Every
     ;; Clojure reify implements IObj.
-    ((jreify? x) (make-jreify (jreify-methods x) (jreify-protos x) (jreify-delegate x)))
+    ((jreify? x) (make-jreify (jreify-methods x) (jreify-protos x) (jreify-delegate x) (jreify-cname x)))
     (else x)))                          ; procedure
 
 ;; Obj.withMeta returns `this` when the metadata is unchanged, and the JVM

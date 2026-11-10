@@ -313,14 +313,27 @@
        (let ((out (make-string cnt)))
          (sa-string-copy-range! out 0 v off (fx+ off cnt))
          out))
+      ;; A boxed backing may hold surrogate units (a jsurr, or the raw int of
+      ;; one): a high unit and the low one after it are the astral character
+      ;; they spell, and a unit left unpaired is U+FFFD (values.ss).
       (else
-       (let ((out (make-string cnt)))
-         (let loop ((i 0))
-           (if (fx=? i cnt)
-               out
-               (let ((c (ja-ref x (fx+ off i))))
-                 (string-set! out i (if (char? c) c (integer->char (jnum->exact c))))
-                 (loop (fx+ i 1))))))))))
+       (let loop ((i 0) (acc '()))
+         (if (fx=? i cnt)
+             (list->string (reverse acc))
+             (let ((u (char-elem->unit (ja-ref x (fx+ off i)))))
+               (cond
+                 ((char? u) (loop (fx+ i 1) (cons u acc)))
+                 ((and (fx<? u #xDC00) (fx<? (fx+ i 1) cnt)
+                       (let ((v (char-elem->unit (ja-ref x (fx+ off i 1)))))
+                         (and (fixnum? v) (fx>=? v #xDC00) v)))
+                  => (lambda (lo) (loop (fx+ i 2) (cons (surrogates->char u lo) acc))))
+                 (else (loop (fx+ i 1) (cons jolt-replacement-char acc)))))))))))
+;; A char[] element as a char, or as the fixnum of the surrogate unit it is.
+(define (char-elem->unit c)
+  (cond ((char? c) c)
+        ((jsurr? c) (jsurr-unit c))
+        (else (let ((n (jnum->exact c)))
+                (if (and (fixnum? n) (fx>=? n #xD800) (fx<=? n #xDFFF)) n (integer->char n))))))
 (define (char-array->string x) (char-array-region x 0 (ja-len x)))
 (define (char-array-chunk x off cnt who)
   (jvm-range-check who (ja-len x) off (+ off cnt))
@@ -499,7 +512,7 @@
         (ja-ref a i))))
 (define (nb-host-char-set! a i c)
   (let ((v (jolt-array-vec a)))
-    (if (and (string? v) (fixnum? i) (fx>=? i 0) (fx<? i (string-length v)))
+    (if (and (string? v) (char? c) (fixnum? i) (fx>=? i 0) (fx<? i (string-length v)))
         (string-set! v i c)
         (ja-set! a i c))))
 (define (nb-host-char-string a)          ; the string a char array holds, or #f
@@ -508,8 +521,7 @@
   (let ((v (jolt-array-vec a)))
     (if (string? v)
         (substring v from to)
-        (let ((s (make-string (fx- to from))))
-          (do ((i from (fx+ i 1))) ((fx=? i to) s) (string-set! s (fx- i from) (ja-ref a i)))))))
+        (char-array-region a from (fx- to from)))))
 (define (nb-host-new-array kind n)
   (make-jolt-array (na-make-backing n kind (case kind ((float double) 0.0) ((char) #\nul) (else 0))) kind))
 
@@ -678,10 +690,17 @@
     ;; na-list->backing's rule: into-array is the lenient door and boxes instead,
     ;; also as before. Routing this through na-list->backing would silently turn
     ;; (char-array [:k]) from an error into a boxed array holding :k.
-    (else (make-jolt-array
-           (list->string (map (lambda (c) (if (char? c) c (integer->char (exact (truncate c)))))
-                              (seq->list (jolt-seq a))))
-           'char))))
+    ;; A surrogate unit (a jsurr, or an int in that range) is a char[] element
+    ;; on the JVM but no Chez char, so an array holding one takes the boxed
+    ;; backing, as ja-set! promotes to for the same store.
+    (else
+     (let ((cs (map (lambda (c) (cond ((char? c) c)
+                                      ((jsurr? c) c)
+                                      (else (jolt-char (exact (truncate c))))))
+                    (seq->list (jolt-seq a)))))
+       (if (for-all char? cs)
+           (make-jolt-array (list->string cs) 'char)
+           (make-jolt-array (list->vector cs) 'char))))))
 ;; Chez bytevector -> jolt byte-array. The inbound half of the raw-bytes seam:
 ;; every producer of a byte-array from raw bytes — .getBytes, stream reads,
 ;; Files/readAllBytes, Base64, FFI — funnels through here. One block copy now
@@ -820,18 +839,21 @@
 ;; arm. pvec first; pvec-nth!/pvec-nth-d are the same shared reads the base
 ;; definition's own pvec arms call, so semantics move nowhere. pvec is
 ;; disjoint from every type the chain below intercepts (each is its own
-;; record type), so reordering cannot shadow them.
+;; record type), so reordering cannot shadow them. A string goes straight to
+;; the base definition too: none of the wraps between intercepts one, and their
+;; probes were most of what nth on a string cost.
 (set! jolt-nth
   (case-lambda
-    ((c i)   (if (pvec? c)
-                 (pvec-nth! c i)
-                 (if (jolt-array? c) (ja-ref c (exact (na-idx i))) (%na-nth c i))))
+    ((c i)   (cond ((pvec? c) (pvec-nth! c i))
+                   ((string? c) (jolt-nth-base c i))
+                   ((jolt-array? c) (ja-ref c (exact (na-idx i))))
+                   (else (%na-nth c i))))
     ((c i d) (if (pvec? c)
                  (begin (jolt-nth-nil-idx! i) (pvec-nth-cast-d c i d))
-                 (if (jolt-array? c)
+                 (if (string? c) (jolt-nth-base c i d) (if (jolt-array? c)
                      (let ((j (exact (na-idx i))))
                        (if (and (>= j 0) (< j (ja-len c))) (ja-ref c j) (begin (index-int-check! j) d)))
-                     (%na-nth c i d))))))
+                     (%na-nth c i d)))))))
 (def-var! "jolt.host" "array-value?" (lambda (x) (if (jolt-array? x) #t jolt-nil)))
 ;; jolt-get on arrays stays as a set!-wrap rather than register-get-arm! because
 ;; the arm dispatch (collections.ss jolt-get-dispatch) already handles the common
@@ -1060,8 +1082,11 @@
     (if (and (jolt-array? x) (eq? (jolt-array-kind x) 'char))
         (begin
           (io-opts-check! opts)
-          (host-new "StringReader"
-                    (apply string-append (map jolt-str-render-one (seq->list (jolt-seq x))))))
+          ;; a BufferedReader over the chars on the JVM
+          (let ((r (host-new "StringReader"
+                             (apply string-append (map jolt-str-render-one (seq->list (jolt-seq x)))))))
+            (vector-set! (jhost-state r) 3 #t)
+            r))
         (apply jolt-io-reader x opts))))
 
 ;; --- bind into clojure.core -------------------------------------------------

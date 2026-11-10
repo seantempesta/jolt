@@ -232,6 +232,15 @@ The tracked, gated list of value-level divergences is
 the prose version is [Differences from Clojure](https://jolt-lang.github.io/docs/differences.html)
 on the docs site.
 
+## Run with Nix
+
+```sh
+nix run 'git+https://github.com/jolt-lang/jolt.git?submodules=1'
+```
+
+The Git URL and `submodules=1` are required to include vendored dependencies.
+Pass Jolt arguments after `--`.
+
 ## Scripts
 
 A file runs with `run` or without it, and needs no extension and no build step:
@@ -493,6 +502,14 @@ sessions and interruptible eval, plus the cider-nrepl ops an editor expects
                     cider.nrepl/cider-middleware]}
 ```
 
+A middleware that has to run each evaluation inside something of its own, such
+as a `jolt.debug` break handler or a timer, binds `jolt.nrepl/*eval-wrapper*` to
+a function of a thunk. `evaluate` calls it around the code's evaluation, inside
+its own `try`, so the wrapper sees a throw before `evaluate` turns it into the
+error reply. Bound around a session's `clone`, it covers every eval in that
+session, since jolt-lang/nrepl starts the session's worker with the clone's
+bindings.
+
 See [REPL-Driven Development](https://jolt-lang.github.io/docs/repl-driven-development.html).
 
 ### Linting with clj-kondo
@@ -620,6 +637,24 @@ directories, and a trailing `/` covers everything under that directory:
 
 An excluded file is gone from the binary, and `io/resource` answers `nil` for
 it. Only the project's own `deps.edn` is read for this key.
+
+At runtime, `(jolt.host/embedded-resource-names)` returns a sorted vector of the
+project and dependency resource names baked into the image, excluding Jolt's own
+runtime internals. Each name can be passed to `io/resource`; filter the vector to
+discover a directory such as a set of migrations:
+
+```clojure
+(require '[clojure.string :as str])
+
+(filter #(str/starts-with? % "migrations/")
+        (jolt.host/embedded-resource-names))
+```
+
+JVM-style discovery works too: the resources read as a jar, so resource URLs
+are `jar:` URLs, `java.util.jar.JarFile` enumerates them, and
+`java.nio.file.FileSystems` opens a read-only filesystem over them. Migration
+scanners such as Migratus work without extracting files to disk. See
+[Embedded Resources](https://jolt-lang.github.io/docs/embedded-resources.html).
 
 `--boot` trades the other way. The boot image ships as a prebuilt heap image
 (*vfasl*), which starts faster and takes more room — `--boot small` keeps the

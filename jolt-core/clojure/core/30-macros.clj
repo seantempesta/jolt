@@ -691,11 +691,12 @@
 ;;
 ;; :on / :on-interface / :method-builders are the JVM's generated-interface keys
 ;; and are deliberately absent here: jolt generates no interface, dispatching on
-;; the receiver's type tag instead. :extend-via-metadata is absent for a
-;; different reason — jolt PARSES the option (below) but its dispatch does not
-;; honor metadata extension, so recording the key would advertise a rule that
-;; does not hold. See make-protocol's comment, unit.edn's defprotocol-value
-;; suite, and jolt-2j3.
+;; the receiver's type tag instead. Every leading keyword OPTION lands on the
+;; value as the reference's parse puts it there (:extend-via-metadata true is
+;; (:extend-via-metadata P) => true), and :extend-via-metadata is also honored:
+;; the method shims then resolve through protocol-resolve-meta, which consults
+;; the receiver's metadata between its type's own impls and extend's
+;; (protocols.ss). See unit.edn's defprotocol-value suite and jolt-2j3.
 ;;
 ;; Each method is a thin dispatch fn over protocol-dispatch, def'd with the var
 ;; metadata the reference gives it — :arglists, :doc, :protocol (the protocol's
@@ -706,16 +707,20 @@
   ;; Clojure's defprotocol takes an optional docstring and leading keyword
   ;; options (:extend-via-metadata true, honeysql uses it) before the method
   ;; signatures. The docstring is kept (it is :doc on the value and on the var);
-  ;; the options are read past. A string anywhere in the leading run is the
-  ;; docstring and the last one wins, which is what the JVM's assoc-in-a-loop
-  ;; parse does.
-  (let [parsed (loop [d nil s sigs]
+  ;; the options are collected into a map merged onto the value. A string
+  ;; anywhere in the leading run is the docstring and the last one wins, which
+  ;; is what the JVM's assoc-in-a-loop parse does.
+  (let [parsed (loop [d nil o {} s sigs]
                  (cond
-                   (string? (first s))  (recur (first s) (rest s))
-                   (keyword? (first s)) (recur d (rest (rest s)))
-                   :else [d s]))
+                   (string? (first s))  (recur (first s) o (rest s))
+                   (keyword? (first s)) (recur d (assoc o (first s) (second s)) (rest (rest s)))
+                   :else [d s o]))
         pdoc (first parsed)
         sigs (second parsed)
+        popts (nth parsed 2)
+        ;; decided here, from the option's form: a literal nil/false (or no
+        ;; option) keeps the plain dispatch path.
+        via-meta? (boolean (get popts :extend-via-metadata))
         methods (reduce (fn [m sig]
                           (assoc m (keyword (name (first sig))) {:name (name (first sig))}))
                         {} sigs)
@@ -744,7 +749,10 @@
        (def ~(if pdoc (with-meta pname (assoc (meta pname) :doc pdoc)) pname)
          ;; :sigs is nil, not {}, for a protocol with no methods — the JVM's
          ;; (when sigs ..) leaves the key present with a nil value.
-         (assoc (make-protocol ~pkey ~methods (quote ~(when (seq sigs) sigs-map)) ~pdoc ~method-map)
+         ;; merge: ours (9e42a0d8) defines the value whole, :var included (no alter-var-root);
+         ;; upstream's protocol options (popts) merged into it
+         (assoc ~(let [mk `(make-protocol ~pkey ~methods (quote ~(when (seq sigs) sigs-map)) ~pdoc ~method-map)]
+                   (if (seq popts) `(merge ~mk ~popts) mk))
                 :var (var ~pname)))
        ;; register method var-keys for devirtualization; the inference
        ;; reads this (via infer-unit!) to resolve a protocol call on a known record
@@ -778,19 +786,27 @@
                                    :arglists (list 'quote (when (seq arglists)
                                                             (apply list arglists)))
                                    :protocol (list 'var pname))
+                      ;; the method's qualified symbol, the key a value's
+                      ;; metadata implements it under
+                      msym (symbol (str *ns*) mn)
                       clause (fn [argv]
                                (let [ps (mapv (fn [_] (fresh-sym)) argv)
                                      n (count ps)
                                      obj (first ps)]
                                  (cond
+                                   via-meta? (list ps (list* (list 'clojure.core/protocol-resolve-meta pn mn (list 'quote msym) obj) ps))
                                    (= n 1) (list ps (list 'clojure.core/protocol-dispatch1 pn mn obj))
                                    (= n 2) (list ps (list 'clojure.core/protocol-dispatch2 pn mn obj (nth ps 1)))
                                    (= n 3) (list ps (list 'clojure.core/protocol-dispatch3 pn mn obj (nth ps 1) (nth ps 2)))
                                    :else   (list ps (list 'clojure.core/protocol-dispatch pn mn obj (vec (rest ps)))))))]
                   (if (seq arglists)
                     `(def ~(with-meta mnm mmeta) (fn* ~@(map clause arglists)))
-                    `(def ~(with-meta mnm mmeta)
-                       (fn* [this# & rest#] (protocol-dispatch ~pn ~mn this# rest#))))))
+                    (if via-meta?
+                      `(def ~(with-meta mnm mmeta)
+                         (fn* [this# & rest#]
+                           (apply (protocol-resolve-meta ~pn ~mn (quote ~msym) this#) this# rest#)))
+                      `(def ~(with-meta mnm mmeta)
+                         (fn* [this# & rest#] (protocol-dispatch ~pn ~mn this# rest#)))))))
               sigs))))
 
 ;; Member threading: (.. x f g) => (. (. x f) g); a parenthesized member
@@ -910,6 +926,14 @@
 ;; reify wants one (name [params*] body*) per arity and groups same-named specs
 ;; into a multi-arity fn, so both shapes flatten to the same list here. `this` is
 ;; implicit in a proxy body and explicit in a reify one, hence the cons.
+;; A proxy's supers are classes, named as the namespace names them: a simple
+;; name it imported is that import's class, which is what the class graph knows
+;; it by (java.util.AbstractList, not AbstractList), so what the class inherits
+;; is found. A protocol keeps its key; a name nothing resolves stays as written.
+(defn- proxy-super-key [sym]
+  (or (jolt.host/protocol-key-of sym)
+      (let [c (when (and (symbol? sym) (nil? (namespace sym))) (resolve sym))]
+        (if (class? c) (.getName c) (name sym)))))
 (defn- proxy-arity-specs [m]
   (let [nm (first m)
         arities (if (vector? (second m)) [(rest m)] (rest m))]
@@ -942,10 +966,12 @@
     (loop [specs (seq (apply concat (map proxy-arity-specs methods)))
            clauses {} order []]
       (if (empty? specs)
-        `(make-proxy
+        ;; the defining ns names the generated class (proxy-name), as on the JVM
+        `(jolt.host/make-proxy-in
+           ~(str *ns*)
            ~(reduce (fn [m k] (assoc m k `(fn ~@(get clauses k)))) {} order)
            [~@ctor-args]
-           ~@(vec (map protocol-key supers)))
+           ~(vec (map proxy-super-key supers)))
         (let [spec (first specs)
               k (keyword (name (first spec)))]
           (recur (rest specs)
@@ -970,8 +996,19 @@
   ;; fn so dispatch picks the clause by arg count.
   (loop [items (seq forms) protos [] methods {} order []]
     (if (empty? items)
+      ;; the third element names the class: ns$reify__N, one per reify form, as
+      ;; the JVM generates one class per form (its name also carries the
+      ;; enclosing fn and an eval counter, which jolt cannot reproduce). N comes
+      ;; from where the form sits (file, line, column), so a form compiled into
+      ;; the AOT cache and one expanded fresh in a later process can never share
+      ;; a name; a form with no position takes a gensym, below the position range
       `(make-reified-at
-         [[~@(map name order)] [~@(map protocol-key protos)]]
+         [[~@(map name order)] [~@(map protocol-key protos)]
+          ~(str (apply str (map (fn [c] (if (= c \-) \_ c)) (str *ns*))) "$"
+                (let [{:keys [line column]} (meta &form)]
+                  (if line
+                    (str "reify__" (+ 1000000000 (mod (hash [*file* line column]) 1000000000)))
+                    (gensym "reify__"))))]
          ~@(map (fn [k] `(fn ~@(get methods k))) order))
       (let [x (first items)]
         (if (symbol? x)
@@ -1037,10 +1074,20 @@
        (register-record-type! (quote ~name-sym))
        ;; build via the positional ctor for declared fields, then carry any
        ;; remaining keys as extension fields (JVM keeps them on the record).
+       ;; One pass over the map carries the extensions, skipping the field keys
+       ;; by identity: no dissoc copy of the map, and no separate test for
+       ;; whether there are any (a count plus a contains? per field cost a map
+       ;; that HAS extensions 1.2-1.3x what the copy did).
        (def ~mapf (fn* [~m]
-                    (reduce-kv assoc
-                               (~arrow ~@(map (fn [f] `(get ~m ~(keyword (name f)))) fields))
-                               (dissoc ~m ~@(map (fn [f] (keyword (name f))) fields)))))
+                    ~(let [r (gensym "r") k (gensym "k") v (gensym "v")
+                           ctor `(~arrow ~@(map (fn [f] `(get ~m ~(keyword (name f)))) fields))]
+                       (if (seq fields)
+                         `(reduce-kv (fn* [~r ~k ~v]
+                                       (case ~k
+                                         ~(apply list (map (fn [f] (keyword (name f))) fields)) ~r
+                                         (assoc ~r ~k ~v)))
+                                     ~ctor ~m)
+                         `(reduce-kv assoc ~ctor ~m)))))
        ~@(mapcat (fn [g]
                    (let [proto (protocol-key (first g))
                          names (distinct (map (fn [spec] (name (first spec))) (rest g)))]

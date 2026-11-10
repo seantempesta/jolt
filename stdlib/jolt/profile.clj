@@ -23,6 +23,10 @@
 
     JOLT_PROFILE=1 jolt run -m my.app
 
+  The same switch has a second mode, (prof/instrument! :debug) or
+  JOLT_PROFILE=debug, that compiles code for jolt.debug instead of counting it:
+  each fn's params and locals stay visible to its frame. See jolt.debug.
+
   Only code jolt compiles at runtime is instrumented: your namespaces and the
   libraries they load from source. The runtime and the stdlib that ships
   compiled in the jolt binary are not, so a call into clojure.core counts as
@@ -66,19 +70,30 @@
 
 (defn instrument!
   "Turn on instrumentation for code compiled from now on, or with false turn it
-  off. Code already compiled keeps its counters either way. Returns true;
+  off. mode is true (or :counts) for the execution counters, or :debug for
+  debug locals: code compiled under :debug keeps every fn's params and locals
+  visible to its frame, for jolt.debug/frames to read. One mode at a time; code
+  already compiled keeps what it was compiled with either way. Returns true;
   throws when the host cannot instrument."
   ([] (instrument! true))
-  ([on?]
-   (if (host/profile-instrument! (boolean on?))
-     true
-     (throw (ex-info "jolt.profile: this host has no compile-profile counters"
-                     {:host :unsupported})))))
+  ([mode]
+   (let [debug? (= mode :debug)]
+     (if (host/profile-instrument! (if debug? :debug (boolean mode)))
+       true
+       (throw (ex-info (if debug?
+                         "jolt.profile: this host cannot keep debug locals"
+                         "jolt.profile: this host has no compile-profile counters")
+                       {:host :unsupported}))))))
 
 (defn instrumenting?
-  "True while code being compiled is instrumented."
+  "True while code being compiled is instrumented, in either mode."
   []
   (boolean (host/profile-instrumenting?)))
+
+(defn instrument-mode
+  "What code compiled now carries: :counts, :debug, or nil."
+  []
+  (host/profile-instrument-mode))
 
 (defn clear!
   "Reset every counter to zero."

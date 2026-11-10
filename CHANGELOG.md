@@ -36,8 +36,151 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Code that bounds its in-flight work with one (Datahike's background GC test) construction
   failed with `No matching ctor found`.
 
+## [0.8.24] - 2026-11-05
+
+java.util and java.util.concurrent are filled out: the remaining collection
+classes, live views, fail-fast iterators, spliterators, `EnumSet`, `Semaphore`
+and `Timer`. Strings index by UTF-16 code unit, as on the JVM.
+`clojure.data.json` ships with jolt. `jolt.debug` shows a throwable's frames
+with their locals, and `jolt.profile` gains a sampling profiler and
+profile-guided builds. `future` runs on a pooled executor, and casts, sorted
+collections and printing a host object are faster.
+
 ### Added
 
+- **`clojure.data.json` ships with jolt** (#1453). It is data.json 2.5.2 as a
+  built-in namespace, resolved ahead of a project's own copy like
+  `babashka.fs` (`:jolt/replaces [clojure.data.json]` opts out). Writing with
+  `:escape-unicode` now escapes a character above U+FFFF as its surrogate
+  pair, `"👍"`, where upstream's escaper wrote an invalid 5-digit
+  `\u` escape over jolt's code-point strings. The namespace also loads without
+  java.time; `:date-formatter` defaults to nil, meaning ISO_INSTANT.
+
+- **`jolt nrepl-server --port-file PATH` and `--no-port-file`** (#1415).
+  The bound port goes to PATH, resolved against the caller's directory, or
+  nowhere; either way the server removes the file it wrote when it stops.
+
+- **`jolt.nrepl/*eval-wrapper*`, a hook around each nREPL evaluation (#1473).**
+  When bound to a function, `jolt.nrepl/evaluate` calls it with a thunk of the
+  code's evaluation (`eval-string`, or `load-string` for a load) inside its own
+  `try` and `*ns*` binding, so the wrapper sees a throw before `evaluate` turns
+  it into the error reply: a tool can run each evaluation under
+  `jolt.debug/call-with-break-handler`, a timer or a binding of its own. Bound
+  around a session's `clone`, it covers every eval in that session, since
+  jolt-lang/nrepl starts the session's worker with the clone's bindings. Unbound,
+  nothing changes.
+- **A source path for `jolt.host/eval-string` and `jolt.host/load-string`,
+  and nREPL's `load-file` `file-path` (#1475).** Each takes an optional
+  second argument, the path of the file the text came from, as the reference's
+  `Compiler.load` takes a source path: the forms carry it as `:file`, as a file
+  load's do (the position a def records, the trace, `jolt.profile`'s counts),
+  and `*file*` and `*source-path*` are the path and its name. Without it
+  nothing changes, and `clojure.core/load-string` still takes the string alone.
+  `jolt.nrepl/evaluate` takes it as `:file`, and the built-in `load-file` op
+  passes the request's `file-path`, as JVM nREPL compiles under it. A third
+  argument (`:file-name` to `evaluate`) is the source name `*source-path*`
+  holds, as `Compiler.load` takes one; `load-file` passes the request's
+  `file-name`, so `*source-path*` is nil when it sends none, as on the JVM.
+- **`jolt.debug`: a throwable's frames with their locals, and a hook before
+  the stack unwinds (#1464).** `(jolt.debug/frames t)` returns the frames
+  `.getStackTrace` reports, innermost first, as maps of `:fn`, `:file`, `:line`
+  and `:locals`, a map of each local's symbol to its value.
+  `(jolt.debug/with-break-handler handler body)` calls `(handler t frames)` on
+  the throwing thread when a throw escapes the body, before anything unwinds,
+  then rethrows; the handler may block. `jolt.profile`'s compile switch gains a
+  debug mode, `(prof/instrument! :debug)` or `JOLT_PROFILE=debug`, and code
+  compiled under it keeps every param and local visible to its frame.
+  Debug-compiled code makes every call but `recur` a real call, as the JVM does,
+  so a tail throw keeps the frame it came from. Other code shows the locals
+  Chez kept live. `(prof/instrument-mode)` says which mode is on. A frame the
+  trace leaves out because no def covers it, a defmethod's body or a record's
+  method, is named as `jolt.profile` names it (`ns/Type.method`,
+  `ns/mm[dispatch]`) when it was compiled under the debug mode.
+- **`java.util.jar.JarInputStream` and `JarOutputStream`.** The input stream
+  reads `META-INF/MANIFEST.MF` when it is the first entry or follows
+  `META-INF/`, and its entries are `JarEntry` values carrying their manifest
+  section; the output stream writes its manifest first and marks the first
+  entry with the JAR magic, byte-compatible with what the JDK writes.
+
+- **`java.util.concurrent.Semaphore` and `locks.ReentrantReadWriteLock`.**
+  Permits and read/write holds, fair and non-fair, timed and interruptible
+  acquires, the queue queries and the JDK's `toString`. Both wait through the
+  same protocol as `CountDownLatch`, so a fiber that waits parks and gives its
+  carrier up.
+- **`java.util.concurrent.atomic.AtomicIntegerArray` and `AtomicLongArray`**,
+  with the update/accumulate members and the memory-order variants.
+  `AtomicInteger`, `AtomicLong` and `AtomicReference` gain `accumulateAndGet`
+  and `getAndAccumulate`.
+
+- **A built binary's resources read as a jar (#1438).** `io/resource` and
+  `ClassLoader.getResource(s)` answer `jar:file:jolt-embedded-resources.jar!/…`
+  URLs for files and directories, with the JDK's percent-encoding and, in a
+  multi-release archive, the entry the runtime version selects.
+  `java.util.jar.JarFile` lists, reads and version-selects the entries,
+  `FileSystems/newFileSystem` opens them as a read-only `jar` file system, and
+  `(jolt.host/embedded-resource-names)` lists them, so migration scanners such
+  as Migratus work inside a binary. `java.util.jar.Manifest`, `Attributes` and
+  `Attributes.Name` read and write as the JDK's do. A jar on disk opens as a
+  `JarFile` too, with its manifest, multi-release lookup and
+  `JarFile$JarFileEntry` entries, and `ZipEntry.getTimeLocal`/`setTimeLocal`
+  take a `java.time.LocalDateTime`.
+- **`java.nio.file.Files` dispatches to the path's file system provider.** The
+  host file system now answers `readString`, `lines`, `list`, `walk`, `find`,
+  `newBufferedReader`, `newBufferedWriter`, `writeString`, `newByteChannel`,
+  `mismatch`, `probeContentType`, `getFileStore`, `getFileAttributeView` and
+  `setOwner`. Text goes through the charset's reporting coder, as the JDK's
+  does: malformed input is `MalformedInputException` and a character the
+  charset cannot hold `UnmappableCharacterException`. `lines`, `walk` and
+  `find` read as the stream is consumed, a failure there arriving as
+  `UncheckedIOException`, and a `DirectoryStream` hands out one iterator.
+- **`ArrayDeque` is a ring buffer, as the JDK's is**: both ends O(1), the
+  same capacities and growth, nulls refused, and the full `Deque` surface
+  (`pollFirst`, `peekLast`, `removeLastOccurrence`, `descendingIterator`, …).
+- **A stream pipeline's `spliterator()`** is the JDK's `WrappingSpliterator`,
+  with the source's characteristics edited by each operation as the JDK's
+  flags edit them; `Stream/of` and `Arrays/stream` hand back an
+  `ArraySpliterator`.
+- **`java.util.Spliterator`.** Every collection answers `spliterator()` with
+  the JDK's class, characteristics, size and comparator: array-backed ones split
+  at the midpoint, iterator-backed ones by batches, and `spliteratorUnknownSize`
+  over an endless iterator stays lazy. `Spliterators` (`spliterator`,
+  `spliteratorUnknownSize`, `emptySpliterator`, `iterator`) and
+  `StreamSupport/stream` are there too. A hash or tree collection splits at the
+  midpoint rather than where the JDK's table or tree would.
+- **A proxy over java.util's abstract collection classes inherits them.**
+  `(proxy [java.util.AbstractList] [] (get [i] …) (size [] …))` gets the
+  class's iterator, contains, indexOf, subList, equality, hashing and printing,
+  and so do proxies over `AbstractSet`, `AbstractCollection`, `AbstractQueue`
+  and `AbstractMap` (whose lookups run over the proxy's `entrySet`). A super
+  named by an import (`(proxy [AbstractList] …)`) is the class the import
+  names.
+- **`Month`, `DayOfWeek` and `ChronoField` `getDisplayName` answer in the
+  locale**, by `TextStyle` for the first two, from the `:date-names` point and a
+  new `:field-names` point. jolt-lang/time supplies the locales and `TextStyle`;
+  core carries ROOT.
+- **The rest of java.util and java.util.concurrent's collections.** `Vector`,
+  `Stack`, `Hashtable`, `BitSet`, `PriorityQueue`, `ConcurrentLinkedQueue`,
+  `ConcurrentLinkedDeque`, `CopyOnWriteArrayList`, `CopyOnWriteArraySet`,
+  `ConcurrentSkipListMap` and `ConcurrentSkipListSet`, with JDK 21's API and
+  classes. Iteration follows the JDK: a `PriorityQueue` walks its heap array, a
+  `Hashtable` its buckets, the linked queues are weakly consistent, the
+  copy-on-write iterators are snapshots, and the `Vector`/`Hashtable` iterators
+  are fail-fast. `Vector`, `Hashtable` and `Collections.synchronized*` hold
+  their own object's monitor, so `(locking v …)` around a walk excludes their
+  methods. Each round-trips through `jolt.image` or is refused naming its class.
+- **`Collections.unmodifiable*` and `synchronized*` are views, and `List/of`,
+  `Set/of`, `Map/of` and `copyOf` immutable collections.** A write through an
+  unmodifiable view, its iterators, entries or sub-views is
+  UnsupportedOperationException; a change to the backing collection shows
+  through. TreeMap, TreeSet and their key sets answer `SequencedMap` and
+  `SequencedCollection` (`reversed`, `getFirst`, `pollLastEntry`, the
+  sequenced views), and ArrayList, LinkedList and ArrayDeque answer `reversed`.
+- **`Collections` `sort`, `reverse`, `max`, `min`, `singletonList`, `nCopies`,
+  `emptySet` and `emptyIterator`.** `sort` and `reverse` change the list in
+  place; `emptyList`, `emptySet` and `emptyMap` are the JDK's single read-only
+  instances (`Collections$EmptyList` …), where `emptyList` and `emptyMap` were a
+  persistent vector and map. `ThreadPoolExecutor` answers
+  `getCompletedTaskCount`.
 - **`jolt.profile`, an execution-count profiler (#1421).** It reads Chez's
   `compile-profile` counters back by Clojure file, line and fn: turn on
   `(prof/instrument!)`, load the code, run it, and `(prof/report)` lists the
@@ -97,8 +240,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `StringBuffer` and the java.time values used to fail to write; they
   round-trip with their contents in order and their class, and one that holds
   itself restores as one. A view or entry of another collection, an iterator,
-  a thread, pool or task and an open stream are refused naming their class.
+  a thread, pool or task, an open stream, and a reify or proxy no var holds
+  are refused naming their class.
   `make imagecoverage` fails on a collection shim that does neither.
+- **`jolt.image/scan-world` and `dump-world!`'s `:stubbed` name each
+  finding's var.** Every entry carries `:var "ns/name"`, as `stubs` already
+  did after a restore, so a tool can say which var holds an open port or an
+  unfinished future without reading the graph path. An object two vars share
+  is named by the var its `:path` runs through, and `stubs` now names that
+  same var (it used to name the last var holding it, beside the first one's
+  path).
 
 ### Changed
 
@@ -115,6 +266,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   image's peak footprint at start fell 17% (350 to 283 MB), its file 20%, and start-up
   took 0.21 s against 0.24 s.
 
+- **`str` of a `java.util.Date`, `java.sql.Timestamp` or `java.sql.Date` is
+  the JVM's `toString`, on the default zone.** `(str #inst "2020-01-01")` is
+  `"Tue Dec 31 19:00:00 EST 2019"` under America/Toronto (it was
+  `"2020-01-01T00:00:00.000-00:00"`), a Timestamp `"2019-12-31 19:00:00.0"` and
+  a `java.sql.Date` `"2019-12-31"`. This covers every path that stringifies:
+  `.toString`, `format "%s"`, StringBuilder, `clojure.string`, and string
+  concatenation in messages. `pr`, `prn`, `print`, `println` and EDN still
+  print `#inst "…"`, as on the JVM. A Timestamp is now its own class
+  (`instance? java.sql.Timestamp`, `.getNanos`) and prints its fraction to
+  nine digits; a `java.sql.Date` prints as `#inst` instead of `#object`, and
+  equals the `java.util.Date` at its instant. `TimeZone/setDefault` sets the
+  default zone; a provider registered with
+  `jolt.host/set-default-zone-provider!` now answers only where the system
+  names no zone. A zone's offset is remembered over the stretch it holds, so
+  reading dates in order (a Date's getters, `SimpleDateFormat`, `str`) asks
+  libc once per stretch instead of once per instant.
+
+- **`future` runs on a pooled executor**, as the JVM's solo executor does,
+  instead of a fresh OS thread per call; a wait spins briefly before parking.
+
+- **`Runtime/version` and `JarFile/runtimeVersion` report 21**, the JDK jolt's
+  oracle certifies against, and that version picks a multi-release jar's
+  entries. The `java.version` property stays `nil`, as before.
+- `Files/readAllLines` splits on `\r` as well as `\n` and `\r\n`, and raises
+  `MalformedInputException` on bytes its charset cannot decode.
+- **List and deque iterators fail fast.** `ArrayList`, `LinkedList` and
+  `Vector` keep a modCount, and their iterators, `listIterator`, `forEach`,
+  `removeIf`, `subList`, spliterators and streams raise
+  `ConcurrentModificationException` where the JDK does. Iterators are live:
+  a `set` during iteration shows. `ArrayDeque`'s behaviour follows its ring
+  buffer, as the JDK's does.
+- **`WeakHashMap` and `IdentityHashMap` are their own classes**: a
+  `WeakHashMap` drops an entry whose key nothing else holds, and an
+  `IdentityHashMap` matches keys and values by reference.
+- **The JDK's interfaces are known** (every public interface in its java.* and
+  javax.* packages and in the com.sun.* and jdk.* packages it exports, such as
+  `com.sun.net.httpserver.HttpHandler`; annotation types included), so a
+  proxy over a JDK class jolt does not model (`java.util.TimerTask`) extends it, and `isInterface`
+  answers for those types.
+- **Images are format 14**: they name the defrecord and deftype types they
+  hold, so a process that restores one without having loaded the code knows a
+  record from a deftype. An `ArrayDeque` travels as its ring buffer and a list
+  carries its modCount. Older images still read, except an old `ArrayDeque`
+  holding nil, which is refused by name.
+- **`iterator-seq` is lazy, as `RT.chunkIteratorSeq` is**: it asks `hasNext`
+  when made and pulls 32 elements at a time through `next`, so a list changed
+  before the seq is walked throws `ConcurrentModificationException`, and any
+  iterator with `hasNext`/`next` works. A Clojure collection's own iterator
+  still hands over the seq it walks without moving (known-divergences).
+- **`doseq` walks a chunked seq a chunk at a time**, reading each block where
+  the vector holds it, as Clojure's `doseq` does. Over a vector it ran 3.5x a
+  list of the same elements; it is now 0.54x what it was (a range 0.63x,
+  `:when` 0.47x), and a list or a short collection costs the same as before.
+  `make doseqperf` holds the vector walk to a list's. The body is written
+  out twice per binding, as Clojure's is, so a doseq nested in a doseq's body
+  doubles its expansion per level like the JVM's.
+- **A HashMap's `keySet`, `values` and `entrySet` are live views**
+  (`HashMap$KeySet` / `$Values` / `$EntrySet`): removing through one removes
+  from the map, a later put shows through, an entry's `setValue` writes the map
+  and their iterators are fail-fast. They were copies. Adds
+  `AbstractMap$SimpleEntry`.
+- **A proxy's class is the JVM's generated name**
+  (`user.proxy$java.lang.Object$ff19274a`), and each `reify` form has a class
+  of its own (`user$reify__N`) rather than one shared placeholder.
+- **`ConcurrentHashMap` is its own class**: a `ConcurrentMap` that refuses
+  null keys and values, whose `keySet`/`values`/`entrySet` are the JDK's
+  weakly consistent views (`ConcurrentHashMap$KeySetView` …, and
+  `keySet(default)`). It used to be a `java.util.HashMap`. `Properties`' views
+  are the synchronized ones over the same weakly consistent walk.
+- **Locale-keyed extension points narrow a missed key to its language** (a
+  point's new `:parent` separator), so `de-DE` reads `de`'s data rather than
+  ROOT's; `String/format` uses the locale's grouping separator too.
+- **A reify form's class name comes from where it sits** (file, line, column),
+  so a form from the AOT cache and one expanded later never share a class. A
+  proxy is an `IProxy` with the JDK's superclass, interfaces and simple name,
+  and `extend` on a reify's or proxy's class reaches its instances.
+- **Locale data is found by a Locale's id whichever way it prints**, so
+  jolt-lang/time's Locale can print as the JDK's `en_US`.
+- **Every `#object` print carries the identity hash, and a plain deftype prints
+  as one**, `#object[user.T 0x1b2c3d4e "user.T@1b2c3d4e"]`, as on the JVM; a
+  defrecord keeps its `#ns.R{…}` form, and a deftype that is a `java.util.Map`,
+  `List`, `RandomAccess` list or `Set` prints as a map, `(…)`, `[…]` or `#{…}`
+  under `pr` and as `#object` under `print`, as `print-method` has it.
+  `str` of a deftype, a reify or a proxy with no `toString` is `Class@hash`. An array prints with its class quoted. A deftype from an image
+  whose code this process never loaded keeps the field form.
+- **`str` of a `ChronoField` is the JDK's display name** (`NanoOfSecond`,
+  `AmPmOfDay`). A project pinned to a jolt-lang/time older than 28d55d62 needs
+  that pin bumped: its `appendFraction` read field names through `str`.
+- **The java.io stream shims report their own class** (`InputStreamReader`,
+  `ByteArrayInputStream`, `System/in` is a `BufferedInputStream`), and a proxy
+  over a java.util collection prints and compares as the collection.
 - **A required namespace's `:file` is its classpath name (#1410).** A def,
   `*file*`, `:clojure.error/source` and trace frames used to carry the path as
   the root spelled it: `./src/mylib/where.clj`, an absolute path, or a
@@ -123,6 +365,111 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `load-file` names a file by its absolute path, also as on the JVM. Error
   reports and traces still show the file's location in source mode, and the AOT
   cache keys on the name, so a project that moves keeps its cache.
+
+### Performance
+
+- **`Arrays/copyOf` and `copyOfRange` block-copy the shared prefix (#1495).**
+  They copied one element at a time through the boxed element accessors, so a
+  64 KB `byte[]` took about 1.2 ms where `byte-array` + `System/arraycopy` took
+  10 us. They now move the prefix through the same block copy `arraycopy` uses:
+  the 64 KB `copyOf` is 12 us, `copyOfRange` 4 us, and a 64 K-element `long[]`
+  `copyOf` 1139 -> 58 us.
+
+- **Printing a host object.** `pr-str` of a `java.io.File` asked every
+  predicate of the pr, pr-str and str arm registries before reaching the
+  `#object` form, and each host family added this cycle lengthened all three
+  walks; with the identity hash it now prints, it was 1.27x slower than 0.8.23.
+  A host object or plain host record now walks only the arms that can claim
+  its type, found on its first print, and the hash renders in one allocation:
+  `pr-str` of a File is 0.72x of 0.8.23, `str` of one 0.6x, and `str` of a
+  StringBuilder 0.25x.
+- **`nth` and `get` on a string.** Each java.util family added this cycle put
+  another wrap around `nth` and another predicate in front of `get`, and a
+  string reached its answer only after all of them: `nth` was 1.2x and `get`
+  1.5x slower than 0.8.23. A string now answers before the wraps and the arms,
+  about 2x faster than 0.8.23 for `nth` and 3x for `get`. fastpathratio rows
+  `string-nth` and `string-get` hold it there.
+- **A cast on a double the compiler has proven takes an inline fast path.**
+  `long`, `int`, `short`, `byte`, `char`, `unchecked-long` and `unchecked-int`
+  on an operand the numeric pass knows is a double (a `^double` param, an
+  `aget` on `^doubles`, flonum arithmetic) emit a window test and
+  `flonum->fixnum` in place, and call the runtime cast only outside the
+  window: NaN, out-of-range values, the `long` saturation at 2^63 and
+  surrogate or astral chars keep their results and messages. The window
+  bounds are constants the runtime computes at load from its own fixnum
+  limits, so one emitted form is right on 61-bit and 30-bit fixnums.
+  `bench/num_casts.clj`: `(long d)` 41 ms to 18 ms for 2M casts on an M1 Pro,
+  about 2 ms over the same loop on a fixnum; on a 32-bit target (Nintendo
+  Wii, `tpb32b`) `(long x)` in a `^double` fn 6.4 us to 1.1 us. Five corpus
+  rows in typed functions pin the edges. `char` now compiles as a cast in
+  every context, as `byte` and `short` already did (a direct call to the
+  runtime cast rather than a var call), and the build's type inference
+  types its result as a char. Closes #1492 with #1493.
+
+- **A double inside the fixnum range converts with `flonum->fixnum`.** After
+  the flonum-bounds fix below, `long`, `int`, `short`, `byte`, `char`,
+  `unchecked-long` and `unchecked-int` on a double still ended in a generic
+  `exact` of a generic `truncate`. The in-range case now takes Chez's
+  `flonum->fixnum` (truncation toward zero in one primitive), behind a range
+  test with the target's own fixnum limits, so it holds on 61-bit and 30-bit
+  fixnums alike; the Gambit host gets the name as a shim over
+  `##flonum->fixnum`. `bench/num_casts.clj`: `(long d)` 62 ms to 41 ms and
+  `(unchecked-long d)` 49 ms to 28 ms for 2M casts on an M1 Pro; on a 32-bit
+  target (Nintendo Wii, `tpb32b`) `(long 123.7)` 27.0 us to 6.3 us and
+  `(unchecked-long 123.7)` 23.0 us to 3.1 us.
+  No result changes; three corpus rows pin the fixnum edges on both widths.
+  Part of #1492.
+
+- **`long`, `int`, `short`, `byte` and `char` on a double, and `unchecked-long`
+  and `unchecked-int` on a double, range-check against flonum bounds instead
+  of bignum ones.** The checked casts compared the flonum against the type's
+  bounds held as exact integers, and for `long` those (+-2^63) are bignums on
+  every Chez, so each cast paid two flonum-vs-bignum compares and a second
+  exact-vs-bignum check after truncation; `unchecked-long` saturated through the
+  same compares (and `unchecked-int` through exact ones). `bench/num_casts.clj`
+  (new): `(long d)` 398 ms to 62 ms for 2M casts on an M1 Pro,
+  `(unchecked-long d)` 68 ms to 50 ms; on a 32-bit target (Nintendo Wii,
+  `tpb32b`) `(long 123.7)` 135.5 us to 27.0 us. One value changes, to match
+  Clojure's `RT.longCast(double)`: `(long 9.223372036854776E18)` (2^63 as a
+  double) now returns `Long/MAX_VALUE` instead of throwing. Eight new corpus
+  rows pin the boundaries.
+- **A socket read receives into a buffer the socket keeps (#1500).** A read
+  allocated what it asked for and copied what arrived out twice, one element at
+  a time for the second. The socket now keeps one receive buffer, up to 64 KB,
+  until it closes: a 120-byte read into a 64 KB array allocates about 8 KB rather
+  than 72 KB. A read asking for more than 64 KB returns at most 64 KB, as
+  `InputStream` allows.
+
+- **`map->R` is one pass over the map.** #1479 sped up a map holding only
+  field keys but made one with extension keys 1.2-1.3x slower than 0.8.23; a
+  single fold that skips the field keys is faster in both cases (one extension:
+  215 -> 117 ns, fields only: 118 -> 53 ns, in an `--opt` build). It also takes a
+  `java.util.Map`, as the JVM's does.
+
+- **Sorted maps and sets keep their red-black tree in the host**, with
+  vector nodes, so building and updating them is several times faster than in
+  0.8.23. `sorted-map` `assoc` of an `=` value now keeps the existing value only
+  when it is identical, as the JVM's does.
+
+- **The precompiled stdlib runs at user-code speed under `jolt run`.** The
+  namespaces a release binary carries as embedded fasls (`jolt.time.*`,
+  `clojure.data`, `babashka.fs`, `babashka.process`, `clojure.test`, …) were
+  compiled with var caching off, so every var reference inside them was looked
+  up by name on each call. `jolt.time.util/hmsn->nano` goes from 143 ns to
+  20 ns a call, the same as a copy of it in a user file; `clojure.data/diff`
+  34 µs to 17 µs, `babashka.process/tokenize` 14.8 µs to 9.2 µs. The seven
+  seed-embedded namespaces (`clojure.string`, `clojure.set`, …) and `jolt
+  build` binaries were not affected. `make stdlibratio` gates the ratio.
+
+- **`count`, `get`, `contains?` and `hash` on java.util collections pay less
+  for dispatch.** Each walks a registry of per-type predicates, and every host
+  type's predicate compared its tag string; they now remember the answer per
+  tag. Against 0.8.23 on macOS arm64: `count` of an ArrayList 41 -> 29 ns, of a
+  HashMap 66 -> 33 ns, of a HashSet 36 -> 28 ns; `hash` of a plain `Object`
+  480 -> 350 ns. ArrayList `add`/`remove` are about a fifth faster.
+- **`java.nio.file.Path` members take the call-site cache** as every other host
+  class's do: `.toString` 125 -> 18 ns, `.resolve` 291 -> 121 ns,
+  `.getFileName` 204 -> 90 ns, and `Paths/get` of one name 61 -> 41 ns.
 
 ### Fixed
 
@@ -135,6 +482,375 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fn of a def nothing registered (eval'd code) is an element named `ns$def$fn__n`, as the
   JVM names it. `build-smoke` pins it on a built app.
 
+- **`jolt build --target` to a 32-bit machine compiled the runtime for the
+  host's fixnum width.** The compile runs on the 64-bit host Chez, so
+  `hasheq.ss`'s `define-width-op` (#801) chose the unsafe `#3%fx` hash arm for a
+  target where an int hash is a bignum, and runtime init failed with
+  "variable murmur3-seed is not bound". Past that, host code's checked fx ops on
+  int-width values (`(fx>=? k -2147483648)`, `(fx- i #x100000000)`) raised
+  "-2147483648 is not a fixnum". For a cross target in the i3/arm32/armv7/
+  ppc32/pb32 families, the generated compile script now sets
+  `JOLT_NARROW_HASH` before `compile-file` and aliases the checked fx operators
+  to their generic counterparts, which agree with them on fixnums. Native builds
+  and 64-bit cross builds generate the same script as before. Found bringing up
+  `tpb32b` (big-endian 32-bit portable bytecode) on a Nintendo Wii, where a
+  cross-built program's output now matches the native macOS build.
+- **`byte`, `short`, `char` and `int` follow both of `RT`'s cast paths.** The JVM
+  has one overload for a primitive `double` or `float` and another for a boxed
+  number, and they disagree; jolt had one path that was right for neither. A
+  primitive operand (a literal, `^double`, `aget`, flonum arithmetic) now checks
+  the raw value, so `(byte ##NaN)` and `(byte 127.9)` throw. A boxed one (through
+  `identity`, `apply` or `map`) goes through `longCast` first: `(byte (identity
+  127.9))` is 127, `(byte (identity ##NaN))` is 0, `(char (identity -0.5))` is
+  `\u0000`, `(byte (identity ##Inf))` says "for long" and `(int (identity 2.5e9))`
+  is `integer overflow`. A param that only a build proved a double, or an untyped
+  one after inlining, keeps the boxed answer, as `jolt run` of the same code does.
+- **`System/arraycopy` and `Arrays/copyOfRange` raise HotSpot's messages.**
+  Out-of-range and store errors say what `arraycopy: source index -1 out of bounds
+  for long[3]`, `arraycopy: length -1 is negative` and `arraycopy: type mismatch:
+  can not copy long[] into int[]` say on the JVM, checked in its order.
+  `copyOfRange` now fails as the `arraycopy` inside it does.
+- **`Arrays/copyOfRange` pads past the end and checks its range as the JDK
+  does (#1495).** A `to` past the array's end read past it instead of padding
+  with the kind's zero; `from > to` is now `IllegalArgumentException("from >
+  to")` rather than `NegativeArraySizeException`, and a `from` outside
+  `[0, length]` is `ArrayIndexOutOfBoundsException`.
+
+- **`seq?` answers true for a deftype or reify implementing `ISeq`**, as
+  `(instance? clojure.lang.ISeq x)` does on the JVM, and `(sequence s)` returns
+  such a value rather than seqing it again. A record stays false.
+- **A reify implementing `Seqable` or `ISeq` could not be walked.** `seq`,
+  `first`, `into` and friends threw "Don't know how to create ISeq"; they now
+  ask its `seq` method and walk an `ISeq` lazily. `coll?` and `count` answer
+  for such a reify as the JVM does, and `count` of a seq deftype that is not
+  `Counted` walks its seq instead of throwing `AbstractMethodError`.
+  `clojure.lang.IndexedSeq` is modeled, so a type declaring it is `seq?`.
+- **A monitor wait could leave the monitor held for good.** `Object.wait`
+  released the owner word before clearing the hold count, so a thread entering
+  at that moment could have its count overwritten and never free the monitor.
+  A `ConcurrentHashMap` `merge` or `compute` on one key from four threads hung
+  within a few rounds.
+- **A `require` on another thread could move the caller's `*ns*`.** `a/thread`
+  conveys its parent's binding frames, and the loader wrote the loaded file's
+  namespace into the parent's frame, so the parent's next top-level form could
+  raise `Unable to resolve symbol`. Each load now has a `*ns*` binding of its
+  own, as `Compiler.load` pushes one.
+- **`*file*` in a namespace loaded from the AOT cache (#1466).** Its top level
+  read its requirer's `*file*` and `*source-path*`; it now reads its own, as on
+  a cold load.
+- **`jolt.loader`'s `unload!` drops its namespaces from `*loaded-libs*`
+  (#1469)**, so a later `require` loads the host's copy instead of doing nothing.
+- **`Path.toUri` is the JDK's own form (#1467)**: `file:///` plus the path's
+  UTF-8 bytes, percent-encoded outside RFC 2396's path set. It was
+  `File.toURI`'s `file:/x/ünï%20cödé.clj`.
+- **`URI.toASCIIString` escapes non-ASCII (#1468)** as NFC-normalized UTF-8; it
+  returned the same string as `toString`.
+- **`slurp`, `spit`, `io/reader`, `io/writer`, `io/input-stream` and
+  `io/output-stream` open a `java.net.URI`** through `.toURL`, as Clojure's
+  `IOFactory` does. They threw `Cannot open`, or for `spit` wrote to a path
+  named by the URI's string. A relative URI is `IllegalArgumentException: URI is
+  not absolute`.
+- **`java.net.URI` equality, `hashCode` and `compareTo` follow the JDK.** They
+  compared the string forms, so `(= (.toUri path) (.toURI file))` was false
+  for the same file, `Path.toUri` writing `file:///`. They compare
+  component by component: an empty authority is none, the scheme and host
+  ignore case, and an escape's hex digits ignore case.
+- **A started `Thread`, an executor's pool thread and a virtual thread read
+  `*ns*` at its root, `clojure.core`,** as on the JVM, instead of the
+  `user` namespace of the thread that made them. A virtual thread no longer
+  inherits its creator's bindings either. `future`, agents and `bound-fn`
+  still convey the caller's. `(.getRawRoot #'*ns*)` is `clojure.core` too.
+- **`java.util.Timer` exists.** All four constructors, `schedule` (delay or
+  `Date`, one-shot or fixed-delay), `scheduleAtFixedRate`, `cancel` and
+  `purge`, with a `TimerTask` proxy's `cancel` and `scheduledExecutionTime`.
+  `(java.util.Timer. true)` used to be "No matching ctor".
+- **`ReentrantLock.tryLock` could refuse a free lock on arm64.** The claim is
+  a compare-and-swap that may fail spuriously there, and the try path answered
+  false instead of retrying: about 3 in 5*10^7 uncontended tryLocks on Apple
+  silicon, already in 0.8.23.
+- **A condition wait with interrupts disabled could still stall a
+  collection** when the thread requesting it held the waited mutex: the
+  sliced wait took the mutex back inside Chez's `condition-wait`, still
+  counted as active. It now releases the mutex, naps in a collect-safe call
+  and retakes it collect-safely.
+- **A caught throw keeps the fn that threw when the call into it went through a
+  fn value.** `(defn caught [f] (try (f) (catch Throwable t t)))` called from
+  another fn, with `f` tail-calling a fn that divides by zero: `.getStackTrace`
+  (and `jolt.debug/frames`) left out the thrower and named only the caller. The
+  report second-guessed the site a tail call records against the innermost
+  frame's registered callees, which never name a fn reached through a value.
+  Code that is not traced now puts that site back whenever a fn value it called
+  returns (`jolt-invoke0`..`4`, and the natives' direct callback calls in `map`,
+  `filter`, `reduce` and `reduce-kv`), so a site at a throw always belongs to
+  the call that threw and the guess goes. That also drops the frame a callback
+  left when core threw after it returned: `(into {} (map f xs))` failing on a
+  non-pair named `f` innermost, where it now names the fn that called `into`, as
+  the JVM does. No measurable cost (one load and store per callback).
+
+- **`require`, `load`, `load-string`, `load-reader` and `load-file` raise a
+  `Compiler$CompilerException` for what a form's run throws**, as
+  `Compiler.load` and `RT.load` do: "Syntax error macroexpanding at
+  ([source:]line:col).", ex-data `{:clojure.error/phase :execution, :line,
+  :column}` (and `:source`: the classpath file for a namespace, the path for
+  `load-file`), the throw as its cause, at the reader's position before the
+  form. A `(catch ArithmeticException ...)` around a `require` or `load-string`
+  no longer catches it, as on the JVM; read the cause. A nested require's
+  wrapper passes through unchanged. `eval` and `jolt.host/eval-string` are
+  unchanged, and the uncaught report still names the original throw, its
+  location and its trace. `clojure.main/root-cause` stops at the wrapper, so
+  nREPL replies `ex`/`root-ex` `Compiler$CompilerException` for such an error,
+  as JVM nREPL does, and its `err` names the failing form's file and line when
+  no frame does ("at (b.clj:3)" where it said "at (REPL:1)").
+- **A diagnostic in text evaluated under a source path shows that text**
+  (`jolt.host/eval-string`/`load-string` with a path, nREPL `load-file` of an
+  unsaved buffer). Its snippet was read from the file on disk.
+- **The default time zone is the machine's, whatever has loaded.** With `TZ`
+  unset, core answered UTC until jolt.time loaded and registered the
+  machine's zone, so a zone-less `SimpleDateFormat` parse moved by hours
+  depending on whether some `java.time` class had been touched first. Core
+  now reads the zone where libc does (the `/etc/localtime` link, else
+  `/etc/timezone`), so `TimeZone/getDefault`, `SimpleDateFormat`, `Calendar`
+  and the deprecated `Date` getters agree with the JVM. An empty `TZ` is UTC.
+- **C arguments past the argument registers land where the callee reads them
+  on arm64 and x86_64 (#1501).** Once the registers were used up, Chez's `foreign-procedure` (and
+  so `jolt.ffi`) on arm64 macOS packed a struct of 16 bytes or less that isn't
+  all floats or all doubles like a scalar, where Apple's ABI gives it 8-byte
+  slots, and its padding before a stack argument could go negative (three
+  `char`s then a `short`; three floats, a `char`, three floats), so the C
+  function read the wrong bytes without any error. On every arm64, a struct over
+  16 bytes after the registers, which goes by pointer, failed to compile
+  (`unexpected Triv`). On x86_64, a struct on the stack whose size isn't a
+  multiple of 8 (three `char`s, say) overwrote the start of the next argument,
+  so a `char` after it arrived as 0. jolt's Chez build carries both fixes from
+  cisco/ChezScheme#1091 until a Chez release has them
+  (`host/chez/chez-patches/0006` for arm64, `0007` for x86_64), checked by
+  `test/chez/ffi-stack-args-test.sh` in the `ffi` gate; a jolt built against a
+  stock Chez keeps the old placement.
+- **`InputStream.read(b off len)` on a socket checks its range first.** An
+  `off` or `len` outside the array is `IndexOutOfBoundsException` with the JDK's
+  message, before the socket is touched. It used to consume the bytes and then
+  throw `ArrayIndexOutOfBoundsException`.
+
+- **A surrogate unit is a value, and the joiners pair it (#1454).**
+  `(char 0xD83D)` used to throw; it is now a `Character` holding the unit, as a
+  `char[]` element and `Character/toChars` are, and `str`, StringBuilder and
+  StringBuffer `append`, Writers, `(String. char[])` and `clojure.string/join`
+  put a high unit followed by its low one together as the code point. A lone
+  unit in finished text is U+FFFD. data.json reads a `\uD83D\uDE00` escape
+  as the emoji. `print`, `format "%c"` and `Character`'s classifiers take a
+  unit. Strings themselves still index by code point everywhere, `count` and
+  `subs` as well as `.length`, `.charAt`, `.substring`, `.indexOf`, a
+  StringBuilder's index methods and a Matcher's `.start`/`.end`: an unreleased
+  change (#1472) had moved the String methods to UTF-16 units, which broke code
+  that mixes the two, such as an editor handing GTK's code-point offsets to
+  `subs`.
+- **`defprotocol` honors `:extend-via-metadata`.** It parsed the option and
+  dropped it, so dispatch never read a value's metadata. `(:extend-via-metadata
+  P)` is now true, and a call looks first at the receiver type's own impl, then
+  at the value's metadata under the method's qualified symbol, then at `extend`
+  impls, under `jolt run` and in built binaries. `satisfies?` still ignores
+  metadata, as on the JVM.
+- **`clojure.core.protocols/Datafiable` and `Navigable` are
+  `:extend-via-metadata`,** as in the reference, so `datafy`/`nav` honor an
+  impl in a value's metadata.
+- **`conj` and `dissoc` on records.** `(conj r nil)` added a nil entry and
+  conj or merge of a sorted map threw; conj now follows defrecord's cons (nil
+  is the record, an entry or vector assocs its first two elements, anything
+  else seqs into entries). `dissoc` dropped the record's metadata, whether the
+  key was a field or an extension.
+- **`reduce-kv` with a reduced init** unwrapped it before folding anything.
+  It now does what each reference kvreduce does: an array map, vector, sorted
+  map or record calls `f` with it, a hash map unwraps it, an empty array map,
+  vector or nil returns it still wrapped, and a type's own `kvreduce` gets it
+  and has its answer returned as is.
+
+- **On macOS a profiling signal could kill the process with status 128**
+  (#1461). `sigwait` there answers 0 for an interrupted wait without naming a
+  signal, and the shutdown watcher read that as signal 0, exiting without
+  flushing output or running shutdown hooks. It now acts only on a signal from
+  its own set.
+- **`spit` writes in place.** It wrote a temp file and renamed it over the
+  target, which replaced a symlink with a regular file, broke hard links and
+  reset the file mode (a 0600 file came back 0644). It overwrites the file and
+  cuts any old tail afterwards rather than truncating on open, which is far
+  cheaper on disk: 4000 overwrites of a small file go from 722 ms to 274 ms on
+  macOS.
+- **`(group-by f coll)` with a NaN key** threw "persistent!: not a
+  transient"; each NaN now gets its own group, as on the JVM.
+- **`clojure.set/intersection` and `select` drop a NaN member** they were
+  asked to drop, and `disj` of an absent member returns the same set.
+- **Collection metadata survives where the JVM keeps it**: `(into to xform
+  from)` keeps `to`'s meta, `empty` of a sorted coll keeps its meta while
+  `empty` of a seq is a bare `()`, and a `PersistentQueue` takes `with-meta`
+  and `empty`s to a queue.
+- **Java methods on lists, seqs, sorted sets and queues answer as their JVM
+  classes do.** These colls answered almost no interop methods, while vectors,
+  maps and sets answered methods their classes lack (`.contains` on a map,
+  `.valAt` on a set); every builtin coll now has its class family's methods,
+  and the others raise the JVM's "No matching method".
+
+- **`load-string` no longer leaves the caller in the namespace it switched
+  to.** `(do (load-string "(ns foo)") *ns*)` answered `foo`; it now answers
+  the caller's namespace, as on the JVM, where `Compiler.load` binds `*ns*`
+  for the load. `load-file`, `load` and `require` bind it the same way, and
+  `load-reader`, which was missing, is there. The REPL and the nREPL `eval`
+  op still switch namespace on an `(ns …)` or `in-ns`: each binds `*ns*` for
+  the session and reads it after the eval, as clojure.main and nREPL do. The
+  nREPL `load-file` op is a load and leaves the session's namespace alone.
+- `AtomicInteger.updateAndGet` and `AtomicLong.getAndUpdate` (and the other
+  update members) refused a reify of `IntUnaryOperator` / `LongUnaryOperator`:
+  they called `apply` instead of `applyAsInt` / `applyAsLong`.
+- `ReentrantLock.toString` adds `[Unlocked]` or `[Locked by thread NAME]`, as the
+  JDK's does.
+- **A `java.io.File` whose path holds a NUL no longer acts on another file.**
+  The OS reads a path only up to a NUL, so `(.delete (File. "notes.txt\u0000x"))`
+  deleted `notes.txt`, and `exists`, `length`, `list` and the rest answered
+  for it. They now give the JDK's answers for an invalid path (false, 0, nil),
+  and `createNewFile`, `slurp`, `spit` and the file streams raise "Invalid file
+  path". `Paths/get`, `Path/of`, `.toPath` and `resolve` raise
+  `InvalidPathException` "Nul character not allowed", as the JDK's do.
+- **`.reduce` follows the class's interfaces.** A vector's seq, an array's
+  seq and an array map's seq are `IReduce` and reduce themselves, a string seq
+  is `IReduceInit` and reduces only from an init, and a set's, a sorted coll's
+  or a hash map's seq, `keys`/`vals`, a `ChunkedCons`, a subvec and a map entry
+  raise `IllegalArgumentException`, as on the JVM.
+- **`()` is a `PersistentList$EmptyList` only.** It reported itself a
+  `PersistentList` and an `ASeq` (and so `IReduce`), which it is not on the
+  JVM; a protocol extended to `PersistentList` no longer reaches it.
+- **`(empty map-entry)` is nil**, as `MapEntry.empty()` is; it was `[]`.
+- **`transient` refuses a sorted map or set** with the JVM's
+  `ClassCastException`; it answered a copy-on-write transient.
+- **A `reduced` box prints** as `#object[clojure.lang.Reduced 0x… {:status
+  :ready, :val 1}]`, and `str` is `clojure.lang.Reduced@hash`.
+- **A built binary keeps a struct field's object identity.** Scalar
+  replacement moved a dropped map or record binding's field value to every
+  read, so a value that allocates (a vector, a nested map) became a new object
+  per read, and per loop iteration: `(identical? (:x m) (:x m))` was false.
+  Such a value is now bound once where the struct was.
+- **`jolt nrepl-server` says when it can't write its port file**, e.g. a
+  `--port-file` into a missing directory. It used to start as if the file had
+  been written, leaving the editor nothing to find.
+- **`(URL. context spec)` resolves as the protocol's handler does.** `.` and
+  `..` segments are dropped, a spec starting with `/` replaces the path, and a
+  `jar:` context resolves against its entry, so `(URL. migration
+  "../seed.sql")` reads the jar's `seed.sql`. `URL.toURI` exists.
+- **A jar on the source roots answers resources as the JDK's class loader
+  does**: `(io/resource "migrations")` finds the directory entry
+  `migrations/`, and `.openConnection` on a `jar:` URL is a
+  `JarURLConnection` where it threw "no protocol handler".
+- **Resource URLs from directory and jar roots are percent-encoded** as the
+  JDK's class loader encodes them, so a space, `#`, `;` or non-ASCII character
+  in a root or a name no longer breaks `toURI` or relative resolution, and
+  `getPath` answers the encoded path, as on the JDK. `slurp`, `io/file` and the
+  streams decode it.
+- **`getBytes` in a charset jolt reaches through iconv writes `?` for a
+  character the charset lacks**, as the JDK does. It threw
+  `UnsupportedEncodingException` on Linux and wrote macOS iconv's own spelling
+  (`gal.` for 日 in ISO-8859-2) there.
+- **`InputStreamReader` and `OutputStreamWriter` built over a
+  `CharsetDecoder` or `CharsetEncoder` use it**: a writer over an encoder wrote
+  UTF-8 whatever its charset, and a decoder's REPORT action, its default, now
+  raises on malformed input, as an encoder does on a character its charset
+  cannot hold.
+- **`LocalDate/of`, `LocalTime/of` and `LocalDateTime/of` refuse an
+  out-of-range field** with the JDK's `DateTimeException` where they rolled it
+  over (`(LocalDate/of 2020 13 1)` was 2021-01-01).
+- The deprecated `(String. bytes hibyte)` and `(String. bytes hibyte offset
+  count)` constructors build their chars from the high byte, where they were
+  read as a charset and a slice.
+- `ZipEntry.setLastModifiedTime` keeps the `FileTime` at its own precision,
+  and `ZipFile` has `stream` and Object's `toString`.
+- **A map hands out one `keySet`, `values` and `entrySet` view**, as the JDK's
+  keep theirs in a field: `HashMap`, `LinkedHashMap`, `TreeMap` (whose `keySet`
+  is its `navigableKeySet`, and whose `descendingMap` is cached too), `EnumMap`,
+  `Hashtable`, `WeakHashMap` and `IdentityHashMap`. `(identical? (.keySet m)
+  (.keySet m))` is true, and so is `.equals` of a `values` view with itself.
+- **`TimeUnit` conversions saturate at Long's range**:
+  `(.toMicros TimeUnit/DAYS Long/MAX_VALUE)` is `Long/MAX_VALUE`, not a
+  bigint. `TimeUnit/of` names an unmapped `ChronoUnit` as it prints (`Weeks`).
+- **`AtomicInteger` and `AtomicLong` print as numbers** (`5`, not
+  `#object[…]`), as the `Number`s they are. `Thread`, `ReentrantLock`,
+  `CountDownLatch` and `ThreadPoolExecutor` have the JDK's `toString`
+  (`Thread[#1,main,5,main]`, `…@1b2c[Unlocked]`, `…[Count = 1]`,
+  `…[Running, pool size = 0, …]`), and `getActiveCount` no longer counts a
+  worker still starting.
+- **`System/identityHashCode` and the hash of a fn or plain deftype are
+  non-negative 31-bit values**, as HotSpot's are; half of them were negative.
+- **`HashMap` and `HashSet` `remove` is O(1)** (jolt-lfm8p). It rebuilt the
+  map's insertion-order key list, so one removal from a 20k-entry map cost
+  ~112us; it now leaves a stale entry the walk skips, and the list is rebuilt
+  once stale entries outnumber live keys. Iteration order is unchanged.
+- **`ConcurrentHashMap` refuses a recursive update** (jolt-2gc66). A write to
+  the key that `computeIfAbsent` (or `compute` over an absent key) is computing,
+  made from inside its function, is `IllegalStateException` "Recursive update",
+  as on the JDK; reads and other keys go through.
+- **`ConcurrentHashMap` is thread-safe.** Writes from several threads lost
+  entries, could drive `size` negative and could corrupt the table. Every write
+  now holds the map's lock, compute functions run outside it with only their key
+  held, so another thread writing that key waits while other keys go through,
+  and walks (`seq`, the views, `forEach`) see each key with its value, never the
+  nil a racing remove left. Single-threaded speed is unchanged.
+- **A `ConcurrentHashMap` iterator reads its next entry ahead**, as the JDK's
+  does, so `next` after a `hasNext` that answered true never throws
+  `NoSuchElementException` when another thread removes keys in between.
+- **`ConcurrentHashMap` refuses nil everywhere the JDK does**: `replace`,
+  `putAll`, `merge`, `getOrDefault`, the compute family and the copy
+  constructor throw `NullPointerException` instead of storing or ignoring it.
+  `mappingCount` is there.
+- **`Properties` is synchronized, as the JDK's is.** Writes and `forEach`
+  hold the object's own monitor (so `locking` it excludes them) and walks see
+  each key with its value; concurrent `setProperty` lost entries, and writes
+  through `System/getProperties` could corrupt the system property table.
+  `clone` keeps the defaults. Single-threaded speed is unchanged.
+- **`Properties.remove(key, value)`** was missing; it removes the key only
+  when it is mapped to that value.
+- **`ArrayDeque.addAll`** of the deque itself throws
+  `ConcurrentModificationException` after adding the elements again, and of nil
+  throws `NullPointerException`, as the JDK's does.
+- **`(seq a-HashMap)` yields the map's own entries** (jolt-12zv0):
+  `HashMap$Node`, `ConcurrentHashMap$MapEntry`, `IdentityHashMap`'s and
+  `WeakHashMap`'s entries, in the map's iteration order, live and printing as
+  `#object[... "k=v"]`, where it yielded detached `MapEntry` pairs in hash
+  order. A `Properties` seqs to `ConcurrentHashMap$MapEntry`, as the JDK's does.
+- **HashSet, LinkedHashSet, TreeSet, the LinkedHashMap and TreeMap views and
+  their iterators are fail-fast** (jolt-i6iwq). HashMap, LinkedHashMap and
+  TreeMap keep the JDK's modCount, bumped by the same operations (a new key, a
+  removal, every clear, an access-order move; not a put over an existing key),
+  and the iterators, `forEach`, `removeIf`, `replaceAll`, the compute family,
+  spliterators, streams, `iterator-seq`, a chunked `seq` and `reduce` raise
+  `ConcurrentModificationException` where the JDK's do. TreeMap's iterators
+  check the end before the count, as the JDK's do; a TreeMap values iterator
+  reads the current value; TreeMap's and LinkedHashSet's spliterators bind at
+  first use. `reduce` over any fail-fast collection, lists included, walks its
+  iterator.
+
+- `(String. s)` returned `s` itself; it is a new string, and `(String.)` is
+  `""`.
+- The per-thread string hash cache held up to 2048 strings strongly; it is
+  weak now.
+- `Vector.addAll` handed the list code a raw list and threw.
+- `iterator-seq` over an `ArrayDeque`'s iterators threw.
+- `ArrayDeque.removeIf` / `removeAll` / `retainAll` threw
+  `ConcurrentModificationException` when the predicate added an element before
+  the first match; they re-read the tail there, as the JDK's do.
+- `Vector.trimToSize` and `Vector.ensureCapacity` count a structural change.
+- `load-file` returned nil; it answers the value of the file's last form.
+- `jch-register-supers!` left the derived name tables stale; a new reify or
+  proxy class no longer flushes the class graph's dispatch caches.
+- `chunk-rest` realized the seq after the chunk; it hands it back unrealized,
+  as `ChunkedCons.chunkedMore` does.
+- `get` on a reify calls the 1-arity `valAt` for `(get r k)` and reads a
+  `java.util.Map` reify through its `get`; `ex-message` and `str` of a proxy
+  over an Exception carry its (possibly overridden) message.
+- Two namespaces' records of the same name are two classes to `instance?`.
+- `HashMap.compute`/`merge` returning nil remove a key mapped to nil; a
+  removed key's entry keeps the value it had; a view's `forEach` throws
+  `ConcurrentModificationException` when the map changes under it;
+  `Properties.remove` of an absent key no longer disturbs iteration.
+- `AbstractMap$SimpleImmutableEntry` exists, and both entry classes construct
+  by the name an `import` gives them.
+- **A HashMap's `entrySet` is empty, not nil, when the map is**, so `.size` on
+  it, and on an unmodifiable or synchronized view of it, no longer throws.
 - **Enums have `values` and `valueOf` (#1433).** The JDK enums jolt provides
   (`TimeUnit`, `Future$State`, `Thread$State`, `RoundingMode`,
   `Normalizer$Form`, `StandardOpenOption`, `StandardCopyOption`, `LinkOption`,

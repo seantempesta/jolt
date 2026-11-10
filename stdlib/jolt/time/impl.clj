@@ -37,7 +37,8 @@
 ;; --- value machinery ---------------------------------------------------------
 
 ;; type-kw -> {:eq (fn [a b]) :hash (fn [v]) :str (fn [v]) :cmp (fn [a b]|nil)
-;;             :classes #{class-name-strings} :enum? true-for-an-enum-type}
+;;             :classes #{class-name-strings} :enum? true-for-an-enum-type
+;;             :class "the-class-name"}   ; optional: what (class v) answers
 (defonce ^:private registry (atom {}))
 
 (def ^:private type-key :jolt.time/type)
@@ -162,7 +163,8 @@
     ;; (extend-protocol P java.time.X …) never fires (tick extends its protocols this way).
     (__register-class!
      jt?
-     (fn [x] (get type->class (type-of x) "java.lang.Object"))
+     ;; a type a library registers names its own class (:class); core's are here
+     (fn [x] (or (:class (spec-of x)) (get type->class (type-of x) "java.lang.Object")))
      (fn [x] (conj (vec (:classes (spec-of x))) "java.io.Serializable" "Serializable"))
      claim)))
 

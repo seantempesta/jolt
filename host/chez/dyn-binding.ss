@@ -242,6 +242,17 @@
 (define (jolt-with-ns-load-vars thunk)
   (dyn-with-frame (jolt-ns-load-var-pairs) thunk))
 
+;; Compiler.load and RT.load bind *ns* to its current value for the duration of
+;; a load, so an (ns …) or in-ns in the loaded source switches only the load's
+;; own binding and the caller is back in its namespace when the load returns,
+;; however it returns. in-ns writes the innermost binding (set-chez-ns!), so a
+;; frame here is all it takes. The frame pairs for a caller that pushes its own
+;; frame; the thunk form for one that does not.
+(define (jolt-ns-binding-pairs)
+  (if star-ns-cell (list (cons star-ns-cell (intern-ns! (chez-current-ns)))) '()))
+(define (jolt-with-ns-bound thunk)
+  (dyn-with-frame (jolt-ns-binding-pairs) thunk))
+
 ;; get-thread-bindings: a jolt map of every currently-bound cell -> value,
 ;; innermost wins. Merge oldest-frame-first (the stack head is innermost). The
 ;; result can be re-pushed by with-bindings* / bound-fn*.

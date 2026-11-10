@@ -41,7 +41,8 @@ check() {
 
 # --- (a) System/in exists and is an InputStream ------------------------------
 check a "$(run '(println (instance? java.io.InputStream System/in))')" "true"
-check a2 "$(run '(println (class System/in))')" "java.io.InputStream"
+# System.in is a BufferedInputStream on the JVM, and reports its own class
+check a2 "$(run '(println (class System/in))')" "java.io.BufferedInputStream"
 
 # stdin is decoded by the same decoder as every other Reader (natives-str.ss
 # utf8-bytes->string), not by Chez's codec: a leading BOM is U+FEFF and an

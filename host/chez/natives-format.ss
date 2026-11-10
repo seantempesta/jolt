@@ -18,7 +18,7 @@
 ;; clause could select it. %c also takes a char.
 (define (fmt-numeric d a f)
   (cond ((jolt-nil? a) "null")
-        ((or (number? a) (and (char? a) (char=? d #\c))) (f a))
+        ((or (number? a) (and (or (char? a) (jsurr? a)) (char=? d #\c))) (f a))
         (else (jolt-throw (jolt-host-throwable "java.util.IllegalFormatConversionException"
                 (string-append (string d) " != " (jolt-class-name a)))))))
 ;; %x / %X / %o are UNSIGNED conversions on the JVM: a negative argument prints the
@@ -53,6 +53,8 @@
 ;; the JVM formats 123.045 as "123,045" under de. Bound rather than passed so
 ;; every directive path picks it up without threading an argument through.
 (define format-decimal-sep (make-parameter "."))
+;; …and the , flag's grouping separator, "," but for the locale's ("1.234,5" under de)
+(define format-grouping-sep (make-parameter ","))
 ;; --- the decimal digits of a number ---------------------------------------------
 ;; (num-digits x) -> (values digits expo) for a finite x >= 0: digits are the
 ;; significant decimal digits with no leading or trailing zeros ("0" for zero),
@@ -165,7 +167,7 @@
     (let loop ((i (string-length int)) (acc '()))
       (if (fx<=? i 3)
           (apply string-append (substring int 0 i) (append acc (list rest)))
-          (loop (fx- i 3) (cons (string-append "," (substring int (fx- i 3) i)) acc))))))
+          (loop (fx- i 3) (cons (string-append (format-grouping-sep) (substring int (fx- i 3) i)) acc))))))
 
 ;; --- %a: the hexadecimal-float conversion ----------------------------------------
 ;; With NO precision %a is Double.toHexString's spelling: 0x1.<13 hex mantissa
@@ -470,7 +472,11 @@
       ((#\B) (fmt-pad (string-upcase (fmt-truncate (if (jolt-truthy? a) "true" "false") prec)) flags width #f))
       ((#\h) (fmt-pad (fmt-truncate (fmt-hash a) prec) flags width #f))
       ((#\H) (fmt-pad (string-upcase (fmt-truncate (fmt-hash a) prec)) flags width #f))
-      ((#\c) (fmt-pad (fmt-numeric d a (lambda (n) (if (char? n) (string n) (string (fmt-code-point n)))))
+      ;; a surrogate unit ((char 0xD83D)) is a char too; on its own it is a
+      ;; lone unit, U+FFFD in finished text
+      ((#\c) (fmt-pad (fmt-numeric d a (lambda (n) (cond ((char? n) (string n))
+                                                         ((jsurr? n) jolt-replacement-string)
+                                                         (else (string (fmt-code-point n))))))
                       flags width #f))
       (else (fmt-unknown-conversion (string d))))))
 

@@ -17,6 +17,62 @@
 ;; cur, so seq just yields it — clojure.test's (iterator-seq (.iterator coll)).
 (register-seq-arm! jiterator? jiterator-cur)
 
+;; iterator-seq is RT.chunkIteratorSeq: hasNext is asked when the seq is made,
+;; and each realization pulls up to 32 through next() — hasNext before the
+;; count, as the JDK loop reads them — then asks hasNext again for the rest. So
+;; a fail-fast iterator throws when the seq is walked after a change, not when
+;; it is made. A jhost iterator's two methods are looked up once per seq; any
+;; other goes through the dispatcher. A SeqIterator walks an immutable seq, so
+;; it hands that seq over as it stands: the same elements, no copy.
+;;
+;; A host iterator whose hasNext / next run no code of the caller's can fill a
+;; chunk in one step (register-iterator-seq-fill!): (fill it buf) does what up
+;; to 32 rounds of the loop would, answering the count, or #f when its state is
+;; one only the loop itself answers right (a change under it, a cursor past the
+;; end), and the loop runs instead. NEXT is the next method the fill stands for:
+;; a tag whose next is some other method by now (a subclass's) gets the loop.
+(define iterator-seq-fills '())
+(define (register-iterator-seq-fill! tags fill next)
+  (for-each (lambda (t) (set! iterator-seq-fills (cons (list t fill next) iterator-seq-fills))) tags))
+(define (iterator-seq-method it name)
+  (or (and (jhost? it) (host-method-ref (jhost-tag it) name))
+      (lambda (self) (record-method-dispatch self name (jolt-vector)))))
+;; A chunk's cells, each already linked to the next as list->cseq's are: the
+;; elements are in hand, so a walk has nothing to compute until the chunk ends,
+;; where the last cell's tail follows from its fields into MORE.
+(define (iterator-seq-chunk v more)
+  (let ((chunk (make-pvec v)))
+    (let loop ((i (fx- (vector-length v) 1)) (next #f))
+      (let ((c (make-cseqv (vector-ref v i) next sk-chunked-cons jolt-nil chunk i more)))
+        (if (fx=? i 0) c (loop (fx- i 1) c))))))
+(define (jolt-iterator-seq it)
+  (cond
+    ((jiterator? it) (jolt-seq (jiterator-cur it)))
+    ;; anything that cannot be an Iterator — a jolt collection, nil — seqs as
+    ;; itself: the documented superset (the JVM raises ClassCastException)
+    ((not (or (jhost? it) (jreify? it) (jrec? it))) (jolt-seq it))
+    (else
+      (let* ((has-next? (iterator-seq-method it "hasNext"))
+             (next (iterator-seq-method it "next"))
+            (fill (let ((e (and (jhost? it) (assoc (jhost-tag it) iterator-seq-fills))))
+                    (and e (eq? (caddr e) next) (cadr e)))))
+        (let chunks ()
+          (if (jolt-truthy? (has-next? it))
+              (jolt-make-lazy-seq
+                (lambda ()
+                  (let* ((buf (make-vector 32))
+                         (n (or (and fill (fill it buf))
+                                (let loop ((n 0))
+                                  (if (and (jolt-truthy? (has-next? it)) (fx<? n 32))
+                                      (begin (vector-set! buf n (next it)) (loop (fx+ n 1)))
+                                      n))))
+                         (more (chunks)))
+                    (if (fx=? n 0)
+                        more
+                        (iterator-seq-chunk (if (fx=? n 32) buf (sa-subvector buf 0 n)) more)))))
+              jolt-nil))))))
+(def-var! "clojure.core" "iterator-seq" jolt-iterator-seq)
+
 ;; A Chez condition's message: "who: text", where text is the &message template
 ;; with each ~s / ~a directive filled by the matching irritant printed as a jolt
 ;; value — "string-append: nil is not a string", not "#[jolt-nil-v1] is not a
@@ -122,15 +178,6 @@
 ;; through to a miss instead of being refused.
 (define (rd-java-list? obj)
   (or (pvec? obj) (cseq? obj) (empty-list-t? obj) (jolt-lazyseq? obj)))
-;; The seq classes that implement IReduce on the JVM (class-hierarchy.ss): a
-;; PersistentList, Iterate, Cycle, Repeat, the ranges, and a vector's ChunkedSeq.
-;; A Cons or a LazySeq doesn't.
-(define (rd-ireduce-seq? obj)
-  (and (cseq? obj)
-       (or (cseqv? obj)
-           (let ((k (cseq-kind obj)))
-             (or (fx=? k sk-iterate) (fx=? k sk-cycle) (fx=? k sk-repeat)
-                 (fx=? k sk-long-range) (fx=? k sk-range) (fx=? k sk-list))))))
 (define (rd-java-set? obj)
   (or (pset? obj) (htable-sorted-set? obj)))
 (define (rd-persistent-coll? obj)
@@ -999,12 +1046,19 @@
     ;; branch and is mis-read as a missing :iterator key (nil). Some libraries
     ;; (e.g. malli's -vmap) iterate a map this way.
     ((string=? name "iterator") (list (make-jiterator (jolt-seq obj))))
-    ;; (.reduce coll f) / (.reduce coll f init): clojure.lang.IReduce — every
-    ;; persistent collection reduces itself on the JVM.
+    ;; (.spliterator coll): the host builds it (jutil-concurrent.ss on Chez)
+    ((and (string=? name "spliterator") persistent-spliterator-hook) (list (persistent-spliterator-hook obj)))
+    ;; (.reduce coll f) is clojure.lang.IReduce's, (.reduce coll f init)
+    ;; IReduceInit's, and which builtins have them is their class's answer
+    ;; (class-hierarchy.ss): a PersistentVector and its ChunkedSeq, a list, an
+    ;; array's or an array map's seq, the ranges, iterate, cycle and repeat. A
+    ;; StringSeq has only the init arity; a set, a map, a sorted coll's seq, a
+    ;; map's keys or vals, a ChunkedCons, a subvec or () has neither.
     ((string=? name "reduce")
-     (let ((k (dot-coll-kind-fast obj)))
-       (when (and k (not (eq? k 'vec)) (not (rd-ireduce-seq? obj)))
-         (no-method-throw name obj (length args))))
+     (when (and (dot-coll-kind-fast obj)
+                (not (rd-instance-of? (if (pair? (cdr args)) "clojure.lang.IReduceInit" "clojure.lang.IReduce")
+                                      obj)))
+       (no-method-throw name obj (length args)))
      (list (if (pair? (cdr args))
                (jolt-reduce (car args) (cadr args) obj)
                (jolt-reduce (car args) obj))))
@@ -1074,7 +1128,6 @@
 (define arm-priority-dotform 30)      ; -field accessor + dot-form method dispatch
 (define arm-priority-date 40)         ; java.util.Date (jinst) method surface
 (define arm-priority-file 41)         ; java.io.File (jfile) methods
-(define arm-priority-nio-path 42)     ; java.nio.file.Path methods (above jfile)
 (define arm-priority-htable 43)       ; tagged htable method registry
 (define arm-priority-host-type 44)    ; jhost/number/string per-type dispatch
 ;; java/concurrency.ss registers clojure.lang.Agent's own methods here rather
@@ -1192,7 +1245,10 @@
 ;; A reify may carry a DELEGATE: an object that answers any method the reify's own
 ;; table does not. clojure.core/proxy over a concrete class builds one that way —
 ;; see java/proxy.ss. A plain reify has no delegate and a method miss still throws.
-(define-record-type jreify (fields methods protos delegate) (nongenerative chez-jreify-v2))
+;; cname: the generated class's name (a reify form's), a #(ns) a proxy's is
+;; worked out from on first ask (java/proxy.ss), or #f. A reify is a code value,
+;; refused by images, so this layout is not image surface.
+(define-record-type jreify (fields methods protos delegate (mutable cname)) (nongenerative chez-jreify-v3))
 ;; likewise a reify: (def r (reify ...)) is code the restoring build already has.
 (register-code-value! jreify?)
 ;; A reify's methods are a LAYOUT and a vector of fns: (slots . fns), where SLOTS
@@ -1240,7 +1296,25 @@
 (register-get-arm! jreify?
   (lambda (coll k d)
     (let ((m (reify-method-ref coll "valAt")))
-      (if m (jolt-invoke m coll k d) d))))
+      (cond ;; RT.get calls valAt(k) for (get x k): a nil default takes the
+            ;; 2-arity when there is one (records.ss jrec-call-valat, same rule)
+            (m (if (and (jolt-nil? d) (proc-accepts? m 2)) (jolt-invoke m coll k) (jolt-invoke m coll k d)))
+            ;; a reify of java.util.Map: RT.get reads it through its get, the
+            ;; default when containsKey says the key is absent
+            ((and (reify-method-ref coll "get") (reify-declares-class? (jreify-protos coll) "java.util.Map"))
+             (let ((g (reify-method-ref coll "get"))
+                   (ck (or (reify-method-ref coll "containsKey")
+                           (and abstract-class-method-hook (abstract-class-method-hook coll "containsKey")))))
+               (if ck
+                   (if (jolt-truthy? (jolt-invoke ck coll k)) (jolt-invoke g coll k) d)
+                   (let ((v (jolt-invoke g coll k))) (if (jolt-nil? v) d v)))))
+            ;; a java.util.Map by an abstract class it declares (a proxy over
+            ;; AbstractMap): RT.get reads it through Map.get
+            ((and abstract-class-method-hook (abstract-class-method-hook coll "containsKey"))
+             => (lambda (ck) (if (jolt-truthy? (ck coll k))
+                                 (record-method-dispatch coll "get" (list->cseq (list k)))
+                                 d)))
+            (else d)))))
 (define (reify-proto-names proto-names)
   (intern-reify-protos
    (map (lambda (p) (if (symbol-t? p) (symbol-t-name p) p))
@@ -1250,6 +1324,9 @@
 ;; The general entry (proxy, and any caller holding a {name fn} map): the layout
 ;; is built for this call.
 (define (make-reified-delegating methods-map delegate proto-names)
+  (make-reified-delegating/protos methods-map delegate (reify-proto-names proto-names)))
+;; …with PROTOS already interned (a proxy site interns its supers once)
+(define (make-reified-delegating/protos methods-map delegate protos)
   (let* ((ks (seq->list (jolt-keys methods-map)))
          (slots (make-hashtable string-hash string=?))
          (fns (make-vector (length ks))))
@@ -1259,7 +1336,7 @@
           (hashtable-set! slots (if (keyword? p) (keyword-t-name p) p) i)
           (vector-set! fns i (jolt-get methods-map p jolt-nil))
           (loop (cdr ks) (fx+ i 1)))))
-    (make-jreify (cons slots fns) (reify-proto-names proto-names) delegate)))
+    (make-jreify (cons slots fns) protos delegate #f)))
 ;; The reify macro's entry: SHAPE is the site's literal [[method-name …]
 ;; [protocol …]], a constant the site's pool binds once, so it is the same object
 ;; for every instance the site builds and its layout is computed once, keyed eq?
@@ -1270,16 +1347,34 @@
   (or (hashtable-ref reify-shape-memo shape #f)
       (let* ((names (seq->list (jolt-nth shape 0)))
              (slots (make-hashtable string-hash string=?))
-             (layout (cons slots (reify-proto-names (seq->list (jolt-nth shape 1))))))
+             (protos (reify-proto-names (seq->list (jolt-nth shape 1))))
+             ;; #(slots protos class-name)
+             (layout (vector slots protos (and (fx>? (jolt-count shape) 2) (jolt-nth shape 2)))))
         (let loop ((ns names) (i 0))
           (unless (null? ns)
             (hashtable-set! slots (car ns) i)
             (loop (cdr ns) (fx+ i 1))))
+        ;; a site compiled with its class name (the macro's third element) hands
+        ;; it to every instance; code compiled before that reports the shared
+        ;; placeholder
+        (when (vector-ref layout 2) (reify-class-graph-hook (vector-ref layout 2) protos))
         (jolt-with-mutex reify-shape-mu (hashtable-set! reify-shape-memo shape layout))
         layout)))
+;; A reify form's or a proxy's generated class name, or #f. A proxy's is worked
+;; out on first ask by the host (proxy-class-name-hook, java/proxy.ss on Chez).
+(define proxy-class-name-hook (lambda (x) #f))
+(define (reify-class-name x)
+  (and (jreify? x)
+       (let ((c (jreify-cname x)))
+         (cond ((string? c) c) ((vector? c) (proxy-class-name-hook x)) (else #f)))))
+;; A persistent collection's java.util.Spliterator, or #f on a host that models none.
+(define persistent-spliterator-hook #f)
+;; Placing a reify form's class in the class graph is the host's (the Chez half
+;; installs it with the graph, proxy.ss); a host without one keeps just the name.
+(define reify-class-graph-hook (lambda (name ifaces) #f))
 (define (make-reified-at shape . fns)
   (let ((layout (reify-shape-layout shape)))
-    (make-jreify (cons (car layout) (list->vector fns)) (cdr layout) #f)))
+    (make-jreify (cons (vector-ref layout 0) (list->vector fns)) (vector-ref layout 1) #f (vector-ref layout 2))))
 ;; Every reify from one site declares the same protocols, but the names arrive
 ;; as rest args, so each instance got its own fresh list. The questions asked of
 ;; that list — its dispatch tags (jreify-host-tags), instance? against a class
@@ -1325,6 +1420,9 @@
          (let ((v (record-method-dispatch it "next" jolt-nil)))
            (jolt-cons v (iterator-cursor->seq it)))
          jolt-nil))))
+;; RT.seqFrom asks a Seqable for its seq whatever made it, a reify included
+;; (records-coll.ss self-seq-arm walks one that answers itself, an ISeq)
+(register-seq-arm! (lambda (x) (and (jreify? x) (reify-method-ref x "seq") #t)) self-seq-arm)
 (register-seq-arm! iface-iterator-cursor
                    (lambda (x) (jolt-seq (iterator-cursor->seq x))))
 (register-seq-arm! (lambda (x) (and (iface-iterator-obj x) (not (iface-iterator-cursor x))))
@@ -1505,17 +1603,16 @@
 ;; jolt exception values (ex-info + host-constructed throwables) are ex-info-shaped
 ;; maps tagged :jolt/type :jolt/ex-info; (class …)/instance? read the JVM class off
 ;; the optional :jolt/class key, defaulting to clojure.lang.ExceptionInfo.
-;; str of a jrec with no toString of its own is its print form. The JVM answers
-;; Object.toString there ("user.Rec@3c6f0c28"); jolt has no identity hash to
-;; print, so it renders the value and drops the leading # of the record marker.
-;; A COLLECTION deftype prints in its collection's shape, which carries no such
-;; marker — dropping a character there turned "(1 2 3)" into "1 2 3)".
+;; str of a jrec with no toString of its own is Object.toString, as on the JVM:
+;; the class name, @, and the hex of its hashCode — a record's is its map hash,
+;; a deftype's its declared hashCode or else its identity hash (jolt-jon4). It
+;; used to be the record's print form with the # dropped.
 (register-str-render! jrec?
   (lambda (v)
-    (let ((f (find-protocol-method (jrec-tag v) "Object" "toString")))
-      (cond (f (jolt-invoke f v))
-            ((jrec-coll-print-shape v) => (lambda (shape) (jrec-coll-pr v shape)))
-            (else (let ((s (jrec-field-pr v))) (substring s 1 (string-length s))))))))
+    (let ((f (find-method-any-protocol (jrec-tag v) "toString")))
+      (if f
+          (jolt-invoke f v)
+          (string-append (jolt-class-name v) "@" (jolt-hex32 (jolt-java-hashcode v)))))))
 
 ;; a reify with a toString method renders through it, like the JVM.
 (register-str-render! (lambda (v) (and (reify-method-ref v "toString") #t))
@@ -1529,6 +1626,17 @@
 
 ;; defrecord marks its type a record (deftype does not), keyed by the same
 ;; "ns.Name" tag make-deftype-ctor bakes — so jrec-record? distinguishes the two.
+;; The tag-keyed half, which an image restore also calls for a record type whose
+;; defrecord never ran in this process (state-image.ss image-register-types!).
+(define (register-record-tag! tag)
+  (jolt-with-mutex rec-tbl-mu (hashtable-set! chez-record-type-tbl tag #t))
+  (chez-infer-registry-bump!)
+  (let ((protos (filter (lambda (s) (not (string=? s "clojure.lang.IType")))
+                        (jch-direct-supers tag))))
+    (jch-set-supers! tag (append protos
+                                 '("clojure.lang.IRecord" "clojure.lang.IObj"
+                                   "clojure.lang.IPersistentMap" "java.util.Map"
+                                   "clojure.lang.IHashEq" "java.io.Serializable")))))
 (define (register-record-type! name-sym)
   (let ((tag (string-append (chez-current-ns) "." (symbol-t-name name-sym))))
     (jolt-with-mutex rec-tbl-mu (hashtable-set! chez-record-type-tbl tag #t))
@@ -1584,6 +1692,7 @@
 (def-var! "clojure.core" "protocol-dispatch1" (lambda (pn mn obj) (protocol-dispatch1 pn mn obj)))
 (def-var! "clojure.core" "protocol-dispatch2" (lambda (pn mn obj a) (protocol-dispatch2 pn mn obj a)))
 (def-var! "clojure.core" "protocol-dispatch3" (lambda (pn mn obj a b) (protocol-dispatch3 pn mn obj a b)))
+(def-var! "clojure.core" "protocol-resolve-meta" (lambda (pn mn msym obj) (protocol-resolve-meta pn mn msym obj)))
 (def-var! "clojure.core" "satisfies?" jolt-satisfies?)
 (def-var! "clojure.core" "extenders" extenders)
 ;; extends? asks with the name a class token PRESENTS (.getName: the JVM spelling,

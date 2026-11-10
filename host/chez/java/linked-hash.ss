@@ -13,16 +13,23 @@
 ;; firstEntry / lastEntry / pollFirstEntry / pollLastEntry, addFirst …
 ;; removeLast, and reversed(), a live view in the other direction.
 ;;
-;;   chain   #(table head tail access? proxy)   table: key -> node
+;;   chain   #(table head tail access? proxy modcount)   table: key -> node
 ;;   node    #(key value prev next)
 ;;
 ;; A map or set is a jhost over a chain; keySet, values, entrySet and their
 ;; sequenced spellings are live views #(chain reversed?); an entry is its node.
+;;
+;; modcount is HashMap's, which LinkedHashMap inherits: a new key, a removal,
+;; every clear, and a move to either end (an access-ordered map's get, a
+;; putFirst / putLast of a key that is elsewhere) bump it. The iterators, the
+;; forEach / replaceAll walks and the compute family watch it as the JDK's do.
 ;; Loaded after jutil-colls.ss (proxy-attach-hook!, the java.util registry) and
 ;; before host-static-classes.ss, so its arms are walked after the HashMap family's.
 
 ;; ---- the chain -------------------------------------------------------------------
-(define (lh-new access?) (vector (make-hashtable hm-hash jolt=2) #f #f access? #f))
+(define (lh-new access?) (vector (make-hashtable hm-hash jolt=2) #f #f access? #f 0))
+(define (lh-mc c) (vector-ref c 5))
+(define (lh-bump! c) (vector-set! c 5 (fxand (fx+ (vector-ref c 5) 1) #x3fffffff)))
 (define (lh-tbl c) (vector-ref c 0))
 (define (lh-head c) (vector-ref c 1))
 (define (lh-tail c) (vector-ref c 2))
@@ -50,17 +57,34 @@
     (vector-set! n 3 h) (vector-set! n 2 #f)
     (if h (vector-set! h 2 n) (vector-set! c 2 n))
     (vector-set! c 1 n)))
-(define (lh-move-last! c n) (unless (eq? n (lh-tail c)) (lh-unlink! c n) (lh-link-last! c n)))
-(define (lh-move-first! c n) (unless (eq? n (lh-head c)) (lh-unlink! c n) (lh-link-first! c n)))
+(define (lh-move-last! c n) (unless (eq? n (lh-tail c)) (lh-unlink! c n) (lh-link-last! c n) (lh-bump! c)))
+(define (lh-move-first! c n) (unless (eq? n (lh-head c)) (lh-unlink! c n) (lh-link-first! c n) (lh-bump! c)))
 ;; an access-ordered map moves what was just reached to the tail
 (define (lh-touch! c n) (when (lh-access? c) (lh-move-last! c n)))
 
 (define (lh-remove-node! c n)
   (hashtable-delete! (lh-tbl c) (n-key n))
-  (lh-unlink! c n))
+  (lh-unlink! c n)
+  (lh-bump! c))
 (define (lh-clear! c)
   (hashtable-clear! (lh-tbl c))
-  (vector-set! c 1 #f) (vector-set! c 2 #f))
+  (vector-set! c 1 #f) (vector-set! c 2 #f)
+  (lh-bump! c))
+;; (f node) from one end to the other along the chain as it stands, then the
+;; modCount check: LinkedHashMap's forEach and replaceAll, and its views'
+;; forEach. A node unlinked under the walk ends it there, as the JDK's does.
+(define (lh-walk c rev? f)
+  (let ((mc (lh-mc c)))
+    (let loop ((n (if rev? (lh-tail c) (lh-head c))))
+      (when n (f n) (loop (if rev? (n-prev n) (n-next n)))))
+    (unless (fx=? mc (lh-mc c)) (jutil-cme!))
+    jolt-nil))
+;; the compute family's function: a change it made is a
+;; ConcurrentModificationException once it returns
+(define (lh-apply-checked c f method . args)
+  (let* ((mc (lh-mc c)) (v (apply jolt-fi-call f method args)))
+    (unless (fx=? mc (lh-mc c)) (jutil-cme!))
+    v))
 ;; nodes in encounter order, or the reverse
 (define (lh-nodes c rev?)
   (let loop ((n (if rev? (lh-head c) (lh-tail c))) (acc '()))
@@ -69,6 +93,7 @@
 ;; a NEW key at the tail (or the head), then the eviction question
 (define (lh-insert! c owner k v first?)
   (let ((n (vector k v #f #f)))
+    (lh-bump! c)
     (hashtable-set! (lh-tbl c) k n)
     (if first? (lh-link-first! c n) (lh-link-last! c n))
     (lh-after-insert! c owner)
@@ -172,7 +197,7 @@
                               (let ((n (lh-node (c self) k)))
                                 (if (and n (not (jolt-nil? (n-val n))))
                                     (begin (lh-touch! (c self) n) (n-val n))
-                                    (let ((v (lh-fi f "apply" k)))
+                                    (let ((v (lh-apply-checked (c self) f "apply" k)))
                                       (cond ((jolt-nil? v) jolt-nil)
                                             (n (vector-set! n 1 v) (lh-touch! (c self) n) v)
                                             (else (lh-insert! (c self) (owner self) k v #f) v)))))))
@@ -180,13 +205,13 @@
                                (let ((n (lh-node (c self) k)))
                                  (if (or (not n) (jolt-nil? (n-val n)))
                                      jolt-nil
-                                     (let ((v (lh-fi f "apply" k (n-val n))))
+                                     (let ((v (lh-apply-checked (c self) f "apply" k (n-val n))))
                                        (if (jolt-nil? v)
                                            (begin (lh-remove-node! (c self) n) jolt-nil)
                                            (begin (vector-set! n 1 v) (lh-touch! (c self) n) v)))))))
     (cons "compute" (lambda (self k f)
                       (let* ((n (lh-node (c self) k))
-                             (v (lh-fi f "apply" k (if n (n-val n) jolt-nil))))
+                             (v (lh-apply-checked (c self) f "apply" k (if n (n-val n) jolt-nil))))
                         (cond ((and n (jolt-nil? v)) (lh-remove-node! (c self) n) jolt-nil)
                               ((jolt-nil? v) jolt-nil)
                               (n (vector-set! n 1 v) (lh-touch! (c self) n) v)
@@ -197,7 +222,7 @@
                           (if n
                               (begin (vector-set! n 1 v) (lh-touch! (c self) n) v)
                               (begin (lh-insert! (c self) (owner self) k v #f) v))
-                          (let ((nv (lh-fi f "apply" (n-val n) v)))
+                          (let ((nv (lh-apply-checked (c self) f "apply" (n-val n) v)))
                             (if (jolt-nil? nv)
                                 (begin (lh-remove-node! (c self) n) jolt-nil)
                                 (begin (vector-set! n 1 nv) (lh-touch! (c self) n) nv)))))))
@@ -211,12 +236,9 @@
                                             (begin (vector-set! n 1 v) (lh-touch! (c self) n) #t)
                                             #f)))))
     (cons "replaceAll" (lambda (self f)
-                         (for-each (lambda (n) (vector-set! n 1 (lh-fi f "apply" (n-key n) (n-val n))))
-                                   (lh-nodes (c self) rev?))
-                         jolt-nil))
+                         (lh-walk (c self) rev? (lambda (n) (vector-set! n 1 (lh-fi f "apply" (n-key n) (n-val n)))))))
     (cons "forEach" (lambda (self f)
-                      (for-each (lambda (n) (lh-fi f "accept" (n-key n) (n-val n))) (lh-nodes (c self) rev?))
-                      jolt-nil))
+                      (lh-walk (c self) rev? (lambda (n) (lh-fi f "accept" (n-key n) (n-val n))))))
     (cons "firstEntry" (lambda (self) (lh-snapshot (if rev? (lh-tail (c self)) (lh-head (c self))))))
     (cons "lastEntry" (lambda (self) (lh-snapshot (if rev? (lh-head (c self)) (lh-tail (c self))))))
     (cons "pollFirstEntry" (lambda (self) (let ((n (if rev? (lh-tail (c self)) (lh-head (c self)))))
@@ -225,9 +247,9 @@
     (cons "pollLastEntry" (lambda (self) (let ((n (if rev? (lh-head (c self)) (lh-tail (c self)))))
                                            (when n (lh-remove-node! (c self) n))
                                            (lh-snapshot n))))
-    (cons "keySet" (lambda (self) (lh-view "lhm-keyset" (c self) rev?)))
-    (cons "values" (lambda (self) (lh-view "lhm-values" (c self) rev?)))
-    (cons "entrySet" (lambda (self) (lh-view "lhm-entryset" (c self) rev?)))
+    (cons "keySet" (lambda (self) (jutil-view self 0 (lambda () (lh-view "lhm-keyset" (c self) rev?)))))
+    (cons "values" (lambda (self) (jutil-view self 1 (lambda () (lh-view "lhm-values" (c self) rev?)))))
+    (cons "entrySet" (lambda (self) (jutil-view self 2 (lambda () (lh-view "lhm-entryset" (c self) rev?)))))
     (cons "sequencedKeySet" (lambda (self) (lh-view "lhm-keyset" (c self) rev?)))
     (cons "sequencedValues" (lambda (self) (lh-view "lhm-values" (c self) rev?)))
     (cons "sequencedEntrySet" (lambda (self) (lh-view "lhm-entryset" (c self) rev?)))))
@@ -292,9 +314,13 @@
               (cons "iterator"
                     (lambda (self)
                       (let ((c (lhv-chain self)))
-                        (make-jutil-iterator it-tag (lhv-nodes self)
-                                             (lambda (n) (when (eq? (lh-node c (n-key n)) n) (lh-remove-node! c n)))
-                                             (lh-project tag)))))
+                        (make-jutil-ff-iterator it-tag (lhv-nodes self)
+                                                (lambda (n) (when (eq? (lh-node c (n-key n)) n) (lh-remove-node! c n)))
+                                                (lh-project tag) c 5))))
+              ;; LinkedKeySet / LinkedValues / LinkedEntrySet walk the chain
+              (cons "forEach" (lambda (self f)
+                                (let ((p (lh-project tag)))
+                                  (lh-walk (lhv-chain self) (lhv-rev? self) (lambda (n) (jolt-fi-call f "accept" (p n)))))))
               (cons "toArray" (case-lambda
                                 ((self) (jcoll-to-array (lhv-elems self) '()))
                                 ((self a) (jcoll-to-array (lhv-elems self) (list a)))))
@@ -374,24 +400,22 @@
                                                ch
                                                (begin (lh-remove-node! (lhs-chain-of self) n) #t)))
                                          #f (lh-nodes (lhs-chain-of self) #f)))))
-        (cons "removeIf" (lambda (self pred)
-                           (fold-left (lambda (ch n)
-                                        (if (jolt-truthy? (jolt-fi-call pred "test" (n-key n)))
-                                            (begin (lh-remove-node! (lhs-chain-of self) n) #t)
-                                            ch))
-                                      #f (lh-nodes (lhs-chain-of self) (lhs-rev? self)))))
+        ;; Collection.removeIf's default, through the iterator
+        (cons "removeIf" (lambda (self pred) (jutil-walk-remove-if (lhs-iterator self) pred)))
         (cons "size" (lambda (self) (lh-size (lhs-chain-of self))))
         (cons "isEmpty" (lambda (self) (fx=? 0 (lh-size (lhs-chain-of self)))))
         (cons "clear" (lambda (self) (lh-clear! (lhs-chain-of self)) jolt-nil))
-        (cons "iterator" (lambda (self)
-                           (let ((c (lhs-chain-of self)))
-                             (make-jutil-iterator "lhs-iterator" (lh-nodes c (lhs-rev? self))
-                                                  (lambda (n) (when (eq? (lh-node c (n-key n)) n) (lh-remove-node! c n)))
-                                                  n-key))))
-        (cons "forEach" (lambda (self f) (jcoll-for-each (lhs-elems self) f)))
+        (cons "iterator" (lambda (self) (lhs-iterator self)))
+        ;; Iterable.forEach, as LinkedHashSet keeps it: over the iterator
+        (cons "forEach" (lambda (self f) (jutil-walk-for-each (lhs-iterator self) f)))
         (cons "toArray" (case-lambda
                           ((self) (jcoll-to-array (lhs-elems self) '()))
                           ((self a) (jcoll-to-array (lhs-elems self) (list a)))))))
+(define (lhs-iterator self)
+  (let ((c (lhs-chain-of self)))
+    (make-jutil-ff-iterator "lhs-iterator" (lh-nodes c (lhs-rev? self))
+                            (lambda (n) (when (eq? (lh-node c (n-key n)) n) (lh-remove-node! c n)))
+                            n-key c 5)))
 (register-host-methods! "linkedhashset"
   (append lhs-methods
           (list (cons "reversed" (lambda (self) (make-jhost "lhs-reversed" self)))
@@ -404,21 +428,32 @@
     ("lhs-iterator" . "java.util.LinkedHashMap$LinkedKeyIterator")))
 (register-jutil-iterator! "lhs-iterator")
 (register-jutil-coll! "linkedhashset" 'set lhs-elems)
+;; every member of the family reads its chain's modCount
+(register-modcount! "linkedhashmap" (lambda (m) (lh-mc (lhm-chain m))))
+(register-modcount! "lhm-reversed" (lambda (v) (lh-mc (lhm-chain (lhm-reversed-base v)))))
+(for-each (lambda (t) (register-modcount! t (lambda (v) (lh-mc (lhv-chain v)))))
+          '("lhm-keyset" "lhm-values" "lhm-entryset"))
+(for-each (lambda (t) (register-modcount! t (lambda (s) (lh-mc (lhs-chain-of s)))))
+          '("linkedhashset" "lhs-reversed"))
 (register-jutil-coll! "lhs-reversed" 'set lhs-elems)
 
 ;; ---- what the rest of the runtime sees ----------------------------------------------
 ;; seq / count / contains? / get, one arm each for the family: every tag starts
-;; with l, so another value is turned away by its first character
-(define (lh-kind x)
-  (and (jhost? x)
-       (let ((t (jhost-tag x)))
-         (and (fx>? (string-length t) 3) (char=? (string-ref t 0) #\l)
-              (cond ((string=? t "linkedhashmap") 'map)
-                    ((string=? t "lhm-reversed") 'rmap)
-                    ((string=? t "linkedhashset") 'set)
-                    ((string=? t "lhs-reversed") 'set)
-                    ((member t '("lhm-keyset" "lhm-values" "lhm-entryset")) 'view)
-                    (else #f))))))
+;; with l, so another value is turned away by its first character. A
+;; java.util.jar.Attributes (embedded-manifest.ss) is a LinkedHashMap chain under
+;; its own class and answers through these arms too, rather than through arms of
+;; its own registered later -- which would be walked ahead of the HashMap
+;; family's and put a predicate in front of every HashMap get
+;; (test/fastpath_ratio_test.clj hashmap-get). The answer is remembered by tag
+;; (define-jhost-tag-pred, host-static.ss), so a repeat costs one eq?.
+(define-jhost-tag-pred (lh-kind t)
+  (cond ((string=? t "linkedhashmap") 'map)
+        ((string=? t "jar-attributes") 'map)
+        ((string=? t "lhm-reversed") 'rmap)
+        ((string=? t "linkedhashset") 'set)
+        ((string=? t "lhs-reversed") 'set)
+        ((member t '("lhm-keyset" "lhm-values" "lhm-entryset")) 'view)
+        (else #f)))
 (define (lh-seq-elems x)
   (case (lh-kind x)
     ((map) (lhm-entries x))
@@ -431,7 +466,8 @@
     ((rmap) (lhm-chain (lhm-reversed-base x)))
     ((set) (lhs-chain-of x))
     (else (lhv-chain x))))
-(register-seq-arm! lh-kind (lambda (x) (let ((xs (lh-seq-elems x))) (if (null? xs) jolt-nil (list->cseq xs)))))
+;; chunk by chunk, as RT.seq walks the fail-fast iterator (jutil-ff-seq)
+(register-seq-arm! lh-kind (lambda (x) (jutil-ff-seq x (lh-seq-elems x))))
 (register-count-arm! lh-kind (lambda (x) (lh-size (lh-chain-of x))))
 (register-contains-arm! lh-kind
   (lambda (x k) (if (eq? (lh-kind x) 'view)

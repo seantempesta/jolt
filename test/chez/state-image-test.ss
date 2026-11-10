@@ -1347,6 +1347,96 @@
   (close-port sp)
   (delete-file refstub-tmp))
 
+;; :var on the world's own answers. A world's paths start inside its
+;; (name . root) list, so scan-world and dump-world! name the var each finding
+;; sits in, and a shared object is named by the first var its path runs
+;; through: the same var jolt.image/stubs lists after a restore.
+(jolt-compile-eval "(def plain 1)" "r12.world")
+(jolt-compile-eval "(def cfg {:name \"app\" :log nil})" "r12.world")
+(var-cell-root-set! (jolt-var "r12.world" "cfg")
+  (jolt-assoc (var-cell-root (jolt-var "r12.world" "cfg")) (jolt-keyword "log") stub-port))
+(let ((f (jolt-image-scan-world (jolt-vector "r12.world"))))
+  (ok "scan-world names the var a finding sits in"
+      (and (fx=? 1 (jolt-count f))
+           (equal? "r12.world/cfg" (jolt-get (jolt-nth f 0) (jolt-keyword "var") jolt-nil))))
+  (ok "scan-world keeps the path from the world's root"
+      (str-contains? (jolt-get (jolt-nth f 0) (jolt-keyword "path") jolt-nil) "-> :log")))
+(let ((rep (jolt-image-dump-world! world-tmp (jolt-vector "r12.world"))))
+  (ok "dump-world! names the var each stub sits in"
+      (equal? "r12.world/cfg"
+              (jolt-get (jolt-nth (jolt-get rep (jolt-keyword "stubbed") jolt-nil) 0)
+                        (jolt-keyword "var") jolt-nil))))
+(ok "scan of a plain value has no :var"
+    (jolt-nil? (jolt-get (jolt-nth (jolt-image-scan (jolt-hash-map (jolt-keyword "log") stub-port)) 0)
+                         (jolt-keyword "var") jolt-nil)))
+;; one port held by two vars: one finding, and all three answers name the
+;; var its :path runs through
+(jolt-compile-eval "(def left nil)" "r13.world")
+(jolt-compile-eval "(def right nil)" "r13.world")
+(var-cell-root-set! (jolt-var "r13.world" "left") (jolt-hash-map (jolt-keyword "p") stub-port))
+(var-cell-root-set! (jolt-var "r13.world" "right") (jolt-vector stub-port))
+(let* ((f (jolt-image-scan-world (jolt-vector "r13.world")))
+       (scan-var (jolt-get (jolt-nth f 0) (jolt-keyword "var") jolt-nil))
+       (scan-path (jolt-get (jolt-nth f 0) (jolt-keyword "path") jolt-nil))
+       (rep (jolt-image-dump-world! world-tmp (jolt-vector "r13.world")))
+       (st (jolt-nth (jolt-get rep (jolt-keyword "stubbed") jolt-nil) 0))
+       (dump-var (jolt-get st (jolt-keyword "var") jolt-nil)))
+  (ok "a shared port is one finding" (fx=? 1 (jolt-count f)))
+  (ok "the var is the one the path runs through"
+      (if (equal? scan-var "r13.world/left")
+          (str-contains? scan-path ":p")
+          (and (equal? scan-var "r13.world/right") (not (str-contains? scan-path ":p")))))
+  (ok "dump-world! names the same var as scan-world" (equal? scan-var dump-var))
+  (jolt-image-restore-world! world-tmp)
+  (let ((ss (jolt-image-stubs)))
+    (ok "stubs names the same var after a restore"
+        (and (fx=? 1 (jolt-count ss))
+             (equal? dump-var (jolt-get (jolt-nth ss 0) (jolt-keyword "var") jolt-nil))
+             (equal? (jolt-get st (jolt-keyword "path") jolt-nil)
+                     (jolt-get (jolt-nth ss 0) (jolt-keyword "path") jolt-nil))))))
+;; the same port inside one var's closure and directly in another: the restore
+;; walk doesn't enter the rebuilt closure, so stubs reads the var off the path.
+;; Which var the world lists first follows the var table's hash, so six
+;; namespaces, at least one with the closure first (its path has "free:").
+(let loop ((i 0) (agree? #t) (closure-first? #f))
+  (if (fx=? i 6)
+      (begin
+        (ok "stubs names the var a closure-held stub's path runs through" agree?)
+        (ok "the closure-first case was exercised" closure-first?))
+      (let ((ns (string-append "r14.w" (number->string i))))
+        (jolt-compile-eval "(defn mk [x] {:f (fn [] x)})" ns)
+        (jolt-compile-eval "(def held nil)" ns)
+        (jolt-compile-eval "(def direct nil)" ns)
+        (var-cell-root-set! (jolt-var ns "held")
+          (jolt-invoke (var-cell-root (jolt-var ns "mk")) stub-port))
+        (var-cell-root-set! (jolt-var ns "direct") (jolt-hash-map (jolt-keyword "d") stub-port))
+        (let* ((rep (jolt-image-dump-world! world-tmp (jolt-vector ns)))
+               (st (jolt-nth (jolt-get rep (jolt-keyword "stubbed") jolt-nil) 0)))
+          (jolt-image-restore-world! world-tmp)
+          (let ((ss (jolt-image-stubs)))
+            (loop (fx+ i 1)
+                  (and agree? (fx=? 1 (jolt-count ss))
+                       (equal? (jolt-get st (jolt-keyword "var") jolt-nil)
+                               (jolt-get (jolt-nth ss 0) (jolt-keyword "var") jolt-nil)))
+                  (or closure-first?
+                      (str-contains? (jolt-get st (jolt-keyword "path") jolt-nil) "free:"))))))))
+;; every finding in a world names its var, whatever the shape it sits in
+(jolt-compile-eval "(def top nil)" "r15.world")
+(jolt-compile-eval "(def inmeta nil)" "r15.world")
+(jolt-compile-eval "(def deep nil)" "r15.world")
+(var-cell-root-set! (jolt-var "r15.world" "top") stub-port)
+(var-cell-root-set! (jolt-var "r15.world" "deep")
+  (jolt-vector (jolt-hash-map (jolt-keyword "a") (jolt-atom-new (jolt-vector stub-port)))))
+(var-cell-root-set! (jolt-var "r15.world" "inmeta")
+  (jolt-with-meta (jolt-vector 1) (jolt-hash-map (jolt-keyword "p") stub-port)))
+(let ((f (jolt-image-scan-world (jolt-vector "r15.world"))))
+  (ok "every world finding has a :var"
+      (and (fx>? (jolt-count f) 0)
+           (let loop ((i 0))
+             (or (fx=? i (jolt-count f))
+                 (and (string? (jolt-get (jolt-nth f i) (jolt-keyword "var") jolt-nil))
+                      (loop (fx+ i 1))))))))
+
 ;; resolver pre-registered: the stub never materializes
 ;; kind strings match the STUBBED OBJECT's class (a port's, here), so a
 ;; catch-all predicate is the simplest fixture
@@ -1390,7 +1480,54 @@
 (is "v0.6.8 fixture: imgrec8/plain" "imgrec8/plain" "7")
 (is "v0.6.8 fixture: a defrecord instance prints" "(pr-str imgrec8/box)" "#imgrec8.Box{:a 1, :b \"two\"}")
 (is "v0.6.8 fixture: its fields read" "[(:a imgrec8/box) (:b imgrec8/box) (count imgrec8/box)]" "[1 two 2]")
+;; This process never defined imgrec8's types: the instances came in raw with
+;; their descriptors, but defrecord and deftype never ran here, so nothing says
+;; which of the two Pt was. An instance of a type the process does not know keeps
+;; the field form; once the code is loaded (the world-restore workflow), a
+;; deftype prints as the JVM's #object (jolt-jon4).
 (is "v0.6.8 fixture: a deftype instance prints" "(pr-str imgrec8/pt)" "#imgrec8.Pt{:x 3, :y 4}")
+
+;; From format 13 an image names the defrecord and deftype types it holds, so a
+;; process that restores it without having loaded the code still knows a record
+;; from a deftype (jolt-yrrzq). The stand-in for "never loaded the code": write
+;; the image, then forget the types the way a fresh process would not know them.
+(ev "(defrecord ImgRec13 [a b]) (deftype ImgTyp13 [x])")
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" [(->ImgRec13 1 2) (ImgTyp13. 3)])"))
+(for-each (lambda (tag)
+            (hashtable-delete! chez-record-type-tbl tag)
+            (hashtable-delete! chez-deftype-tag-set tag)
+            (jch-set-supers! tag '()))
+          '("user.ImgRec13" "user.ImgTyp13"))
+(is "format 13: a restored record of a forgotten type is a record and a map"
+    (string-append "(let [[r t] (jolt.host/image-read \"" tmp "\")] [(record? r) (map? r) (vec (keys r)) (pr-str r) (record? t) (contains? (supers (class t)) clojure.lang.IType) (clojure.string/replace (pr-str t) #\"(0x|@)[0-9a-f]+\" \"$1H\")])")
+    "[true true [:a :b] #user.ImgRec13{:a 1, :b 2} false true #object[user.ImgTyp13 0xH \"user.ImgTyp13@H\"]]")
+
+;; Format 14: an image written before it holds an ArrayDeque as the list layout
+;; #(backing count head) and an ArrayList with no modCount slot. Both still
+;; work once read: the deque becomes a ring buffer on first use, the list counts
+;; from 0 and gains the slot on its first change, so its iterators fail fast.
+(def-var! "user" "legacy-dq" (make-jhost "arraydeque" (vector (vector jolt-nil 1 2 3 jolt-nil) 3 1)))
+(def-var! "user" "legacy-al" (make-jhost "arraylist" (vector (vector 7 8 jolt-nil) 2 0)))
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" [legacy-dq legacy-al])"))
+(is "format 14: an old-layout ArrayDeque and ArrayList read and work"
+    (string-append "(let [[d l] (jolt.host/image-read \"" tmp "\")] [(vec d) (.pollFirst d) (do (.addFirst d 0) (.addLast d 9) (vec d)) (count d) (vec l) (let [it (.iterator l)] (.next it) (.add l 9) (try (.next it) :no-cme (catch java.util.ConcurrentModificationException _ :cme))) (vec l)])")
+    "[[1 2 3] 1 [0 2 3 9] 4 [7 8] :cme [7 8 9]]")
+;; The list layout let a nil in ((.add d nil) was accepted); the ring buffer
+;; marks an empty slot with nil, so such a deque cannot become one. Reading it
+;; is refused by name rather than turning the nil into a hole.
+(def-var! "user" "legacy-dq-nil" (make-jhost "arraydeque" (vector (vector 1 jolt-nil 2) 3 0)))
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" [legacy-dq-nil])"))
+(is "format 14: an old-layout ArrayDeque holding nil is refused on read"
+    (string-append "(try (jolt.host/image-read \"" tmp "\") :read (catch Exception e (ex-message e)))")
+    "image: cannot read a java.util.ArrayDeque at 0 -> 0: it holds nil, which an ArrayDeque cannot (an image written before format 14 let one in)")
+
+;; The hash and tree collections travel by codec and are rebuilt through their
+;; constructors, so a restored one carries a modCount (jolt-i6iwq): its
+;; iterators fail fast exactly as a fresh one's do.
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" [(java.util.HashSet. [1 2]) (java.util.HashMap. {1 2 3 4}) (java.util.LinkedHashMap. {1 2 3 4}) (java.util.TreeMap. {1 2 3 4}) (java.util.TreeSet. [1 2])])"))
+(is "restored hash and tree collections have fail-fast iterators"
+    (string-append "(mapv (fn [c add] (let [it (.iterator (if (instance? java.util.Map c) (.keySet c) c))] (.next it) (add c) (try (.next it) :no-cme (catch java.util.ConcurrentModificationException _ :cme)))) (jolt.host/image-read \"" tmp "\") [#(.add % 9) #(.put % 9 9) #(.put % 9 9) #(.put % 9 9) #(.add % 0)])")
+    "[:cme :cme :cme :cme :cme]")
 
 ;; --- the same proof for the COLLECTION records and their metadata. Format 7
 ;; carried a vector/map/set/list/lazy-seq/() as the slotless records

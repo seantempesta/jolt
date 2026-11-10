@@ -326,6 +326,12 @@
 (def-var! "jolt.host" "profile-instrument!"
   (lambda (on?) (sa-profile-instrument! (jolt-truthy? on?))))
 (def-var! "jolt.host" "profile-instrumenting?" (lambda () (sa-profile-instrumenting?)))
+;; the counters never turn on here (sa-profile-instrument! refuses)
+(def-var! "jolt.host" "profile-instrument-mode" (lambda () jolt-nil))
+;; jolt.debug: Gambit has no inspector frames to read, so a throwable has no
+;; frames here, and a break handler is never called (the body just runs).
+(def-var! "jolt.host" "debug-frames" (lambda (t) (jolt-vector)))
+(def-var! "jolt.host" "debug-call-with-break" (lambda (handler thunk) (jolt-invoke thunk)))
 (def-var! "jolt.host" "profile-clear!" (lambda () (sa-profile-clear!) jolt-nil))
 (def-var! "jolt.host" "profile-sites" (lambda () (jolt-vector)))
 (def-var! "jolt.host" "profile-retired" (lambda () (jolt-vector)))
@@ -373,6 +379,9 @@
 ;; The interop entry points (host-new, host-static-call / -ref, static-member)
 ;; and the shims behind them are host-statics.ss.
 (degrade-core-vars! '("make-proxy") "there are no JVM class shims on this target")
+;; the proxy macro's entry point (it passes the form's ns, for the class name)
+(def-var! "jolt.host" "make-proxy-in"
+  (gambit-unsupported-fn "make-proxy-in" "there are no JVM class shims on this target"))
 ;; The fn-form registry (fn-form-registry.ss) is the image's; the back end asks
 ;; it inside a try and falls back to constructing the form.
 (def-var! "jolt.host" "fn-form-parse"

@@ -50,7 +50,13 @@
   (let loop ((i (- (string-length cn) 1)))
     (cond ((fx<? i 0) #f)
           ((char=? (string-ref cn i) #\.) #f)
-          ((and (char=? (string-ref cn i) #\$) (jch-known? (substring cn 0 i))) i)
+          ;; the enclosing class must be one the graph has (exactly, when it is
+          ;; dotted: a proxy's user.proxy$java.lang.Object$Runnable is not nested
+          ;; in a class whose last segment is Runnable)
+          ((and (char=? (string-ref cn i) #\$)
+                (let ((outer (substring cn 0 i)))
+                  (if (memv #\. (string->list outer)) (jch-known-exact? outer) (jch-known? outer))))
+           i)
           (else (loop (fx- i 1))))))
 ;; Class.getSimpleName drops the package and, for a nested class, the enclosing
 ;; class too. Class.getCanonicalName spells nesting with a dot instead of a `$`.
@@ -116,7 +122,7 @@
 ;; A class token (java.util.Date) now evaluates to a Class object (not a name
 ;; string), so (= (class x) java.util.Date) works by jclass identity.
 (define (make-class-obj name) (make-jhost "class" (vector name)))
-(define (jclass? x) (and (jhost? x) (string=? (jhost-tag x) "class")))
+(define-jhost-tag-pred (jclass? t) (string=? t "class"))
 (define (jclass-name x) (vector-ref (jhost-state x) 0))
 ;; two distinct Class tokens, for the eq and hash registries' fast-path probes
 ;; (values.ss): jolt=2 and jolt-hash answer Class tokens ahead of the arm walk

@@ -63,7 +63,8 @@
              (empty-list-t? x) (jolt-lazyseq? x))
          (jolt-class-base x))
         ((jrec? x) (jrec-tag x))
-        ((and (jreify? x) (not (jreify-delegate x))) "clojure.lang.IObj$reify__0")
+        ((and (jreify? x) (not (jreify-delegate x)))
+         (or (reify-class-name x) "clojure.lang.IObj$reify__0"))
         (else #f)))
 (define (class-fast-probes)
   (append (list jolt-nil #t #f 0 1.5 (expt 2 70) 1/3 "s" #\a
@@ -188,7 +189,7 @@
     ((jolt-atom? x) "clojure.lang.Atom")
     ((jolt-ref? x) "clojure.lang.Ref")
     ((jolt-reduced? x) "clojure.lang.Reduced")
-    ((char? x) "java.lang.Character")
+    ((or (char? x) (jsurr? x)) "java.lang.Character")
     ((regex-t? x) "java.util.regex.Pattern")
     ;; a stateful matcher (re-matcher) is a java.util.regex.Matcher, as the
     ;; record's own comment in regex.ss already said — without this arm it fell
@@ -387,17 +388,39 @@
 ;; (hash f) already reports — the same number the JVM prints. Rendering it
 ;; unsigned over 32 bits is what Integer.toHexString does; the old (abs …)
 ;; collapsed h and -h onto one string.
-(define (jolt-identity-hex x)
-  (let loop ((n (bitwise-and (jolt-identity-hasheq x) #xffffffff)) (acc '()))
-    (let ((acc (cons (string-ref "0123456789abcdef" (fxremainder n 16)) acc))
-          (m (fxquotient n 16)))
-      (if (fx=? m 0) (list->string acc) (loop m acc)))))
+(define (jolt-identity-hex x) (jolt-hex32 (jolt-identity-hasheq x)))
+;; Integer.toHexString: N's low 32 bits unsigned, lowercase, no leading zeros.
+;; Sized from the bit length and filled from the right, one allocation: #object
+;; printing pays this per value, and an 8-wide buffer cut down by substring was
+;; two of them and a copy.
+(define (jolt-hex32 h)
+  (let* ((n (bitwise-and h #xffffffff))
+         (len (if (fx=? n 0) 1 (fxsrl (fx+ (fxlength n) 3) 2)))
+         (buf (make-string len)))
+    (let loop ((n n) (i (fx- len 1)))
+      (string-set! buf i (string-ref "0123456789abcdef" (fxand n 15)))
+      (if (fx=? i 0) buf (loop (fxsrl n 4) (fx- i 1))))))
 ;; (str f) of a fn renders JVM-style — "ns$name@hexhash" — so code that parses
 ;; fn identity out of the string (expound's pprint-fn) finds the $-separated
 ;; class name instead of a raw Chez #<procedure> form.
 (register-str-render!
   (lambda (x) (procedure? x))
   (lambda (x) (string-append (jolt-class-name x) "@" (jolt-identity-hex x))))
+;; str of a reify or a proxy that declares no toString is Object.toString,
+;; Class@hash, as on the JVM (a proxy over a java.util collection renders as the
+;; collection through its own arm). Without this it fell through to the printer
+;; and came back as the whole #object[...] form.
+(register-str-render!
+  (lambda (x) (and (jreify? x) (not (reify-method-ref x "toString")) (not (proxy-coll-kind x))))
+  (lambda (x)
+    (if (and (jreify-delegate x) (jolt-ex-info-record? (jreify-delegate x)))
+        ;; a proxy over a Throwable class: Throwable.toString, the proxy's class
+        ;; and its (possibly overridden) message
+        ;; getLocalizedMessage is getMessage unless the proxy writes its own, so
+        ;; an overridden getMessage shows through
+        (let ((m (record-method-dispatch x (if (reify-method-ref x "getLocalizedMessage") "getLocalizedMessage" "getMessage") jolt-nil)))
+          (if (jolt-nil? m) (jolt-class-name x) (string-append (jolt-class-name x) ": " (jolt-str-render-one m))))
+        (string-append (jolt-class-name x) "@" (jolt-identity-hex x)))))
 ;; pr/print of a fn uses the JVM object form — #object[ns$name 0xHASH
 ;; "ns$name@HASH"] — which fn-identity parsers (lasertag's resolve-fn-name)
 ;; read the class name out of.

@@ -12,7 +12,7 @@
 ;; throw-jvm; loads after those and before anything that constructs a builder.
 
 ;; ---- StringBuilder ----------------------------------------------------------
-;; state: #(buf len owner cache monitor pend flushed cap)
+;; state: #(buf len owner cache monitor pend flushed cap hi)
 ;;   buf     the flushed text, buf[0, flushed), edited in place
 ;;   len     the whole length, flushed and pending
 ;;   pend    the pieces appended since the last flush, newest first; they hold
@@ -20,6 +20,8 @@
 ;;   cap     capacity() — java.lang.AbstractStringBuilder's number, by its rules
 ;;           (16 by default, length + 16 from a String, (max needed (+ (* 2 old) 2))
 ;;           when an edit outgrows it), kept as arithmetic
+;;   hi      a high surrogate unit appended last, as (its U+FFFD piece . unit),
+;;           for a low unit to complete, or #f (see %sb-append-unit!)
 ;;
 ;; An append conses its piece onto pend and copies nothing. Chez strings are four
 ;; bytes a char, and a buffer that copied each piece in, grew by copying, and
@@ -49,7 +51,7 @@
 ;; ones (sb-append*! sb-str* sb-length* sb-char-at*) for a StringBuffer.
 (define (make-sb-state s cap)
   (let ((n (string-length s)))
-    (vector "" n #f #f #f (if (fx=? n 0) '() (list s)) 0 cap)))
+    (vector "" n #f #f #f (if (fx=? n 0) '() (list s)) 0 cap #f)))
 (define-syntax sb-wrote! (syntax-rules () ((_ st) (vector-set! st 3 #f))))
 
 ;; --- operations on the state vector: no locking here ---------------------------
@@ -120,7 +122,7 @@
     out))
 (define-syntax %sb-str
   (syntax-rules () ((_ st) (let ((s st)) (or (vector-ref s 3) (%sb-materialize! s))))))
-(define-syntax %sb-append!
+(define-syntax %sb-push!
   (syntax-rules ()
     ((_ st* piece*)
      (let* ((st st*) (piece piece*) (pn (string-length piece)))
@@ -130,6 +132,31 @@
            (vector-set! st 5 (cons piece (vector-ref st 5)))
            (vector-set! st 1 nn)
            (sb-wrote! st)))))))
+;; A piece is a string, or a surrogate unit (values.ss jsurr: a (char 0xD83D),
+;; data.json's decoding of a \uD83D escape) that pairs with the next one.
+(define-syntax %sb-append!
+  (syntax-rules ()
+    ((_ st* piece*)
+     (let ((st st*) (piece piece*))
+       (if (string? piece) (%sb-push! st piece) (%sb-append-unit! st piece))))))
+;; A high unit goes in as U+FFFD, the lone half it is so far, and slot 8 keeps
+;; that one-char piece with the unit. A low unit appended while that piece is
+;; still the newest one (nothing appended, flushed or read out since) replaces
+;; it with the astral character the two spell, as the JVM's builder holds them;
+;; any other unit stays U+FFFD. The builder's text is code points, so its
+;; length counts the pair as one.
+(define (%sb-append-unit! st u)
+  (let ((h (vector-ref st 8)) (pend (vector-ref st 5)))
+    (vector-set! st 8 #f)
+    (cond
+      ((jsurr-high? u)
+       (let ((f (string jolt-replacement-char)))
+         (%sb-push! st f)
+         (vector-set! st 8 (cons f (jsurr-unit u)))))
+      ((and h (jsurr-low? u) (pair? pend) (eq? (car pend) (car h)))
+       (set-car! pend (string (surrogates->char (cdr h) (jsurr-unit u))))
+       (sb-wrote! st))
+      (else (%sb-push! st jolt-replacement-string)))))
 ;; Replace buf[s, e) with piece, in place: the one primitive insert, delete,
 ;; replace and deleteCharAt are spelled in. The tail moves first (string-copy!
 ;; copies as if through a temporary, so the overlap is safe).
@@ -184,7 +211,7 @@
 ;; subsequence csq[start,end) (data.json's writer appends string runs this way).
 (define (append-text x rest)
   (if (null? rest)
-      (render-piece x)
+      (if (jsurr? x) x (render-piece x))   ; a unit, for the sink to pair
       (substring (render-piece x) (jnum->exact (car rest)) (jnum->exact (cadr rest)))))
 
 ;; The bounds every (offset, len) region shares, reported the way the JVM reports
@@ -214,6 +241,7 @@
   ;; render-piece would reach its own arms for them only after failed tests.
   (cond ((string? x) x)
         ((char? x) (string x))
+        ((jsurr? x) x)                    ; for %sb-append! to pair
         ((char-array-arg? x) (char-array->string x))
         (else (render-piece x))))
 (define (sb-piece-range x a b who)
@@ -418,7 +446,8 @@
                              (%sb-splice! st o o p)))
                          self)))
               (case-lambda
-                ((self offset x) (ins self offset (sb-piece x)))
+                ((self offset x) (ins self offset (let ((p (sb-piece x)))
+                                                    (if (jsurr? p) jolt-replacement-string p))))
                 ((self offset x a b)
                  (ins self offset (sb-piece-range x a b (quote StringIndexOutOfBoundsException)))))))
       ;; .getChars srcBegin srcEnd dst dstBegin — the CharSequence copy-out the
@@ -470,8 +499,8 @@
 ;; Both tags answer here: every arm below is about the shared store, so asking
 ;; the tag literally at any one of them is how a StringBuffer silently stops
 ;; being countable, seqable or printable while a StringBuilder still is.
-(define (sb-builder-jhost? x) (and (jhost? x) (string=? (jhost-tag x) "string-builder")))
-(define (sb-buffer-jhost? x) (and (jhost? x) (string=? (jhost-tag x) "string-buffer")))
+(define-jhost-tag-pred (sb-builder-jhost? t) (string=? t "string-builder"))
+(define-jhost-tag-pred (sb-buffer-jhost? t) (string=? t "string-buffer"))
 (define (sb-jhost? x) (or (sb-builder-jhost? x) (sb-buffer-jhost? x)))
 (define (sb-class-name x)
   (if (sb-buffer-jhost? x) "java.lang.StringBuffer" "java.lang.StringBuilder"))

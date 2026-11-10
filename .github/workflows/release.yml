@@ -650,7 +650,7 @@ jobs:
           - repo: transit-jolt
             apt: ''
           - repo: xml
-            apt: libxml2
+            apt: libxml2-16     # 2.14+ soname; ubuntu-latest is 26.04
           - repo: yaml
             apt: ''
           - repo: time                # needs a non-English locale on the OS

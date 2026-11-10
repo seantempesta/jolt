@@ -26,7 +26,10 @@
 ;;
 ;; Iteration hands out live TreeMap$Entry objects whose setValue writes through,
 ;; the navigation methods immutable snapshots (see "entries" below); an iterator
-;; walks a snapshot of its view and removes through it.
+;; walks a snapshot of its view and removes through it, and is fail-fast: the
+;; root keeps TreeMap's modCount (a new key, a removal, a clear of the whole map
+;; bump it; a put over an existing key and setValue do not), which an iterator,
+;; forEach, replaceAll and the compute family watch as the JDK's do.
 ;;
 ;; Needs jutil-colls.ss (the Map / Set seam), jolt-fi-call (records-dispatch.ss), host-table.ss's
 ;; sorted-coll op access (sc-call, kw-op-*), and clojure.core's sorted-map-by /
@@ -44,7 +47,9 @@
 ;; order.
 (define (tm-comparable? x)
   (not (or (pmap? x) (pset? x) (cseq? x) (empty-list-t? x) (jolt-lazyseq? x)
-           (procedure? x) (htable-sorted? x) (jutil-coll-kind x))))
+           (procedure? x) (htable-sorted? x) (jutil-coll-kind x)
+           ;; a bare (Object.), which is no Comparable
+           (and (jhost? x) (string=? (jhost-tag x) "object")))))
 (define (tm-number-class x)
   (cond ((flonum? x) "java.lang.Double")
         ((and (exact? x) (integer? x)) "java.lang.Long")
@@ -110,38 +115,62 @@
                                           ((c) (tm-reverse-of c))))))
 
 ;; ---- the root: the sorted map a TreeMap and all its views share -----------------
-;; #(sorted-map comparator-object cmpf). comparator-object is nil for natural
-;; ordering — what .comparator answers — and cmpf the 3-way procedure every
-;; compare in this file goes through, bounds checks included.
+;; #(sorted-map comparator-object cmpf modcount). comparator-object is nil for
+;; natural ordering — what .comparator answers — and cmpf the 3-way procedure
+;; every compare in this file goes through, bounds checks included.
 (define (tm-make-root cmp-obj)
   (let ((cmpf (if (jolt-nil? cmp-obj) tm-natural-compare (tm-comparator->cmpf cmp-obj))))
-    (vector (jolt-invoke (var-deref "clojure.core" "sorted-map-by") cmpf) cmp-obj cmpf)))
+    (vector (jolt-invoke (var-deref "clojure.core" "sorted-map-by") cmpf) cmp-obj cmpf 0)))
 (define (tmr-sm r) (vector-ref r 0))
-(define (tmr-sm! r sm) (vector-set! r 0 sm))
+(define (tmr-sm! r sm)
+  (when (tmr-concurrent? r) (tm-publish-fence))
+  (vector-set! r 0 sm))
 (define (tmr-cmp-obj r) (vector-ref r 1))
 (define (tmr-cmpf r) (vector-ref r 2))
 (define (tmr-natural? r) (jolt-nil? (vector-ref r 1)))
+(define (tmr-bump! r) (vector-set! r 3 (fxand (fx+ (vector-ref r 3) 1) #x3fffffff)))
+;; the modCount a walk over the root expects, or #f for one that is not
+;; fail-fast (a ConcurrentSkipListMap's, whose iterators are weakly consistent)
+(define (tmr-expect r) (and (not (tmr-concurrent? r)) (vector-ref r 3)))
+(define (tmr-check! r e) (when (and e (not (fx=? e (vector-ref r 3)))) (jutil-cme!)))
+;; A ConcurrentSkipListMap / Set (jutil-concurrent.ss, Chez only) is this same
+;; root with a lock in a fifth slot. Every write to it runs under that lock
+;; (tmr-write), so two writers never build from the same tree and lose one's
+;; change, and publishes the new tree with one store behind a release fence;
+;; a read takes the published tree with no lock, and since the tree is
+;; persistent it is never seen half built. It refuses nil keys and values. A
+;; TreeMap's root has four slots and takes none of this.
+(define (tmr-concurrent? r) (fx>? (vector-length r) 4))
+(define tm-publish-fence (lambda () #f))
+(define tm-root-write (lambda (r thunk) (thunk)))
+(define (tmr-write r thunk) (if (tmr-concurrent? r) (tm-root-write r thunk) (thunk)))
 (define tm-absent (list 'tm-absent))
 (define (tmr-count r) (sc-call (tmr-sm r) kw-op-count))
 ;; getEntry's Objects.requireNonNull: natural ordering refuses a nil key even
 ;; when there is nothing to compare it with.
 (define (tmr-check-key r k)
-  (when (and (jolt-nil? k) (tmr-natural? r)) (throw-jvm 'NullPointerException jolt-nil)))
+  (when (and (jolt-nil? k) (or (tmr-natural? r) (tmr-concurrent? r))) (throw-jvm 'NullPointerException jolt-nil)))
 (define (tmr-ref r k)
   (tmr-check-key r k)
   (sc-call (tmr-sm r) kw-op-get k tm-absent))
 (define (tmr-put! r k v)
-  ;; put on an empty map compares the key with itself: the JDK's type (and null)
-  ;; check, so (.put (TreeMap.) {:a 1} 1) fails before anything is stored.
-  (when (eqv? 0 (tmr-count r)) ((tmr-cmpf r) k k))
-  (let ((old (tmr-ref r k)))
-    (tmr-sm! r (sc-call (tmr-sm r) kw-op-assoc (jolt-vector k v)))
-    (if (eq? old tm-absent) jolt-nil old)))
+  (when (and (jolt-nil? v) (tmr-concurrent? r)) (throw-jvm 'NullPointerException jolt-nil))
+  (tmr-write r
+    (lambda ()
+      ;; put on an empty map compares the key with itself: the JDK's type (and
+      ;; null) check, so (.put (TreeMap.) {:a 1} 1) fails before anything is stored.
+      (when (eqv? 0 (tmr-count r)) ((tmr-cmpf r) k k))
+      (let ((old (tmr-ref r k)))
+        (tmr-sm! r (sc-call (tmr-sm r) kw-op-assoc (jolt-vector k v)))
+        (if (eq? old tm-absent) (begin (tmr-bump! r) jolt-nil) old)))))
 (define (tmr-remove! r k)
-  (let ((old (tmr-ref r k)))
-    (unless (eq? old tm-absent)
-      (tmr-sm! r (sc-call (tmr-sm r) kw-op-dissoc (jolt-vector k))))
-    old))
+  (tmr-write r
+    (lambda ()
+      (let ((old (tmr-ref r k)))
+        (unless (eq? old tm-absent)
+          (tmr-sm! r (sc-call (tmr-sm r) kw-op-dissoc (jolt-vector k)))
+          (tmr-bump! r))
+        old))))
 (define (tm-seq-head s)
   (let ((s (jolt-seq s))) (if (jolt-nil? s) #f (seq-first s))))
 (define (tm-always c z) #t)
@@ -257,10 +286,15 @@
       (begin (tmr-check-key (v-root v) k) jolt-nil)))
 (define (v-remove-present! v k)
   (if (v-in-range? v k) (not (eq? (tmr-remove! (v-root v) k) tm-absent)) #f))
+;; TreeMap.clear counts a change even on an empty map; a sub-map (a descending
+;; one included) clears through its entry set's iterator, one removal at a time
 (define (v-clear! v)
-  (if (v-unbounded? v)
-      (tmr-sm! (v-root v) (sc-call (tmr-sm (v-root v)) (keyword #f "empty")))
-      (for-each (lambda (k) (tmr-remove! (v-root v) k)) (v-keys v)))
+  (tmr-write (v-root v)
+    (lambda ()
+      (cond ((not (v-unbounded? v)) (for-each (lambda (k) (tmr-remove! (v-root v) k)) (v-keys v)))
+            ((and (v-sub? v) (eqv? 0 (tmr-count (v-root v)))) #f)
+            (else (tmr-sm! (v-root v) (sc-call (tmr-sm (v-root v)) (keyword #f "empty")))
+                  (tmr-bump! (v-root v))))))
   jolt-nil)
 (define (v-poll! v e)
   (if e (begin (tmr-remove! (v-root v) (e-key e)) e) #f))
@@ -301,6 +335,9 @@
       (v-make-sub v tag from from-incl to to-incl #f)))
 (define (v-flip v tag)
   (make-tm-view tag (v-root v) (v-lo v) (v-lo-incl v) (v-hi v) (v-hi-incl v) (not (v-desc? v)) #t))
+;; a map's descending view, made once per map as the JDK keeps it in a field
+(define (tm-descending-map v)
+  (jutil-view v 3 (lambda () (v-flip v (tm-map-tag (not (v-desc? v)))))))
 (define (v-retag v tag)
   (make-tm-view tag (v-root v) (v-lo v) (v-lo-incl v) (v-hi v) (v-hi-incl v) (v-desc? v) (v-sub? v)))
 
@@ -323,12 +360,12 @@
   (cond ((not (v-sub? v)) "treemap-entryset")
         ((v-desc? v) "treemap-desc-entryset")
         (else "treemap-asc-entryset")))
-(define (tm-tag-in? x tags) (and (jhost? x) (member (jhost-tag x) tags) #t))
-(define (tm-map? x) (tm-tag-in? x tm-map-tags))
-(define (tm-set? x) (tm-tag-in? x tm-set-tags))
-(define (tm-view? x)
-  (tm-tag-in? x (append '("treemap" "treemap-asc-sub" "treemap-desc-sub" "treeset" "treemap-keyset")
-                        tm-values-tags tm-entryset-tags)))
+(define-jhost-tag-pred (tm-map? t) (and (member t tm-map-tags) #t))
+(define-jhost-tag-pred (tm-set? t) (and (member t tm-set-tags) #t))
+(define-jhost-tag-pred (tm-view? t)
+  (and (or (member t tm-map-tags) (member t tm-set-tags)
+           (member t tm-values-tags) (member t tm-entryset-tags))
+       #t))
 ;; what a view's iteration yields, by what it is
 ;; ---- entries ---------------------------------------------------------------------------
 ;; What iteration hands out is a TreeMap$Entry: a live entry whose setValue
@@ -353,8 +390,10 @@
               (lambda (self x)
                 (let* ((st (jhost-state self)) (r (vector-ref st 0)) (k (vector-ref st 1))
                        (old (tm-live-entry-value self)))
-                  (unless (eq? (sc-call (tmr-sm r) kw-op-get k tm-absent) tm-absent)
-                    (tmr-sm! r (sc-call (tmr-sm r) kw-op-assoc (jolt-vector k x))))
+                  (tmr-write r
+                    (lambda ()
+                      (unless (eq? (sc-call (tmr-sm r) kw-op-get k tm-absent) tm-absent)
+                        (tmr-sm! r (sc-call (tmr-sm r) kw-op-assoc (jolt-vector k x))))))
                   (vector-set! st 2 x)
                   old)))))
 (define (tm-snapshot-entry e)
@@ -371,7 +410,8 @@
     (cond ((member t tm-set-tags) (v-keys v))
           ((member t tm-values-tags) (map e-val (v-entries v)))
           (else (v-live-entries v)))))
-(define (tm-elems-seq v) (list->cseq (tm-elems v)))
+;; (seq v) chunk by chunk, as RT.seq walks the fail-fast iterator (jutil-ff-seq)
+(define (tm-elems-seq v) (jutil-ff-seq v (tm-elems v)))
 (define (tm-no-such-element) (throw-jvm 'NoSuchElementException jolt-nil))
 (define (tm-key-or-throw e) (if e (e-key e) (tm-no-such-element)))
 (define (tm-key-or-nil e) (if e (e-key e) jolt-nil))
@@ -386,17 +426,22 @@
 ;; a copy of a whole, ascending TreeMap shares the persistent tree
 (define (tm-copy-root-view v tag)
   (let* ((r (v-root v))
-         (nr (vector (tmr-sm r) (tmr-cmp-obj r) (tmr-cmpf r))))
+         (nr (vector (tmr-sm r) (tmr-cmp-obj r) (tmr-cmpf r) 0)))
     (make-tm-view tag nr tm-unbounded #f tm-unbounded #f #f)))
 (define (tm-ctor-arg-error class)
   (throw-jvm 'IllegalArgumentException (string-append "No matching ctor found for class " class)))
 ;; (TreeMap.) | (TreeMap. Comparator) | (TreeMap. SortedMap) | (TreeMap. Map).
 ;; A SortedMap keeps its comparator; any other Map — a Clojure sorted-map is
 ;; not a java.util.SortedMap — is copied under natural ordering.
+;; A ConcurrentSkipListMap / Set is a SortedMap / SortedSet with a view's state
+;; under a tag of its own; tm-foreign-view answers that view, so the copy
+;; constructors keep its comparator and share its tree. Set by jutil-concurrent.ss.
+(define tm-foreign-view (lambda (x) #f))
 (define tm-ctor
   (case-lambda
     (() (tm-new-map jolt-nil))
-    ((x)
+    ((x0)
+     (define x (or (tm-foreign-view x0) x0))
      (cond
        ((and (tm-map? x) (v-unbounded? x) (not (v-desc? x))) (tm-copy-root-view x "treemap"))
        ((tm-map? x) (let ((v (tm-new-map (v-comparator x)))) (tm-fill-map! v x) v))
@@ -417,7 +462,8 @@
 (define ts-ctor
   (case-lambda
     (() (make-tm-view "treeset" (tm-make-root jolt-nil) tm-unbounded #f tm-unbounded #f #f))
-    ((x)
+    ((x0)
+     (define x (or (tm-foreign-view x0) x0))
      (cond
        ((and (tm-set? x) (v-unbounded? x) (not (v-desc? x))) (tm-copy-root-view x "treeset"))
        ((tm-set? x)
@@ -456,11 +502,16 @@
                                        #f))))
     (cons "clear" (lambda (self) (v-clear! self)))
     (cons "putAll" (lambda (self m) (tm-fill-map! self m) jolt-nil))
-    (cons "keySet" (lambda (self) (tm-key-set self (v-desc? self))))
-    (cons "navigableKeySet" (lambda (self) (tm-key-set self (v-desc? self))))
-    (cons "descendingKeySet" (lambda (self) (tm-key-set self (not (v-desc? self)) #t)))
-    (cons "values" (lambda (self) (v-retag self (tm-values-tag self))))
-    (cons "entrySet" (lambda (self) (v-retag self (tm-entryset-tag self))))
+    ;; keySet IS navigableKeySet on the JDK, one cached view
+    (cons "keySet" (lambda (self) (jutil-view self 0 (lambda () (tm-key-set self (v-desc? self))))))
+    (cons "navigableKeySet" (lambda (self) (jutil-view self 0 (lambda () (tm-key-set self (v-desc? self))))))
+    ;; descendingMap().navigableKeySet(), as the JDK answers it: cached on the
+    ;; cached descending map
+    (cons "descendingKeySet" (lambda (self)
+                               (let ((d (tm-descending-map self)))
+                                 (jutil-view d 0 (lambda () (tm-key-set d (v-desc? d)))))))
+    (cons "values" (lambda (self) (jutil-view self 1 (lambda () (v-retag self (tm-values-tag self))))))
+    (cons "entrySet" (lambda (self) (jutil-view self 2 (lambda () (v-retag self (tm-entryset-tag self))))))
     ;; Map's default methods. A key mapped to nil counts as absent, like the
     ;; JDK's; each returns what the JDK's returns (the previous value for
     ;; putIfAbsent, the new one for the compute/merge family).
@@ -471,7 +522,7 @@
     (cons "computeIfAbsent" (lambda (self k f)
                               (let ((old (v-get self k)))
                                 (if (jolt-nil? old)
-                                    (let ((nv (jolt-fi-call f "apply" k)))
+                                    (let ((nv (v-apply-checked self f "apply" k)))
                                       (unless (jolt-nil? nv) (v-put! self k nv))
                                       nv)
                                     old))))
@@ -479,18 +530,18 @@
                                (let ((old (v-get self k)))
                                  (if (jolt-nil? old)
                                      jolt-nil
-                                     (let ((nv (jolt-fi-call f "apply" k old)))
+                                     (let ((nv (v-apply-checked self f "apply" k old)))
                                        (if (jolt-nil? nv) (v-remove! self k) (v-put! self k nv))
                                        nv)))))
     (cons "compute" (lambda (self k f)
                       (let* ((old (v-get self k))
-                             (nv (jolt-fi-call f "apply" k old)))
+                             (nv (v-apply-checked self f "apply" k old)))
                         (cond ((not (jolt-nil? nv)) (v-put! self k nv) nv)
                               ((v-contains? self k) (v-remove! self k) jolt-nil)
                               (else jolt-nil)))))
     (cons "merge" (lambda (self k val f)
                     (let* ((old (v-get self k))
-                           (nv (if (jolt-nil? old) val (jolt-fi-call f "apply" old val))))
+                           (nv (if (jolt-nil? old) val (v-apply-checked self f "apply" old val))))
                       (if (jolt-nil? nv)
                           (begin (v-remove! self k) jolt-nil)
                           (begin (v-put! self k nv) nv)))))
@@ -499,15 +550,19 @@
                       ((self k old val) (if (and (v-contains? self k) (jolt=2 old (v-get self k)))
                                             (begin (v-put! self k val) #t)
                                             #f))))
+    ;; TreeMap's forEach and replaceAll check the modCount after every entry
     (cons "forEach" (lambda (self f)
-                      (for-each (lambda (e) (jolt-fi-call f "accept" (e-key e) (e-val e)))
-                                (v-entries self))
+                      (let* ((r (v-root self)) (mc (tmr-expect r)))
+                        (for-each (lambda (e) (jolt-fi-call f "accept" (e-key e) (e-val e)) (tmr-check! r mc))
+                                  (v-entries self)))
                       jolt-nil))
     (cons "replaceAll" (lambda (self f)
-                         (for-each (lambda (e)
-                                     (tmr-put! (v-root self) (e-key e)
-                                               (jolt-fi-call f "apply" (e-key e) (e-val e))))
-                                   (v-entries self))
+                         (let* ((r (v-root self)) (mc (tmr-expect r)))
+                           (for-each (lambda (e)
+                                       (let ((nv (jolt-fi-call f "apply" (e-key e) (e-val e))))
+                                         (tmr-check! r mc)
+                                         (tmr-put! r (e-key e) nv)))
+                                     (v-entries self)))
                          jolt-nil))
     (cons "firstKey" (lambda (self) (tm-key-or-throw (v-lowest self))))
     (cons "lastKey" (lambda (self) (tm-key-or-throw (v-highest self))))
@@ -534,17 +589,33 @@
                      ((self from to) (v-sub self (tm-map-tag (v-desc? self)) from #t to #f))
                      ((self from fi to ti)
                       (v-sub self (tm-map-tag (v-desc? self)) from (jolt-truthy? fi) to (jolt-truthy? ti)))))
-    (cons "descendingMap" (lambda (self) (v-flip self (tm-map-tag (not (v-desc? self))))))
+    (cons "descendingMap" (lambda (self) (tm-descending-map self)))
+    ;; SequencedMap, as NavigableMap answers it: reversed is the descending map,
+    ;; and a sorted map has no first or last place to put a key
+    (cons "reversed" (lambda (self) (tm-descending-map self)))
+    (cons "putFirst" (lambda (self k val) (throw-jvm 'UnsupportedOperationException jolt-nil)))
+    (cons "putLast" (lambda (self k val) (throw-jvm 'UnsupportedOperationException jolt-nil)))
     (cons "comparator" (lambda (self) (v-comparator self)))
     (cons "clone" (lambda (self) (tm-ctor self)))))
+;; the compute family's function: a change it made to the map's structure is a
+;; ConcurrentModificationException once it returns (TreeMap's
+;; callMappingFunctionWithCheck)
+(define (v-apply-checked v f method . args)
+  (let* ((r (v-root v)) (mc (tmr-expect r)) (x (apply jolt-fi-call f method args)))
+    (tmr-check! r mc)
+    x))
 (for-each (lambda (t) (register-host-methods! t treemap-methods)) tm-map-tags)
 
 ;; ---- iterators ---------------------------------------------------------------------------
 ;; An iterator over a view walks a snapshot of it taken when the iterator is
 ;; made, and remove() takes the last element it returned out of the map through
-;; the view it came from — the JDK idiom for filtering a TreeMap in place.
-;; State: #(view remaining-entries last-entry-or-#f project) where project maps
-;; an entry to what next() hands back.
+;; the view it came from — the JDK idiom for filtering a TreeMap in place. It is
+;; fail-fast as TreeMap$PrivateEntryIterator is: next checks the end first, then
+;; the modCount; remove the IllegalStateException first, then the count, and
+;; takes the new count after removing. With the count unchanged the snapshot is
+;; the walk the JDK makes.
+;; State: #(view remaining-entries last-entry-or-#f project expected-modcount root)
+;; where project maps an entry to what next() hands back.
 ;; One tag per JDK iterator class (classes follow tags), all sharing these
 ;; methods: the map's own Entry/Key/ValueIterator, a sub-map's SubMap* and
 ;; DescendingSubMap* iterators, and a sub-map values() view's anonymous one.
@@ -554,26 +625,57 @@
     "treemap-desc-submap-entry-iterator" "treemap-desc-submap-key-iterator"
     "treemap-submap-value-iterator"))
 (define (make-tm-iterator tag v entries project)
-  (make-jhost tag (vector v entries #f project)))
+  (let ((r (v-root v))) (make-jhost tag (vector v entries #f project (tmr-expect r) r))))
 (define (tmi-ref it i) (vector-ref (jhost-state it) i))
 (define (tmi-set! it i x) (vector-set! (jhost-state it) i x))
+;; inline: next pays it per element. Unchecked reads (sa-uvector-ref): ST is
+;; the 6-slot vector make-tm-iterator builds and slot 5 a root, which has at
+;; least four slots (tm-make-root, cs-new-root).
+(define-syntax tmi-current-st?
+  (syntax-rules ()
+    ((_ st) (let ((e (sa-uvector-ref st 4))) (or (not e) (fx=? e (sa-uvector-ref (sa-uvector-ref st 5) 3)))))))
+(define (tmi-current? it) (tmi-current-st? (jhost-state it)))
+(define (tmi-next self)
+  (let* ((st (jhost-state self)) (es (vector-ref st 1)))
+    (when (null? es) (tm-no-such-element))
+    (unless (tmi-current-st? st) (jutil-cme!))
+    (vector-set! st 1 (cdr es))
+    (vector-set! st 2 (car es))
+    ((vector-ref st 3) (car es))))
+;; iterator-seq's chunk fill (records-dispatch.ss): up to 32 nexts at once
+(define (tmi-fill it buf)
+  (let ((project (tmi-ref it 3)))
+    (and (or (null? (tmi-ref it 1)) (tmi-current? it))
+    (let loop ((j 0) (es (tmi-ref it 1)) (last (tmi-ref it 2)))
+      (if (or (fx=? j 32) (null? es))
+          (begin (tmi-set! it 1 es) (tmi-set! it 2 last) j)
+          (begin (vector-set! buf j (project (car es)))
+                 (loop (fx+ j 1) (cdr es) (car es))))))))
 (define treemap-iterator-methods
-  (list (cons "hasNext" (lambda (self) (pair? (tmi-ref self 1))))
-        (cons "next" (lambda (self)
-                       (let ((es (tmi-ref self 1)))
-                         (when (null? es) (tm-no-such-element))
-                         (tmi-set! self 1 (cdr es))
-                         (tmi-set! self 2 (car es))
-                         ((tmi-ref self 3) (car es)))))
+  (list (cons "hasNext" (lambda (self) (pair? (vector-ref (jhost-state self) 1))))
+        (cons "next" tmi-next)
         (cons "remove" (lambda (self)
                          (let ((e (tmi-ref self 2)))
                            (unless e (throw-jvm 'IllegalStateException jolt-nil))
-                           (tmr-remove! (v-root (tmi-ref self 0)) (e-key e))
+                           (unless (tmi-current? self) (jutil-cme!))
+                           (let ((r (v-root (tmi-ref self 0))))
+                             (tmr-remove! r (e-key e))
+                             (tmi-set! self 4 (tmr-expect r)))
                            (tmi-set! self 2 #f)
-                           jolt-nil)))))
+                           jolt-nil)))
+        ;; Iterator's default: hasNext and next to the end
+        (cons "forEachRemaining" (lambda (self f)
+                                   (when (jolt-nil? f) (throw-jvm 'NullPointerException jolt-nil))
+                                   (let loop ()
+                                     (when (pair? (tmi-ref self 1))
+                                       (jolt-fi-call f "accept" (tmi-next self))
+                                       (loop)))
+                                   jolt-nil))))
 (for-each (lambda (t) (register-host-methods! t treemap-iterator-methods)) tm-iterator-tags)
+(register-iterator-seq-fill! tm-iterator-tags tmi-fill tmi-next)
 ;; (iterator-seq it) / (seq it): what the iterator has not handed out yet
-(register-seq-arm! (lambda (x) (tm-tag-in? x tm-iterator-tags))
+(define-jhost-tag-pred (tm-iterator? t) (and (member t tm-iterator-tags) #t))
+(register-seq-arm! tm-iterator?
                    (lambda (it) (list->cseq (map (tmi-ref it 3) (tmi-ref it 1)))))
 ;; DESC? is a descendingIterator() call, which on the JDK goes through the
 ;; map's descending key set — a sub-map — even on the map itself.
@@ -595,8 +697,18 @@
                               "treemap-submap-entry-iterator")))))
     (make-tm-iterator tag v es (case kind
                                  ((key) e-key)
-                                 ((value) e-val)
+                                 ((value) (tm-live-value (v-root v)))
                                  (else (lambda (e) (tm-live-entry v e)))))))
+;; a value iterator hands out the value the map holds when next() is called, as
+;; the JDK's (which reads the node) does: the snapshot's while the tree is the
+;; one it was taken from, else the map's for that key
+(define (tm-live-value r)
+  (let ((sm0 (vector-ref r 0)))
+    (lambda (e)
+      (let ((sm (vector-ref r 0)))
+        (if (eq? sm sm0)
+            (e-val e)
+            (let ((x (sc-call sm kw-op-get (e-key e) tm-absent))) (if (eq? x tm-absent) (e-val e) x)))))))
 
 ;; ---- the NavigableSet surface: TreeSet and a map's key set -------------------------------
 ;; The two differ in add (a key set has no value to put, so it refuses) and in
@@ -617,6 +729,10 @@
     (cons "clear" (lambda (self) (v-clear! self)))
     (cons "iterator" (lambda (self) (ts-iterator self #f)))
     (cons "descendingIterator" (lambda (self) (ts-iterator self #t)))
+    ;; Iterable.forEach and Collection.removeIf, the defaults a TreeSet and a
+    ;; key set keep: over the fail-fast iterator
+    (cons "forEach" (lambda (self f) (jutil-walk-for-each (ts-iterator self #f) f)))
+    (cons "removeIf" (lambda (self pred) (jutil-walk-remove-if (ts-iterator self #f) pred)))
     (cons "first" (lambda (self) (tm-key-or-throw (v-lowest self))))
     (cons "last" (lambda (self) (tm-key-or-throw (v-highest self))))
     (cons "floor" (lambda (self x) (tm-key-or-nil (v-floor self x))))
@@ -636,6 +752,14 @@
                      ((self from fi to ti)
                       (v-sub self (jhost-tag self) from (jolt-truthy? fi) to (jolt-truthy? ti)))))
     (cons "descendingSet" (lambda (self) (v-flip self (jhost-tag self))))
+    ;; SequencedCollection, as NavigableSet answers it
+    (cons "reversed" (lambda (self) (v-flip self (jhost-tag self))))
+    (cons "getFirst" (lambda (self) (tm-key-or-throw (v-lowest self))))
+    (cons "getLast" (lambda (self) (tm-key-or-throw (v-highest self))))
+    (cons "removeFirst" (lambda (self) (tm-key-or-throw (v-poll! self (v-lowest self)))))
+    (cons "removeLast" (lambda (self) (tm-key-or-throw (v-poll! self (v-highest self)))))
+    (cons "addFirst" (lambda (self x) (throw-jvm 'UnsupportedOperationException jolt-nil)))
+    (cons "addLast" (lambda (self x) (throw-jvm 'UnsupportedOperationException jolt-nil)))
     (cons "comparator" (lambda (self) (v-comparator self)))))
 (register-host-methods! "treeset"
   (append navigable-set-methods
@@ -662,7 +786,9 @@
                          (let ((e (tm-find (lambda (e) (jolt=2 x (e-val e))) (v-entries self))))
                            (if e (begin (tmr-remove! (v-root self) (e-key e)) #t) #f))))
         (cons "clear" (lambda (self) (v-clear! self)))
-        (cons "iterator" (lambda (self) (tm-iterator self #f)))))
+        (cons "iterator" (lambda (self) (tm-iterator self #f)))
+        (cons "forEach" (lambda (self f) (jutil-walk-for-each (tm-iterator self #f) f)))
+        (cons "removeIf" (lambda (self pred) (jutil-walk-remove-if (tm-iterator self #f) pred)))))
 (define treemap-entryset-methods
   (list (cons "size" (lambda (self) (v-size self)))
         (cons "isEmpty" (lambda (self) (v-empty? self)))
@@ -672,11 +798,16 @@
                              (begin (tmr-remove! (v-root self) (e-key e)) #t)
                              #f)))
         (cons "clear" (lambda (self) (v-clear! self)))
-        (cons "iterator" (lambda (self) (tm-iterator self #f)))))
+        (cons "iterator" (lambda (self) (tm-iterator self #f)))
+        (cons "forEach" (lambda (self f) (jutil-walk-for-each (tm-iterator self #f) f)))
+        (cons "removeIf" (lambda (self pred) (jutil-walk-remove-if (tm-iterator self #f) pred)))))
 (for-each (lambda (t) (register-host-methods! t treemap-values-methods)) tm-values-tags)
 (for-each (lambda (t) (register-host-methods! t treemap-entryset-methods)) tm-entryset-tags)
 
 ;; ---- what the rest of the runtime sees ----------------------------------------------------
+;; every view reads its root's modCount (a concurrent root's is never watched)
+(for-each (lambda (t) (register-modcount! t (lambda (v) (tmr-expect (v-root v)))))
+          (append tm-map-tags tm-set-tags tm-values-tags tm-entryset-tags))
 (for-each (lambda (t) (register-jutil-coll! t 'map v-entries)) tm-map-tags)
 (for-each (lambda (t) (register-jutil-coll! t 'set v-keys)) tm-set-tags)
 (for-each (lambda (t) (register-jutil-coll! t 'entries v-live-entries)) tm-entryset-tags)
@@ -689,7 +820,7 @@
 ;; Set.contains (RT.get has no Set arm, so get on a TreeSet stays nil).
 (register-get-arm! tm-map?
   (lambda (m k d) (let ((x (v-ref m k))) (if (eq? x tm-absent) d x))))
-(register-contains-arm! (lambda (x) (tm-tag-in? x '("treemap" "treemap-asc-sub" "treemap-desc-sub"
-                                                    "treeset" "treemap-keyset")))
-                        v-contains?)
-(register-contains-arm! (lambda (x) (tm-tag-in? x tm-entryset-tags)) tm-entry-in?)
+(define-jhost-tag-pred (tm-keyed? t) (and (or (member t tm-map-tags) (member t tm-set-tags)) #t))
+(define-jhost-tag-pred (tm-entryset? t) (and (member t tm-entryset-tags) #t))
+(register-contains-arm! tm-keyed? v-contains?)
+(register-contains-arm! tm-entryset? tm-entry-in?)

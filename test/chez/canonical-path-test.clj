@@ -147,6 +147,39 @@
        (.exists (File. (str "/tmp/a" (char 0) "b"))) false)
 (check "getAbsolutePath keeps the NUL"
        (count (.getAbsolutePath (File. (str "/tmp/a" (char 0) "b")))) 8)
+;; ...and the answer may not depend on what the path's text before the NUL
+;; names: a C path stops there, so asking the OS asked about that file instead.
+;; Every File query takes the JVM's invalid-path answer, against a file and a
+;; directory that do exist ahead of the NUL.
+(let [f (File. (str inside "/plain.txt" (char 0) "x"))
+      d (File. (str inside (char 0) "x"))]
+  (check "a NUL past an existing file: exists"       (.exists f) false)
+  (check "a NUL past an existing file: isFile"       (.isFile f) false)
+  (check "a NUL past an existing file: canRead"      (.canRead f) false)
+  (check "a NUL past an existing file: length"       (.length f) 0)
+  (check "a NUL past an existing file: lastModified" (.lastModified f) 0)
+  (check "a NUL past an existing file: delete"       (.delete f) false)
+  (check "a NUL past an existing file: renameTo"
+         (.renameTo f (File. (str inside "/renamed.txt"))) false)
+  (check "a NUL past an existing file: createNewFile"
+         (try (.createNewFile f) (catch java.io.IOException e (.getMessage e)))
+         "Invalid file path")
+  (check "a NUL past an existing directory: isDirectory" (.isDirectory d) false)
+  (check "a NUL past an existing directory: list"        (.list d) nil)
+  (check "a NUL past an existing directory: listFiles"   (.listFiles d) nil)
+  (check "a NUL past an existing directory: mkdirs"      (.mkdirs d) false)
+  (check "a NUL path cannot be slurped"
+         (try (slurp f) (catch java.io.FileNotFoundException e (.getMessage e)))
+         "Invalid file path")
+  (check "a NUL path cannot be spit to"
+         (try (spit f "clobbered") (catch java.io.FileNotFoundException e (.getMessage e)))
+         "Invalid file path")
+  (check "a NUL path cannot be opened as a stream"
+         (try (.close (java.io.FileInputStream. f)) :opened
+              (catch java.io.FileNotFoundException e (.getMessage e)))
+         "Invalid file path")
+  (check "the file a NUL path stopped at is untouched"
+         (slurp (str inside "/plain.txt")) "inside"))
 
 ;; A symlink cycle, and the distinction that makes it subtle: the JVM raises
 ;; when it had to WALK THROUGH the loop, and answers when the loop is the final

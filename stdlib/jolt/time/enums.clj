@@ -3,7 +3,8 @@
   ValueRange. Requiring the namespace registers the classes. The temporal-coupled
   operations (Month/from, ChronoUnit.between, ChronoField.getFrom, …) are added by
   the temporal namespaces, which own the receiver types."
-  (:require [jolt.time.impl :as impl]
+  (:require [clojure.string :as str]
+            [jolt.time.impl :as impl]
             [jolt.time.util :as u]))
 
 (defn- statics! [names members]
@@ -22,6 +23,38 @@
   (apply str (map (fn [part]
                     (str (subs part 0 1) (.toLowerCase (subs part 1))))
                   (.split nm "_"))))
+
+;; ---- localized names -----------------------------------------------------------
+;; Month / DayOfWeek .getDisplayName(TextStyle, Locale) and ChronoField
+;; .getDisplayName(Locale), from the :date-names and :field-names extension
+;; points: core carries ROOT, jolt-lang/time the other locales (RFC 0008). A
+;; Locale renders as its id. A provider without narrow forms gets the format
+;; name's first letter, which is CLDR's narrow form in every locale measured;
+;; one without standalone forms gets the format forms.
+(defn- locale-id [l]
+  (when (nil? l) (throw (jolt.host/throwable "java.lang.NullPointerException" "locale")))
+  ;; the data's key is the BCP-47-style id (language-Script-COUNTRY-variant); a
+  ;; Locale prints the JDK's toString (en_US, zh_TW_#Hant)
+  (let [s (str l) h (.indexOf s "_#")
+        base (if (neg? h) s (subs s 0 h))
+        script (if (neg? h) "" (subs s (+ h 2)))
+        [lang & more] (str/split base #"_" -1)]
+    (str/join "-" (remove empty? (concat [lang script] more)))))
+(defn- text-name [kind i style l]
+  (when (nil? style) (throw (jolt.host/throwable "java.lang.NullPointerException" "style")))
+  (let [id (locale-id l)
+        d (jolt.host/extension-value :date-names id)
+        st (str style)
+        standalone? (.endsWith st "_STANDALONE")
+        k (fn [suffix] (keyword (str (name kind) suffix)))
+        pick (fn [ks] (some (fn [key] (let [v (get d key)] (when v (nth v i nil)))) ks))]
+    (cond
+      (.startsWith st "FULL") (pick (if standalone? [(k "-standalone") kind] [kind]))
+      (.startsWith st "SHORT") (pick (if standalone? [(k "-short-standalone") (k "-short")] [(k "-short")]))
+      :else (or (pick [(k "-narrow")])
+                (if (and (= id "") (= kind :months))
+                  (str (inc i))
+                  (let [full (pick [kind])] (.toUpperCase (subs full 0 1))))))))
 
 ;; ---- Month ------------------------------------------------------------------
 
@@ -55,7 +88,7 @@
    "ordinal"   (fn [e] (dec (month-val e)))
    "name"      month-name
    "toString"  month-name
-   "getDisplayName" (fn [e & _] (month-name e))
+   "getDisplayName" (fn [e style l] (text-name :months (dec (month-val e)) style l))
    "plus"      (fn [e n] (month (inc (u/floor-mod (+ (dec (month-val e)) (u/->long n)) 12))))
    "minus"     (fn [e n] (month (inc (u/floor-mod (- (dec (month-val e)) (u/->long n)) 12))))
    "length"    (fn [e leap] (u/len-of-month (if leap 4 1) (month-val e)))
@@ -96,7 +129,7 @@
    "ordinal"   (fn [e] (dec (dow-val e)))
    "name"      dow-name
    "toString"  dow-name
-   "getDisplayName" (fn [e & _] (dow-name e))
+   "getDisplayName" (fn [e style l] (text-name :days (dec (dow-val e)) style l))
    "plus"      (fn [e n] (dow (inc (u/floor-mod (+ (dec (dow-val e)) (u/->long n)) 7))))
    "minus"     (fn [e n] (dow (inc (u/floor-mod (- (dec (dow-val e)) (u/->long n)) 7))))
    "compareTo" compare
@@ -155,14 +188,13 @@
       (throw (jolt.host/throwable "java.lang.IllegalArgumentException"
                                   (str "No enum constant java.time.temporal.ChronoField." name)))))
 (defn cf-name [f] (impl/field f :name))
+;; the JDK's toString: the camel-case name, AM/PM spelled AmPm (AmPmOfDay)
+(defn- cf-display [f] (.replace (display-name (cf-name f)) "Ampm" "AmPm"))
 
 (impl/register-type! :jolt.time/chrono-field
   {:eq   (fn [a b] (= (cf-name a) (cf-name b)))
    :hash (fn [f] (hash (cf-name f)))
-   ;; the JDK's toString is the camel-case name (AmPmOfDay); jolt-lang/time's
-   ;; DateTimeFormatterBuilder reads a field's name through str, so it stays the
-   ;; constant name until that reads .name
-   :str  cf-name
+   :str  cf-display
    :enum? true
    :cmp  (fn [a b] (- (u/chrono-field-index (cf-name a))
                       (u/chrono-field-index (cf-name b))))
@@ -172,10 +204,13 @@
 
 (__register-class-methods! :jolt.time/chrono-field
   {"name"      cf-name
-   "toString"  cf-name
+   "toString"  cf-display
    "ordinal"   (fn [f] (u/chrono-field-index (cf-name f)))
    "compareTo" compare
-   "getDisplayName" (fn [f & _] (cf-name f))
+   ;; CLDR names some fields per locale (DAY_OF_WEEK, MONTH_OF_YEAR, …); the
+   ;; rest are their toString in every locale
+   "getDisplayName" (fn [f l] (get (:names (jolt.host/extension-value :field-names (locale-id l)))
+                                   (cf-name f) (cf-display f)))
    "isDateBased" (fn [f] (contains? u/date-based-fields (cf-name f)))
    "isTimeBased" (fn [f] (not (or (contains? u/date-based-fields (cf-name f))
                                   (contains? #{"INSTANT_SECONDS" "OFFSET_SECONDS"} (cf-name f)))))

@@ -27,6 +27,39 @@
 ;; A Float as the double it widens to; anything else unchanged.
 (define (jfloat-unbox x) (if (jfloat? x) (jfloat-fl x) x))
 
+;; A UTF-16 SURROGATE CODE UNIT as a value: what (char 0xD83D) is, and what a
+;; char[] holds for each half of an astral character it was given as units
+;; (#1454). jolt strings hold code points and every string index counts them, so
+;; a Chez char cannot be half a pair. A JVM char can, and library code depends on
+;; it: data.json decodes \uD83D\uDE00 one unit at a time and appends each to a
+;; StringBuilder. So a surrogate exists as a value OUTSIDE a string (char?, a
+;; java.lang.Character, int gives its unit back), and every place that joins
+;; text pairs a high unit with the low unit after it into the one scalar. A unit
+;; left unpaired in finished text is U+FFFD, the replacement the JDK's own UTF-8
+;; encoder writes for one. surrogates.ss registers it with class/pr/str/hash.
+;;
+;; All 2048 are made here, once, so (char n) is always the same object: = and
+;; identical? need no arm, and no two threads can race to intern one.
+(define-record-type jsurr (fields unit) (nongenerative chez-jsurr-v1))
+(define jsurr-units
+  (let ((v (make-vector 2048 #f)))
+    (do ((i 0 (fx+ i 1))) ((fx=? i 2048) v)
+      (vector-set! v i (make-jsurr (fx+ #xD800 i))))))
+(define (jolt-surrogate n) (vector-ref jsurr-units (fx- n #xD800)))
+(define (jsurr-high? x) (and (jsurr? x) (fx<? (jsurr-unit x) #xDC00)))
+(define (jsurr-low? x) (and (jsurr? x) (fx>=? (jsurr-unit x) #xDC00)))
+;; The scalar a high and a low unit (fixnums) spell.
+(define (surrogates->char hi lo)
+  (integer->char (fx+ #x10000 (fx+ (fxarithmetic-shift-left (fx- hi #xD800) 10)
+                                   (fx- lo #xDC00)))))
+;; The two units of an astral character (code point > #xFFFF), as fixnums.
+(define (astral-high-unit cp) (fx+ #xD800 (fxarithmetic-shift-right (fx- cp #x10000) 10)))
+(define (astral-low-unit cp) (fx+ #xDC00 (fxand (fx- cp #x10000) #x3FF)))
+;; A char or a unit as its 16-bit-or-wider code: the int (int c) answers.
+(define (char-or-unit->integer x) (if (char? x) (char->integer x) (jsurr-unit x)))
+(define jolt-replacement-char (integer->char #xFFFD))
+(define jolt-replacement-string (string jolt-replacement-char))
+
 ;; Has a second OS thread ever been started? #f until the first fork-thread
 ;; (lazy-bridge.ss shadows it to flip this), never #f again. The lock-free
 ;; paths that are only unsafe under real concurrency — a lazy node's first
@@ -529,6 +562,10 @@
 (define (register-eq-arm! pred handler)
   (eq-arm-reject-fast-type! 'register-eq-arm! pred)
   (set! jolt-eq-arms (cons (cons pred handler) jolt-eq-arms)))
+;; At the END of the walk, for a family of rare values (the arms run newest first).
+(define (register-eq-arm-last! pred handler)
+  (eq-arm-reject-fast-type! 'register-eq-arm-last! pred)
+  (set! jolt-eq-arms (append jolt-eq-arms (list (cons pred handler)))))
 (define (jolt=2-base a b)
   (cond
     ((and (jolt-nil? a) (jolt-nil? b)) #t)
@@ -693,13 +730,26 @@
 (define (register-hash-arm! pred handler)
   (hash-arm-reject-fast-type! 'register-hash-arm! pred)
   (set! jolt-hash-arms (cons (cons pred handler) jolt-hash-arms)))
+;; At the END of the walk, for a family of rare values (the arms run newest first).
+(define (register-hash-arm-last! pred handler)
+  (hash-arm-reject-fast-type! 'register-hash-arm-last! pred)
+  (set! jolt-hash-arms (append jolt-hash-arms (list (cons pred handler)))))
 (define (jolt-hash-base x)
   ;; Delegate to jolt-hasheq for all scalars; sequential/coll handled by
   ;; seq-hash / jolt-coll-hash which now use the Murmur3 mixers from hasheq.ss.
+  ;; Only jolt-hash calls this, once its arms have all passed on x, and x is none
+  ;; of the types jolt-hasheq answers ahead of its walks (jolt-hash answered
+  ;; those, and the sequentials above). So jolt-hasheq's route for x is its own
+  ;; arms, then jolt-hash-arms again, then the fallback: the second walk of
+  ;; jolt-hash-arms is skipped here, as it can only miss again. It was a third
+  ;; of the hash of a host object no arm claims ((hash (Object.))).
   (cond
     ((jolt-sequential? x) (seq-hash x))
     ((jolt-coll? x) (jolt-coll-hash x))
-    (else (jolt-hasheq x))))
+    (else (let loop ((as jolt-hasheq-arms))
+            (cond ((null? as) (jolt-hasheq-fallback x))
+                  (((caar as) x) ((cdar as) x))
+                  (else (loop (cdr as))))))))
 (define (jolt-hash x)
   ;; Fast path for common types: skip the arm walk entirely.
   (cond ((jolt-nil? x) 0)

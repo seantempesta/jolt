@@ -356,6 +356,11 @@
 ;; separate backend copy. run-passes shares one unit for inference and emit, so it
 ;; is populated before each form's emit.
 (defn- ctor-shapes [] (get @(:config (cur)) :record-shapes))
+;; the shape of the record whose class tag is CLASS ("ns.Name"), or nil — what a
+;; (Name. …) constructor call names, where (->Name …) names the shape's key
+(defn- record-shape-for-class [class]
+  (when (string? class)
+    (some (fn [e] (let [s (val e)] (when (= class (get s :type)) s))) (ctor-shapes))))
 
 ;; Tail-frame tracing (JOLT_TRACE): a TAIL CALL SITE stores its static
 ;; ('ns/fn' . line) pair in the site vreg — one store, no allocation, nothing
@@ -421,6 +426,43 @@
 ;; everywhere else.
 (defn set-source-reg! [on] (reset! (:source-reg? (cur)) (boolean on)))
 (defn- source-reg? [] @(:source-reg? (cur)))
+;; Debug locals (jolt.profile/instrument! :debug, #1464). Code compiled while it
+;; is on keeps every fn's params and let-locals visible to its frame, so
+;; jolt.debug/frames can read them off a throwable's captured continuation. Chez
+;; 10.4 has no continuation attachments, so the locals travel the way the
+;; _ss$/_so$ site slots do: in a variable the frame keeps live across its calls.
+;;
+;; Each scope binds a jolt-dbg chain record (rt.ss) in a fresh _dl$ variable — an
+;; arity's params, each let binding (a catch's local is one), a loop iteration's
+;; bindings — and *dbg-scope* names the innermost one while its body emits. Every tail leaf
+;; is emitted NON-tail and followed by (keep-live _dl$N): the fn's frame then
+;; exists while the leaf runs, so a tail throw keeps the frame it was thrown
+;; from, and _dl$N is live across every call in the scope. recur stays a tail
+;; jump (emit-recur). So debug-compiled code loses tail calls except recur, as on
+;; the JVM. Off, nothing here emits a byte, so the seed mint is unchanged.
+(defn set-debug-locals! [on] (reset! (:debug-locals? (cur)) (boolean on)))
+(defn- debug-locals? [] (boolean (some-> (:debug-locals? (cur)) deref)))
+(def ^:dynamic *dbg-scope* nil)
+(declare chez-str-lit)
+;; The analyzer's own locals (gen-name: _r$<prefix><n>, a raw catch value, a
+;; destructured arg) are not the program's, so no scope record names them, and
+;; neither does a bare (gensym), G__<n>, which is how destructure names the
+;; whole of a destructured arg.
+(defn- dbg-hidden? [nm]
+  (or (str/starts-with? nm "_r$")
+      (and (str/starts-with? nm "G__") (> (count nm) 3)
+           (every? (fn [c] (<= (int \0) (int c) (int \9))) (subs nm 3)))))
+;; A scope record's constructor call: one name and value, or a vector of each.
+(defn- dbg-record1 [parent nm munged]
+  (str "(jolt-dbg-new1 " (or parent "#f") " " (chez-str-lit nm) " " munged ")"))
+(defn- dbg-record [parent nms munged]
+  (let [ps (remove (fn [p] (dbg-hidden? (nth p 0))) (map vector nms munged))]
+    (str "(jolt-dbg-new " (or parent "#f") " (quote #(" (str/join " " (map (fn [p] (chez-str-lit (nth p 0))) ps)) "))"
+         " (vector " (str/join " " (map (fn [p] (nth p 1)) ps)) "))")))
+;; Ops that pass their tail position through to a child the leaf rule then
+;; wraps. A try is NOT one here, unlike tail-transparent-ops: a guard in tail
+;; position erases the enclosing frame, so the whole try is the leaf.
+(def ^:private dbg-structural-ops #{:if :do :let :loop :recur})
 
 ;; --- identifier munging ------------------------------------------------------
 ;; Every Clojure name the emitter writes as a Scheme IDENTIFIER — a local, a
@@ -614,7 +656,7 @@
 ;; site-restore).
 (def ^:dynamic *self-wrap* nil)
 ;; Inside a fn, a non-tail call's restore is a call to jolt-site-call, which the
-;; outermost fn's clause binds once (site-restore, emit-fn). Bound to an atom per
+;; fn clause it sits in binds once (site-restore, emit-fn). Bound to an atom per
 ;; clause while that clause emits; set once a site uses the helper.
 (def ^:dynamic *site-call* nil)
 ;; Inside a fn the restore is spelled ONCE per clause, as the procedure
@@ -626,6 +668,12 @@
 ;; ~30 pairs of that per site, repeated in every enclosing lambda's copy. A
 ;; 4,000-fn app's binary grew 32% with it (#1423). Outside any fn there is no
 ;; clause to bind the helper in, and the site keeps the inline form.
+;;
+;; Every clause binds its own, nested fns included. A nested fn's sites once
+;; used the outermost clause's binding, and in a built program cp0 left those
+;; calls in: a closure per site and an out-of-line call, which made
+;; bench/keyed_lookup (a reduce fn per walk) 1.15x slower than 0.8.23. Bound in
+;; the clause, the helper is a known local of the lambda that calls it.
 (def ^:private site-call-helper
   (str "(lambda (_th$) (let ((_ss$ (virtual-register 2)) (_so$ (virtual-register 12)))"
        " (if (pair? _ss$) (set-virtual-register! 12 _ss$))"
@@ -1211,10 +1259,33 @@
 ;; special-form name emitted as a call head that a user local could shadow —
 ;; MUST be added to the `helpers` set below. The op-registry derivation covers
 ;; registry-driven heads; everything else is enumerated there by emission site.
+;; The casts the :coerce arm lowers on a proven double, each with the suffix
+;; of its window constants (converters.ss: jolt-cast-lo-<s> / jolt-cast-hi-<s>).
+;; The unchecked casts share the checked ones' windows: inside the window the
+;; two agree, and outside it the helper does the saturating. The same seven
+;; strings as jolt.passes.numeric's lowered-cast-fns.
+(def ^:private cast-window-suffix
+  {"jolt-long-cast" "long" "jolt-unchecked-long" "long"
+   "jolt-int-cast" "int" "jolt-unchecked-int" "int"
+   "jolt-short-cast" "short" "jolt-byte-cast" "byte" "jolt-char" "char"})
+
+;; What a double or float the JVM holds primitive (:fl-prim) calls, where RT's
+;; primitive overload differs from its Object one (converters.ss). The unchecked
+;; casts have no check to differ on.
+(def ^:private cast-prim-entry
+  {"jolt-byte-cast" "jolt-byte-cast-prim" "jolt-short-cast" "jolt-short-cast-prim"
+   "jolt-int-cast" "jolt-int-cast-prim" "jolt-long-cast" "jolt-long-cast-prim"
+   "jolt-char" "jolt-char-prim"})
+(defn- cast-entry [node]
+  (if (:fl-prim node)
+    (get cast-prim-entry (:cast-fn node) (:cast-fn node))
+    (:cast-fn node)))
+
 (def ^:private rt-emitted-names
   (let [from-registry registry-emitted-names
         helpers #{"jolt-nil" "jolt-invoke" "jolt-invoke0" "jolt-invoke1"
                   "jolt-invoke2" "jolt-invoke3" "jolt-invoke4"
+                  "jolt-invoke-t0" "jolt-invoke-t1" "jolt-invoke-t2" "jolt-invoke-t3" "jolt-invoke-t4"
                   "var-deref" "list->cseq" "cseq->list"
                   "jolt-rest-seq" "jolt-register-variadic!"
                   "make-jrec" "jrec-field-at" "jrec-field-set!"
@@ -1228,6 +1299,13 @@
                   ;; :fl-coerce contagion widening, whose fixnum->flonum has been
                   ;; emitted bare since before this set existed.
                   "fixnum?" "flonum?" "fixnum->flonum"
+                  ;; the cast fast path on a proven double (the :coerce arm's
+                  ;; :fl-arg branch): its lane and the runtime's window
+                  ;; constants, which the emitted test reads by name
+                  "flonum->fixnum"
+                  "jolt-cast-lo-long" "jolt-cast-hi-long" "jolt-cast-lo-int" "jolt-cast-hi-int"
+                  "jolt-cast-lo-short" "jolt-cast-hi-short" "jolt-cast-lo-byte" "jolt-cast-hi-byte"
+                  "jolt-cast-lo-char" "jolt-cast-hi-char"
                   ;; the trace site-restore around a non-tail call (site-restore,
                   ;; lookup-restore): it reads and writes the site slots and
                   ;; tests the slot's pair. honeysql's (let [pair? ...]) turned
@@ -1304,6 +1382,8 @@
                   ;; (let [fx+ 1] (try 1 (finally nil))) called the local.
                   "+" "=" "not" "eq?" "null?" "procedure?" "string?"
                   "car" "cdr" "cons" "vector" "vector-ref" "vector-set!"
+                  ;; debug locals (*dbg-scope*): every tail leaf and recur
+                  "keep-live"
                   "string-append" "string-length" "string-downcase" "string-upcase"
                   "fx+" "fx-" "fx>" "fx=" "fx=?" "fx>=?" "fl+" "fl-"
                   "flsingle" "flvector-ref" "flvector-set!"
@@ -1411,7 +1491,14 @@
       :else (let [v (fresh-label "_cv$")]
               (str "(let ((" v " " s ")) " st " " v ")")))))
 
+(declare emit-plain)
 (defn emit [node]
+  (if (and *dbg-scope* *tail?* (not (contains? dbg-structural-ops (:op node))))
+    (let [r (fresh-label "_dr$")]
+      (str "(let ((" r " " (binding [*tail?* false] (emit-plain node)) ")) (keep-live "
+           *dbg-scope* ") " r ")"))
+    (emit-plain node)))
+(defn- emit-plain [node]
   (let [s (if (and *tail?* (not (tail-transparent? node)))
             (binding [*tail?* false] (emit* node))
             (emit* node))
@@ -1808,6 +1895,7 @@
 
 ;; letfn lowers to a :let flagged :letrec (mutually-recursive named local fns):
 ;; Scheme `letrec*` binds them so each sees its siblings. A plain let uses let*.
+(declare emit-let-dbg)
 (defn- emit-let [node]
   (let [kw (if (:letrec node) "letrec*" "let*")
         bs (:bindings node)
@@ -1816,24 +1904,54 @@
         ;; flvector from there on (*array-vecs*). let* binds sequentially, so
         ;; each init is emitted under the names bound BEFORE it; letrec* binds
         ;; every name up front.
-        av-body (apply dissoc *array-vecs* names)
-        ;; bindings are non-tail; the body inherits the let's tail position
-        binds (binding [*tail?* false
-                        *letrec-binders* (if (:letrec node)
-                                           (into *letrec-binders*
-                                                 (map #(nth % 0) bs))
-                                           *letrec-binders*)]
-                (cond
-                  (empty? *array-vecs*) (str/join " " (mapv emit-binding bs))
-                  (:letrec node) (binding [*array-vecs* av-body]
-                                   (str/join " " (mapv emit-binding bs)))
-                  :else (loop [bs bs av *array-vecs* acc []]
-                          (if (empty? bs)
-                            (str/join " " acc)
-                            (let [b (first bs)
-                                  s (binding [*array-vecs* av] (emit-binding b))]
-                              (recur (rest bs) (dissoc av (munge-name (nth b 0))) (conj acc s)))))))]
-    (str "(" kw " (" binds ") " (binding [*array-vecs* av-body] (emit (:body node))) ")")))
+        av-body (apply dissoc *array-vecs* names)]
+    (if *dbg-scope*
+      (emit-let-dbg node kw names av-body)
+      ;; bindings are non-tail; the body inherits the let's tail position
+      (let [binds (binding [*tail?* false
+                            *letrec-binders* (if (:letrec node)
+                                               (into *letrec-binders*
+                                                     (map #(nth % 0) bs))
+                                               *letrec-binders*)]
+                    (cond
+                      (empty? *array-vecs*) (str/join " " (mapv emit-binding bs))
+                      (:letrec node) (binding [*array-vecs* av-body]
+                                       (str/join " " (mapv emit-binding bs)))
+                      :else (loop [bs bs av *array-vecs* acc []]
+                              (if (empty? bs)
+                                (str/join " " acc)
+                                (let [b (first bs)
+                                      s (binding [*array-vecs* av] (emit-binding b))]
+                                  (recur (rest bs) (dissoc av (munge-name (nth b 0))) (conj acc s)))))))]
+        (str "(" kw " (" binds ") " (binding [*array-vecs* av-body] (emit (:body node))) ")")))))
+
+;; emit-let under debug locals (*dbg-scope*): each binding is followed by a scope
+;; record holding it, so an init sees the locals bound before it and the body all
+;; of them; a letrec's names get one record after the group. The body is emitted
+;; as a tail region, so its leaves keep the innermost record live.
+(defn- emit-let-dbg [node kw names av-body]
+  (let [bs (:bindings node)]
+    (if (:letrec node)
+      (let [binds (binding [*tail?* false
+                            *letrec-binders* (into *letrec-binders* (map #(nth % 0) bs))
+                            *array-vecs* av-body]
+                    (str/join " " (mapv emit-binding bs)))
+            v (fresh-label "_dl$")
+            rec (dbg-record *dbg-scope* (map #(nth % 0) bs) names)]
+        (str "(" kw " (" binds " (" v " " rec ")) "
+             (binding [*array-vecs* av-body *dbg-scope* v *tail?* true] (emit (:body node))) ")"))
+      (loop [bs bs av *array-vecs* scope *dbg-scope* acc []]
+        (if (empty? bs)
+          (str "(" kw " (" (str/join " " acc) ") "
+               (binding [*array-vecs* av-body *dbg-scope* scope *tail?* true] (emit (:body node))) ")")
+          (let [b (first bs)
+                nm (munge-name (nth b 0))
+                init (binding [*tail?* false *array-vecs* av *dbg-scope* scope] (emit-binding b))]
+            (if (dbg-hidden? (nth b 0))
+              (recur (rest bs) (dissoc av nm) scope (conj acc init))
+              (let [v (fresh-label "_dl$")]
+                (recur (rest bs) (dissoc av nm) v
+                       (conj acc init (str "(" v " " (dbg-record1 scope (nth b 0) nm) ")")))))))))))
 
 (defn- emit-loop [node]
   (let [label (fresh-label "loop")
@@ -1856,9 +1974,16 @@
         seq-bs (str/join " " (map (fn [n i] (str "(" n " " i ")")) names inits))
         rebinds (str/join " " (map (fn [n] (str "(" n " " n ")")) names))
         ;; the loop body inherits the loop's tail position
+        dv (when *dbg-scope* (fresh-label "_dl$"))
         body (binding [*recur-target* label
-                       *array-vecs* (apply dissoc *array-vecs* names)]
-               (emit (:body node)))]
+                       *array-vecs* (apply dissoc *array-vecs* names)
+                       *dbg-scope* (or dv *dbg-scope*)
+                       *tail?* (or (some? dv) *tail?*)]
+               (emit (:body node)))
+        ;; under debug locals each iteration binds a record of the loop's names
+        body (if dv
+               (str "(let ((" dv " " (dbg-record *dbg-scope* (map #(nth % 0) pairs) names) ")) " body ")")
+               body)]
     (str "(let* (" seq-bs ") (let " label " (" rebinds ") " body "))")))
 
 ;; jolt.ffi/__cfn -> a Chez foreign-procedure (jolt-ffi). The C symbol + types are
@@ -2443,8 +2568,15 @@
 (defn- emit-recur [node]
   (when-not *recur-target* (throw (ex-info "emit: recur outside a loop/fn target" {})))
   (let [arg-nodes (:args node)]
-    (ordered-call arg-nodes (mapv emit arg-nodes)
-                  (fn [as] (str "(" *recur-target* " " (str/join " " as) ")")))))
+    (if *dbg-scope*
+      ;; debug locals: the args go to temps and the scope is kept live past them,
+      ;; so a call in an arg sees the locals; the jump itself stays a tail call
+      (let [as (mapv emit arg-nodes)
+            tmps (mapv (fn [_] (fresh-label "_ra$")) as)]
+        (str "(let* (" (str/join " " (map (fn [t a] (str "(" t " " a ")")) tmps as)) ")"
+             " (keep-live " *dbg-scope* ") (" *recur-target* " " (str/join " " tmps) "))"))
+      (ordered-call arg-nodes (mapv emit arg-nodes)
+                    (fn [as] (str "(" *recur-target* " " (str/join " " as) ")"))))))
 
 ;; One arity -> a Scheme lambda param-list + a named-let-wrapped body. The named
 ;; let lets fn-level `recur` rebind this arity's params. A variadic arity takes a
@@ -2504,8 +2636,18 @@
         ;; the body is the fn's tail position — UNLESS a ^double/^long return hint
         ;; wraps it in a coercion below, which puts the body back in non-tail.
         body-tail? (not (or (= ret :double) (= ret :long)))
-        body (binding [*recur-target* label *tail?* body-tail? *array-vecs* av]
+        ;; debug locals: the arity's params are the root of its frame's scope
+        ;; chain, bound inside the named let so a fn-level recur rebinds them; the
+        ;; body is a tail region whatever the return hint (emit's leaf rule)
+        dv (when (debug-locals?) (fresh-label "_dl$"))
+        body (binding [*recur-target* label *tail?* (or (some? dv) body-tail?) *array-vecs* av
+                       *dbg-scope* dv]
                (emit (:body a)))
+        body (if dv
+               (str "(let ((" dv " " (dbg-record nil (concat orig (when-let [r (:rest a)] [r]))
+                                                 (concat params (when restp [restp]))) ")) "
+                    body ")")
+               body)
         body (if (seq avecs)
                (str "(let (" (str/join " " (map (fn [[p v]] (str "(" v " (jolt-array-vec-of " p "))")) avecs))
                     ") " body ")")
@@ -2974,10 +3116,10 @@
                           *letrec-binders* #{}
                           *fnsrc-def-init?* false]
                   (mapv (fn [a]
-                          ;; the outermost fn binds the restore helper in each
-                          ;; clause that has a site; a nested fn's sites use the
-                          ;; binding of the clause they sit in (site-restore)
-                          (if (and (nil? *site-call*) (trace-frames?) (= :chez (target)))
+                          ;; each clause that has a site binds the restore
+                          ;; helper its sites call (site-restore), a nested
+                          ;; fn's clauses their own
+                          (if (and (trace-frames?) (= :chez (target)))
                             (let [used (atom false)
                                   c (binding [*site-call* used] (emit-arity-clause a))]
                               (if @used
@@ -3481,6 +3623,64 @@
        (site-restore (plain-call callee operand-strs))
        :else (plain-call callee operand-strs)))))
 
+;; A record's positional constructor, inlined: the native per-arity ctor
+;; (make-jrecN) applied to the descriptor (a per-site cell after warmup), no
+;; extension map, and one inline slot per field — no var deref, no rest list, no
+;; field vector, no class lookup. S is the record's shape from the unit's
+;; record-shapes ({:fields :tags :type}); ARG-NODES / ARGS the field arguments,
+;; nodes and emitted strings. Shared by (->R …) and (R. …), which construct the
+;; same record.
+(defn- emit-record-ctor [s arg-nodes args]
+  (let [tag (:type s)
+        ;; A ^double field is widened on the way in, exactly as the dispatched
+        ;; ctor does it (make-deftype-ctor's build calls the same jolt-rec-dbl).
+        ;; This used to disqualify the whole inline path — which meant a
+        ;; coordinate record, the shape the ^double machinery exists for, always
+        ;; paid the slow ctor: jolt-invoke, var-deref, rest-list, ctor call,
+        ;; hashtable lookup and a field vector.
+        tags (vec (get s :tags))
+        ;; ...but only over an argument that is not ALREADY a flonum.
+        ;; jolt-rec-dbl is a runtime guard — (number? a) and (not (flonum? a))
+        ;; before exact->inexact — so wrapping it around a proven double makes
+        ;; the ^double DECLARATION cost two type tests per field per
+        ;; construction that the same record without the tag does not pay.
+        ;; Measured: (->Vec3 i (+ i 1) 2.5) in a loop ran 2.3x SLOWER declared
+        ;; ^double than undeclared, all of it here. Extra static type
+        ;; information must never make the emitted code slower than its
+        ;; absence; where it cannot help it has to cost nothing.
+        ;;
+        ;; Proven means: a literal flonum (double? is exact here — a bigdec
+        ;; and a ratio both answer false, and both still need the coercion),
+        ;; or a node the numeric pass typed :double, whose emission is an fl
+        ;; op and so yields a flonum by construction. Anything else keeps the
+        ;; guard: a :long is 64-bit and may be a bignum at runtime, which is
+        ;; exactly what jolt-rec-dbl's exact->inexact handles.
+        proven-double? (fn [nd]
+                         (and (map? nd)
+                              (or (and (= :const (:op nd)) (double? (:val nd)))
+                                  (= :double (:num-kind nd)))))
+        ;; One tag per ARGUMENT (a record may declare fewer tags than the
+        ;; ctor takes), so the three vectors below are the same length and
+        ;; map together. Mapping rather than indexing three vectors apart is
+        ;; the point: it is what makes pairing a field's tag with another
+        ;; field's argument impossible to write.
+        arg-tags (mapv (fn [i] (nth tags i nil)) (range (count arg-nodes)))
+        ;; field-tag: what the FIELD declares. nd: the IR node being passed
+        ;; into it. a: that node already emitted. Only nd can answer a
+        ;; question about the value. Named field-tag, not tag, because `tag`
+        ;; in this scope is the record's TYPE tag, bound above.
+        coerce-arg (fn [field-tag nd a]
+                     (if (and (= "double" field-tag) (not (proven-double? nd)))
+                       (str "(jolt-rec-dbl " a ")") a))
+        cached-desc (cached-tag-desc tag)]
+    (ordered-call arg-nodes args (fn [as]
+                  (let [n (count as)
+                        as (vec (map coerce-arg arg-tags arg-nodes as))]
+                    (if (<= n 8)
+                      (str "(make-jrec" n " " cached-desc " jolt-nil 0"
+                           (when (pos? n) (str " " (str/join " " as))) ")")
+                      (str "(let ((v (vector " (str/join " " as) "))) (make-jrec " cached-desc " v jolt-nil))")))))))
+
 (defn- emit-invoke [node]
   (let [tail? *tail?*]           ; capture: children below emit non-tail
    (binding [*tail?* false]
@@ -3516,9 +3716,16 @@
         ;; fixed-arity entry point (jolt-invoke0..4) by arg count so the common
         ;; raw-procedure fast path allocates no rest-list; keep variadic jolt-invoke
         ;; for larger arities / apply tails.
+        ;;
+        ;; jolt-invokeN puts the site slot back when the fn value returns (seq.ss):
+        ;; this code may be untraced (clojure.core) and the fn a traced callback,
+        ;; whose tail site would otherwise outlive it. A tail call must stay one,
+        ;; and a traced non-tail call restores the slot itself (site-restore), so
+        ;; both take jolt-invoke-tN, which does not.
         invoke (fn []
                  (let [callee (if (<= (count args) 4)
-                                (str "jolt-invoke" (count args))
+                                (str (if (or tail? (trace-frames?)) "jolt-invoke-t" "jolt-invoke")
+                                     (count args))
                                 "jolt-invoke")]
                    (ordered-call (cons fnode arg-nodes) (cons (emit fnode) args)
                                  (fn [operands] (emit-call tail? callee operands tl ich)))))]
@@ -3899,56 +4106,7 @@
          (and (= :var (:op fnode)) shape
               (= (count (get shape :fields)) (count args))
               (<= (count args) 6)))
-       (let [s (get (ctor-shapes) (str (:ns fnode) "/" (:name fnode)))
-             tag (:type s)
-             ;; A ^double field is widened on the way in, exactly as the dispatched
-             ;; ctor does it (make-deftype-ctor's build calls the same jolt-rec-dbl).
-             ;; This used to disqualify the whole inline path — which meant a
-             ;; coordinate record, the shape the ^double machinery exists for, always
-             ;; paid the slow ctor: jolt-invoke, var-deref, rest-list, ctor call,
-             ;; hashtable lookup and a field vector.
-             tags (vec (get s :tags))
-             ;; ...but only over an argument that is not ALREADY a flonum.
-             ;; jolt-rec-dbl is a runtime guard — (number? a) and (not (flonum? a))
-             ;; before exact->inexact — so wrapping it around a proven double makes
-             ;; the ^double DECLARATION cost two type tests per field per
-             ;; construction that the same record without the tag does not pay.
-             ;; Measured: (->Vec3 i (+ i 1) 2.5) in a loop ran 2.3x SLOWER declared
-             ;; ^double than undeclared, all of it here. Extra static type
-             ;; information must never make the emitted code slower than its
-             ;; absence; where it cannot help it has to cost nothing.
-             ;;
-             ;; Proven means: a literal flonum (double? is exact here — a bigdec
-             ;; and a ratio both answer false, and both still need the coercion),
-             ;; or a node the numeric pass typed :double, whose emission is an fl
-             ;; op and so yields a flonum by construction. Anything else keeps the
-             ;; guard: a :long is 64-bit and may be a bignum at runtime, which is
-             ;; exactly what jolt-rec-dbl's exact->inexact handles.
-             proven-double? (fn [nd]
-                              (and (map? nd)
-                                   (or (and (= :const (:op nd)) (double? (:val nd)))
-                                       (= :double (:num-kind nd)))))
-             ;; One tag per ARGUMENT (a record may declare fewer tags than the
-             ;; ctor takes), so the three vectors below are the same length and
-             ;; map together. Mapping rather than indexing three vectors apart is
-             ;; the point: it is what makes pairing a field's tag with another
-             ;; field's argument impossible to write.
-             arg-tags (mapv (fn [i] (nth tags i nil)) (range (count arg-nodes)))
-             ;; field-tag: what the FIELD declares. nd: the IR node being passed
-             ;; into it. a: that node already emitted. Only nd can answer a
-             ;; question about the value. Named field-tag, not tag, because `tag`
-             ;; in this scope is the record's TYPE tag two lines below.
-             coerce-arg (fn [field-tag nd a]
-                          (if (and (= "double" field-tag) (not (proven-double? nd)))
-                            (str "(jolt-rec-dbl " a ")") a))
-             cached-desc (cached-tag-desc tag)]
-         (order-args (fn [as]
-                       (let [n (count as)
-                             as (vec (map coerce-arg arg-tags arg-nodes as))]
-                         (if (<= n 8)
-                           (str "(make-jrec" n " " cached-desc " jolt-nil 0"
-                                (when (pos? n) (str " " (str/join " " as))) ")")
-                           (str "(let ((v (vector " (str/join " " as) "))) (make-jrec " cached-desc " v jolt-nil))"))))))
+       (emit-record-ctor (get (ctor-shapes) (str (:ns fnode) "/" (:name fnode))) arg-nodes args)
       ;; a late-bound :var call head can hold a procedure OR a non-applicable
       ;; value the RT dispatches (multimethod, keyword/coll IFn) — route via
       ;; jolt-invoke (transparent for a procedure).
@@ -3957,6 +4115,11 @@
       ;; a computed callee can yield ANY IFn — route through jolt-invoke.
       :else
       (invoke))))))
+
+;; A try's body runs in a closure of guard's or dynamic-wind's. Under debug
+;; locals it is a tail region of its own, so its leaves keep the scope live there.
+(defn- emit-try-body [node]
+  (binding [*tail?* (or (some? *dbg-scope*) *tail?*)] (emit (:body node))))
 
 ;; try/catch/finally. throw raises a Chez condition wrapping the jolt value
 ;; (jolt-throw = Scheme `raise` of a &jolt-throw condition); catch lowers to
@@ -4007,10 +4170,22 @@
                      ;; handler that runs later. Only under tracing — with it off
                      ;; there are no line stores to snapshot.
                      cl (when (trace-frames?) (fresh-label "_cl$"))
+                 ;; MERGE-REVIEW(deep-fixes): ours (c22cb9c0, 00a3b321) lowers catch to jolt-try-body /
+                 ;; jolt-try-handler with the body NON-tail unless a finally wraps it; upstream (slice 2)
+                 ;; made the body and the handler body tail regions under a debug scope (*dbg-scope*,
+                 ;; emit-try-body) so debug locals record themselves. Chosen: ours' lowering; the
+                 ;; handler body takes upstream's binding; the Chez body is tail when a debug scope is
+                 ;; open (upstream's rule) or a finally wraps it (ours). Whether a tail body under
+                 ;; jolt-try-body keeps ours' frame/line guarantee under a debug scope is unread.
+                 ;; Gate: degradedbacktrace, traceemit, errorreport, the debug-locals gates.
                      handler (str "(let ((" (munge-name cs) " (jolt-unwrap-throw " raw "))) "
                                   (if cl (str "(let ((" cl " (jolt-catch-enter!))) ") "")
                                   "(let ((r " (binding [*array-vecs* (dissoc *array-vecs* (munge-name cs) raw)]
-                                               (emit (:catch-body node))) ")) "
+                                               ;; debug locals: the handler body is a tail region.
+                                               ;; cs is the analyzer's; the user's name is a let
+                                               ;; inside, which records itself.
+                                               (binding [*tail?* (or (some? *dbg-scope*) *tail?*)]
+                                                 (emit (:catch-body node)))) ")) "
                                   (if cl (str "(jolt-catch-leave! " cl ") ") "")
                                   "(jolt-catch-complete!) r)"
                                   (if cl ")" "")
@@ -4019,7 +4194,7 @@
                  ;; a one-shot escape and a hand-pushed handler — 160 B and ~8 ns per
                  ;; entry against guard's 297 B and ~18 ns. Gambit keeps R7RS guard.
                  (if (= :gambit (target))
-                   (str "(guard (" raw " (else " handler ")) " (emit (:body node)) ")")
+                   (str "(guard (" raw " (else " handler ")) " (emit-try-body node) ")")
                    ;; Without a finally the body is emitted NON-tail: the enclosing
                    ;; fn's frame stays live under the call/1cc (guard's tail call
                    ;; erased it), so the body's last call is an ordinary call from
@@ -4033,9 +4208,9 @@
                    ;; else the try's.
                    (with-site (if (and (map? (:body node)) (node-line (:body node))) (:body node) node)
                      (str "(call-with-values (lambda () (jolt-try-body "
-                          (binding [*tail?* (and *tail?* (some? (:finally node)))] (emit (:body node))) ")) "
+                          (binding [*tail?* (or (some? *dbg-scope*) (and *tail?* (some? (:finally node))))] (emit (:body node))) ")) "
                           "(jolt-try-handler " raw " " handler "))"))))
-               (emit (:body node)))]
+               (emit-try-body node))]
     (if-let [fin (:finally node)]
       ;; The edges are masked against an interrupt's escape. run-interruptible
       ;; leaves its body by jumping out of a timer interrupt, and Chez checks for
@@ -4270,9 +4445,16 @@
                         (chez-str-lit (:class node)) " " (chez-str-lit (:member node)) ")")
                    (str "(host-static-ref " (chez-str-lit (:class node)) " "
                         (chez-str-lit (:member node)) ")")))
-    :host-new (str "(host-new " (chez-str-lit (:class node))
-                   (let [args (map emit (:args node))]
-                     (if (empty? args) "" (str " " (str/join " " args)))) ")")
+    ;; (R. f …) on a record whose shape the unit knows is its positional ctor,
+    ;; the one (->R f …) already inlines — same arity rule. Anything else (a host
+    ;; class, the JVM's (R. f … meta ext) arity) is the runtime's class lookup.
+    :host-new (let [arg-nodes (:args node)
+                    s (record-shape-for-class (:class node))]
+                (if (and s (= (count (get s :fields)) (count arg-nodes)) (<= (count arg-nodes) 6))
+                  (emit-record-ctor s arg-nodes (mapv emit arg-nodes))
+                  (str "(host-new " (chez-str-lit (:class node))
+                       (let [args (map emit arg-nodes)]
+                         (if (empty? args) "" (str " " (str/join " " args)))) ")")))
     ;; the test is non-tail; then/else inherit the if's tail position
     :if (let [test (:test node)
               t (binding [*tail?* false]
@@ -4383,21 +4565,38 @@
      ;; emits the checked runtime helper — clojure.core's full JVM semantics —
      ;; NOT the hint coercion (jolt->fl / jolt->fx) a proven typed-param cast uses.
      ;; The 2-arg :coerce (inlined ^double/^long param or return) has no :cast-fn
-     ;; and keeps the hint coercion.
+     ;; and keeps the hint coercion. A cast whose operand the numeric pass has
+     ;; PROVEN a double (:fl-arg) tests the cast's window inline and converts
+     ;; with flonum->fixnum, calling the helper only outside the window: NaN
+     ;; fails both compares and reaches it (stays 0), and out-of-range values,
+     ;; the long saturation at 2^63 and surrogate or astral chars keep their
+     ;; results and messages. The window constants live in the RUNTIME
+     ;; (converters.ss jolt-cast-windows), computed at load from the target's
+     ;; own fixnum limits: the compiling host's fixnum width is not the
+     ;; target's, so no bound is baked in here.
      :coerce (let [e (emit (:expr node))]
                (cond
+                 (and (:fl-arg node) (contains? cast-window-suffix (:cast-fn node)))
+                 (let [t (fresh-label "_fa$")
+                       s (get cast-window-suffix (:cast-fn node))
+                       lane (str "(flonum->fixnum " t ")")]
+                   (str "(let ((" t " " e "))"
+                        " (if (and (" (unsafe-prefix) "fl>=? " t " jolt-cast-lo-" s ")"
+                        " (" (unsafe-prefix) "fl<=? " t " jolt-cast-hi-" s "))"
+                        " " (if (= "jolt-char" (:cast-fn node)) (str "(integer->char " lane ")") lane)
+                        " (" (cast-entry node) " " t ")))"))
                  ;; (long x) and (unchecked-long x) both hand a fixnum back
                  ;; unchanged, and a fixnum is what a loop counter or a char code
                  ;; point is: test it here so the common case is a type check,
                  ;; not a call. The helper still owns every other operand.
                  (contains? #{"jolt-long-cast" "jolt-unchecked-long"} (:cast-fn node))
                  (let [t (fresh-label "_lc$")]
-                   (str "(let ((" t " " e ")) (if (fixnum? " t ") " t " (" (:cast-fn node) " " t ")))"))
+                   (str "(let ((" t " " e ")) (if (fixnum? " t ") " t " (" (cast-entry node) " " t ")))"))
                  ;; a float cast whose value an fl op takes (:fl-unbox, numeric
                  ;; pass) hands it the double it widens to, never building the jfloat
                  (and (:fl-unbox node) (contains? #{"jolt-float" "jolt-unchecked-float"} (:cast-fn node)))
                  (str "(" (:cast-fn node) "->flonum " e ")")
-                 (:cast-fn node) (str "(" (:cast-fn node) " " e ")")
+                 (:cast-fn node) (str "(" (cast-entry node) " " e ")")
                      (= :double (:kind node)) (emit-nhint-coerce :double e)
                      (= :long (:kind node)) (emit-nhint-coerce :long e (boolean (:return? node)))
                      :else e))

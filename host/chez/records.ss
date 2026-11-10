@@ -153,7 +153,7 @@
           (define fromexisting-def
             `(define (make-jrec-from-existing src ov ov-val ext)
                (let ((desc (jrec-desc src)))
-                 (case (jrec-nfields src)
+                 (case (jrdesc-nfields desc)
                    ((0) (make-jrec0 desc ext 0))
                    ,@(map fromexisting-clause (range 1 mn))
                    (else (let ((nv (jrec-vec-copy (jrec*-vals src))))
@@ -422,11 +422,14 @@
           (else (loop (+ i 1))))))
 
 ;; materialize chez-record-shapes-tbl into "ns/->Name" -> {:fields :tags :type},
-;; the shape record-type-from-entry consumes. Built fresh; chez-record-shapes-map
+;; the shape record-type-from-entry consumes, plus :record true for a defrecord:
+;; a deftype has a shape too, and what a record? or seq? on one answers depends
+;; on which it is (the passes fold both — types.clj pred-on). Built fresh; chez-record-shapes-map
 ;; below serves it from the generation cache.
 (define (chez-record-shapes-map-build)
   (let ((by-name (make-hashtable string-hash string=?))
         (kw-fields (keyword #f "fields")) (kw-tags (keyword #f "tags")) (kw-type (keyword #f "type"))
+        (kw-record (keyword #f "record"))
         (out (jolt-hash-map)))
     ;; index the full type tag "ns.Name" AND the simple record name -> ctor-key
     ;; for nested-field-tag resolution (qualified entries are unambiguous; the
@@ -453,9 +456,12 @@
                  (rtags (map (lambda (t) (chez-resolve-field-tag t by-name owner-ns)) tags)))
             (unless (chez-type-owns-lookup? type-tag)
               (set! out (jolt-assoc out k
-                                    (jolt-hash-map kw-fields (apply jolt-vector fields)
-                                                   kw-tags   (apply jolt-vector rtags)
-                                                   kw-type   type-tag))))))
+                                    (let ((m (jolt-hash-map kw-fields (apply jolt-vector fields)
+                                                            kw-tags   (apply jolt-vector rtags)
+                                                            kw-type   type-tag)))
+                                      (if (hashtable-ref chez-record-type-tbl type-tag #f)
+                                          (jolt-assoc m kw-record #t)
+                                          m)))))))
         ks vs))
     out))
 
@@ -524,10 +530,26 @@
 ;; (:field r) on a defrecord at exactly the cost it had: a per-type flag
 ;; consulted ahead of the index measured 1.27x on that path.
 ;;
+;; Field keys are interned keywords, so for a record of up to 8 fields an eq?
+;; scan of the declared key vector finds the slot faster than the eq-hashtable
+;; probe does (the vector is in slot order, so the position IS the index) —
+;; Clojure's valAt is the same idea, a case on keyword identity. The table stays
+;; the answer for a wider record, and for the get path once any type in the
+;; process has had its fields masked (jrdesc-masked-any?, below): the mask lives
+;; only in the table.
+(define (jrec-fkey-scan fk k)
+  (let ((n (vector-length fk)))
+    (let loop ((i 0))
+      (cond ((fx=? i n) #f)
+            ((eq? (vector-ref fk i) k) i)
+            (else (loop (fx+ i 1)))))))
 ;; index of a declared field key, or #f (only an interned keyword can be one).
 (define (jrec-field-index r k)
-  (let ((i (hashtable-ref (jrdesc-index (jrec-desc r)) k #f)))
-    (and i (if (fx<? i 0) (fx- -1 i) i))))
+  (let* ((d (jrec-desc r)) (fk (jrdesc-fkeys d)))
+    (if (fx<=? (vector-length fk) 8)
+        (jrec-fkey-scan fk k)
+        (let ((i (hashtable-ref (jrdesc-index d) k #f)))
+          (and i (if (fx<? i 0) (fx- -1 i) i))))))
 ;; The declared slot an interop member name K (a keyword) reads or sets, as its
 ;; keyword, or #f. The JVM compiler munges a member name before the reflector
 ;; looks, and a slot's Java field is its own munged name, so two spellings that
@@ -550,8 +572,11 @@
 ;; the slot the GET path may read — #f for a masked type, so get falls through to
 ;; the valAt that type declares.
 (define (jrec-get-index r k)
-  (let ((i (hashtable-ref (jrdesc-index (jrec-desc r)) k #f)))
-    (and i (fx>=? i 0) i)))
+  (let* ((d (jrec-desc r)) (fk (jrdesc-fkeys d)))
+    (if (and (not jrdesc-masked-any?) (fx<=? (vector-length fk) 8))
+        (jrec-fkey-scan fk k)
+        (let ((i (hashtable-ref (jrdesc-index d) k #f)))
+          (and i (fx>=? i 0) i)))))
 ;; #t when TAG answers every key through a valAt IT declares — a bare deftype
 ;; implementing clojure.lang.ILookup. Such a type has no field-first lookup at
 ;; all, so three things have to agree about it: the get path (which reads the
@@ -568,7 +593,11 @@
 ;; Bias every field of DESC negative. Driven by register-protocol-method the
 ;; moment a non-record type registers a valAt; fkeys is walked (not the table's
 ;; keys) so nothing scans a hashtable another thread may be writing.
+;; jrdesc-masked-any? turns jrec-get-index's key scan off for good, before the
+;; first mask lands: from then on the get path reads the table, where the mask is.
+(define jrdesc-masked-any? #f)
 (define (jrdesc-mask-fields! desc)
+  (set! jrdesc-masked-any? #t)
   (let ((idx (jrdesc-index desc)))
     (vector-for-each
       (lambda (k)
@@ -586,6 +615,14 @@
     (if (jolt-nil? s) (reverse acc)
         (let ((e (seq-first s)))
           (loop (jolt-seq (seq-more s)) (cons (cons (jolt-nth e 0) (jolt-nth e 1)) acc))))))
+
+;; every entry, fields then extension map, as an (k . v) alist
+(define (jrec-entry-pairs r)
+  (let ((fkeys (jrdesc-fkeys (jrec-desc r))) (ext (jrec-ext r)))
+    (let loop ((i (fx- (jrec-nfields r) 1))
+               (acc (if (jolt-nil? ext) '() (jrec-ext-pairs ext))))
+      (if (fx<? i 0) acc
+          (loop (fx- i 1) (cons (cons (vector-ref fkeys i) (jrec-field-ref r i)) acc))))))
 
 ;; lookup with default d: a declared field reads index+vector-ref (a present nil
 ;; returns nil), then the extension map, then d.
@@ -747,13 +784,16 @@
         ((or (jolt-nil? ea) (jolt-nil? eb)) #f)
         (else (jolt=2 ea eb))))
 (define (jrec=? a b)
-  (and (or (eq? (jrec-desc a) (jrec-desc b)) (string=? (jrec-tag a) (jrec-tag b)))
-       (let ((n (jrec-nfields a)))
-         (and (= n (jrec-nfields b))
-              (let loop ((i 0))
-                (or (= i n)
-                    (and (jolt=2 (jrec-field-ref a i) (jrec-field-ref b i)) (loop (+ i 1)))))))
-       (jrec-ext=? (jrec-ext a) (jrec-ext b))))
+  (let ((da (jrec-desc a)) (db (jrec-desc b)))
+    (and (or (eq? da db) (string=? (jrdesc-tag da) (jrdesc-tag db)))
+         ;; one descriptor is one field count; only a redefinition's old and new
+         ;; descriptors (same tag) can differ
+         (let ((n (jrdesc-nfields da)))
+           (and (or (eq? da db) (fx=? n (jrdesc-nfields db)))
+                (let loop ((i 0))
+                  (or (fx=? i n)
+                      (and (jolt=2 (jrec-field-ref a i) (jrec-field-ref b i)) (loop (fx+ i 1)))))))
+         (jrec-ext=? (jrec-ext a) (jrec-ext b)))))
 ;; The class-hash half of a record's hash is a murmur over the type tag, so it
 ;; is a per-TYPE constant — but it was recomputed on every hash of every
 ;; instance, walking the tag's characters each time. A symbol's hasheq is cached
@@ -803,30 +843,60 @@
 ;; Elements render through jolt-pr-readable, so print / println reach this too
 ;; (with *print-readably* off) rather than a type's toString, again as on the JVM.
 (define (jrec-coll-print-shape r) (vector-ref (jrdesc-ifc-of r) 1))
-(define (jrec-coll-pr r shape)
-  (if (jolt-print-hash?)
-      "#"
+;; The java.util arms print the collection only under *print-readably*, as
+;; core_print's do; print and println write the #object form instead.
+(define (jrec-coll-pr r shape readable?)
+  (cond
+    ((and (memq shape '(jmap jvec jlist jset)) (not (jolt-pr-readable?)))
+     (jolt-object-repr r readable?))
+    ((jolt-print-hash?) "#")
+    (else
       (with-deeper-print
-        (if (eq? shape 'map)
+        (if (memq shape '(map jmap))
             ;; a map's seq yields entries; render each as "k v" and comma-join, in
             ;; the order the type's own seq produced them (the JVM prints an
-            ;; insertion-ordered map-like deftype in that order too).
+            ;; insertion-ordered map-like deftype in that order too). A
+            ;; java.util.Map that is not a Clojure map is seq'd through its
+            ;; entrySet, as RT.seq does.
             (string-append "{"
               (jolt-str-join-comma
                 (jolt-limited-list-strs
                   (map (lambda (e) (string-append (jolt-pr-readable (jolt-nth e 0)) " "
                                                   (jolt-pr-readable (jolt-nth e 1))))
-                       (seq->list r))))
+                       (if (eq? shape 'jmap)
+                           (seq->list (jolt-seq (record-method-dispatch r "entrySet" jolt-nil)))
+                           (seq->list r)))))
               "}")
             (let ((body (jolt-str-join (jolt-limited-seq-strs (jolt-seq r) jolt-pr-readable))))
               (case shape
-                ((seq) (string-append "(" body ")"))
-                ((vec) (string-append "[" body "]"))
-                (else (string-append "#{" body "}"))))))))
-(define (jrec-pr r)                      ; #ns.Name{:k v, :k v}
+                ((seq jlist) (string-append "(" body ")"))
+                ((vec jvec) (string-append "[" body "]"))
+                (else (string-append "#{" body "}")))))))))
+;; A defrecord prints #ns.Name{:k v, :k v}. A plain deftype is an Object to
+;; print-method on the JVM, so it prints the #object form over its toString,
+;; identity hash included, and one that implements IDeref prints its
+;; deref-as-map the way an atom does (jolt-jon4). READABLE? is pr's against
+;; print's, which only the #object content's quoting depends on.
+(define (jrec-pr r readable?)
   (cond
-    ((jrec-coll-print-shape r) => (lambda (shape) (jrec-coll-pr r shape)))
-    (else (jrec-field-pr r))))
+    ((jrec-coll-print-shape r) => (lambda (shape) (jrec-coll-pr r shape readable?)))
+    ;; a type this process never defined (an instance that came in through an
+    ;; image, its code not loaded) cannot say whether it was a defrecord or a
+    ;; deftype; it keeps the field form rather than guess
+    ((or (jrec-record? r) (not (hashtable-ref chez-deftype-tag-set (jrec-tag r) #f))) (jrec-field-pr r))
+    ((rec-coll-method r "deref")
+     (let ((port (open-output-string)))
+       (deref-print-to! port r jrec-deref-print-state readable?)
+       (get-output-string port)))
+    (else (jolt-object-repr r readable?))))
+;; clojure.core/deref-as-map: an IPending that is not realized is :pending with
+;; no value; a deref that throws is :failed with the throwable.
+(define (jrec-deref-print-state r)
+  (let ((realized (rec-coll-method r "isRealized")))
+    (if (and realized (not (jolt-truthy? (jolt-invoke realized r))))
+        (cons "pending" jolt-nil)
+        (guard (e (#t (cons "failed" (jolt-unwrap-throw e))))
+          (cons "ready" (jolt-invoke (rec-coll-method r "deref") r))))))
 (define (jrec-field-pr r)
   ;; the JVM spelling of the tag (my_app.core.Foo for a type in my-app.core):
   ;; what the JVM's reader resolves a record literal by, and what its own

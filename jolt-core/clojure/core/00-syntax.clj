@@ -1043,6 +1043,22 @@
 ;; which allocated a lazy cell per iteration and held the seq head): :let binds,
 ;; :when skips one element, :while stops the coll — same source-order semantics
 ;; as for.
+;;
+;; Each group walks a chunked seq (a vector's, a range's, a chunked map's) as
+;; the reference's doseq does: a chunk at a time, stepping the seq once per
+;; chunk, where first/next made a new cell for every element (3.5x a list's walk
+;; over a vector; make doseqperf). The block is read where the seq holds it
+;; (__chunk-vec and friends, natives-transduce.ss, lowered by the compiler), not
+;; copied out. The outer loop takes one seq cell per pass: a chunked one runs its
+;; block [start, end) in an inner index loop that answers true when the block is
+;; done (so the outer steps past it) and nil when a :while stopped the walk; any
+;; other seq — from the start, or a rest that turns out unchunked, a concat's —
+;; drops into the plain first/next loop, which is what the old macro was, so a
+;; list pays one __chunk-vec test per doseq over it and nothing per element. A
+;; first pass through the block loop with an empty block (iv = ev = 0) cost a
+;; short list 10%. The body is written out twice per group, once per loop, as
+;; the reference's is: a doseq nested in a doseq's body doubles per level (the
+;; gate in corpus "doseq / chunked" holds the growth to the reference's).
 (defmacro doseq [bindings & body]
   (check-bindings &form bindings)
   (let [build (fn build [idx groups]
@@ -1052,14 +1068,26 @@
                       my-mods (nth g 2)
                       is-last (= idx (dec (count groups)))
                       k-form (if is-last `(do ~@body nil) (build (inc idx) groups))
-                      sv (fresh-sym)]
+                      sv (fresh-sym) cv (fresh-sym) iv (fresh-sym) ev (fresh-sym) ps (fresh-sym)
+                      nx (fresh-sym)
+                      in-chunk `(recur (unchecked-inc ~iv))
+                      ;; the plain loop is entered with a cell the outer loop
+                      ;; already found non-nil, so it tests each next, not ps
+                      plain-next `(let [~nx (next ~ps)] (when ~nx (recur ~nx)))]
                   `(loop [~sv (seq ~my-coll)]
                      (when ~sv
-                       (let [~my-bind (first ~sv)]
-                         ~(comprehension-chain my-mods
-                                 `(do ~k-form (recur (next ~sv)))
-                                 `(recur (next ~sv))
-                                 nil))))))]
+                       (let [~cv (__chunk-vec ~sv)]
+                         (if ~cv
+                           (when (let [~ev (__chunk-end ~sv)]
+                                   (loop [~iv (__chunk-start ~sv)]
+                                     (if (< ~iv ~ev)
+                                       (let [~my-bind (__chunk-nth ~cv ~iv)]
+                                         ~(comprehension-chain my-mods `(do ~k-form ~in-chunk) in-chunk nil))
+                                       true)))
+                             (recur (seq (__chunk-after ~sv))))
+                           (loop [~ps ~sv]
+                             (let [~my-bind (first ~ps)]
+                               ~(comprehension-chain my-mods `(do ~k-form ~plain-next) plain-next nil)))))))))]
     (if (>= (count bindings) 2)
       `(do ~(build 0 (for-parse-groups bindings 0 [])) nil)
       `(do ~@body nil))))

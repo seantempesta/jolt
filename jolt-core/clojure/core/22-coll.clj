@@ -166,8 +166,8 @@
 
 ;; An empty coll of the same category, carrying the receiver's metadata (Clojure's
 ;; .empty() does EMPTY.withMeta(meta())). Sorted colls keep their comparator (the
-;; value's own :empty op). Strings and scalars are nil, as in Clojure; a lazy
-;; seq empties to ().
+;; value's own :empty op). Strings, scalars and map entries are nil, as in
+;; Clojure; a lazy seq empties to ().
 (defn empty [coll]
   (cond
     (nil? coll) nil
@@ -180,6 +180,8 @@
     (sorted? coll) (with-meta ((get (jolt.host/ref-get coll :ops) :empty) coll) (meta coll))
     (map? coll) (with-meta {} (meta coll))
     (set? coll) (with-meta #{} (meta coll))
+    ;; a map entry is a vector with no empty one (MapEntry.empty() is null)
+    (map-entry? coll) nil
     (vector? coll) (with-meta [] (meta coll))
     ;; only a list's .empty() keeps meta; a seq, lazy seq or range answers a bare
     ;; () (ASeq/LazySeq.empty is PersistentList.EMPTY)
@@ -349,7 +351,7 @@
     (seq e)
     (lazy-seq (when (.hasMoreElements e)
                 (cons (.nextElement e) (enumeration-seq e))))))
-(defn iterator-seq [i] (seq i))
+;; iterator-seq is the host's (records-dispatch.ss): RT.chunkIteratorSeq.
 
 ;; jolt is single-threaded: a promise is an atom, deref never blocks
 ;; ((deref undelivered) is nil rather than a hang).

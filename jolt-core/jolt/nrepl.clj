@@ -141,6 +141,20 @@
   the parent's thread, which is not the one writing."
   nil)
 
+(def ^:dynamic *eval-wrapper*
+  "When bound to a function, `evaluate` calls it with a no-argument thunk that
+  evaluates the code (eval-string, or load-string for a load) and uses what it
+  returns as the value. It runs inside evaluate's own try and *ns* binding, so
+  a throw from the code reaches the wrapper before evaluate catches it: a tool
+  can run the evaluation under jolt.debug/call-with-break-handler, a timer or a
+  binding of its own. Printing the value happens after it returns. nil, the
+  default, evaluates directly.
+
+  A middleware that binds it around a session's clone gives every eval in that
+  session the wrapper, since the session's worker starts with that clone's
+  bindings."
+  nil)
+
 (def ^:private last-backtrace (atom nil))
 (defn last-error-backtrace
   "The backtrace of the exception now in *e (the \"  trace:\" block evaluate
@@ -347,6 +361,17 @@
                floc (assoc :clojure.error/symbol (:symbol floc))
                (:source floc) (assoc :clojure.error/source (:source floc))
                fline (assoc :clojure.error/line fline))
+           ;; a load's CompilerException (load-string, load-file, require) names
+           ;; the form that failed in the loaded text: with no frame of the
+           ;; user's to say more, that is the place, as the JVM's eval frame
+           ;; there names it (its file's base name)
+           wd (when (= 'clojure.lang.Compiler$CompilerException (:type (first (:via m))))
+                (:data (first (:via m))))
+           t (if (and run-phase? (nil? floc) (nil? (:clojure.error/symbol t)) (:clojure.error/line wd))
+               (cond-> (assoc t :clojure.error/line (:clojure.error/line wd))
+                 (:clojure.error/source wd)
+                 (assoc :clojure.error/source (last (str/split (:clojure.error/source wd) #"/"))))
+               t)
            t (if (and line run-phase? (nil? floc) (nil? (:clojure.error/line t)))
                (assoc t :clojure.error/line line)
                t)]
@@ -395,8 +420,10 @@
 
 (defn evaluate
   "Evaluate `code` (optionally in loaded ns `ns-str`). Returns
-  {:value .. :out .. :ns .. :err ..}. in-ns — not (binding [*ns* ..]) — sets the
-  ns load-string resolves against on jolt. Reusable by eval middleware.
+  {:value .. :out .. :ns .. :err ..}. As JVM nREPL's eval does, it binds *ns*
+  to that namespace (else the current one) around the eval, and :ns is the
+  binding's value when the eval is done, so an (ns foo) or in-ns in the code is
+  what the session's next eval starts in. Reusable by eval middleware.
 
   With two arguments, *out* is captured and returned whole as :out when the eval
   finishes. With a third, a map {:out f :err f}, output streams instead, as
@@ -405,6 +432,13 @@
   the eval is still running, so an editor's console shows a long job's progress.
   Whatever is left unflushed is sent before this returns, and :out is then empty.
   A future the eval starts inherits the writers, so its output streams too.
+  :load true in the map evaluates the code as a load (load-string), as the
+  load-file op does, so a namespace switch in it does not reach :ns. :file
+  names the code's source path, as nREPL's load-file sends it: its forms carry
+  it as :file (the position a def records, the trace) and *file* is that path,
+  as for a file load. :file-name, when the map has the key, is *source-path*
+  (Compiler.load's sourceName, which load-file sends as file-name); without it
+  *source-path* is the path's last segment.
 
   The value is printed inside the eval, under its *out* and its try: what a lazy
   result prints as it is realized is the eval's output, and an error while
@@ -419,18 +453,33 @@
     :ex-class       the `ex` string, \"class java.lang.ArithmeticException\"
     :root-ex-class  the `root-ex` string, the class of the root cause"
   ([code ns-str] (evaluate code ns-str nil))
-  ([code ns-str {on-out :out on-err :err}]
+  ([code ns-str {on-out :out on-err :err load? :load file :file :as opts}]
    (let [result (atom nil) evaluated (atom false) printed (atom nil)
          err (atom nil) exc (atom nil) failure (atom nil)
+         start-ns (or (when (and ns-str (not (str/blank? ns-str)))
+                        (find-ns (symbol ns-str)))
+                      *ns*)
+         ns-after (atom (str (ns-name start-ns)))
          run (fn []
-               (binding [*capturing-thread* (Thread/currentThread)]
+               (binding [*capturing-thread* (Thread/currentThread)
+                         *ns* start-ns]
                  (let [phase (volatile! nil)]
-                   (try (when (and ns-str (not (str/blank? ns-str)) (find-ns (symbol ns-str)))
-                          (in-ns (symbol ns-str)))
+                   (try
                         ;; strict, as clojure.main's REPL and `jolt repl`: an
                         ;; undefined name is "Unable to resolve symbol", and a
-                        ;; forward reference across evals takes a declare
-                        (let [v (load-string code)]
+                        ;; forward reference across evals takes a declare.
+                        ;; eval-string, not load-string: load-string binds *ns*
+                        ;; for its own load, and this eval's switch must reach :ns
+                        (let [src (when file
+                                    (if (contains? opts :file-name) [file (:file-name opts)] [file]))
+                              ev (fn []
+                                   (if load?
+                                     ;; a load-file op is a load, as nREPL's is
+                                     ;; (Compiler.load): the file's ns form does
+                                     ;; not switch the session
+                                     (if src (apply jolt.host/load-string code src) (load-string code))
+                                     (if src (apply jolt.host/eval-string code src) (jolt.host/eval-string code))))
+                              v (if-let [w *eval-wrapper*] (w ev) (ev))]
                           (reset! result v)
                           (reset! evaluated true)
                           (vreset! phase :print-eval-result)
@@ -450,7 +499,8 @@
                             (reset! last-backtrace bt)
                             (reset! failure {:phase @phase :frame (first (filter user-frame? frames))
                                              :line (:line pos) :outer outer})
-                            (reset! err (str (err-msg e) (when bt (str "\n" bt))))))))))
+                            (reset! err (str (err-msg e) (when bt (str "\n" bt))))))
+                        (finally (reset! ns-after (str (ns-name *ns*))))))))
          out (if on-out
                (let [ow (chunk-writer on-out)
                      ew (when on-err (chunk-writer on-err))]
@@ -476,7 +526,7 @@
        (alter-var-root #'*e (constantly @exc)))
      (cond-> {:value (when (nil? @err) @printed)
               :out out
-              :ns (str (ns-name *ns*))
+              :ns @ns-after
               :err @err}
        @exc (merge (let [e @exc
                          {:keys [phase] :as f} @failure
@@ -568,7 +618,13 @@
             {:keys [value ns err err-msg ex-class root-ex-class]}
             (evaluate code (get request "ns")
                       {:out #(respond request {"out" %})
-                       :err #(respond request {"err" %})})]
+                       :err #(respond request {"err" %})
+                       :load (= op "load-file")
+                       ;; the file's path, which load-file sends, as JVM nREPL
+                       ;; compiles it under
+                       :file (when (= op "load-file") (some-> (get request "file-path") wire->))
+                       ;; and *source-path* is its file-name, nil when it sends none
+                       :file-name (some-> (get request "file-name") wire->)})]
         ;; an error goes out as JVM nREPL sends it: the err->msg text, then the
         ;; classes with eval-error, then done on its own
         (if err
@@ -657,10 +713,15 @@
          ;; absolute, so the delete hits the file spit wrote: spit resolves a
          ;; relative path against the started-from directory, delete-file!
          ;; against the process's (bin/jolt cd's to the repo root). nil when the
-         ;; write fails, so stop never deletes a file it did not write.
+         ;; write fails, so stop never deletes a file it did not write; the
+         ;; server still starts, but says the editor won't find it that way.
          port-file (when requested
                      (let [port-file (.getAbsolutePath (io/file requested))]
-                       (try (spit port-file (str port)) port-file (catch :default _ nil))))
+                       (try (spit port-file (str port)) port-file
+                            (catch :default e
+                              (binding [*out* *err*]
+                                (println (str ";; could not write " requested ": " (ex-message e))))
+                              nil))))
          stopped (atom false)]
      (println (str "jolt " (jolt.host/jolt-version) " nREPL server started on port "
                    port " (127.0.0.1)"

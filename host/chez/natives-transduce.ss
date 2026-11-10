@@ -139,6 +139,54 @@
 ;; the buffer is clojure.lang.ChunkBuffer, a Counted: count reads its fill
 (register-class-arm! jolt-chunkbuf? (lambda (b) "clojure.lang.ChunkBuffer"))
 (register-count-arm! jolt-chunkbuf? (lambda (b) (jolt-chunkbuf-cnt b)))
+;; doseq's chunk walk (00-syntax.clj): the block a chunked seq cell heads, read
+;; in place. The block is a run of one 32-slot leaf of the cell's backing vector
+;; (a vector seq's blocks are leaf-aligned, a ChunkedCons's chunk is one small
+;; vector), so __chunk-vec answers that leaf and [__chunk-start, __chunk-end)
+;; the run within it, and __chunk-nth is a slot read: indexing the whole trie
+;; per element cost a descent at every step of a large vector. __chunk-after is
+;; the seq that follows the block, unrealized (a ChunkedCons's rest, or the
+;; vector seq at the block's end). nil from __chunk-vec — the cell is not
+;; chunked, or a rare block crosses a leaf — walks it with first/next instead.
+;; Nothing is copied: chunk-first's block copy cost more than the walk it bought
+;; on a short vector.
+(define (doseq-block-end s)
+  (let ((v (cseq-cvec s)))
+    (if (cseq-crest s) (pvec-count v) (fxmin (fx+ (cseq-ci s) seq-chunk-size) (pvec-count v)))))
+;; Asked once of every seq a doseq walks, so the sealed cseqv? goes first: a
+;; list's cell (a cseqn) or a lazy seq answers nil on one record-type compare,
+;; where cseq? walked the parent chain and the kind test ran before it.
+(define (doseq-chunk-vec s)
+  (if (and (cseqv? s) (sk-chunked? (cseq-kind s)))
+      (let ((v (cseq-cvec s)) (i (cseq-ci s)))
+        (if (fx>=? i (pv-tailoff-of v))
+            (pvec-tail v)               ; a short vector is all tail: no descent
+            (let-values (((node off) (pv-leaf-for v i)))
+              (if (fx<=? (fx+ off (fx- (doseq-block-end s) i)) (vector-length node)) node jolt-nil))))
+      jolt-nil))
+;; where the block starts in its leaf, as pv-leaf-for finds it, without the
+;; descent: the tail starts at the tail offset, a classic trie's leaf on a 32
+;; boundary; a relaxed (RRB) trie's leaves are anywhere, so it asks
+(define (doseq-chunk-start s)
+  (let* ((v (cseq-cvec s)) (i (cseq-ci s)) (t (pv-tailoff-of v)))
+    (cond ((fx>=? i t) (fx- i t))
+          ((rrbnode? (pvec-root v)) (let-values (((node off) (pv-leaf-for v i))) off))
+          (else (fxand i pv-mask)))))
+(define (doseq-chunk-end s) (fx+ (doseq-chunk-start s) (fx- (doseq-block-end s) (cseq-ci s))))
+(define (doseq-chunk-after s)
+  (let ((r (cseq-crest s)))
+    (if r r (vec->seq/k (cseq-cvec s) (doseq-block-end s) (cseq-kind s)))))
+(define (doseq-chunk-nth node i) (vector-ref node i))
+;; private core names: doseq's expansion is their only caller, and the compiler
+;; lowers each to its procedure (op-registry.clj), so a walk pays no var
+(let ((d! (lambda (n v) (def-var! "clojure.core" n v))))
+  (d! "__chunk-vec" doseq-chunk-vec) (d! "__chunk-start" doseq-chunk-start)
+  (d! "__chunk-end" doseq-chunk-end) (d! "__chunk-after" doseq-chunk-after)
+  (d! "__chunk-nth" doseq-chunk-nth))
+;; and private: out of ns-publics, as the reference's chunk walk names no public
+;; helper of its own (host-contract.ss lets the expansion's call through)
+(for-each (lambda (n) (set-var-meta! "clojure.core" n (jolt-hash-map (keyword #f "private") #t)))
+  '("__chunk-vec" "__chunk-start" "__chunk-end" "__chunk-after" "__chunk-nth"))
 (let ((d! (lambda (n v) (def-var! "clojure.core" n v))))
   (d! "chunk-buffer" na-chunk-buffer) (d! "chunk-append" na-chunk-append)
   (d! "chunk" na-chunk) (d! "chunk-cons" na-chunk-cons)

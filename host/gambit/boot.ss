@@ -58,6 +58,7 @@
 (##include "../chez/natives-coll.ss")
 (##include "../chez/natives-num.ss")
 (##include "../chez/multimethods.ss")
+(##include "../chez/java/jdk-interfaces.ss")
 (##include "../chez/java/class-hierarchy.ss")
 (##include "records-gambit.ss")  ;; GENERATED from records.ss (make gambitgen) — phase wall, see gen-records.ss
 (##include "../chez/java/records-interop.ss")
@@ -98,6 +99,7 @@
 ;; ByteBuffer has no .array, and the typed buffers exist only as views).
 (##include "../chez/java/byte-buffer.ss")
 (##include "../chez/float.ss")  ;; java.lang.Float as a value (jfloat)
+(##include "../chez/surrogates.ss")  ;; a UTF-16 surrogate unit as a Character (jsurr)
 
 ;; ---- G3: the cross-minted compiler on gsi (jolt-mj95.4) ----------------------
 ;;

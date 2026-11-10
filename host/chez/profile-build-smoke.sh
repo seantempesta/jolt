@@ -120,8 +120,32 @@ mv "$tmp/core.clj.orig" "$tmp/app/src/app/core.clj"
 # a profile from a release build used by an --opt one is a mode mismatch, said as one
 if build optuse --opt --profile-use "$tmp/run1.jpd"; then
   bad "an --opt build should refuse a release build's profile"
-elif grep -q 'is from a release build' "$tmp/optuse.log"; then ok; else
+elif grep -q 'is from a build in release mode, and this build is in optimized mode' "$tmp/optuse.log"; then ok; else
   bad "the mode-mismatch failure should name the profile's mode"; tail -3 "$tmp/optuse.log" | sed 's/^/    /'; fi
+
+# --- the runtime's own hooks leave a program single-threaded --------------------
+# Every launcher registers the block-count dump, and JOLT_PROFILE=sample the
+# report, as shutdown hooks. A hook of the program's own is a second mutator and
+# puts lazy seqs on the multi-threaded claim path (up to 1.45x slower); these are
+# not, and a program that starts no thread must keep the cheap path. The hook and
+# future rows pin that the probe answers at all.
+cp -R test/chez/mt-path-app "$tmp/mtapp"
+if JOLT_PWD="$tmp/mtapp" "$jolt" build -m mtpath.core -o "$tmp/mtpath" >"$tmp/mtpath.log" 2>&1; then
+  # mt ARGS... : what the binary prints, run from $tmp/run
+  mt() { (cd "$tmp/run" && "$tmp/mtpath" "$@" 2>/dev/null); }
+  got="$(mt)"
+  [ "$got" = "false" ] && ok || bad "a built binary that starts no thread should stay single-threaded (got $got)"
+  got="$(cd "$tmp/run" && JOLT_PROFILE=sample "$tmp/mtpath" 2>/dev/null)"
+  [ "$got" = "false" ] && ok || bad "JOLT_PROFILE=sample should leave a built binary single-threaded (got $got)"
+  [ "$(mt hook)" = "true" ] && ok || bad "a program's own shutdown hook should make it multi-threaded"
+  [ "$(mt future)" = "true" ] && ok || bad "a future should make the program multi-threaded"
+else
+  bad "the mtpath build exited non-zero"; tail -5 "$tmp/mtpath.log" | sed 's/^/    /'
+fi
+for prof in "" sample 1; do
+  got="$(cd "$tmp/run" && JOLT_PROFILE=$prof "$jolt" -e '(println (jolt.host/multi-threaded?))' 2>/dev/null)"
+  [ "$got" = "false" ] && ok || bad "JOLT_PROFILE=$prof should leave the CLI single-threaded (got $got)"
+done
 
 # --- the flags refuse what they cannot do ----------------------------------------
 if build both --profile-gen --profile-use "$tmp/run1.jpd"; then

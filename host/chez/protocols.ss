@@ -396,7 +396,12 @@
 ;; per list (interned by make-reified-delegating, so one per reify site) and
 ;; stamped with jch-graph-epoch, which is what changes an interface's ancestry.
 (define jreify-tags-memo (make-weak-eq-hashtable))
+;; A reify form's or proxy's own generated class leads, so (extend (class r) P …)
+;; reaches its instances.
 (define (jreify-host-tags obj)
+  (let ((tags (jreify-protos-host-tags obj)) (c (reify-class-name obj)))
+    (if c (cons c tags) tags)))
+(define (jreify-protos-host-tags obj)
   (let* ((ps (jreify-protos obj))
          (e (hashtable-ref jreify-tags-memo ps #f)))
     (if (and e (fx= (car e) jch-graph-epoch))
@@ -484,7 +489,7 @@
         ((number? obj) (jch-tags "java.lang.Number"))
         ((string? obj) (jch-tags "java.lang.String"))
         ((boolean? obj) (jch-tags "java.lang.Boolean"))
-        ((char? obj) (jch-tags "java.lang.Character"))
+        ((or (char? obj) (jsurr? obj)) (jch-tags "java.lang.Character"))
         ((keyword? obj) (jch-tags "clojure.lang.Keyword"))
         ((jolt-symbol? obj) (jch-tags "clojure.lang.Symbol"))
         ;; a map entry is a flagged pvec — check before plain vectors so its
@@ -557,12 +562,12 @@
                '("[Ljava.lang.Object;" "Object"))))
         ;; host value types with a distinct record repr (not jhost-backed): a regex,
         ;; a #uuid, a #inst Date, a BigDecimal — each derives its ancestry from the
-        ;; class graph. A #inst is a java.util.Date (NOT a java.sql.Timestamp — the
-        ;; instance? arm in inst-time.ss agrees).
+        ;; class graph. A #inst is a java.util.Date and a (Timestamp. ms) the jinst
+        ;; child that is a java.sql.Timestamp (the instance? arm in inst-time.ss agrees).
         ((regex-t? obj) (jch-tags "java.util.regex.Pattern"))
         ((matcher-t? obj) (jch-tags "java.util.regex.Matcher"))
         ((juuid? obj) (jch-tags "java.util.UUID"))
-        ((jinst? obj) (jch-tags "java.util.Date"))
+        ((jinst? obj) (jch-tags (if (jts? obj) "java.sql.Timestamp" "java.util.Date")))
         ((jbigdec? obj) (jch-tags "java.math.BigDecimal"))
         ;; a bare procedure (fn) — extend-protocol to clojure.lang.{Fn,IFn,AFn}.
         ((procedure? obj) (jch-tags "clojure.lang.AFunction"))
@@ -634,6 +639,21 @@
 ;; ---- the native that handles the analyzer/overlay call ----------------------
 ;; make-deftype-ctor: (name-sym field-kws field-tags field-muts) -> ctor closure.
 ;; The tag is baked at definition time in the type's ns (chez-current-ns).
+;; A record's constructor, at its positional arity: one native allocation
+;; (make-jrecN — desc, no extension map, the hasheq slot unset, then the fields
+;; inline), with a ^double field widened as the field vector path does it. Every
+;; other arity — the JVM's second (fields, __meta, __extmap) constructor, or a
+;; wrong count — goes to SLOW. The variadic ctor this replaces consed a rest
+;; list, measured its length, filled a field vector and applied a per-arity ctor
+;; to it, so (R. …) and the ->R factory outside an optimized build cost 4x the
+;; allocation they exist to perform. CO is a per-field ^double flag vector, or #f
+;; when the type declares none, so an untagged record tests nothing per field.
+(define-syntax jrec-fixed-ctor
+  (syntax-rules ()
+    ((_ mk desc co slow (a ...) (i ...))
+     (case-lambda
+       ((a ...) (mk desc jolt-nil 0 (if (and co (vector-ref co i)) (jolt-rec-dbl a) a) ...))
+       (args (slow args))))))
 (define (make-deftype-ctor name-sym field-kws . rest-args)
   (let* ((tag (string-append (chez-current-ns) "." (symbol-t-name name-sym)))
          (kws (seq->list field-kws))
@@ -677,7 +697,7 @@
                                           (if (and (fx< i ndbl) (vector-ref dbl-flags i))
                                               (jolt-rec-dbl a) a))
                              (loop (cdr as) (+ i 1))))))))
-           (ctor (lambda args
+           (slow (lambda (args)
                    (let ((n (length args)))
                      (cond
                        ((= n nf) (build args))
@@ -695,7 +715,27 @@
                        (else
                         (throw-jvm (quote ArityException)
                           (string-append "Wrong number of args (" (jvm-arity-count n)
-                                         ") passed to: " ctor-name))))))))
+                                         ") passed to: " ctor-name)))))))
+           ;; the positional arity, straight to the native per-field-count ctor —
+           ;; see jrec-fixed-ctor
+           (co (and (exists (lambda (x) x) (vector->list dbl-flags))
+                    (let ((v (make-vector nf #f)))
+                      (do ((i 0 (fx+ i 1))) ((fx=? i (fxmin nf ndbl)) v)
+                        (vector-set! v i (vector-ref dbl-flags i))))))
+           (ctor (case nf
+                   ;; not a case-lambda: a 0-arity clause beside a bare rest clause is the
+                   ;; pair Gambit's expander drops the rest parameter of
+                   ;; (backend_scheme.clj emit-fn)
+                   ((0) (lambda args (if (null? args) (make-jrec0 desc jolt-nil 0) (slow args))))
+                   ((1) (jrec-fixed-ctor make-jrec1 desc co slow (a0) (0)))
+                   ((2) (jrec-fixed-ctor make-jrec2 desc co slow (a0 a1) (0 1)))
+                   ((3) (jrec-fixed-ctor make-jrec3 desc co slow (a0 a1 a2) (0 1 2)))
+                   ((4) (jrec-fixed-ctor make-jrec4 desc co slow (a0 a1 a2 a3) (0 1 2 3)))
+                   ((5) (jrec-fixed-ctor make-jrec5 desc co slow (a0 a1 a2 a3 a4) (0 1 2 3 4)))
+                   ((6) (jrec-fixed-ctor make-jrec6 desc co slow (a0 a1 a2 a3 a4 a5) (0 1 2 3 4 5)))
+                   ((7) (jrec-fixed-ctor make-jrec7 desc co slow (a0 a1 a2 a3 a4 a5 a6) (0 1 2 3 4 5 6)))
+                   ((8) (jrec-fixed-ctor make-jrec8 desc co slow (a0 a1 a2 a3 a4 a5 a6 a7) (0 1 2 3 4 5 6 7)))
+                   (else (lambda args (slow args))))))
     ;; Register the ctor under its fully-qualified tag ("ns.Name") — a bare
     ;; (Name. …) in the DEFINING ns is qualified to this by the analyzer, so a
     ;; deftype whose simple name collides with a built-in host class (tools.reader's
@@ -735,12 +775,12 @@
 ;; docstring" signal, so an assoc, not a fixed key.
 ;;
 ;; The keys the reference has that jolt does NOT set — :on, :on-interface,
-;; :method-builders, :extend-via-metadata — are a deliberate omission, not an
-;; oversight: the first three describe the interface defprotocol generates on
-;; the JVM, and jolt generates none (dispatch is by the receiver's type tag,
-;; protocol-resolve), while :extend-via-metadata would advertise a dispatch rule
-;; jolt does not yet honor. Pinned jolt-side in unit.edn (defprotocol-value) and
-;; written up in the divergence legend; jolt-2j3 tracks metadata extension.
+;; :method-builders — are a deliberate omission, not an oversight: they
+;; describe the interface defprotocol generates on the JVM, and jolt generates
+;; none (dispatch is by the receiver's type tag, protocol-resolve). Pinned
+;; jolt-side in unit.edn (defprotocol-value) and written up in the divergence
+;; legend. defprotocol's leading keyword options (:extend-via-metadata) are
+;; merged onto the value by the macro, not passed here.
 ;;
 ;; Each trailing argument is optional only so a seed minted before it existed
 ;; still loads while it mints the next one: the arity the OLD prelude spells is
@@ -1076,6 +1116,47 @@
 (define (protocol-dispatch proto-name method-name obj rest-args)
   (let ((rest (if (jolt-nil? rest-args) '() (seq->list rest-args))))
     (apply (protocol-resolve proto-name method-name obj) obj rest)))
+
+;; ---- :extend-via-metadata -----------------------------------------------------
+;; A protocol defined with :extend-via-metadata true lets a VALUE implement a
+;; method through its metadata: the key is the method's fully-qualified symbol
+;; (my.ns/foo), the value the implementation. The reference's lookup order is
+;; direct definitions first (a defrecord/deftype/reify that declares the
+;; protocol in its own body — on the JVM, an instance of the generated
+;; interface), then the value's metadata, then external extensions
+;; (extend/extend-type/extend-protocol, which includes a record type extended
+;; after the fact). defprotocol's shims for such a protocol call
+;; protocol-resolve-meta instead of protocol-dispatchN; every other protocol
+;; keeps the plain path and pays nothing for this. The back end's PIC and devirt
+;; only recognize protocol-dispatchN, so they never cache past the metadata
+;; check.
+;;
+;; protocol-direct-impl answers the first step alone: the impl a value's own
+;; type DECLARES for the protocol, or #f. A record type's impl table counts
+;; unless extend alone filled it (extend-impl-table?); a reify counts when the
+;; protocol is one of the reify's own.
+(define (protocol-direct-impl proto-name method-name obj)
+  (cond
+    ((jrec? obj)
+     (let* ((tag (jrdesc-tag (jrec-desc obj)))
+            (ti (hashtable-ref type-registry tag #f))
+            (pi (and ti (hashtable-ref ti proto-name #f))))
+       (and pi (not (extend-impl-table? pi)) (hashtable-ref pi method-name #f))))
+    ((jreify? obj)
+     (and (member proto-name (jreify-protos obj))
+          (reify-method-ref obj method-name)))
+    (else #f)))
+;; The impl for obj under a metadata-extensible protocol, in the reference's
+;; order. meta-sym is the method's qualified symbol. A metadata value need not
+;; be a procedure (any IFn implements the method on the JVM), so the shim
+;; invokes whatever comes back as a Clojure call rather than applying it here.
+(define (protocol-resolve-meta proto-name method-name meta-sym obj)
+  (or (protocol-direct-impl proto-name method-name obj)
+      (let ((m (jolt-meta obj)))
+        (and (not (jolt-nil? m))
+             (let ((f (jolt-get m meta-sym)))
+               (and f (not (jolt-nil? f)) f))))
+      (protocol-resolve proto-name method-name obj)))
 
 ;; ---- per-site polymorphic inline cache (PIC) --------------------------------
 ;; The back end emits, at each protocol call site it recognizes under --opt, a

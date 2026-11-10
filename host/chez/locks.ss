@@ -490,6 +490,47 @@
 ;; broadcast (jolt-cv-wake!); mu is held at both ends, which is what the count needs.
 ;; A raw condition is for the waits no fiber can reach and no value carries: the
 ;; carriers' idle wait, the timer, the loader, the main queue.
+;;
+;; WAITING WITH INTERRUPTS DISABLED. Chez's condition-wait gives up the thread's
+;; place in a collect rendezvous only when interrupts are ENABLED (thread.c
+;; S_condition_wait: DISABLECOUNT(tc) == 0), as mutex-acquire does (see
+;; jolt-mutex-acquire! above). A thread that blocked here with them disabled
+;; stayed counted as active: a collection requested meanwhile waited for it, and
+;; every thread that reached the rendezvous -- the one that would have signalled
+;; this wait among them -- waited with it. Nor can the wait be a timed
+;; condition-wait cut into slices: whenever a slice ends, the wait takes mu back
+;; inside the same call, still counted as active, and a collection requested by
+;; the thread holding mu meanwhile waits for it while it waits for mu. So with
+;; interrupts disabled the wait does not touch the condition at all. It lets mu
+;; go, naps for cw-masked-nap-us in a collect-safe call (which deactivates the
+;; thread whatever its disable count), and takes mu back through
+;; jolt-mutex-acquire!, collect-safe too. The nap ends as a wake: every caller
+;; re-checks its condition after one, since condition-wait may wake spuriously
+;; anyway. A nap that ends before the caller's own timeout answers as a wake;
+;; one cut to the end of it answers a timeout.
+(define cw-masked-nap-us 1000)                                  ; 1ms
+(define cw-masked-slice (make-time 'time-duration (* 1000 cw-masked-nap-us) 0))
+(define jolt-collect-safe-nap
+  (guard (e (#t (lambda (us) (jolt-collect-safe-pause)))) sa-collect-safe-nap))
+(define (cw-masked-nap! mu us)
+  (mutex-release mu)
+  (jolt-collect-safe-nap us)
+  (jolt-mutex-acquire! mu))
+(define cw-wait
+  (case-lambda
+    ((c mu)
+     (if (fx=? 0 (jolt-locks-disable-count))
+         (condition-wait c mu)
+         (begin (cw-masked-nap! mu cw-masked-nap-us) #t)))
+    ((c mu t)
+     (if (fx=? 0 (jolt-locks-disable-count))
+         (condition-wait c mu t)
+         (let ((sliced? (time<? cw-masked-slice t)))
+           (cw-masked-nap! mu (if sliced?
+                                  cw-masked-nap-us
+                                  (max 0 (+ (* 1000000 (time-second t))
+                                            (quotient (time-nanosecond t) 1000)))))
+           sliced?)))))
 (define jolt-condition-wait
   (case-lambda
     ((cv mu)
@@ -499,9 +540,15 @@
      (if (jolt-cv? cv)
          (begin
            (jolt-cv-threads-set! cv (fx+ (jolt-cv-threads cv) 1))
+;; MERGE-REVIEW(deep-fixes): ours (f6850ca8..cf159447) wraps each wait in jolt-asleep-while for
+;; the all-asleep detector; upstream (slice 2) waits through cw-wait, which with interrupts
+;; disabled naps 1ms in a collect-safe call instead of touching the condition. Chosen: both, our
+;; wrappers around upstream's cw-wait. A masked waiter is counted asleep across its naps (it
+;; is waiting); whether a nap's wake can race the detector's tell is not read. Gate:
+;; threadeddeadlock, main-carrier-monitor-test, maskedacquire.
            ;; a value wait: asleep, and told when nothing can ever wake the process
            (call-with-thread-state 'WAITING
-             (lambda () (jolt-asleep-while cv mu (lambda () (condition-wait (jolt-cv-cond cv) mu)))))
+             (lambda () (jolt-asleep-while cv mu (lambda () (cw-wait (jolt-cv-cond cv) mu)))))
            (jolt-cv-threads-set! cv (fx- (jolt-cv-threads cv) 1))
            (jolt-asleep-told-check!))
          ;; a raw condition: the runtime's own waits, never told (their waiters are what is told),
@@ -513,18 +560,18 @@
          (call-with-thread-state 'WAITING
            (lambda ()
              (if (jolt-asleep-raw-counts)
-                 (jolt-asleep-while #f mu (lambda () (condition-wait cv mu)))
-                 (condition-wait cv mu))))))
+                 (jolt-asleep-while #f mu (lambda () (cw-wait cv mu)))
+                 (cw-wait cv mu))))))
     ((cv mu abs-time)
      (when (jolt-current-fiber) (jolt-blocking-refuse 'jolt-condition-wait))
      (if (jolt-cv? cv)
          (begin
            (jolt-cv-threads-set! cv (fx+ (jolt-cv-threads cv) 1))
            (let ((r (call-with-thread-state 'TIMED_WAITING
-                      (lambda () (condition-wait (jolt-cv-cond cv) mu abs-time)))))
+                      (lambda () (cw-wait (jolt-cv-cond cv) mu abs-time)))))
              (jolt-cv-threads-set! cv (fx- (jolt-cv-threads cv) 1))
              r))
-         (call-with-thread-state 'TIMED_WAITING (lambda () (condition-wait cv mu abs-time)))))))
+         (call-with-thread-state 'TIMED_WAITING (lambda () (cw-wait cv mu abs-time)))))))
 
 ;; --- all asleep: a threaded process that nothing can wake ----------------------
 ;; A process run on threads (a test shard, the forks runner: not a main carrier, whose loop sees

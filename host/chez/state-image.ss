@@ -72,8 +72,8 @@
 ;; Version 12: a host collection shim travels as an image-hosted record (its
 ;; codec's kind and plain data, host-static.ss register-image-codec!) and an
 ;; enum constant as its class and name; formats 11 and older carry neither.
-(define jolt-image-format-version 12)
-(define jolt-image-read-versions '(2 3 4 5 6 7 8 9 10 11 12))
+(define jolt-image-format-version 14)
+(define jolt-image-read-versions '(2 3 4 5 6 7 8 9 10 11 12 13 14))
 
 ;; --- classification -----------------------------------------------------------
 ;; An eq hashtable is the ONE hashtable kind Chez can fasl; eqv/equal/string-hash
@@ -1102,7 +1102,15 @@
              (walk
               (lambda (x path)
                 (if restore?
-                    (let ((r (walk-body x path)))
+                    (let ((r (begin
+                               (let ((why (image-read-refusal x)))
+                                 (when why
+                                   (jolt-throw
+                                     (jolt-ex-info
+                                       (string-append "image: cannot read a " (jolt-class-name x) " at "
+                                                      (image-path->string path) ": " why)
+                                       empty-pmap))))
+                               (walk-body x path))))
                       (when (jolt-identity-hashed? r) (set! proc-touched #t))
                       r)
                     (walk-body x path))))
@@ -2169,9 +2177,15 @@
 ;; ride on the object, so it rides in the SAME fasl stream instead: fasl
 ;; preserves sharing within one stream, so the objects in this alist come back
 ;; eq? to the ones in the graph and the meta can be re-attached.
+;; Answers (meta-pairs . types): types is every defrecord / deftype the graph
+;; holds an instance of, as #(tag record?), which the reader registers when its
+;; process never ran the form (image-register-types!).
 (define (image-collect-meta v)
-  (let ((acc '()))
+  (let ((acc '()) (types '()) (seen (make-hashtable string-hash string=?)))
     (image-walk v (lambda (x path)
+                    (when (and (jrec? x) (not (hashtable-ref seen (jrec-tag x) #f)))
+                      (hashtable-set! seen (jrec-tag x) #t)
+                      (set! types (cons (vector (jrec-tag x) (and (jrec-record? x) #t)) types)))
                     ;; Same write-side walk, second job: drop cached hasheqs so
                     ;; no cache lands in the fasl. A content-derived hash would
                     ;; be stable across processes, but a collection holding a
@@ -2196,7 +2210,7 @@
                                  (with-exception-handler (lambda (e) (k jolt-nil))
                                    (lambda () (jolt-meta x)))))))
                         (unless (jolt-nil? m) (set! acc (cons (cons x m) acc)))))))
-    acc))
+    (cons acc types)))
 
 ;; Runs on the restored graph, after the restore walk has been over the pairs
 ;; together with the body (jolt-image-read), so each pair keys the object that
@@ -2239,7 +2253,7 @@
     ;; cannot be written ahead of the body.
     (let ((body (call-with-bytevector-output-port
                   (lambda (p)
-                    (sa-fasl-write (vector v* (image-collect-meta v*)) p
+                    (sa-fasl-write (let ((mt (image-collect-meta v*))) (vector v* (car mt) (cdr mt))) p
                       (lambda (x)
                         (and (image-external? x)
                              (begin
@@ -2286,6 +2300,30 @@
                        (apply jolt-vector (map image-stub-info stubs)))
         jolt-nil)))
 
+;; Format 14 changes no framing: it is the format in which an ArrayDeque travels
+;; as its ring buffer #(elements head tail #f) rather than the list layout
+;; #(backing count head), and an ArrayList / LinkedList carries its modCount as a
+;; fourth slot. Both older layouts still read (java/array-deque.ss converts an
+;; old deque on first use; host-static-classes.ss reads a 3-slot list as count
+;; 0); a jolt that knows only 13 refuses a 14 rather than misread a deque. An
+;; old deque holding nil, which the list layout allowed and the ring cannot
+;; hold, is refused on read (image-read-refusal, from array-deque.ss).
+;;
+;; Format 13 names the defrecord and deftype types an image holds instances of.
+;; An instance travels with its descriptor, but whether its type was a record —
+;; what record?, map?, keys and printing ask — lives in tables defrecord and
+;; deftype fill when they run, and a process that restores the image without
+;; having loaded the code never ran them. A type this process does not know is
+;; registered here as what it was; one it does know is left alone.
+(define (image-register-types! types)
+  (for-each
+    (lambda (t)
+      (let ((tag (vector-ref t 0)) (record? (vector-ref t 1)))
+        (unless (hashtable-ref chez-deftype-tag-set tag #f)
+          (jolt-with-mutex rec-tbl-mu (hashtable-set! chez-deftype-tag-set tag #t))
+          (when (null? (jch-direct-supers tag)) (jch-set-supers! tag '("clojure.lang.IType")))
+          (when record? (register-record-tag! tag)))))
+    types))
 (define (jolt-image-read path)
   (unless (file-exists? path)
     (jolt-throw (jolt-ex-info (string-append "image: no such file: " path) empty-pmap)))
@@ -2296,8 +2334,10 @@
            (exts (list->vector (map image-decode-external descs)))
            (b (sa-fasl-read port 'load exts)))
       (close-port port)
-      (unless (and (vector? b) (fx=? (vector-length b) 2))
+      ;; #(value meta) to format 12, #(value meta types) from 13
+      (unless (and (vector? b) (or (fx=? (vector-length b) 2) (fx=? (vector-length b) 3)))
         (jolt-throw (jolt-ex-info (string-append "image: malformed body in " path) empty-pmap)))
+      (when (fx=? (vector-length b) 3) (image-register-types! (vector-ref b 2)))
       ;; R3: rebuild what the write side substituted — fn source records become
       ;; live closures, handler payloads go back through their restore fns. The
       ;; meta sidecar rides through the same walk (one memo, so a pair's object
@@ -2386,14 +2426,61 @@
      (let ((strict? (and (not (jolt-nil? opts))
                          (eq? (jolt-get opts (jolt-keyword "unwritable") jolt-nil)
                               (jolt-keyword "fail")))))
-       (jolt-image-write! path (vector 'jolt-world (image-world-vars ns-list))
-                          (if strict?
-                              jolt-nil
-                              (jolt-hash-map (jolt-keyword "unwritable")
-                                             (jolt-keyword "stub"))))))))
+       (let* ((pairs (image-world-vars ns-list))
+              (rep (jolt-image-write! path (vector 'jolt-world pairs)
+                                      (if strict?
+                                          jolt-nil
+                                          (jolt-hash-map (jolt-keyword "unwritable")
+                                                         (jolt-keyword "stub"))))))
+         ;; each stub names the var it sits in, as jolt.image/stubs does
+         (if strict?
+             rep
+             (jolt-assoc rep (jolt-keyword "stubbed")
+                         (image-world-name-vars (jolt-get rep (jolt-keyword "stubbed") jolt-nil)
+                                                pairs))))))))
+
+;; The var a world path starts in. A world is (vector 'jolt-world pairs), pairs
+;; the ("ns/name" . root) list image-world-vars built, so every path into it
+;; opens "1", then one "cdr" per pair it passes over, then "car" into the pair
+;; the object sits under. That pair's name, or #f for a path of another shape.
+;; PAIRS is that list as a vector. An object two vars share is reached through
+;; the first of them, and this is the var its path runs through.
+(define (image-world-path-var pairs path)
+  (let ((n (string-length path)))
+    ;; the index past step S and its " -> " when S is the step at i, else #f
+    (define (past i s)
+      (let ((e (fx+ i (string-length s))))
+        (and (fx<=? (fx+ e 4) n)
+             (let same ((k 0))
+               (or (fx=? k (string-length s))
+                   (and (char=? (string-ref path (fx+ i k)) (string-ref s k))
+                        (same (fx+ k 1)))))
+             (char=? (string-ref path e) #\space)
+             (char=? (string-ref path (fx+ e 1)) #\-)
+             (char=? (string-ref path (fx+ e 2)) #\>)
+             (char=? (string-ref path (fx+ e 3)) #\space)
+             (fx+ e 4))))
+    (let ((i (past 0 "1")))
+      (and i
+           (let loop ((i i) (k 0))
+             (cond ((past i "cdr") => (lambda (j) (loop j (fx+ k 1))))
+                   ((and (past i "car") (fx<? k (vector-length pairs)))
+                    (car (vector-ref pairs k)))
+                   (else #f)))))))
+
+;; findings (a jolt vector of maps with :path) with :var added from each path
+(define (image-world-name-vars findings pairs)
+  (let ((pv (list->vector pairs)))
+    (let loop ((i (fx- (jolt-count findings) 1)) (acc '()))
+      (if (fx<? i 0)
+          (apply jolt-vector acc)
+          (let* ((m (jolt-nth findings i))
+                 (v (image-world-path-var pv (jolt-get m (jolt-keyword "path") jolt-nil))))
+            (loop (fx- i 1) (cons (if v (jolt-assoc m (jolt-keyword "var") v) m) acc)))))))
 
 (define (jolt-image-scan-world ns-list)
-  (jolt-image-scan (vector 'jolt-world (image-world-vars ns-list))))
+  (let ((pairs (image-world-vars ns-list)))
+    (image-world-name-vars (jolt-image-scan (vector 'jolt-world pairs)) pairs)))
 
 (define (jolt-image-restore-world! path)
   (hashtable-clear! image-restore-stub-tbl)
@@ -2403,7 +2490,7 @@
                     (string-append "image: " path
                                    " is a value image, not a world image — read it with read-image")
                     empty-pmap)))
-    (let ((n 0))
+    (let ((n 0) (pv (list->vector (vector-ref w 1))))
       (for-each
         (lambda (p)
           (let* ((k (car p))
@@ -2419,10 +2506,16 @@
               ;; the read transform; the root binds as-is. Unresolved stubs left
               ;; in the root are recorded with their owning var so
               ;; jolt.image/stubs can list them and resolve-stub! can reach them.
+              ;; The var is the one the stub's :path runs through, as
+              ;; dump-world! named it: a stub two vars share, or one this walk
+              ;; meets only in the second because the first holds it in a
+              ;; rebuilt closure, still names the first.
               (image-walk v (lambda (o pth)
                               (when (image-stub? o)
                                 (hashtable-set! image-restore-stub-tbl
-                                                (image-stub-id o) (cons o k)))))
+                                                (image-stub-id o)
+                                                (cons o (or (image-world-path-var pv (image-stub-path o))
+                                                            k))))))
               (var-root-set! cell v)
               (var-cell-defined?-set! cell #t)
               (set! n (fx+ n 1)))))

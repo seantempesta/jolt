@@ -108,7 +108,7 @@
          (or (ldr-rel-prefix? rel (ns-name->rel (car ns))) (loop (cdr ns))))))
 ;; Matched as a namespace PREFIX so a child (babashka/process/pprint) travels
 ;; with its parent.
-(define ldr-builtin-ns-rels '("babashka/fs" "babashka/process"))
+(define ldr-builtin-ns-rels '("babashka/fs" "babashka/process" "clojure/data/json"))
 (define (ldr-builtin-ns-rel? rel)
   (let loop ((bs ldr-builtin-ns-rels))
     (and (pair? bs)
@@ -283,7 +283,9 @@
 ;; file now have no reader. The load's position does not outlive the warning:
 ;; load-jolt-file* unwinds it, so the next error in the process is not reported
 ;; "at" this namespace's failing form.
-(define (ldr-warn-reader-ns-failed! ns-name e readers)
+(define (ldr-warn-reader-ns-failed! ns-name e0 readers)
+  ;; the throw the load's CompilerException wraps, as the uncaught report names it
+  (define e (jolt-load-wrap-origin e0))
   (when (jolt-warnings?)
     (let ((port (current-error-port))
           (msg (guard (_ (#t "(unprintable error)"))
@@ -633,28 +635,44 @@
 (define ldr-assert-cell #f)
 (define ldr-unchecked-cell #f)
 (define ldr-allow-cells (make-hashtable string-hash string=?))
-(define (ldr-with-file-vars path thunk)
+(define (ldr-file-cells-ready?)
   (unless ldr-file-cell
     (set! ldr-file-cell (var-cell-lookup "clojure.core" "*file*"))
     (set! ldr-spath-cell (var-cell-lookup "clojure.core" "*source-path*"))
     (set! ldr-warn-cell (var-cell-lookup "clojure.core" "*warn-on-reflection*"))
     (set! ldr-assert-cell (var-cell-lookup "clojure.core" "*assert*"))
     (set! ldr-unchecked-cell (var-cell-lookup "clojure.core" "*unchecked-math*")))
-  (if (not (and ldr-file-cell ldr-spath-cell ldr-warn-cell ldr-assert-cell
-                ldr-unchecked-cell))
-      (thunk)
+  (and ldr-file-cell ldr-spath-cell ldr-warn-cell ldr-assert-cell
+       ldr-unchecked-cell #t))
+;; The *file* / *source-path* half of the frame, for `path` as the loader resolved
+;; it: *file* is the name the source is known by (root-relative for a classpath
+;; namespace, as Compiler.load binds it from RT.load's resource name), and
+;; *source-path* the bare file name. Shared with the compiled entrances
+;; (ldr-with-compiled-ns-vars), so a namespace sees the same *file* whether it
+;; arrived from source or from a cached artifact.
+(define (ldr-file-name-pairs path)
+  (if (not (and path (ldr-file-cells-ready?)))
+      '()
       (let ((name (let loop ((i (- (string-length path) 1)))
                     (cond ((< i 0) path)
                           ((char=? (string-ref path i) #\/)
                            (substring path (+ i 1) (string-length path)))
                           (else (loop (- i 1)))))))
-        (dyn-with-frame
-          (list (cons ldr-file-cell (ldr-source-name path))
-                (cons ldr-spath-cell name)
-                (cons ldr-warn-cell (var-cell-deref ldr-warn-cell))
+        (list (cons ldr-file-cell (ldr-source-name path))
+              (cons ldr-spath-cell name)))))
+(define (ldr-with-file-vars path thunk)
+  (if (not (ldr-file-cells-ready?))
+      (thunk)
+      (dyn-with-frame
+        (append
+          (ldr-file-name-pairs path)
+          (list (cons ldr-warn-cell (var-cell-deref ldr-warn-cell))
                 (cons ldr-assert-cell (var-cell-deref ldr-assert-cell))
                 (cons ldr-unchecked-cell (var-cell-deref ldr-unchecked-cell)))
-          thunk))))
+          ;; *ns*, as RT.load binds it: the file's ns form switches this
+          ;; frame's binding, not the caller's namespace
+          (jolt-ns-binding-pairs))
+        thunk)))
 
 ;; The loader's two compile-from-source entrances -- load-jolt-file* below and
 ;; the AOT capture around it (aot-capture-load) -- each refuse BY NAME in a
@@ -694,7 +712,14 @@
 ;; capture load, instead of re-reading inside the loop.
 (define (load-jolt-file* path src)
   (ldr-need-compiler! path)
-  (let ((end (string-length src)))
+  ;; this load's snippets read the file, not a text eval-string held for it
+  (jolt-eval-source-text-forget! path)
+  (let ((end (string-length src))
+        ;; a load-file's or require's Compiler.load wrap (rt.ss jolt-load-wrap),
+        ;; for this file's own forms only: bound #f below for whatever they
+        ;; load. It names the file as *source-path*'s caller sees it: the
+        ;; classpath name for a namespace, the path itself for a load-file.
+        (w (and (jolt-load-wrap) (vector (ldr-source-name path)))))
     ;; parameterize (not a bare set!) so a require nested in this file's ns form
     ;; restores path when control returns to the rest of this file.
     (parameterize ((rdr-source-file path)    ; list forms read here carry :file = path
@@ -725,7 +750,8 @@
                    ;; install-owned namespaces leaked: a cacheable one opens its own
                    ;; capture (aot-capture-load) and so already redirected.
                    (jolt-aot-capture (and (equal? path (jolt-aot-capture-file))
-                                          (jolt-aot-capture))))
+                                          (jolt-aot-capture)))
+                   (jolt-load-wrap #f))
       (ldr-with-file-vars path
         (lambda ()
           ;; The failing form's position, recorded before the stack unwinds (an
@@ -745,10 +771,16 @@
               ;; and the run exited 0. A test file that lost its whole body that
               ;; way still looked like a pass. The JVM raises "Unmatched
               ;; delimiter: )" here (jolt-3amm).
-              (let loop ((i 0) (ord 0))
-                (when (< i end)
+              ;; the value of the last form is the load's, as Compiler.load's is
+              ;; pos: the reader's (line . col) at i, kept only for a wrap
+              (let loop ((i0 0) (ord 0) (last jolt-nil) (pos0 '(1 . 1)))
+                (if (>= i0 end)
+                    last
+                  (let* ((i (if w (ce-skip-ws src i0 end) i0))
+                         (pos (if w (ce-advance src i0 i (car pos0) (cdr pos0)) pos0)))
                   (let-values (((form j) (rdr-read-top src i end)))
-                    (when (> j i)
+                    (if (<= j i)
+                        last
                       ;; ord counts every top-level form read (the ns form
                       ;; included): it is the def-ordinal clock for the build's
                       ;; visibility replay — rt.ss var-def-ordinals, stamped via
@@ -765,17 +797,20 @@
                       ;; stamps at its call form's ordinal), then bumped. One
                       ;; tail call: an eof placeholder read consumes no ordinal.
                       (if (rdr-eof? form)
-                          (loop j ord)
-                          (begin
+                          (loop j ord last (if w (ce-advance src i j (car pos) (cdr pos)) pos))
+                          ;; data readers run at the read, outside the wrap: a reader fn's throw is a
+                          ;; read error, not the form's run
+                          (let* ((form (if data-readers-active (ldr-apply-readers form) form))
+                                 (v (jolt-load-run-form w pos (lambda ()
                             (when (getenv "JOLT_TRACE_LOAD")
                               (display "  [load-form] " (current-error-port))
                               (display (jolt-pr-str form) (current-error-port)) (newline (current-error-port)))
                             (parameterize ((jolt-load-frames
                                              (cons (make-load-frame path ord (chez-current-ns))
                                                    (jolt-load-frames))))
-                              (jolt-compile-eval-form (if data-readers-active (ldr-apply-readers form) form)
-                                                      (chez-current-ns)))
-                            (loop j (fx+ ord 1)))))))))))))))
+                              (jolt-compile-eval-form form
+                                                      (chez-current-ns)))))))
+                            (loop j (fx+ ord 1) v (if w (ce-advance src i j (car pos) (cdr pos)) pos))))))))))))))))
 
 ;; --- AOT / compile cache for required namespaces ----------------------------
 ;; A disk-backed namespace is recompiled from source on EVERY run (load-jolt-file
@@ -2081,8 +2116,15 @@
 ;; worked when some enclosing file load happened to have the frame up already,
 ;; which is why loading such a namespace from a script looked fine and loading it
 ;; from -e, a REPL, or an nREPL eval did not.
-(define (ldr-with-compiled-ns-vars thunk)
-  (jolt-with-ns-load-vars thunk))
+;;
+;; The frame also carries *file* and *source-path* for the namespace's source
+;; (`file`, #f for an artifact with no source beside it). Without them a cached
+;; namespace's top level read whatever its REQUIRER had bound — a (def here
+;; *file*) named the requiring script on every warm run, and only the first,
+;; cold run named the namespace's own source (#1466).
+(define (ldr-with-compiled-ns-vars file thunk)
+  (dyn-with-frame (append (ldr-file-name-pairs file) (jolt-ns-load-var-pairs))
+                  thunk))
 
 ;; " (msg)" for a diagnostic line, or "" when the message can't be read — the
 ;; jolt.host seam is absent in a bootstrap image, and a diagnostic may not throw.
@@ -2131,6 +2173,13 @@
               (var-cell-dynamic?-set! c #f)
               (var-root-set! c (make-jolt-var-unbound (var-cell-ns c) (var-cell-name c)))))))
       ks was)))
+;; A namespace load from source is RT.load, which is Compiler.load: what a
+;; top-level form's run throws leaves it as a CompilerException naming the file
+;; (compile-eval.ss jolt-load-run-form). A cache hit runs no reader walk to wrap
+;; a form in, but a throw from it is taken for a broken artifact and the
+;; namespace recompiles from source (aot-safe-load-or-recompile), which wraps.
+(define (ldr-wrapping thunk)
+  (parameterize ((jolt-load-wrap (vector #t))) (thunk)))
 (define (aot-safe-load-or-recompile name file source base assumed-now)
   (let ((so (string-append base ".so"))
         (defs (vector name (make-hashtable string-hash string=?))))
@@ -2147,11 +2196,11 @@
       ;; in the same place.
       (aot-undo-captured-defs! defs)
       (let ((ks (force source)))
-        (aot-compile-and-cache name file (cdr ks) (car ks))))
+        (ldr-wrapping (lambda () (aot-compile-and-cache name file (cdr ks) (car ks))))))
     (let ((state (guard (e (else 'corrupt))
                    (aot-complete-reset! name)
                    (parameterize ((aot-loading-file file) (jolt-def-capture defs))
-                     (ldr-with-compiled-ns-vars (lambda () (load so))))
+                     (ldr-with-compiled-ns-vars file (lambda () (load so))))
                    (if (aot-complete? name) 'ok 'incomplete))))
       (case state
         ;; loaded — but if the key was computed with an inert ASSUMPTION for a dep
@@ -2173,7 +2222,7 @@
 ;; relative to the binary it ships in. A guard falls back to the caller's source
 ;; path: the bytes are baked (never truncated by a killed write), but a guard
 ;; beats a dead binary. Returns #t when the embedded fasl was loaded, else #f.
- (define (jolt-load-embedded-fasl! name)
+ (define (jolt-load-embedded-fasl! name file)
    (and (not (ldr-source-only?))
         (let ((bv (jolt-embedded-fasl name)))
           (and bv
@@ -2196,7 +2245,7 @@
                                                           (ldr-condition-suffix e)
                                                           ", falling back to source"))
                                  #f))
-                   (ldr-with-compiled-ns-vars
+                   (ldr-with-compiled-ns-vars file
                      (lambda () (load-compiled-from-port (open-bytevector-input-port bv))))
                    (aot-info (string-append "embedded " name))
                    #t))))))
@@ -2216,14 +2265,16 @@
           (ldr-install-file? file)
           (jolt-embedded-fasl name))
      (parameterize ((aot-dep-sink #f) (io-file-read-sink #f))
-       (unless (jolt-load-embedded-fasl! name)
+       (unless (jolt-load-embedded-fasl! name file)
          ;; embedded fasl registered but failed to load: fall back to source.
-         (load-jolt-file file))))
+         (ldr-wrapping (lambda () (load-jolt-file file))))))
     ((and (aot-cache-enabled?) (not force?) (not (ldr-reload-all?))
           ;; jolt.profile counts code it compiled itself: a cached fasl carries no
           ;; counters, and what an instrumented compile would write to the cache
           ;; is the slower code every later run would load
           (not (sa-profile-instrumenting?))
+          ;; ...and jolt.profile's :debug mode keeps locals that cached code lacks
+          (not (jolt-debug-locals-instrumenting?))
           (or (not (ldr-source-only?)) (ldr-build-aot-cache?))
           (not (ldr-install-file? file))
           ;; no fingerprint = we can't tell this runtime from another one, so
@@ -2256,12 +2307,13 @@
                     (aot-safe-load-or-recompile name file source base assumed-now)))
            (begin (aot-info (string-append "miss " name))
                   (let ((ks (force source)))
-                    (aot-compile-and-cache name file (cdr ks) (car ks))))))))
+                    (ldr-wrapping (lambda () (aot-compile-and-cache name file (cdr ks) (car ks))))))))))
     (else
      ;; a reload bypasses the cache, and whatever key this process read for the
      ;; namespace before may no longer describe its source
      (when force? (aot-forget-own-key! name))
-     (parameterize ((aot-dep-sink #f) (io-file-read-sink #f)) (load-jolt-file file)))))
+     (parameterize ((aot-dep-sink #f) (io-file-read-sink #f))
+       (ldr-wrapping (lambda () (load-jolt-file file)))))))
 
 ;; Mark a namespace as loaded in both the host hashtable and the *loaded-libs* ref.
 ;; Namespaces defined by the CLI's OWN AOT closure (bld-emit-cli-aot bakes
@@ -3030,7 +3082,7 @@
                        (unless was-loaded? (ldr-unmark-loaded! name)) ; roll the mark back
                        (raise e)))
              (cond
-               (art (ldr-with-compiled-ns-vars (lambda () (load (cpath-so-file art)))))
+               (art (ldr-with-compiled-ns-vars file (lambda () (load (cpath-so-file art)))))
                ;; inside a compile, loading from source also emits the artifact
                ;; — RT.load's COMPILE_FILES branch, which is what carries a
                ;; compile through to the whole load closure.
@@ -3092,9 +3144,10 @@
 ;; The path is absolute, as Compiler.loadFile's is (File.getAbsolutePath), and is
 ;; the file's name too (ldr-source-name).
 (define (jolt-load-file path)
-  (parameterize ((ldr-file-load-path path))
-    (load-jolt-file/restoring-ns path))
-  jolt-nil)
+  ;; load-file is Compiler.load: what a form's run throws leaves as a
+  ;; CompilerException naming this path (compile-eval.ss jolt-load-run-form)
+  (parameterize ((ldr-file-load-path path) (jolt-load-wrap (vector path)))
+    (load-jolt-file/restoring-ns path)))
 
 ;; expand-spec: the shared prefix-list expansion (expand-libspec, ns.ss) —
 ;; kept under its old name for the build driver's callers.
@@ -3128,14 +3181,11 @@
           (parameterize ((ldr-verbose? verbose?))
             (k (and (member "reload" flags) #t)))))))
 
-;; A leading ./ is dropped before the path is made absolute: "./x.clj" from /proj
-;; is /proj/x.clj, not /proj/./x.clj.
-(define (ldr-strip-dot-slash p)
-  (if (and (fx>? (string-length p) 2) (string=? (substring p 0 2) "./"))
-      (ldr-strip-dot-slash (substring p 2 (string-length p)))
-      p))
+;; The file is named by its absolute path as Compiler.loadFile names it,
+;; File.getAbsolutePath, which puts user.dir in front and normalizes nothing:
+;; "./x.clj" from /proj is /proj/./x.clj, in *file* and in :file.
 (def-var! "clojure.core" "load-file"
-  (lambda (p) (jolt-load-file (host-fs-path (project-relative (ldr-strip-dot-slash p))))))
+  (lambda (p) (jolt-load-file (host-fs-path (project-relative p)))))
 
 ;; The directory of a namespace's resource path: "clojure.tools.reader-test" ->
 ;; "clojure/tools" (drop the last segment of ns-name->rel). "" for a top-level ns.
@@ -3160,7 +3210,7 @@
                     (else (let ((dir (ns-rel-dir (chez-current-ns))))
                             (if (string=? dir "") p (string-append dir "/" p))))))
              (f (resolve-on-roots rel)))
-        (if f (load-jolt-file/restoring-ns f)
+        (if f (ldr-wrapping (lambda () (load-jolt-file/restoring-ns f)))
             (throw-jvm (quote java.io.FileNotFoundException) (string-append "Could not locate resource on source roots: " p)))))
     paths)
   jolt-nil)
@@ -3224,6 +3274,12 @@
     (let ((f (find-ns-file (if (string? nm) nm (jolt-str-render-one nm)))))
       (if f f jolt-nil))))
 (def-var! "jolt.host" "load-namespace" (lambda (n) (load-namespace n) jolt-nil))
+;; Drop a namespace's loaded mark from both halves of the loaded set (loaded-ns
+;; and *loaded-libs*). jolt.loader's unload! calls it for each namespace it
+;; unmaps, so the runtime never reports as loaded a name find-ns answers nil for:
+;; a later require loads it again instead of no-op'ing (#1469).
+(def-var! "jolt.host" "unmark-loaded!"
+  (lambda (n) (ldr-unmark-loaded! (jolt-str-render-one n)) jolt-nil))
 ;; The Clojure-facing seam for :jolt/replaces (see ldr-ns-replacements above).
 ;; jolt.deps collects the key and jolt.main calls this once per namespace after
 ;; it resolves the project, before any of the project compiles.
@@ -3348,6 +3404,8 @@
 ;; resolver instead of opening the key as a filesystem path.
 (def-var! "jolt.host" "embedded-resource?"
   (lambda (name) (if (embedded-resource-has? name) #t #f)))
+(def-var! "jolt.host" "embedded-resource-names"
+  (lambda () (make-pvec (list->vector (sort string<? (embedded-resource-names))))))
 
 ;; jolt version string — one source (jolt-version-string, rt.ss): the baked
 ;; release tag in a binary, $JOLT_VERSION under bin/jolt, else "dev".

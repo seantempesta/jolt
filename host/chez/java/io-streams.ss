@@ -46,6 +46,27 @@
 (define (in-stream-markable? self) (vector-ref (jhost-state self) 1))
 (define (make-in-stream-markable port) (make-in-stream port 'markable))
 (define (in-stream? x) (and (jhost? x) (string=? (jhost-tag x) "in-stream")))
+;; The JDK class a stream or reader was made as. One tag serves every byte
+;; input stream (and one every output stream, one every port-backed Reader), so
+;; the class is carried in the state, at a slot past every optional one: a
+;; constructor names its class as it builds the value, before anything else
+;; holds the state, and (class x) answers it (jolt-iad8f). A stream nothing
+;; classed keeps the generic answer. The padding is #f, which is what each
+;; optional slot reads as when absent.
+(define stream-class-slot 9)
+(define (stream-classed! x cls)
+  (let* ((st (jhost-state x)) (n (vector-length st)))
+    (if (fx>? n stream-class-slot)
+        (vector-set! st stream-class-slot cls)
+        (let ((v (make-vector (fx+ stream-class-slot 1) #f)))
+          (do ((i 0 (fx+ i 1))) ((fx=? i n)) (vector-set! v i (vector-ref st i)))
+          (vector-set! v stream-class-slot cls)
+          (jhost-state-set! x v))))
+  x)
+(define (stream-class x)
+  (let ((st (jhost-state x)))
+    (and (vector? st) (fx>? (vector-length st) stream-class-slot)
+         (vector-ref st stream-class-slot))))
 ;; Two optional slots follow, each #f or absent on an ordinary stream: slot 3 is
 ;; a piped stream's shared pipe (piped-cell, below), slot 4 a
 ;; PushbackInputStream's pushback state (in-stream-pushback, below). Slot 5 is
@@ -399,17 +420,23 @@
              jolt-nil)))
    (cons "flush" (lambda (self)
                    (unless (port-closed? (out-stream-port self))
-                     (flush-output-port (out-stream-port self)))
+                     (flush-output-port (out-stream-port self))
+                     (let ((inner (out-stream-filter-inner self)))
+                       (when inner (record-method-dispatch inner "flush" jolt-nil))))
                    jolt-nil))
    (cons "close" (lambda (self)
                    (unless (port-closed? (out-stream-port self))
                      (flush-output-port (out-stream-port self))
                      ;; a ByteArrayOutputStream's close is a no-op (toByteArray stays valid);
                      ;; a piped stream signals end-of-stream to its reader; a file
-                     ;; stream's port is closed.
-                     (let ((p (piped-pipe self)))
+                     ;; stream's port is closed; a filter closes its port and the
+                     ;; stream it wraps, as FilterOutputStream's close does.
+                     (let ((p (piped-pipe self)) (inner (out-stream-filter-inner self)))
                        (cond (p (pipe-close-write! p))
                              ((vector-ref (jhost-state self) 1))
+                             (inner (close-port (out-stream-port self))
+                                    (record-method-dispatch inner "flush" jolt-nil)
+                                    (record-method-dispatch inner "close" jolt-nil))
                              (else (close-port (out-stream-port self))))))
                    jolt-nil))
    (cons "connect" (lambda (self other) (pipe-connect! self other) jolt-nil))
@@ -463,8 +490,13 @@
        (let-values (((c next) (%utf8-java-step bv k end #t)))
          (if c end k))))))
 
-(define (open-java-utf8-input-port bp id)
+;; REPORT? (optional): malformed input is MalformedInputException, as a
+;; reporting CharsetDecoder answers it, rather than U+FFFD. The check costs
+;; nothing on the bulk path for well-formed input -- %utf8-java-plain? is already
+;; asked there -- and only a run it turns down is decoded again, strictly.
+(define (open-java-utf8-input-port bp id . report?)
   (let ((buf (make-bytevector java-utf8-chunk))
+        (report? (and (pair? report?) (car report?)))
         (lo 0)
         (hi 0)
         (src-eof? #f))
@@ -483,6 +515,10 @@
                      (else (set! hi (fx+ hi got)) #t))))))
     (define (step-one! str start o terminal?)
       (let-values (((c next) (%utf8-java-step buf lo hi (not terminal?))))
+        (when (and c report? (fx=? c #xFFFD))
+          (let ((seq (make-bytevector (fx- next lo))))
+            (bytevector-copy! buf lo seq 0 (fx- next lo))
+            (charset-decode-report seq "UTF-8")))
         (and c
              (begin (string-set! str (fx+ start o) (integer->char c))
                     (set! lo next)
@@ -512,7 +548,7 @@
                 (let* ((len (fx- cut lo))
                        (slice (make-bytevector len)))
                   (bytevector-copy! buf lo slice 0 len)
-                  (let* ((s (utf8-bytes->string slice))
+                  (let* ((s (if report? (charset-decode-report slice "UTF-8") (utf8-bytes->string slice)))
                          (n (string-length s)))
                     ;; sa-string-copy-range!, not string-copy!: Chez's takes
                     ;; (from from-start to to-start count) and R7RS's the same
@@ -1237,11 +1273,13 @@
 (register-host-methods! "char-writer"
   (list
    (cons "write" (lambda (self x . rest)
-                   (put-string (char-writer-live-port self) (writer-piece-range x rest))
+                   (put-string (char-writer-live-port self) (sink-text self (writer-piece-range x rest)))
                    jolt-nil))
    (cons "append" (lambda (self x . rest)
                     (put-string (char-writer-live-port self)
-                                (if (and (null? rest) (char? x)) (string x) (append-text x rest)))
+                                (if (and (null? rest) (char? x))
+                                    (sink-text self (string x))
+                                    (sink-text self (append-text x rest))))
                     self))
    (cons "newLine" (lambda (self) (put-char (char-writer-live-port self) #\newline) jolt-nil))
    (cons "flush" (lambda (self)
@@ -1285,15 +1323,20 @@
 ;; which is why only make-charset-writer calls this: it records bp so the
 ;; writer's flush reaches it. Flushing bp once per block made every non-UTF-8
 ;; write cost a write(2) per block, 8x the UTF-8 writer's time.
-(define (charset-output-port bp name)
+;;
+;; REPORT? encodes as a CharsetEncoder does by default: a character the charset
+;; cannot hold is UnmappableCharacterException when its block is encoded -- at a
+;; flush or close, as the JDK's StreamEncoder raises it -- rather than "?".
+(define (charset-output-port bp name . report?)
   (io-check-encoding! name)
   (if (io-utf8? name)
       (transcoded-port bp utf8-tx)
-      (let ((enc name) (utf16? (string=? (charset-canonical-down name) "utf-16")))
+      (let ((enc name) (utf16? (string=? (charset-canonical-down name) "utf-16"))
+            (encode (if (and (pair? report?) (car report?)) charset-encode-report charset-encode-bv)))
         (make-custom-textual-output-port "charset-writer"
           (lambda (str start count)
             (when (fx>? count 0)
-              (put-bytevector bp (charset-encode-bv (substring str start (fx+ start count)) enc))
+              (put-bytevector bp (encode (substring str start (fx+ start count)) enc))
               (when utf16? (set! utf16? #f) (set! enc "UTF-16BE")))
             count)
           #f #f
@@ -1303,23 +1346,46 @@
 ;; writer, so a charset the host cannot write closes it again; a stream the
 ;; caller handed in is left open, as the JVM's OutputStreamWriter leaves it.
 (define (make-charset-writer bp enc down own? . cls)
+  (make-reporting-charset-writer bp enc down own? #f (and (pair? cls) (car cls))))
+;; …and one that encodes with REPORT? (charset-output-port).
+(define (make-reporting-charset-writer bp enc down own? report? cls)
   (make-jhost "char-writer"
     (vector (if own?
-                (guard (e (#t (close-port bp) (raise e))) (charset-output-port bp enc))
-                (charset-output-port bp enc))
+                (guard (e (#t (close-port bp) (raise e))) (charset-output-port bp enc report?))
+                (charset-output-port bp enc report?))
             down
             bp
-            (and (pair? cls) (car cls)))))
+            cls)))
 ;; Reading: a one-byte charset decodes as the bytes arrive, so a pipe still
 ;; streams. A multi-byte or stateful one decodes the whole input on the first
 ;; read, through decode-bytevector -- the decoder (String. bytes cs) and slurp
 ;; use -- because a block boundary can fall inside a character, and inside an
 ;; iconv shift state, and only the full input decodes the way the JVM's does.
-(define (charset-input-port bp name id)
+;;
+;; REPORT? decodes as a CharsetDecoder does by default: malformed input is
+;; MalformedInputException at the read that reaches it, where the plain reader
+;; answers U+FFFD.
+(define (charset-input-port bp name id . report?)
   (io-check-encoding! name)
-  (let ((cs (charset-canonical-down name)))
+  (let ((cs (charset-canonical-down name))
+        (report? (and (pair? report?) (car report?))))
     (cond
-      ((string=? cs "utf-8") (open-java-utf8-input-port bp id))
+      ((string=? cs "utf-8") (open-java-utf8-input-port bp id report?))
+      ;; a charset with no streaming reporter here: the whole input, decoded
+      ;; through the reporting CharsetDecoder at the first read
+      ((and report? (not (or (string=? cs "iso-8859-1") (string=? cs "us-ascii"))))
+       (let ((text #f) (pos 0))
+         (make-custom-textual-input-port id
+           (lambda (str start count)
+             (unless text
+               (let ((bv (get-bytevector-all bp)))
+                 (set! text (charset-decode-report (if (eof-object? bv) (make-bytevector 0) bv) name))))
+             (let ((n (fxmin count (fx- (string-length text) pos))))
+               (sa-string-copy-range! str start text pos (fx+ pos n))
+               (set! pos (fx+ pos n))
+               n))
+           #f #f
+           (lambda () (close-port bp)))))
       ((or (string=? cs "iso-8859-1") (string=? cs "us-ascii"))
        (let ((top (if (string=? cs "us-ascii") 127 255))
              (buf (make-bytevector 4096)))
@@ -1331,7 +1397,9 @@
                    0
                    (do ((i 0 (fx+ i 1))) ((fx=? i n) n)
                      (let ((b (bytevector-u8-ref buf i)))
-                       ;; past 127 is not ASCII: U+FFFD, as decode-bytevector answers
+                       ;; past 127 is not ASCII: U+FFFD, as decode-bytevector
+                       ;; answers, or malformed to a reporting decoder
+                       (when (and report? (fx>? b top)) (charset-report-malformed 1))
                        (string-set! str (fx+ start i) (if (fx<=? b top) (integer->char b) #\xFFFD)))))))
            #f #f
            (lambda () (close-port bp)))
@@ -1424,23 +1492,28 @@
 (reg-ctor! '("FileInputStream" "java.io.FileInputStream")
   (lambda (src . _)
     (open-file-guarded src
-      (lambda (p) (make-in-stream (open-file-input-port p (file-options) (buffer-mode block)))))))
+      (lambda (p) (stream-classed! (make-in-stream (open-file-input-port p (file-options) (buffer-mode block)))
+                                   "java.io.FileInputStream")))))
 (reg-ctor! '("FileOutputStream" "java.io.FileOutputStream")
   (lambda (src . rest)
     (let ((append? (and (pair? rest) (jolt-truthy? (car rest)))))
       (open-file-guarded src
         (lambda (p)
-          (make-out-stream (open-file-output-port p
-                             (if append? (file-options no-fail no-truncate append) (file-options no-fail))
-                             (buffer-mode block))))))))
+          (stream-classed!
+            (make-out-stream (open-file-output-port p
+                               (if append? (file-options no-fail no-truncate append) (file-options no-fail))
+                               (buffer-mode block)))
+            "java.io.FileOutputStream"))))))
 (reg-ctor! '("ByteArrayInputStream" "java.io.ByteArrayInputStream")
   (lambda (bytes . rest)
     (let ((bv (src-bytevector bytes)))
-      (make-in-stream-markable (open-bytevector-input-port
-                       (if (>= (length rest) 2)
-                           (let ((off (jnum->exact (car rest))) (len (jnum->exact (cadr rest))))
-                             (let ((sub (make-bytevector len))) (bytevector-copy! bv off sub 0 len) sub))
-                           bv))))))
+      (stream-classed!
+        (make-in-stream-markable (open-bytevector-input-port
+                         (if (>= (length rest) 2)
+                             (let ((off (jnum->exact (car rest))) (len (jnum->exact (cadr rest))))
+                               (let ((sub (make-bytevector len))) (bytevector-copy! bv off sub 0 len) sub))
+                             bv)))
+        "java.io.ByteArrayInputStream"))))
 ;; --- java.io.RandomAccessFile -------------------------------------------------
 ;; state #(port writable?). One Chez file port serves both directions: "r" opens
 ;; an input port, "rw" (and "rws"/"rwd", which differ only in how eagerly the JDK
@@ -1610,9 +1683,10 @@
   jolt-nil)
 (register-host-methods! "print-stream"
   (list
-   (cons "print" (lambda (self x) (ps-emit self (writer-piece x))))
+   (cons "print" (lambda (self x) (ps-emit self (sink-text self (writer-piece x)))))
    (cons "println" (lambda (self . xs)
-                     (ps-emit-line self (if (null? xs) "\n" (string-append (writer-piece (car xs)) "\n")))))
+                     (ps-emit-line self (string-append (sink-text self (if (null? xs) "" (writer-piece (car xs))))
+                                                       "\n"))))
    ;; printf and format are the same call, and both answer the stream
    (cons "printf" (lambda (self a . rest)
                     (jvm-format-pieces a rest (lambda (piece) (ps-emit self piece)))
@@ -1671,7 +1745,7 @@
 ;; BufferedInputStream (markSupported true); honouring a mark on interactive
 ;; stdin would need replay buffering over fd 0 (see stdin-one-port-on-fd0), so
 ;; jolt answers false and reset throws cleanly. See known-divergences.edn.
-(define system-in-stream (make-jhost "in-stream" (vector 'stdin #f 0)))
+(define system-in-stream (stream-classed! (make-jhost "in-stream" (vector 'stdin #f 0)) "java.io.BufferedInputStream"))
 (define (sys-set-in! v)
   (for-each (lambda (c) (vector-set! (mutable-static-cell c "in" #t) 0 v))
             '("System" "java.lang.System"))
@@ -1930,15 +2004,19 @@
 (reg-ctor! '("ByteArrayOutputStream" "java.io.ByteArrayOutputStream")
   (lambda _
     (call-with-values open-bytevector-output-port
-      (lambda (port extract) (make-jhost "out-stream" (vector port extract (make-bytevector 0)))))))
+      (lambda (port extract)
+        (stream-classed! (make-jhost "out-stream" (vector port extract (make-bytevector 0)))
+                         "java.io.ByteArrayOutputStream")))))
 (reg-ctor! '("FileReader" "java.io.FileReader")
   (lambda (src . rest)   ; (FileReader. f) | (FileReader. f charset)
     (let ((cs (if (and (pair? rest) (ctor-charset? (car rest))) (charset-arg-name (car rest)) "UTF-8")))
       (open-file-guarded src
         (lambda (p)
           (let ((bp (open-file-input-port p (file-options) (buffer-mode block))))
-            (make-char-reader (guard (e (#t (close-port bp) (raise e)))
-                                (charset-input-port bp cs p)))))))))
+            (stream-classed!
+              (make-char-reader (guard (e (#t (close-port bp) (raise e)))
+                                  (charset-input-port bp cs p)))
+              "java.io.FileReader")))))))
 ;; (FileWriter. f), (FileWriter. f append), (FileWriter. f charset) and
 ;; (FileWriter. f charset append). The append flag was read as "the first extra
 ;; argument", so a Charset there opened the file for APPEND.
@@ -2065,11 +2143,18 @@
     (when (reader-jhost? in)
       (throw-jvm (quote IllegalArgumentException)
                  "InputStreamReader wraps an InputStream, not a Reader (it is already decoded)"))
-    (make-char-reader (charset-input-port (in-stream-source-port in)
-                                          (if (and (pair? rest) (ctor-charset? (car rest)))
-                                              (charset-arg-name (car rest))
-                                              "UTF-8")
-                                          "InputStreamReader"))))
+    ;; (InputStreamReader. in decoder) decodes as the CharsetDecoder is set to:
+    ;; REPORT, its default, refuses malformed input, where a charset replaces it.
+    (let ((decoder (and (pair? rest) (charset-decoder-jhost? (car rest)) (car rest))))
+      (stream-classed!
+        (make-char-reader (charset-input-port (in-stream-source-port in)
+                                              (cond (decoder (charset-name (decoder-charset decoder)))
+                                                    ((and (pair? rest) (ctor-charset? (car rest)))
+                                                     (charset-arg-name (car rest)))
+                                                    (else "UTF-8"))
+                                              "InputStreamReader"
+                                              (and decoder (decoder-reports-malformed? decoder))))
+        "java.io.InputStreamReader"))))
 ;; A byte port that hands each encoded block to the stream's OWN write method,
 ;; whatever kind of stream it is — a port-backed out-stream, a PrintStream, or a
 ;; proxy over one. Dispatching rather than writing to the stream's port directly
@@ -2094,14 +2179,32 @@
     (when (writer-jhost? out)
       (throw-jvm (quote IllegalArgumentException)
                  "OutputStreamWriter wraps an OutputStream, not a Writer (it already takes characters)"))
-    (make-charset-writer (out-stream-sink-port out)
-                         (if (and (pair? rest) (ctor-charset? (car rest)))
-                             (charset-arg-name (car rest))
-                             "UTF-8")
-                         out #f "java.io.OutputStreamWriter")))
-;; BufferedOutputStream — Chez ports are buffered already; the wrapper is the
-;; wrapped stream.
-(for-each (lambda (n) (register-class-ctor! n (lambda (inner . _) inner)))
+    ;; (OutputStreamWriter. out encoder): a CharsetEncoder reports what its
+    ;; charset cannot hold, where a charset writes "?".
+    (let ((encoder (and (pair? rest) (charset-encoder-jhost? (car rest)) (car rest))))
+      (make-reporting-charset-writer (out-stream-sink-port out)
+                                     (cond (encoder (charset-name (vector-ref (jhost-state encoder) 0)))
+                                           ((and (pair? rest) (ctor-charset? (car rest)))
+                                            (charset-arg-name (car rest)))
+                                           (else "UTF-8"))
+                                     out #f (and encoder #t) "java.io.OutputStreamWriter"))))
+;; BufferedOutputStream is its own stream, as on the JVM: (class x) is
+;; BufferedOutputStream, and bytes written to it reach the wrapped stream through
+;; that stream's own write when it flushes, closes or fills its 8192-byte buffer.
+;; Slot 5 holds the wrapped stream, which flush and close then go on to. It used
+;; to answer the wrapped stream itself (jolt-iad8f).
+(define (out-stream-filter-inner self)
+  (let ((st (jhost-state self)))
+    (and (fx>? (vector-length st) 5) (vector-ref st 5))))
+(define (make-buffered-out-stream inner . size)
+  (let ((n (if (pair? size) (jnum->exact (car size)) 8192)))
+    (when (<= n 0) (throw-jvm (quote IllegalArgumentException) "Buffer size <= 0"))
+    (stream-classed!
+      (make-jhost "out-stream"
+                  (vector (parameterize ((custom-port-buffer-size n)) (out-stream-sink-port inner))
+                          #f #f #f #f inner))
+      "java.io.BufferedOutputStream")))
+(for-each (lambda (n) (register-class-ctor! n make-buffered-out-stream))
           '("BufferedOutputStream" "java.io.BufferedOutputStream"))
 ;; A BufferedWriter is its own object, as on the JVM: it reports its class, and
 ;; what is written to it reaches the wrapped Writer when it flushes, closes or
@@ -2147,16 +2250,27 @@
 ;; replay layer, so the wrapper stays the wrapped stream and markSupported
 ;; stays false — the honest answer, and a known divergence (reset throws
 ;; instead of silently rewinding wrong). See known-divergences.edn.
+;; Over a port that cannot seek it is a stream of its own over the same port
+;; (not markable), so it still reports BufferedInputStream and closing it closes
+;; what it wraps; over a stream the program wrote, it reads through that
+;; stream's own read.
 (for-each (lambda (n)
             (register-class-ctor! n
               (lambda (inner . _)
-                (if (and (in-stream? inner)
-                         (let ((p (vector-ref (jhost-state inner) 0)))
-                           (and (port? p)
+                (cond
+                  ((in-stream? inner)
+                   (let ((p (vector-ref (jhost-state inner) 0)))
+                     (stream-classed!
+                       (if (and (port? p)
                                 (port-has-port-position? p)
-                                (port-has-set-port-position!? p))))
-                    (make-in-stream-markable (in-stream-port inner))
-                    inner))))
+                                (port-has-set-port-position!? p))
+                           (make-in-stream-markable p)
+                           (make-in-stream p))
+                       "java.io.BufferedInputStream")))
+                  ((user-in-stream? inner)
+                   (stream-classed! (make-in-stream (in-stream-source-port inner))
+                                    "java.io.BufferedInputStream"))
+                  (else inner)))))
           '("BufferedInputStream" "java.io.BufferedInputStream"))
 
 ;; --- java.io.PushbackInputStream ---------------------------------------------
@@ -2482,13 +2596,15 @@
 ;; BufferedInputStream, so mark/reset work on it; these streams' ports seek, so
 ;; they are made markable the way the BufferedInputStream ctor makes them.
 (define (jio-open-in-file-buffered fs-path given)
-  (make-in-stream-markable (in-stream-port (jio-open-in-file fs-path given))))
+  (jio-buffered-in (make-in-stream-markable (in-stream-port (jio-open-in-file fs-path given)))))
+(define (jio-buffered-in s) (stream-classed! s "java.io.BufferedInputStream"))
 (define (jio-input-stream x . opts)
   (io-opts-check! opts)
   (cond ((or (in-stream? x) (user-in-stream? x)) x)
         ((jfile? x) (jio-open-in-file-buffered (jfile-fs x) (jfile-path x)))
-        ((and (jolt-array? x) (eq? (jolt-array-kind x) 'byte)) (make-in-stream-markable (open-bytevector-input-port (na-bytearray->bv x))))
-        ((bytevector? x) (make-in-stream-markable (open-bytevector-input-port x)))
+        ((and (jolt-array? x) (eq? (jolt-array-kind x) 'byte)) (jio-buffered-in (make-in-stream-markable (open-bytevector-input-port (na-bytearray->bv x)))))
+        ((bytevector? x) (jio-buffered-in (make-in-stream-markable (open-bytevector-input-port x))))
+        ((uri-jhost? x) (apply jio-input-stream (uri->url x) opts))
         ((and (jhost? x) (string=? (jhost-tag x) "url"))
          (if (jar-path? (url-spec x))
              (jar-path-stream (url-spec x))
@@ -2499,9 +2615,7 @@
         ;; while the same call on a file: URL worked. The content is the source
         ;; string or a bytevector, whichever the embed stored.
         ((embedded-res? x)
-         (let ((c (embedded-res-content x)))
-           (make-in-stream (open-bytevector-input-port
-                            (if (bytevector? c) c (string->utf8 c))))))
+         (jio-buffered-in (make-in-stream (open-bytevector-input-port (embedded-res-bytes x)))))
         ;; an entry inside a jar on the roots streams out of the archive (io.ss)
         ((jar-path? x) (jar-path-stream x))
         ((string? x) (jio-open-in-file-buffered (io-source-path x) (if (file-url-string? x) (file-url->path x) x)))
@@ -2521,11 +2635,14 @@
            ;; inside the right class (jolt-g81).
            (open-path-guarded (file-path-of x) (path-of x)
              (lambda (p)
-               (make-out-stream (open-file-output-port p
-                                  (if append? (file-options no-fail no-truncate append) (file-options no-fail))
-                                  (buffer-mode block)))))))
+               (stream-classed!
+                 (make-out-stream (open-file-output-port p
+                                    (if append? (file-options no-fail no-truncate append) (file-options no-fail))
+                                    (buffer-mode block)))
+                 "java.io.BufferedOutputStream")))))
         ;; a file: URL writes its target, any other protocol raises (io.ss).
         ((url-jhost? x) (apply jio-output-stream (url-write-path x) rest))
+        ((uri-jhost? x) (apply jio-output-stream (uri->url x) rest))
         ;; System/out and System/err are already byte streams — pass them through,
         ;; the way an out-stream passes through.
         ((and (jhost? x) (text-sink-tag? (jhost-tag x))) x)
@@ -2546,7 +2663,18 @@
         (lambda (x . opts)
           (io-opts-check! opts)
           (let ((enc (io-encoding opts)))
+          ;; what io/reader opens is a BufferedReader on the JVM, and a Reader
+          ;; that is not one already is wrapped in one (make-reader)
+          (jio-buffered-reader x
           (cond
+            ((char-reader? x)
+             (if (and (stream-class x) (not (jch-isa? (stream-class x) "java.io.BufferedReader")))
+                 (make-reader-adapter x)
+                 x))
+            ((reader-adapter? x) x)
+            ((and (reader-jhost? x)
+                  (not (and (string=? (jhost-tag x) "string-reader") (string-reader-buffered? x))))
+             (make-reader-adapter x))
             ((in-stream? x) (make-char-reader (charset-input-port (in-stream-source-port x) enc "reader")))
             ;; a byte[] is a ByteArrayInputStream decoded as UTF-8 on the JVM.
             ;; It used to fall through to the seq arm in io.ss and read as the
@@ -2591,7 +2719,14 @@
             ((and (string? x) (not (jar-path? (io-source-path x))))
              (jio-file-char-reader (io-source-path x) (if (file-url-string? x) (file-url->path x) x)))
             ((socket-value? x) (apply jolt-io-reader (socket-stream x "getInputStream") opts))
-            (else (prev x)))))))
+            (else (prev x))))))))
+(define (jio-buffered-reader x r)
+  (cond ((eq? r x) r)
+        ((and (char-reader? r) (not (stream-class r))) (stream-classed! r "java.io.BufferedReader"))
+        ((and (jhost? r) (string=? (jhost-tag r) "string-reader")
+              (fx>? (vector-length (jhost-state r)) 3))
+         (vector-set! (jhost-state r) 3 #t) r)
+        (else r)))
 ;; A File, a path or a URL is an encoding writer over the stream io/output-stream
 ;; opens on it, which is the JVM's make-writer, so :append reaches the open and
 ;; the target is truncated -- or created, or refused -- when the writer is made.
@@ -2617,7 +2752,7 @@
                 ((user-out-stream? x)
                  (make-charset-writer (out-stream-sink-port x) enc x #f "java.io.BufferedWriter"))
                 ((user-writer? x) (make-buffered-writer x))
-                ((or (jfile? x) (string? x) (url-jhost? x))
+                ((or (jfile? x) (string? x) (url-jhost? x) (uri-jhost? x))
                  (let ((out (apply jio-output-stream x opts)))
                    (make-charset-writer (out-stream-port out) enc #f #t "java.io.BufferedWriter")))
                 ((socket-value? x) (apply jolt-io-writer (socket-stream x "getOutputStream") opts))
@@ -2764,11 +2899,12 @@
 
 ;; --- instance? for the java.io stream taxonomy ------------------------------
 (register-class-arm! in-stream?
-  (lambda (x) (cond ((in-stream-pushback x) "java.io.PushbackInputStream")
+  (lambda (x) (cond ((stream-class x))
+                    ((in-stream-pushback x) "java.io.PushbackInputStream")
                     ((in-stream-sequence-close x) "java.io.SequenceInputStream")
                     (else "java.io.InputStream"))))
-(register-class-arm! out-stream? (lambda (x) "java.io.OutputStream"))
-(register-class-arm! char-reader? (lambda (x) "java.io.Reader"))
+(register-class-arm! out-stream? (lambda (x) (or (stream-class x) "java.io.OutputStream")))
+(register-class-arm! char-reader? (lambda (x) (or (stream-class x) "java.io.Reader")))
 (register-class-arm! reader-adapter? (lambda (x) "java.io.BufferedReader"))
 (register-class-arm! char-writer? (lambda (x) (or (char-writer-class x) "java.io.Writer")))
 (register-instance-check-arm!
@@ -2780,6 +2916,14 @@
         ;; in-stream answers false to it, as a ByteArrayInputStream does
         ((and (string=? short "PushbackInputStream") (in-stream? val)) (and (in-stream-pushback val) #t))
         ((and (string=? short "SequenceInputStream") (in-stream? val)) (and (in-stream-sequence-close val) #t))
+        ;; a classed stream or reader answers from its class, as the JVM does: a
+        ;; ByteArrayInputStream is not a FileInputStream
+        ((and (or (in-stream? val) (out-stream? val) (char-reader? val)) (stream-class val))
+         => (lambda (cls)
+              (if (or (member short '("Closeable" "AutoCloseable"))
+                      (jch-isa? cls (symbol-t-name type-sym)))
+                  #t
+                  'pass)))
         ((and (in-stream? val) (member short '("InputStream" "FileInputStream" "ByteArrayInputStream"
                                                "BufferedInputStream" "FilterInputStream" "Closeable" "AutoCloseable"))) #t)
         ((and (out-stream? val) (member short '("OutputStream" "FileOutputStream" "ByteArrayOutputStream"
@@ -2961,7 +3105,7 @@
                 "piped-input"
                 (lambda (bv start count) (pipe-read! (unbox cell) bv start count))
                 #f #f (lambda () #f)))
-         (self (make-jhost "in-stream" (vector port #f 0 cell))))
+         (self (stream-classed! (make-jhost "in-stream" (vector port #f 0 cell)) "java.io.PipedInputStream")))
     (when (pair? rest) (pipe-connect! self (car rest)))
     self))
 
@@ -2971,7 +3115,7 @@
                 "piped-output"
                 (lambda (bv start count) (pipe-write! (unbox cell) bv start count))
                 #f #f (lambda () #f)))
-         (self (make-jhost "out-stream" (vector port #f #f cell))))
+         (self (stream-classed! (make-jhost "out-stream" (vector port #f #f cell)) "java.io.PipedOutputStream")))
     (when (pair? rest) (pipe-connect! self (car rest)))
     self))
 

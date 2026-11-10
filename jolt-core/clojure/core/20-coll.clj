@@ -50,11 +50,16 @@
 ;; println/prn append the newline. Defined this early because printf and the
 ;; print-str family below call them. (print-method as a real multimethod is a
 ;; separate project.)
-(defn pr-str [& xs]
-  (loop [out "" s (seq xs) first? true]
-    (if s
-      (recur (str out (if first? "" " ") (__pr-str1 (first s))) (next s) false)
-      out)))
+;; One value, the common call, renders straight through: the variadic loop's
+;; seq walk and string copies cost about as much as rendering a small value.
+(defn pr-str
+  ([] "")
+  ([x] (__pr-str1 x))
+  ([x & more]
+   (loop [out (__pr-str1 x) s (seq more)]
+     (if s
+       (recur (str out " " (__pr-str1 (first s))) (next s))
+       out))))
 
 ;; Each argument is its own write, and the space between two is an
 ;; (.append *out* \space) — the calls the reference's pr makes, which a Writer

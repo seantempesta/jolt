@@ -310,6 +310,126 @@
 ;; INSIDE it, from the R1/R2 marker lookup on its source object — the caller's
 ;; call site — so a rendered frame points at where it was when the error hit, not
 ;; where its fn was defined.
+;; --- jolt.debug: a frame's locals ---------------------------------------------
+;; While jolt-debug-frame-rows walks a continuation this holds an eq table, and
+;; jolt-frame-records puts each frame's locals in it, keyed by the logical frame
+;; vector the trace pipeline then carries through (gap fills add frames of their
+;; own, which have none). #f the rest of the time, so a trace pays nothing.
+(define jolt-debug-locals-sink (make-thread-parameter #f))
+
+;; The Clojure name back-end munge-name made IDENT from, or #f when munge-name
+;; cannot have made it: one of the back end's own temporaries (_ss$12, _dr$3),
+;; whose $ begins no escape, or a named-let label (loop12, fnrec3).
+(define (jolt-debug-demunge ident)
+  (let* ((s (if (and (fx>? (string-length ident) 2) (string=? (substring ident 0 2) "$R"))
+                (substring ident 2 (string-length ident))
+                ident))
+         (n (string-length s))
+         (label? (lambda (prefix)
+                   (let ((p (string-length prefix)))
+                     (and (fx>? n p) (string=? (substring s 0 p) prefix)
+                          (let digits ((i p))
+                            (or (fx=? i n)
+                                (and (char<=? #\0 (string-ref s i) #\9) (digits (fx+ i 1))))))))))
+    (and (fx>? n 0)
+         (not (label? "loop")) (not (label? "fnrec"))
+         (let loop ((i 0) (acc '()))
+           (cond
+             ((fx=? i n) (list->string (reverse acc)))
+             ((not (char=? (string-ref s i) #\$)) (loop (fx+ i 1) (cons (string-ref s i) acc)))
+             ((fx>=? (fx+ i 1) n) #f)
+             (else
+              (case (string-ref s (fx+ i 1))
+                ((#\$) (loop (fx+ i 2) (cons #\$ acc)))
+                ((#\P) (loop (fx+ i 2) (cons #\' acc)))
+                ((#\H) (loop (fx+ i 2) (cons #\# acc)))
+                ((#\V) (loop (fx+ i 2) (cons #\| acc)))
+                ((#\U) (let hex ((j (fx+ i 2)))
+                          (cond ((fx>=? j n) #f)
+                                ((char=? (string-ref s j) #\$)
+                                 (let ((cp (and (fx>? j (fx+ i 2))
+                                                (string->number (substring s (fx+ i 2) j) 16))))
+                                   (and cp (loop (fx+ j 1) (cons (integer->char cp) acc)))))
+                                (else (hex (fx+ j 1))))))
+                (else #f))))))))
+
+;; The frame of an anonymous fn literal that no def covers, jfn$<ns>/$<n>: a
+;; defmethod's body, a defrecord's or reify's method, a fn made at top level.
+;; The trace cannot name it, so it drops it. When the literal was compiled under
+;; :debug, its form's labels name it as jolt.profile does (ns/Type.method,
+;; ns/mm[dispatch]), else ns/fn--n, at the line the frame is at. #f otherwise.
+(define (jolt-debug-unnamed-frame nm io)
+  (and (string? nm)
+       (fx>? (string-length nm) 4) (string=? (substring nm 0 4) "jfn$")
+       (let* ((pair (srcreg-frame-source-pair io))
+              (entry (and pair (hashtable-ref jolt-debug-sources (car pair) #f))))
+         (and entry
+              (let* ((line (jolt-eval-source-line (car pair) (cdr pair)))
+                     (label (jolt-profile-label-at (vector-ref entry 2) line))
+                     (ns (vector-ref entry 1))
+                     (slash (and label
+                                 (let find ((i 0))
+                                   (cond ((fx=? i (string-length label)) #f)
+                                         ((char=? (string-ref label i) #\/) i)
+                                         (else (find (fx+ i 1)))))))
+                     (n (let find ((i (fx- (string-length nm) 1)))
+                          (cond ((fx<? i 0) "0")
+                                ((char=? (string-ref nm i) #\$)
+                                 (substring nm (fx+ i 1) (string-length nm)))
+                                (else (find (fx- i 1)))))))
+                (srcreg-frame nm
+                              (cond
+                                (slash
+                                 (vector (substring label 0 slash)
+                                         (substring label (fx+ slash 1) (string-length label))
+                                         (vector-ref entry 0) (or line 0)))
+                                (label
+                                 (vector ns label (vector-ref entry 0) (or line 0)))
+                                (else
+                                 (vector ns (string-append "fn--" n) (vector-ref entry 0) (or line 0))))
+                              line))))))
+
+;; A frame's jolt-dbg chain: code compiled under jolt.profile's :debug mode keeps
+;; one live in each frame (rt.ss), holding every param and local in scope by its
+;; Clojure name. The deepest is the innermost scope. #f in other code.
+(define (jolt-frame-io-dbg io)
+  (guard (e (#t #f))
+    (let ((n (io 'length)))
+      (let loop ((i 0) (best #f) (depth -1))
+        (if (fx=? i n)
+            best
+            (let ((val (((io 'ref i) 'ref) 'value)))
+              (if (and (jolt-dbg? val) (fx>? (jolt-dbg-depth val) depth))
+                  (loop (fx+ i 1) val (jolt-dbg-depth val))
+                  (loop (fx+ i 1) best depth))))))))
+;; Other code's locals: whatever Chez kept live in the frame, which is only what
+;; the code reads after the call it is paused in returns. As (name . value)
+;; pairs under their Clojure names, or #f for none.
+(define (jolt-frame-io-live io)
+  (guard (e (#t #f))
+    (let ((n (io 'length)))
+      (let loop ((i 0) (acc '()))
+        (if (fx=? i n)
+            (and (pair? acc) (reverse acc))
+            (let* ((v (io 'ref i)) (nm (v 'name)))
+              (cond
+                ((and (symbol? nm) (jolt-debug-demunge (symbol->string nm)))
+                 => (lambda (s) (loop (fx+ i 1) (cons (cons s ((v 'ref) 'value)) acc))))
+                (else (loop (fx+ i 1) acc)))))))))
+(define (jolt-dbg-within? outer inner)
+  (let loop ((d inner)) (and (jolt-dbg? d) (or (eq? d outer) (loop (jolt-dbg-parent d))))))
+;; The locals for a frame, given the chain PENDING that an unnamed frame just
+;; inside it left (or #f). A catch body and a try's body run in closures of
+;; their own (guard's and dynamic-wind's), which no trace names; a chain there
+;; that extends this frame's own is this fn's innermost scope. A chain that
+;; does not (an unnamed method body below a caller) is no one's here, and is
+;; dropped rather than shown as the caller's.
+(define (jolt-frame-locals io pending)
+  (let ((d (jolt-frame-io-dbg io)))
+    (cond ((and pending d (jolt-dbg-within? d pending)) (jolt-dbg-locals pending))
+          (d (jolt-dbg-locals d))
+          (else (jolt-frame-io-live io)))))
+
 (define (jolt-frame-records k)
   ;; read the env at call time, not load time: a built binary runs top-level forms
   ;; at heap-build time, where this would always be unset.
@@ -329,6 +449,25 @@
                                             (else ""))
                                       (srcreg-frame-source-debug io) "\n")
                        (current-error-port)))
+            ;; A jolt.debug walk names a debug-compiled fn literal no def covers
+            ;; (jolt-debug-unnamed-frame); the trace proper leaves it out.
+            (when (and (jolt-debug-locals-sink) (string? nm)
+                       (not (exists (lambda (f) (vector? (srcreg-frame-rec f))) fs))
+                       (not (srcreg-jfn-parts nm)))
+              (let ((f (jolt-debug-unnamed-frame nm io)))
+                (when f (set! fs (list f)))))
+            ;; jolt.debug reads the frame's locals while it has the frame: they
+            ;; go to the innermost logical frame, where execution is paused.
+            ;; An unnamed frame's chain waits for the frame it sits in.
+            (let ((sink (jolt-debug-locals-sink)))
+              (when sink
+                (if (pair? fs)
+                    (let ((ls (jolt-frame-locals io (hashtable-ref sink 'pending #f))))
+                      (hashtable-delete! sink 'pending)
+                      (when ls (eq-hashtable-set! sink (car fs) ls)))
+                    (unless (hashtable-ref sink 'pending #f)
+                      (let ((d (jolt-frame-io-dbg io)))
+                        (when d (hashtable-set! sink 'pending d)))))))
             ;; One PHYSICAL frame can stand for several logical ones when code
             ;; was spliced into it. They come back innermost first, and acc is
             ;; reversed on return, so each is consed IN ORDER — a left fold, not
@@ -579,9 +718,22 @@
 ;; INFO is (pos written ns): the form's own {:line :column :file?} position (or
 ;; nil), the form as the user wrote it and the ns it compiles in. Only the
 ;; profiler keeps them (jolt-profile-note-source!).
+;; jolt.debug's own record of a form compiled under :debug: name ->
+;; #(file ns labels), the labels as jolt-profile-form-labels gives them, so a
+;; frame of a fn literal no def covers (a defmethod's body, a record's method)
+;; can be named and placed. Kept and evicted with the marker table, under
+;; jolt-eval-source-mutex.
+(define jolt-debug-sources (make-hashtable string-hash string=?))
+(define (jolt-debug-source-entry pos written ns)
+  (let ((file (let ((v (if (pmap? pos) (jolt-get pos jolt-profile-kw-file jolt-nil) jolt-nil)))
+                (if (string? v) v #f))))
+    (and (string? ns)
+         (vector file ns (car (jolt-profile-form-labels written ns))))))
 (define (jolt-register-eval-marker-table! scm . info)
   (define prof (and (sa-profile-instrumenting?) (= (length info) 3)
                     (apply jolt-profile-source-entry scm info)))
+  (define dbg (and (jolt-debug-locals-instrumenting?) (= (length info) 3)
+                   (apply jolt-debug-source-entry info)))
   (jolt-lock! jolt-eval-source-mutex)
   (let ((name (string-append "jolt-eval-src-"
                              (number->string jolt-eval-source-counter)))
@@ -589,10 +741,13 @@
     (set! jolt-eval-source-counter (+ jolt-eval-source-counter 1))
     (when (fx>=? (hashtable-size jolt-eval-marker-registry) jolt-eval-source-max)
       (let ((old (jolt-eval-queue-pop!)))
-        (when old (hashtable-delete! jolt-eval-marker-registry old))))
+        (when old
+          (hashtable-delete! jolt-eval-marker-registry old)
+          (hashtable-delete! jolt-debug-sources old))))
     (hashtable-set! jolt-eval-marker-registry name table)
     (jolt-eval-queue-push! name)
     (when prof (jolt-profile-note-source! name prof))
+    (when dbg (hashtable-set! jolt-debug-sources name dbg))
     (jolt-unlock! jolt-eval-source-mutex)
     name))
 ;; Resolve an eval-path frame's (name . offset) to a clj line, or #f when the
@@ -772,27 +927,42 @@
   (when (fx=? 0 (fxmod jolt-profile-noted jolt-profile-pass-every))
     (jolt-profile-pass!)))
 
-;; Switch instrumentation for code compiled from now on. Turning it on also turns
-;; trace frames on, whatever JOLT_TRACE says: the markers they emit are what a
-;; counter's offset resolves against, and without them nothing could be mapped.
-;; Turning it off puts trace frames back as they were. #f when the target cannot
-;; instrument.
+;; Switch instrumentation for code compiled from now on. MODE is true for the
+;; counters, the keyword :debug for debug locals (jolt.debug: each fn's params and
+;; locals kept visible to its frame, backend set-debug-locals!), or false for
+;; neither; one mode at a time. Turning either on also turns trace frames on,
+;; whatever JOLT_TRACE says: the markers they emit are what a counter's offset
+;; resolves against, and what names a debug frame's fn and line. Turning it off
+;; puts trace frames back as they were. #f when the target cannot instrument.
 (define jolt-profile-trace-before #f)   ; #f, or (frames? . ring-on?) to restore
-(define (jolt-profile-instrument! on?)
-  (let ((on? (jolt-truthy? on?))
-        (stf (var-deref "jolt.backend-scheme" "set-trace-frames!")))
+(define (jolt-profile-debug-mode? mode)
+  (and (keyword-t? mode) (not (string? (keyword-t-ns mode)))
+       (string=? (keyword-t-name mode) "debug")))
+(define (jolt-profile-instrument! mode)
+  (let* ((debug? (jolt-profile-debug-mode? mode))
+         (on? (and (not debug?) (jolt-truthy? mode)))
+         (any? (or on? debug?))
+         (stf (var-deref "jolt.backend-scheme" "set-trace-frames!"))
+         (sdl (var-deref "jolt.backend-scheme" "set-debug-locals!")))
     (and (sa-profile-instrument! on?)
          (begin
+           (jolt-debug-locals-set! debug?)
+           (when (procedure? sdl) (sdl debug?))
            (cond
-             ((and on? (not jolt-profile-trace-before))
+             ((and any? (not jolt-profile-trace-before))
               (set! jolt-profile-trace-before (cons (jolt-ce-trace-frames?) jolt-trace-on?))
               (when (procedure? stf) (stf #t))
               (jolt-trace-enable!))
-             ((and (not on?) jolt-profile-trace-before)
+             ((and (not any?) jolt-profile-trace-before)
               (when (procedure? stf) (stf (car jolt-profile-trace-before)))
               (set! jolt-trace-on? (cdr jolt-profile-trace-before))
               (set! jolt-profile-trace-before #f)))
            #t))))
+;; :counts, :debug, or nil: what code compiled now carries.
+(define (jolt-profile-instrument-mode)
+  (cond ((sa-profile-instrumenting?) (jolt-keyword "counts"))
+        ((jolt-debug-locals-instrumenting?) (jolt-keyword "debug"))
+        (else jolt-nil)))
 
 ;; One source's counters CS as rows #(file line count owner name form-line top?
 ;; label wins?): file and line are where the expression's code was written (#f
@@ -963,7 +1133,9 @@
                         acc))))))))
 
 (def-var! "jolt.host" "profile-instrument!" jolt-profile-instrument!)
-(def-var! "jolt.host" "profile-instrumenting?" (lambda () (sa-profile-instrumenting?)))
+(def-var! "jolt.host" "profile-instrumenting?"
+  (lambda () (or (sa-profile-instrumenting?) (jolt-debug-locals-instrumenting?))))
+(def-var! "jolt.host" "profile-instrument-mode" jolt-profile-instrument-mode)
 (def-var! "jolt.host" "profile-clear!" (lambda () (jolt-profile-clear!) jolt-nil))
 (def-var! "jolt.host" "profile-sites" jolt-profile-sites)
 (def-var! "jolt.host" "profile-retired" jolt-profile-retired-lines)
@@ -1156,36 +1328,20 @@
               (else (loop caller (cons (cons caller line) acc)
                           (cons caller seen) (fx+ n 1)))))))))
 
-;; Staleness validation (R2's rule over the walk): the pair's fn must be
-;; absent from the live continuation, and is rejected only on POSITIVE
-;; registered disagreement — the walk unconnected AND the innermost
-;; continuation frame's registered callees naming none of the walked fns.
-;; A returned tail site's residue fails exactly this; a genuine pair behind
-;; a dynamic launcher survives via the no-evidence arm.
+;; Staleness validation (R2's rule over the walk): the pair's fn must be absent
+;; from the live continuation. That is all a throw's pair needs now. It is
+;; residue only if the tail call it records returned and nothing put the slot
+;; back, and every way back into the code that threw puts it back: a traced
+;; non-tail call restores it (backend site-restore), and so does an untraced
+;; one through a fn value (seq.ss jolt-invoke0..4, the callback boundary). The
+;; registered-callee test this used to apply instead rejected the genuine pair
+;; whenever the chain ran through a fn value -- (f) inside a try -- since nothing
+;; registered at the frame's line names the fn the value turned out to be
+;; (jolt-gqtdc), while a callback that returned into core before core threw got
+;; through it whenever the frame's line happened to name that callback.
 (define (jolt-site-valid? pair path connected? cont cont-names)
   (and (pair? pair)
-       (not (hashtable-ref cont-names (car pair) #f))
-       (or connected?
-           (null? cont)
-           ;; Two evidence tiers, because a CATCH context's frame can resolve
-           ;; to an imprecise line (the guard's establishment point): the
-           ;; precise line-keyed callees first, then the fn's callees at ANY
-           ;; line. Reject only when the fn is registered and neither tier
-           ;; names a walked fn — a returned tail site's residue fails exactly
-           ;; that; a genuine chain behind an imprecise line survives the
-           ;; fn-level tier.
-           (let* ((ctx (car cont))
-                  (fnm (srcreg-frame-nm ctx))
-                  (path-hit? (lambda (expected)
-                               (exists (lambda (p) (and (member (car p) expected) #t))
-                                       path)))
-                  (line-callees (jolt-callsite-callees fnm (srcreg-frame-line ctx)))
-                  (fn-callees (jolt-callsite-fn-callees fnm)))
-             (cond
-               ((and line-callees (path-hit? line-callees)) #t)
-               ((and fn-callees (path-hit? fn-callees)) #t)
-               ((or line-callees fn-callees) #f)
-               (else #t))))))
+       (not (hashtable-ref cont-names (car pair) #f))))
 
 ;; The positive half of jolt-site-valid?: the walk connected to a live frame, or
 ;; the innermost live frame's registered callees (at its line, else anywhere in
@@ -1395,7 +1551,7 @@
 ;; ambiguous frame would have to be invented, so it is left out.
 (define (ste-make cls method file line)
   (make-jhost "stack-trace-element" (vector cls method file line)))
-(define (ste? x) (and (jhost? x) (string=? (jhost-tag x) "stack-trace-element")))
+(define-jhost-tag-pred (ste? t) (string=? t "stack-trace-element"))
 (define (ste-field x i) (vector-ref (jhost-state x) i))
 
 (define (ste-base-name path)
@@ -1466,6 +1622,85 @@
 (define (jolt-throwable-backtrace-string v)
   (let ((recs (jolt-throwable-recs v)))
     (if (pair? recs) (jolt-render-recs recs) (jolt-backtrace-string v))))
+
+;; --- jolt.debug/frames and with-break-handler -----------------------------------
+;; A frame as jolt.debug reports it: (fn file line locals), for the frames
+;; getStackTrace would report (one that maps to registered Clojure source), with
+;; the locals jolt-frame-records found in it, or #f.
+(define (jolt-debug-frame-row f sink)
+  (let ((r (srcreg-frame-rec f))
+        (line (srcreg-frame-line f))
+        (locals (and sink (eq-hashtable-ref sink f #f))))
+    (cond
+      ((vector? r)
+       (list (string-append (vector-ref r 0) "/" (vector-ref r 1)) (vector-ref r 2)
+             (or line (vector-ref r 3)) locals))
+      ;; an anonymous fn: a named literal by its own name, else as Clojure
+      ;; demunges the JVM's ns$def$fn__n, ns/def/fn--n
+      ((srcreg-jfn-parts (srcreg-frame-nm f))
+       => (lambda (p)
+            (let ((rec (srcreg-record-for-fqn (string-append (car p) "/" (cadr p)))))
+              (list (or (srcreg-literal-display (srcreg-frame-nm f))
+                        (string-append (car p) "/" (cadr p) "/fn--" (caddr p)))
+                    (vector-ref rec 2) (or line (vector-ref rec 3)) locals))))
+      (else #f))))
+(define (jolt-debug-recs->rows recs sink)
+  (let loop ((fs recs) (acc '()))
+    (cond ((null? fs) (reverse acc))
+          ((jolt-debug-frame-row (car fs) sink) => (lambda (r) (loop (cdr fs) (cons r acc))))
+          (else (loop (cdr fs) acc)))))
+;; The frames continuation K stands for, read as a throw's are (SITE is the pair
+;; its throw stashed), with their locals.
+(define (jolt-debug-continuation-rows k site)
+  (let* ((sink (make-eq-hashtable))
+         (recs (parameterize ((jolt-debug-locals-sink sink))
+                 (guard (e (#t #f)) (jolt-continuation-recs/site k #f site)))))
+    (if (pair? recs) (jolt-debug-recs->rows recs sink) '())))
+;; A throwable's frames: from its own capture, the one getStackTrace reads, else
+;; (a host fault) from the continuation its raise carried. A capture resolved at
+;; the throw (a stack overflow's) has frames but no locals.
+(define (jolt-debug-throwable-rows raw)
+  (let ((cap (jolt-thrown-cont (jolt-unwrap-throw raw))))
+    (cond ((not cap)
+           (let ((k (jolt-error-continuation raw)))
+             (if k (jolt-debug-continuation-rows k (jolt-throw-site)) '())))
+          ((eq? (car cap) 'resolved) (jolt-debug-recs->rows (cdr cap) #f))
+          (else (jolt-debug-continuation-rows (car cap) (cdr cap))))))
+;; Rows as jolt data: [fn file line [[name value] ...]], nil for what is missing.
+(define (jolt-debug-rows->jolt rows)
+  (let ((nil-or (lambda (x) (if x x jolt-nil))))
+    (apply jolt-vector
+           (map (lambda (row)
+                  (jolt-vector (car row) (nil-or (cadr row)) (nil-or (caddr row))
+                               (apply jolt-vector
+                                      (map (lambda (p) (jolt-vector (car p) (cdr p)))
+                                           (or (cadddr row) '())))))
+                rows))))
+
+;; Run THUNK; when a throw escapes it, call (HANDLER throwable frames) on the
+;; throwing thread before the stack unwinds, then rethrow. The handler runs in
+;; the raise's own dynamic context (with-exception-handler, not guard), so the
+;; frames it is handed are still the live stack and it may block. A throw a
+;; catch inside THUNK handles never gets here. Unlike jolt.debug/frames, which
+;; follows the throwable's construction capture, the break handler always reads
+;; the active raise: a preconstructed throwable must show where it is thrown now,
+;; not a constructor frame that has already returned. The handler's continuation
+;; sits on top of that raise. A condition that is not serious (a warning) passes
+;; through untouched.
+(define (jolt-debug-break! handler c)
+  (let* ((v (jolt-unwrap-throw c))
+         (rows (call/cc (lambda (k) (jolt-debug-continuation-rows k (jolt-live-site))))))
+    (jolt-invoke handler v (jolt-debug-rows->jolt rows))))
+(define (jolt-debug-call-with-break handler thunk)
+  (with-exception-handler
+    (lambda (c)
+      (if (or (jolt-throw-condition? c) (serious-condition? c))
+          (begin (jolt-debug-break! handler c) (raise c))
+          (raise-continuable c)))
+    (lambda () (jolt-invoke thunk))))
+(def-var! "jolt.host" "debug-frames"
+  (lambda (t) (jolt-debug-rows->jolt (jolt-debug-throwable-rows t))))
+(def-var! "jolt.host" "debug-call-with-break" jolt-debug-call-with-break)
 
 (define (jolt-stack-trace-list k)
   (guard (e (#t '()))
@@ -1612,7 +1847,9 @@
 
 ;; Render the throwable, then its Clojure backtrace when one maps. The caller adds
 ;; any top-level source location (the runtime cli does; a built binary has none).
-(define (jolt-report-throwable v port)
+(define (jolt-report-throwable v0 port)
+  ;; a load-file's CompilerException reports the throw it wraps (cli-core.ss)
+  (define v (jolt-load-wrap-origin v0))
   (jolt-render-throwable v port)
   (let ((bt (jolt-backtrace-string v)))
     (when bt (display "  trace:\n" port) (display bt port))))
@@ -1670,16 +1907,27 @@
 ;; read error keeps its diagnostic position on its RuntimeException — and
 ;; printing that into its toString broke the text a caller builds from it, the
 ;; ReaderException's message first among them.
+;; A CompilerException's toString is its message alone, then its cause's message
+;; on a line of its own when the cause is an IExceptionInfo.
 (register-str-render! jolt-ex-info-record?
   (lambda (x)
     (let* ((class-name (jolt-ex-info-record-class-name x))
            (msg (jolt-ex-info-record-message x))
            (data (jolt-ex-info-record-data x)))
+      (if (equal? class-name "clojure.lang.Compiler$CompilerException")
+          (let ((c (jolt-ex-info-record-cause x)))
+            (string-append (if (jolt-nil? msg) "" (jolt-str-render-one msg))
+                           (if (and (jolt-ex-info-record? c)
+                                    (member (jolt-ex-info-record-class-name c)
+                                            '("clojure.lang.ExceptionInfo" "clojure.lang.Compiler$CompilerException")))
+                               (string-append "\n" (let ((m (jolt-ex-info-record-message c)))
+                                                      (if (jolt-nil? m) "null" (jolt-str-render-one m))))
+                               "")))
       (string-append class-name
                      (if (jolt-nil? msg) "" (string-append ": " (jolt-str-render-one msg)))
                      (if (or (jolt-nil? data) (not (equal? class-name "clojure.lang.ExceptionInfo")))
                          ""
-                         (string-append " " (jolt-pr-str data)))))))
+                         (string-append " " (jolt-pr-str data))))))))
 
 ;; count on ex-info / host throwable records throws UnsupportedOperationException
 ;; matching JVM: "count not supported on this type: <SimpleClassName>"

@@ -194,11 +194,17 @@
 ;; the java/ tree the Gambit boot excludes.
 (define (jolt-u32 x) (bitwise-and x #xFFFFFFFF))
 (define (jolt-s32 x) (let ((m (jolt-u32 x))) (if (>= m #x80000000) (- m #x100000000) m)))
+;; String.hashCode is over UTF-16 units, so an astral char adds both halves.
 (define (java-string-hash s)
   (let ((n (string-length s)))
     (let loop ((i 0) (h 0))
       (if (fx<? i n)
-          (loop (fx+ i 1) (jolt-s32 (+ (* 31 h) (char->integer (string-ref s i)))))
+          (let ((cp (char->integer (string-ref s i))))
+            (loop (fx+ i 1)
+                  (if (fx<? cp #x10000)
+                      (jolt-s32 (+ (* 31 h) cp))
+                      (jolt-s32 (+ (* 31 (jolt-s32 (+ (* 31 h) (astral-high-unit cp))))
+                                   (astral-low-unit cp))))))
           (jolt-s32 h)))))
 (define (java-hash-combine seed hash)
   (let* ((su (jolt-u32 seed))
@@ -265,9 +271,17 @@
     ;; a jrec is jolt-map? (so dot-coll?) — route it here directly, NOT through
     ;; record-method-dispatch, which would re-enter the .hashCode arm and loop. A
     ;; declared hashCode governs (flatland's types via APersistentMap/mapHash);
-    ;; else the structural record hash.
+    ;; else a record's is APersistentMap.mapHash over its entries, as defrecord's
+    ;; hashCode is, and a deftype's is Object.hashCode, its identity. Both used
+    ;; to answer the record hasheq.
     ((jrec? x) (let ((m (find-method-any-protocol (jrec-tag x) "hashCode")))
-                 (if m (call-declared-hash m x) (jrec-hash x))))
+                 (cond (m (call-declared-hash m x))
+                       ((jrec-record? x)
+                        (fold-left (lambda (a e)
+                                     (i32 (+ a (bitwise-xor (jolt-java-hashcode (car e))
+                                                            (jolt-java-hashcode (cdr e))))))
+                                   0 (jrec-entry-pairs x)))
+                       (else (jolt-identity-hasheq x)))))
     ;; any other sequential coll (a PersistentQueue) is a java.util.List
     ((jolt-sequential? x)
      (let loop ((s (jolt-seq x)) (h 1))

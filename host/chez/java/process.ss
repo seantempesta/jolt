@@ -998,6 +998,16 @@
   (open-bytevector-input-port (make-bytevector 0)))
 (define (proc-null-output-port)
   (make-custom-binary-output-port "process-null" (lambda (bv start n) n) #f #f #f))
+;; The streams getOutputStream / getInputStream / getErrorStream answer, as
+;; the JDK's classes: a pipe end on POSIX, a buffered stream over one on
+;; Windows, and ProcessBuilder's null stream for one that was redirected (PIPE
+;; is #f for those: the spawn made no pipe).
+(define proc-pipe-in-class "java.lang.ProcessImpl$ProcessPipeInputStream")
+(define proc-pipe-out-class "java.lang.ProcessImpl$ProcessPipeOutputStream")
+(define (proc-in-stream port pipe cls)
+  (stream-classed! (make-in-stream port) (if pipe cls "java.lang.ProcessBuilder$NullInputStream")))
+(define (proc-out-stream port pipe cls)
+  (stream-classed! (make-out-stream port) (if pipe cls "java.lang.ProcessBuilder$NullOutputStream")))
 
 ;; The pipe fds are not close-on-exec: macOS has no pipe2()/O_CLOEXEC (unlike
 ;; Linux), so FD_CLOEXEC can only be applied with a SEPARATE fcntl(F_SETFD)
@@ -2114,9 +2124,9 @@
              (let* ((child-stdin  (or cin  (proc-null-output-port)))
                     (child-stdout (or cout (proc-null-input-port)))
                     (child-stderr (or cerr (proc-null-input-port)))
-                    (pst (vector (make-out-stream child-stdin)
-                                 (make-in-stream child-stdout)
-                                 (make-in-stream child-stderr)
+                    (pst (vector (proc-out-stream child-stdin cin "java.io.BufferedOutputStream")
+                                 (proc-in-stream child-stdout cout "java.io.BufferedInputStream")
+                                 (proc-in-stream child-stderr cerr "java.io.BufferedInputStream")
                                  pid (box #f) (proc-pb-cmd self) (make-mutex)
                                  child-stdout child-stdin (box '()) (box #f)
                                  hproc)))
@@ -2137,9 +2147,9 @@
                 (let* ((child-stdin  (or cin  (proc-null-output-port)))
                        (child-stdout (or cout (proc-null-input-port)))
                        (child-stderr (or cerr (proc-null-input-port)))
-                       (pst (vector (make-out-stream child-stdin)
-                                    (make-in-stream child-stdout)
-                                    (make-in-stream child-stderr)
+                       (pst (vector (proc-out-stream child-stdin cin proc-pipe-out-class)
+                                    (proc-in-stream child-stdout cout proc-pipe-in-class)
+                                    (proc-in-stream child-stderr cerr proc-pipe-in-class)
                                     pid (box #f) (proc-pb-cmd self) (make-mutex)
                                     child-stdout child-stdin (box '()) (box #f))))
                   (make-jhost "process" pst))))))
@@ -2154,9 +2164,9 @@
                          (lambda () (sa-run-process (proc-build-shell-command self) #f))))
             (lambda (child-stdin child-stdout child-stderr pid)
               (let* ((latches (box '()))
-                     (pst (vector (make-out-stream child-stdin)
-                                  (make-in-stream child-stdout)
-                                  (make-in-stream child-stderr)
+                     (pst (vector (proc-out-stream child-stdin #t proc-pipe-out-class)
+                                  (proc-in-stream child-stdout #t proc-pipe-in-class)
+                                  (proc-in-stream child-stderr #t proc-pipe-in-class)
                                   pid (box #f) (proc-pb-cmd self) (make-mutex)
                                   child-stdout child-stdin latches (box #f))))
                 ;; INHERIT emulation fallback (no posix_spawn FFI): pump between

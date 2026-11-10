@@ -1,0 +1,13 @@
+## Stance on LLM Use in an Jolt
+
+There is a view that code written by hand must be more intentional, almost by definition, since it requires the maintainer to put it there personally. That is, of course, true, but once a project grows past a certain size or has multiple maintainers, no one really has the totality of the code in their heads. Any new code that is added is therefore always done with limited understanding. Code being written by hand should not be equated with faithfully expressing intent. If that were the case, we would never have software bugs. Humans make mistakes all the time, as is clearly evidenced by the abundance of buggy code that predates LLM use.
+
+It is simply not feasible for humans to keep the entirety of large projects in their heads all at once. When working on a project, one is constantly forgetting and relearning code along the way. The situation is even worse for projects where multiple people work together and no one knows what everyone else was thinking. We look at the code and try to build up sufficient context in our heads to make the necessary changes. When we misjudge that context or misunderstand existing code, we end up making mistakes.
+
+The reality is that neither code produced by a human nor code produced by an LLM can be trusted to be free of defects. The way we ensure software quality is through a solid development process. The focus has to be on ensuring the quality of the code through code reviews, specifications, testing, and other well established practices. All of these same tools work just as well with LLM-generated code as they do with code written by hand.
+
+The core skill in using these tools is the same as the skill needed when writing code manually. One has to understand the given requirement, the shape of the solution, and how to verify that the code produced actually matches the intent.
+
+What these tools do is automate the mechanical aspect of producing the code. Once it is written, you can read it, understand it, and change it as you would with any other code. The intention and the ideas come from the human using the tool, and new ways to automate the work of typing out code do not change the role or the responsibility of the developer.
+
+Focusing on how the code was produced rather than on the code itself dilutes the responsibility since blame should never be deflected to LLMs. The ownership of the code rests with the person submitting the code, and they must take responsibility for its quality and correctness. Either the code is clean and lives up to the standards of the project, or it will be rejected and the author will be asked to make changes to address the problems.

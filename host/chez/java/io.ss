@@ -30,11 +30,21 @@
 ;; "/srv/sh" names a directory on the current drive instead. POSIX has no root
 ;; to protect (FROM is 0 there), so "//a/b" still folds to "/a/b" as the JVM
 ;; does — the row win-path-test.ss already pins.
-(define (path-has-double-sep? p n from)
-  (let loop ((i (fxmax 1 from)))
-    (and (fx<? i n)
-         (or (and (char=? (string-ref p i) #\/) (char=? (string-ref p (fx- i 1)) #\/))
-             (loop (fx+ i 1))))))
+;;
+;; With NUL? the same pass also looks for a NUL anywhere in p and answers 'nul
+;; for one, so a java.nio Path (which refuses a NUL as it parses) pays no second
+;; scan for it; without, it stops at the first doubled separator. The walk is
+;; unchecked: p is a string and i stays below its length.
+(define (path-has-double-sep? p n from nul?)
+  (let ((lo (fxmax 1 from)))
+    (let loop ((i 0) (dbl #f) (prev-slash? #f))
+      (if (sa-ufx<? i n)
+          (let ((c (sa-ustring-ref p i)))
+            (cond ((and nul? (eq? c #\nul)) 'nul)
+                  ((and (eq? c #\/) prev-slash? (sa-ufx>=? i lo))
+                   (if nul? (loop (sa-ufx+ i 1) #t #t) #t))
+                  (else (loop (sa-ufx+ i 1) dbl (eq? c #\/)))))
+          dbl))))
 
 ;; May the trailing separator at index N-1 be dropped? Not when it IS the root:
 ;; "/" is a path rather than an empty one, and on Windows so is the drive root
@@ -89,18 +99,23 @@
 (define (fs-exception-message file other reason)
   (fs-exception-message-for (eq? (sa-os-family) 'windows) file other reason))
 
-(define (jolt-path-normalize-for windows? p0)
+(define (jolt-path-normalize-for windows? p0) (path-normalize* windows? p0 #f))
+;; The same, or 'nul when p0 holds a NUL (nio-file.ss npath-held-for).
+(define (jolt-path-normalize-for/nul windows? p0) (path-normalize* windows? p0 #t))
+(define (path-normalize* windows? p0 nul?)
   (define (trailing-sep-droppable? p n) (trailing-sep-droppable-for? windows? p n))
   (let* ((p (if windows? (path-backslashes->slashes p0) p0))
          (n (string-length p))
          ;; POSIX classifies nothing as a root here, so its answers are exactly
          ;; what they were; only Windows has a prefix to hold back.
          (root-end (if windows? (path-root-end #t p) 0)))
+    (let ((scan (path-has-double-sep? p n root-end nul?)))
     (cond
+      ((eq? scan 'nul) 'nul)
       ;; an already-normal path is the overwhelmingly common case, and a jfile is
       ;; built per entry on every directory listing: look before copying, so the
       ;; answer is p itself and nothing is allocated
-      ((not (path-has-double-sep? p n root-end))
+      ((not scan)
        (if (trailing-sep-droppable? p n)
            (substring p 0 (fx- n 1))
            p))
@@ -129,7 +144,7 @@
                (let ((c (string-ref p i)))
                  (cond ((and (char=? c #\/) prev-slash?) (loop (fx+ i 1) j #t))
                        (else (string-set! out j c)
-                             (loop (fx+ i 1) (fx+ j 1) (char=? c #\/))))))))))))
+                             (loop (fx+ i 1) (fx+ j 1) (char=? c #\/)))))))))))))
 (define (jolt-path-normalize p)
   (jolt-path-normalize-for (eq? (sa-os-family) 'windows) p))
 
@@ -141,14 +156,139 @@
 (define (file-path-of x) (if (jfile? x) (jfile-path x) (jolt-str-render-one x)))
 
 ;; Resources baked into a standalone binary by `jolt build` (deps.edn
-;; :jolt/build :embed). The build emits a register-embedded-resource! per file at
-;; heap-build time, so the contents live in the boot image — io/resource serves
+;; :jolt/build :embed). The build emits a register-public-embedded-resource! per
+;; file at heap-build time, so the contents live in the boot image — io/resource serves
 ;; them with no file on disk. An embedded hit reads through slurp/reader exactly
 ;; like a jfile would.
+;;
+;; The PUBLIC ones -- the project's and its dependencies' resources, not jolt's
+;; own runtime files -- are also an archive, the way an uberjar's are: a JarFile,
+;; a read-only NIO filesystem and jar: URLs over "jolt-embedded-resources.jar"
+;; (zip-file.ss, embedded-archive.ss, embedded-url.ss). Their names are kept as
+;; one sorted vector, built once, which is what directory questions search.
 (define embedded-resources (make-hashtable equal-hash equal?))
+(define public-embedded-resources (make-hashtable string-hash string=?))
+(define embedded-resource-index #f)
 (define (register-embedded-resource! name content)
   (hashtable-set! embedded-resources name content))
+(define (register-public-embedded-resource! name content)
+  (register-embedded-resource! name content)
+  (hashtable-set! public-embedded-resources name #t)
+  (set! embedded-resource-index #f))
+(define (embedded-resource-sorted)
+  (or embedded-resource-index
+      (let ((v (hashtable-keys public-embedded-resources)))
+        (vector-sort! string<? v)
+        (set! embedded-resource-index v)
+        v)))
+(define (embedded-resource-names) (vector->list (embedded-resource-sorted)))
+(define (embedded-public-resource? name) (hashtable-ref public-embedded-resources name #f))
+;; The first index whose name is not below KEY.
+(define (embedded-resource-lower-bound key)
+  (let ((v (embedded-resource-sorted)))
+    (let loop ((lo 0) (hi (vector-length v)))
+      (if (fx>=? lo hi)
+          lo
+          (let ((mid (fxsrl (fx+ lo hi) 1)))
+            (if (string<? (vector-ref v mid) key) (loop (fx+ mid 1) hi) (loop lo mid)))))))
+(define (embedded-string-prefix? prefix s)
+  (and (fx>=? (string-length s) (string-length prefix))
+       (string=? (substring s 0 (string-length prefix)) prefix)))
+;; The names under directory PREFIX (which ends in "/"), in order.
+(define (embedded-resources-under prefix)
+  (let ((v (embedded-resource-sorted)))
+    (let loop ((i (embedded-resource-lower-bound prefix)) (acc '()))
+      (if (and (fx<? i (vector-length v)) (embedded-string-prefix? prefix (vector-ref v i)))
+          (loop (fx+ i 1) (cons (vector-ref v i) acc))
+          (reverse acc)))))
+;; The directory NAME names, spelled with its trailing "/", when some public
+;; resource lives under it. A directory exists only by holding something, as in
+;; a jar written by the jar tool, so with nothing embedded there is none -- not
+;; even the root, which a jar has no entry for.
+(define (embedded-directory-name name)
+  (let ((n (string-length name)))
+    (and (fx>? n 0)
+         (let* ((prefix (if (char=? (string-ref name (fx- n 1)) #\/) name (string-append name "/")))
+                (v (embedded-resource-sorted))
+                (i (embedded-resource-lower-bound prefix)))
+           (and (fx<? i (vector-length v))
+                (embedded-string-prefix? prefix (vector-ref v i))
+                prefix)))))
+(define (embedded-directory? name) (and (embedded-directory-name name) #t))
+
+(define embedded-archive-name "jolt-embedded-resources.jar")
+(define embedded-archive-prefix "jar:file:jolt-embedded-resources.jar!/")
+
+;; Percent-encoding, the JDK's two ways. A class loader's resource URL is
+;; built by ParseUtil.encodePath: lowercase escapes, and ";" "=" "[" "]" are
+;; escaped too. A zipfs Path's toUri goes through the multi-argument URI
+;; constructor, which escapes only what a URI cannot hold, in uppercase, and
+;; leaves other non-ASCII characters as they are.
+(define (embedded-percent-encode s escape? upper?)
+  (let ((out (open-output-string))
+        (hex (if upper? "0123456789ABCDEF" "0123456789abcdef")))
+    (string-for-each
+     (lambda (c)
+       (if (escape? c)
+           (embedded-bytes-for-each
+            (lambda (b)
+              (write-char #\% out)
+              (write-char (string-ref hex (fxsrl b 4)) out)
+              (write-char (string-ref hex (fxand b 15)) out))
+            (string->utf8 (string c)))
+           (write-char c out)))
+     s)
+    (get-output-string out)))
+(define (embedded-bytes-for-each f bv)
+  (let loop ((i 0))
+    (when (fx<? i (bytevector-length bv))
+      (f (bytevector-u8-ref bv i))
+      (loop (fx+ i 1)))))
+(define (embedded-url-escape? c)
+  (let ((n (char->integer c)))
+    (or (fx<=? n #x20) (fx>=? n #x7F)
+        (memv c '(#\" #\# #\% #\; #\< #\= #\> #\? #\[ #\\ #\] #\^ #\` #\{ #\| #\})))))
+(define (embedded-uri-escape? c)
+  (let ((n (char->integer c)))
+    (if (fx<? n #x80)
+        (or (fx<=? n #x20) (fx=? n #x7F)
+            (memv c '(#\" #\# #\% #\< #\> #\\ #\^ #\` #\{ #\| #\})))
+        (or (char-whitespace? c) (eq? (char-general-category c) 'Cc)))))
+(define (embedded-url-encode name) (embedded-percent-encode name embedded-url-escape? #f))
+(define (embedded-uri-encode name) (embedded-percent-encode name embedded-uri-escape? #t))
+;; %XX sequences back to the UTF-8 text they spell.
+(define (embedded-percent-decode s)
+  (let ((n (string-length s)))
+    (if (not (exists (lambda (c) (char=? c #\%)) (string->list s)))
+        s
+        (let-values (((out extract) (open-bytevector-output-port)))
+          (let loop ((i 0))
+            (cond ((fx>=? i n)
+                   (utf8->string (extract)))
+                  ((and (char=? (string-ref s i) #\%) (fx<=? (fx+ i 3) n)
+                        (string->number (substring s (fx+ i 1) (fx+ i 3)) 16))
+                   => (lambda (b) (put-u8 out b) (loop (fx+ i 3))))
+                  (else (put-bytevector out (string->utf8 (string (string-ref s i))))
+                        (loop (fx+ i 1)))))))))
+
+;; A resource URL in the archive: the entry NAME (as asked for, or the
+;; multi-release entry the runtime version selects) and its bytes, or #f for a
+;; directory. Its text is the jar: URL a class loader would answer.
 (define-record-type embedded-res (fields name content) (nongenerative jolt-embres-v1))
+(define (embedded-res-url r) (string-append embedded-archive-prefix (embedded-url-encode (embedded-res-name r))))
+;; Its bytes; a directory entry has none, as a jar's directory entry has none.
+(define (embedded-res-bytes r)
+  (let ((c (embedded-res-content r)))
+    (cond ((bytevector? c) c) ((string? c) (string->utf8 c)) (else (make-bytevector 0)))))
+(define (embedded-resource-url name)
+  (cond
+    ((fx=? (string-length name) 0) #f)
+    ((let ((source (embedded-runtime-resource-name name)))
+       (and (embedded-public-resource? source) source))
+     => (lambda (source) (make-embedded-res source (embedded-resource-ref source))))
+    ((embedded-resource-ref name) => (lambda (content) (make-embedded-res name content)))
+    ((embedded-directory-name name) (make-embedded-res name #f))
+    (else #f)))
 ;; io/resource returns a java.net.URL from BOTH branches: a file: URL (a jhost
 ;; "url") for a hit on a source root, and this embedded-res (class java.net.URL,
 ;; protocol "jar") for a resource baked into a built binary. The two must answer the
@@ -158,28 +298,45 @@
 ;; it. Registered below (after record-method-dispatch's arm registry exists)
 ;; rather than inline, so both branches stay in one place.
 (define (embedded-res-method obj name args)
-  (let ((nm (embedded-res-name obj)))
+  (let* ((url (embedded-res-url obj))
+         (directory? (not (embedded-res-content obj)))
+         (file (substring url 4 (string-length url))))
     (cond
-      ((string=? name "getPath")     (list nm))
-      ((string=? name "getFile")     (list nm))
-      ((string=? name "getName")     (list (path-last-segment nm)))
-      ((string=? name "toString")    (list nm))
-      ;; embedded content has no file on disk; the JVM would report a jar: URL for
-      ;; a resource inside an artifact, so "jar" is the honest protocol here.
+      ((string=? name "getPath")     (list file))
+      ((string=? name "getFile")     (list file))
+      ((string=? name "getName")     (list (path-last-segment (embedded-res-name obj))))
+      ((string=? name "toString")    (list url))
       ((string=? name "getProtocol") (list "jar"))
       ((string=? name "exists")      (list #t))
-      ((string=? name "isDirectory") (list #f))
-      ((string=? name "isFile")      (list #t))
+      ((string=? name "isDirectory") (list directory?))
+      ((string=? name "isFile")      (list (not directory?)))
+      ((or (string=? name "equals") (string=? name "sameFile"))
+       (list (and (embedded-res? (car args))
+                  (string=? (embedded-res-name obj) (embedded-res-name (car args))))))
+      ((string=? name "hashCode")    (list (string-hash url)))
+      ((string=? name "getHost")     (list ""))
+      ((string=? name "getAuthority") (list jolt-nil))
+      ((or (string=? name "getPort") (string=? name "getDefaultPort")) (list -1))
+      ((or (string=? name "getQuery") (string=? name "getUserInfo") (string=? name "getRef")) (list jolt-nil))
+      ((string=? name "toExternalForm") (list url))
+      ((string=? name "toURI")      (list (uri-ctor url)))
+      ((string=? name "openConnection")
+       (begin
+         (when (pair? args)
+           (cond ((jolt-nil? (car args))
+                  (throw-jvm 'IllegalArgumentException "proxy can not be null"))
+                 ((not (and (jhost? (car args)) (string=? (jhost-tag (car args)) "proxy")))
+                  (throw-jvm 'ClassCastException "argument is not java.net.Proxy"))))
+         (list (embedded-url-open-connection obj))))
+      ((string=? name "getContent")
+       (embedded-jar-connection-method (embedded-url-open-connection obj) "getContent" args))
       ((string=? name "openStream")
        ;; A byte stream, not a reader: a URL's openStream is byte-level on the
        ;; JVM, and a baked resource can be binary (the same StringReader ->
        ;; InputStream fix url-open-stream records for file: URLs). io/reader
        ;; still decodes whatever it is handed.
-       (let ((c (embedded-res-content obj)))
-         (list (make-in-stream (open-bytevector-input-port
-                                (if (bytevector? c) c (string->utf8 c)))))))
+       (list (embedded-connection-stream (embedded-url-open-connection obj))))
       (else #f))))
-
 ;; --- self-contained build artifacts (jolt-eaj) ------------------------------
 ;; A toolchain-free `jolt build` (the distributed jolt) carries the Chez
 ;; petite/scheme boots and a prebuilt launcher stub baked into its own boot image.
@@ -375,15 +532,27 @@
         (let ((d (zipdir-for (file-url->path (car parts)))))
           (if (not d)
               (values #f #f)
-              (let ((ent (hashtable-ref (zipdir-table d) (uri-decode-lenient (cdr parts)) #f)))
+              ;; a directory answers to its name without the "/", as
+              ;; ZipFile.getEntry looks it up
+              (let ((ent (zipdir-lookup d (uri-decode-lenient (cdr parts)))))
                 (if ent (values d ent) (values #f #f))))))))
+;; A jar path into the image's own archive ("jar:file:jolt-embedded-resources.jar
+;; !/name", the URL io/resource hands out in a built binary) names an embedded
+;; resource, not a file: its resource URL, or #f.
+(define (embedded-jar-path-res p)
+  (let ((parts (jar-path-split p)))
+    (and parts
+         (string=? (car parts) embedded-archive-name)
+         (embedded-resource-url (embedded-percent-decode (cdr parts))))))
 (define (jar-path-exists? p)
-  (let-values (((d ent) (jar-path-entry p))) (and ent #t)))
+  (or (and (embedded-jar-path-res p) #t)
+      (let-values (((d ent) (jar-path-entry p))) (and ent #t))))
 ;; The entry's bytes, or #f when the path names no entry. A damaged entry raises
 ;; the ZipException the read finds, with the path in it.
 (define (jar-path-bytes p)
   (let-values (((d ent) (jar-path-entry p)))
-    (and ent
+    (if (not ent)
+        (let ((r (embedded-jar-path-res p))) (and r (embedded-res-bytes r)))
          (guard (e ((jolt-throw-condition? e)
                     (let ((v (jolt-throw-condition-value e)))
                       (if (ex-info-map? v)
@@ -528,6 +697,14 @@
 (define (jfile-path-absolute? p)
   (jfile-path-absolute-for? (eq? (sa-os-family) 'windows) p))
 
+;; BASE joined to the relative P with one separator: a base that already ends in
+;; one -- the root directory "/" -- does not get a second, which made "/src" into
+;; "//src" and its URL file://src/, a host named "src".
+(define (path-under base p)
+  (let ((n (string-length base)))
+    (if (and (> n 0) (memv (string-ref base (- n 1)) '(#\/ #\\)))
+        (string-append base p)
+        (string-append base "/" p))))
 (define (project-relative p)
   (cond
     ((or (= (string-length p) 0) (jfile-path-absolute? p)) p)
@@ -557,7 +734,7 @@
      (let ((base (jolt-user-dir)))
        ;; "." adds nothing the OS won't do itself when it resolves a relative
        ;; path — leave it alone rather than prefixing "./".
-       (if (string=? base ".") p (string-append base "/" p))))))
+       (if (string=? base ".") p (path-under base p))))))
 
 ;; (io/file path) / (io/file parent child) — join children with "/". The File
 ;; keeps the path AS GIVEN (like the JVM: new File("rel").getPath() is "rel");
@@ -748,6 +925,51 @@
 (define (jfile->uri-spec p)
   (string-append "file:" (uri-quote-path (file-uri-path (jfile-uri-path p)))))
 (define (jfile->uri p) (uri-parse (jfile->uri-spec p)))
+;; Path.toUri is NOT File.toURI (jolt-lang/jolt#1467). The JDK's default
+;; filesystem has its own builder: on Unix, UnixUriUtils.toUri writes
+;; "file:///" and then the absolute path's bytes, each one outside the RFC 2396
+;; path set (unreserved, ":@&=+$," and ";/") as an uppercase %XX -- so the
+;; authority is present but empty, and non-ASCII is escaped as UTF-8 bytes where
+;; File.toURI leaves it raw. On Windows, WindowsUriSupport keeps File.toURI's
+;; quoting but writes the empty authority too ("file:///C:/a"), and a UNC host
+;; becomes the authority ("file://srv/sh/").
+(define (nio-uri-path-byte-ok? b)
+  (or (and (fx>=? b 97) (fx<=? b 122)) (and (fx>=? b 65) (fx<=? b 90)) (and (fx>=? b 48) (fx<=? b 57))
+      (memv (integer->char b)
+            '(#\- #\_ #\. #\! #\~ #\* #\' #\( #\) #\: #\@ #\& #\= #\+ #\$ #\, #\; #\/))))
+(define (nio-uri-path-encode s)
+  (let ((bv (string->utf8 s)) (out (open-output-string)))
+    (do ((i 0 (fx+ i 1))) ((fx=? i (bytevector-length bv)) (get-output-string out))
+      (let ((b (bytevector-u8-ref bv i)))
+        (if (nio-uri-path-byte-ok? b)
+            (write-char (integer->char b) out)
+            (begin (write-char #\% out) (put-string out (uri-hex2 b))))))))
+;; ABS is absolute, a directory's already ending in its separator.
+(define (nio-path-uri-spec-for windows? abs)
+  (let ((path (file-uri-path-for windows? abs)))
+    (cond ((not windows?) (string-append "file://" (nio-uri-path-encode path)))
+          ((and (>= (string-length path) 4) (string=? (substring path 0 4) "////"))
+           (string-append "file:" (uri-quote-path (substring path 2 (string-length path)))))
+          (else (string-append "file://" (uri-quote-path path))))))
+(define (nio-path->uri windows? p)
+  (uri-parse (nio-path-uri-spec-for windows? (jfile-uri-path p))))
+;; URI.toASCIIString: the string form with every non-ASCII character, NFC
+;; normalized, as its UTF-8 bytes in uppercase %XX (jolt-lang/jolt#1468). ASCII
+;; is untouched -- the URI already quoted what ASCII it cannot hold.
+(define (uri-ascii-string s)
+  (let ((n (string-length s)))
+    (let scan ((i 0))
+      (cond ((fx=? i n) s)
+            ((fx<? (char->integer (string-ref s i)) #x80) (scan (fx+ i 1)))
+            (else
+             (let ((out (open-output-string)))
+               (string-for-each
+                (lambda (c)
+                  (if (fx<? (char->integer c) #x80)
+                      (write-char c out)
+                      (put-string out (uri-percent-encode c))))
+                (string-normalize-nfc s))
+               (get-output-string out)))))))
 ;; File.toURL: the same URL unencoded, as the JDK's (deprecated) toURL spells it.
 (define (jfile->url-spec p)
   (string-append "file:" (file-uri-path (jfile-uri-path p))))
@@ -842,12 +1064,34 @@
 ;; specifically: File.exists answers false rather than raising, and
 ;; getAbsolutePath hands the NUL straight back. So this belongs here and not in
 ;; jfile-abs, which those two go through.
+;; It runs ahead of every File query and file open, so the walk is unchecked:
+;; the string? test leaves only the index, which stays below the length, and
+;; the checked string-ref made it ~4x slower.
+(define (jfile-nul? p)
+  (and (string? p)
+       (let ((n (string-length p)))
+         (let loop ((i 0))
+           (and (sa-ufx<? i n)
+                (or (eq? (sa-ustring-ref p i) #\nul)
+                    (loop (sa-ufx+ i 1))))))))
 (define (jfile-nul-free! p)
-  (when (let loop ((i 0))
-          (cond ((>= i (string-length p)) #f)
-                ((char=? (string-ref p i) #\nul) #t)
-                (else (loop (+ i 1)))))
+  (when (jfile-nul? p)
     (throw-jvm (quote java.io.IOException) "Invalid file path")))
+
+;; What a File whose path holds a NUL answers to the methods that ask the file
+;; system, File.isInvalid's answers: nothing exists, nothing changes. Asking the
+;; OS instead asked about the path's text BEFORE the NUL, where a C string ends,
+;; so (.delete (File. "notes.txt\0x")) deleted notes.txt. createNewFile raises
+;; (jfile-nul-free!), as the JVM's does.
+(define jfile-invalid-answers
+  (let ((t (make-hashtable string-hash string=?)))
+    (for-each (lambda (m) (hashtable-set! t m #f))
+              '("exists" "isDirectory" "isFile" "isHidden" "canRead" "canWrite"
+                "canExecute" "mkdir" "mkdirs" "delete" "renameTo" "setReadable"
+                "setWritable" "setExecutable" "setReadOnly" "setLastModified"))
+    (for-each (lambda (m) (hashtable-set! t m 0)) '("length" "lastModified"))
+    (for-each (lambda (m) (hashtable-set! t m jolt-nil)) '("list" "listFiles"))
+    t))
 
 ;; The directory half of an output path: "/a/b" -> "/a", "/a" -> "/", and #f for
 ;; a root or a bare name, which have nothing above them to create. Its callers
@@ -1568,7 +1812,7 @@
   (let ((st (jhost-state u)))
     (and (> (vector-length st) 1)
          (let ((h (vector-ref st 1))) (and (not (jolt-nil? h)) h)))))
-(define (url-jhost? x) (and (jhost? x) (string=? (jhost-tag x) "url")))
+(define-jhost-tag-pred (url-jhost? t) (string=? t "url"))
 ;; The path component: the spec without its scheme, and without an authority when
 ;; one is present. "https://example.com/a.html" -> "/a.html", "file:/a/b" -> "/a/b"
 ;; (a file: URL keeps giving the filesystem path callers read it for).
@@ -1645,19 +1889,155 @@
 ;;   (URL. context spec)             context a URL or nil
 ;;   (URL. context spec handler)
 ;;   (URL. protocol host file)       three strings
-;; A relative spec resolves against the context's directory; an absolute one
-;; ignores the context, as on the JVM.
+;; A relative spec resolves against the context, as the protocol's handler
+;; parses it (URLStreamHandler.parseURL, and the jar handler's own for a jar:
+;; context); an absolute one ignores the context, as on the JVM. The context is
+;; either kind of java.net.URL: a "url" jhost or a resource in the image's
+;; archive.
 (define (url-resolve-spec context spec)
   (if (or (jolt-nil? context) (not context)
           ;; absolute: it carries its own scheme
           (let ((i (proto-colon-index spec))) (and i (> i 0))))
       spec
-      (let* ((base (url-spec context))
-             (cut (let loop ((j (- (string-length base) 1)))
-                    (cond ((< j 0) #f)
-                          ((char=? (string-ref base j) #\/) j)
-                          (else (loop (- j 1)))))))
-        (string-append (if cut (substring base 0 (+ cut 1)) base) spec))))
+      (let* ((base (cond ((url-jhost? context) (url-spec context))
+                         ((embedded-res? context) (embedded-res-url context))
+                         (else (throw-jvm 'ClassCastException
+                                          (string-append "class " (jolt-class-name context)
+                                                         " cannot be cast to class java.net.URL")))))
+             (hash (url-char-index spec #\# 0))
+             (ref (and hash (substring spec (+ hash 1) (string-length spec))))
+             (spec (if hash (substring spec 0 hash) spec))
+             (base-hash (url-char-index base #\# 0))
+             (bare (if base-hash (substring base 0 base-hash) base))
+             (resolved (cond ((and (string=? spec "") ref) bare)       ; a new ref, the rest kept
+                             ((string=? (url-protocol base) "jar") (url-resolve-jar bare spec))
+                             ((string=? spec "") base)                   ; the context, ref and all
+                             (else (url-resolve-hierarchical bare spec)))))
+        (if ref (string-append resolved "#" ref) resolved))))
+(define (url-char-index s c from)
+  (let loop ((i from))
+    (cond ((>= i (string-length s)) #f)
+          ((char=? (string-ref s i) c) i)
+          (else (loop (+ i 1))))))
+(define (url-last-index s c)
+  (let loop ((i (- (string-length s) 1)))
+    (cond ((< i 0) #f) ((char=? (string-ref s i) c) i) (else (loop (- i 1))))))
+(define (url-string-index s sub from)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i from))
+      (cond ((> (+ i m) n) #f)
+            ((string=? (substring s i (+ i m)) sub) i)
+            (else (loop (+ i 1)))))))
+;; The "/" of the last "!/" (the jar handler's indexOfBangSlash), or #f.
+(define (url-bang-slash s)
+  (let loop ((i (- (string-length s) 2)))
+    (cond ((< i 0) #f)
+          ((and (char=? (string-ref s i) #\!) (char=? (string-ref s (+ i 1)) #\/)) (+ i 1))
+          (else (loop (- i 1))))))
+(define (url-ends-with? s suffix)
+  (let ((n (string-length s)) (m (string-length suffix)))
+    (and (>= n m) (string=? (substring s (- n m) n) suffix))))
+;; jar: (the jar handler's parseContextSpec, then ParseUtil.canonizeString over
+;; what follows the "!/"): a spec starting "/" replaces the entry, anything
+;; else is resolved against the entry's directory, and "." and ".." segments go.
+(define (url-resolve-jar base spec)
+  (define (malformed msg) (jolt-throw (jolt-host-throwable "java.net.MalformedURLException" msg)))
+  (let* ((ctx (substring base 4 (string-length base)))
+         (ctx (if (and (> (string-length spec) 0) (char=? (string-ref spec 0) #\/))
+                  (let ((bang (url-bang-slash ctx)))
+                    (unless bang (malformed (string-append "malformed context url:" base ": no !/")))
+                    (substring ctx 0 bang))
+                  (let ((slash (url-last-index ctx #\/)))
+                    (unless slash (malformed (string-append "malformed context url:" base)))
+                    (substring ctx 0 (+ slash 1)))))
+         (file (string-append ctx spec))
+         (bang (or (url-bang-slash file) (malformed "no !/ in spec"))))
+    (string-append "jar:" (substring file 0 bang)
+                   (url-canonize-jar (substring file bang (string-length file))))))
+(define (url-canonize-jar file)
+  (let* ((file (let loop ((file file))
+                 (let ((i (url-string-index file "/../" 0)))
+                   (if (not i)
+                       file
+                       (let ((lim (and (> i 0) (url-last-index (substring file 0 i) #\/))))
+                         (loop (if lim
+                                   (string-append (substring file 0 lim) (substring file (+ i 3) (string-length file)))
+                                   (substring file (+ i 3) (string-length file)))))))))
+         (file (let loop ((file file))
+                 (let ((i (url-string-index file "/./" 0)))
+                   (if i
+                       (loop (string-append (substring file 0 i) (substring file (+ i 2) (string-length file))))
+                       file))))
+         (file (let loop ((file file))
+                 (if (url-ends-with? file "/..")
+                     (let* ((i (url-string-index file "/.." 0))
+                            (lim (and (> i 0) (url-last-index (substring file 0 i) #\/))))
+                       (loop (if lim (substring file 0 (+ lim 1)) (substring file 0 i))))
+                     file))))
+    (if (url-ends-with? file "/.") (substring file 0 (- (string-length file) 1)) file)))
+;; Every other protocol (URLStreamHandler.parseURL): "//" brings its own
+;; authority, a spec starting "/" replaces the path, "?" only the query, and a
+;; relative path joins the context's directory; then "." segments go and each
+;; ".." takes the segment before it, as far as there is one.
+(define (url-resolve-hierarchical base spec)
+  (let* ((colon (url-char-index base #\: 0))
+         (scheme (substring base 0 (+ colon 1)))
+         (rest (substring base (+ colon 1) (string-length base)))
+         (auth-end (if (and (>= (string-length rest) 2) (string=? (substring rest 0 2) "//"))
+                       (let loop ((i 2))
+                         (cond ((>= i (string-length rest)) i)
+                               ((memv (string-ref rest i) '(#\/ #\?)) i)
+                               (else (loop (+ i 1)))))
+                       0))
+         (authority (substring rest 0 auth-end))
+         (rest (substring rest auth-end (string-length rest)))
+         (q (url-char-index rest #\? 0))
+         (base-path (if q (substring rest 0 q) rest))
+         (base-query (and q (substring rest q (string-length rest))))
+         (sq (url-char-index spec #\? 0))
+         (spec-path (if sq (substring spec 0 sq) spec))
+         (spec-query (and sq (substring spec sq (string-length spec)))))
+    (cond
+      ((and (>= (string-length spec) 2) (string=? (substring spec 0 2) "//"))
+       (string-append scheme spec))
+      ;; a query alone keeps the context's directory
+      ((string=? spec-path "")
+       (let ((slash (url-last-index base-path #\/)))
+         (string-append scheme authority (if slash (substring base-path 0 (+ slash 1)) base-path)
+                        (or spec-query base-query ""))))
+      (else
+       (let ((path (if (char=? (string-ref spec-path 0) #\/)
+                       spec-path
+                       (let ((slash (url-last-index base-path #\/)))
+                         (string-append (if slash (substring base-path 0 (+ slash 1))
+                                            (if (string=? authority "") "" "/"))
+                                        spec-path)))))
+         (string-append scheme authority (url-normalize-path path) (or spec-query "")))))))
+(define (url-normalize-path path)
+  (let* ((path (let loop ((path path))
+                 (let ((i (url-string-index path "/./" 0)))
+                   (if i
+                       (loop (string-append (substring path 0 i) (substring path (+ i 2) (string-length path))))
+                       path))))
+         (path (let loop ((path path) (from 0))
+                 (let ((i (url-string-index path "/../" from)))
+                   (if (not i)
+                       path
+                       (let ((lim (and (> i 0) (url-last-index (substring path 0 i) #\/))))
+                         ;; the JDK's test, verbatim: only a "/../" at the very start stays
+                         (if (and lim (not (eqv? (url-string-index path "/../" lim) 0)))
+                             (loop (string-append (substring path 0 lim) (substring path (+ i 3) (string-length path))) 0)
+                             (loop path (+ i 3))))))))
+         (path (let loop ((path path))
+                 (if (url-ends-with? path "/..")
+                     (let* ((i (url-string-index path "/.." 0))
+                            (lim (and (> i 0) (url-last-index (substring path 0 i) #\/))))
+                       (if lim (loop (substring path 0 (+ lim 1))) path))
+                     path)))
+         (path (if (and (> (string-length path) 2) (string=? (substring path 0 2) "./"))
+                   (substring path 2 (string-length path))
+                   path)))
+    (if (url-ends-with? path "/.") (substring path 0 (- (string-length path) 1)) path)))
 (define (proto-colon-index spec)
   (let loop ((j 0))
     (cond ((>= j (string-length spec)) #f)
@@ -1675,13 +2055,20 @@
            (file (jolt-str-render-one (caddr args))))
        (make-url (url-canonical (string-append proto "://" host file)))))
     ((= (length args) 1)
-     (make-url (url-canonical (jolt-str-render-one (car args)))))
+     (let ((spec (jolt-str-render-one (car args))))
+       ;; a URL into the image's own archive is the resource it names
+       (or (embedded-jar-path-res spec)
+           (make-url (url-canonical spec)))))
     ;; (URL. context spec [handler])
     (else
      (let* ((context (car args))
             (spec (jolt-str-render-one (cadr args)))
-            (handler (and (>= (length args) 3) (caddr args))))
-       (make-url (url-canonical (url-resolve-spec context spec)) handler)))))
+            (handler (and (>= (length args) 3) (caddr args)))
+            (resolved (url-resolve-spec context spec)))
+       ;; a URL into the image's own archive is the resource it names, as the
+       ;; one-argument form makes it
+       (or (and (not handler) (embedded-jar-path-res resolved))
+           (make-url (url-canonical resolved) handler))))))
 (register-class-ctor! "URL" jolt-make-url)
 (register-class-ctor! "java.net.URL" jolt-make-url)
 ;; (str url) is the spec, like the JVM — without this it renders the opaque
@@ -1704,7 +2091,9 @@
         ;; protocol has no local backing and raises (the JVM would connect or read
         ;; the jar), never empty content.
         (cons "openConnection" (lambda (self . _) (url-open-connection self)))
-        (cons "openStream"     (lambda (self) (url-open-stream self)))))
+        (cons "openStream"     (lambda (self) (url-open-stream self)))
+        ;; URL.toURI: the URI its text parses to
+        (cons "toURI"          (lambda (self) (uri-ctor (url-spec self))))))
 ;; openStream hands back an InputStream, like the JVM (a file: URL there is a
 ;; FileInputStream behind a BufferedInputStream). It used to answer a StringReader
 ;; -- content-correct, but the wrong half of the io hierarchy, so the documented
@@ -1730,15 +2119,20 @@
 ;; opens it; a path with no such entry is java.io.FileNotFoundException.
 (define (jar-path-stream p)
   (let-values (((d ent) (jar-path-entry p)))
-    (if ent (zipdir-entry-stream-owned d ent) (jar-path-missing p))))
+    (cond (ent (zipdir-entry-stream-owned d ent))
+          ((embedded-jar-path-res p)
+           => (lambda (r) (make-in-stream (open-bytevector-input-port (embedded-res-bytes r)))))
+          (else (jar-path-missing p)))))
 ;; The handler's own openConnection. Without one there is nothing to connect
 ;; through — say so rather than returning something that reads as empty.
 (define (url-open-connection u)
   (let ((h (url-handler u)))
-    (if h
-        (record-method-dispatch h "openConnection" (jolt-list u))
-        (throw-jvm (quote java.io.IOException)
-                   (string-append "no protocol handler for: " (url-spec u))))))
+    (cond
+      (h (record-method-dispatch h "openConnection" (jolt-list u)))
+      ;; a jar: URL is a JarURLConnection onto the jar (embedded-url.ss)
+      ((jar-path? (url-spec u)) (embedded-url-open-connection u))
+      (else (throw-jvm (quote java.io.IOException)
+                       (string-append "no protocol handler for: " (url-spec u)))))))
 ;; (instance? java.net.URL x): the url jhost and an embedded-res (the jar: branch of
 ;; io/resource) both report java.net.URL. records-interop's case-string has no URL
 ;; arm, so answer it here where the two types live.
@@ -1813,6 +2207,10 @@
       ;; File.toURI returns a java.net.URI (JVM), not a String.
       ((string=? name "toURI")          (list (jfile->uri fp)))
       ((string=? name "toURL")          (list (make-url (jfile->url-spec fp))))
+      ;; a method that asks the file system, on a path holding a NUL
+      ;; (jfile-invalid-answers); the path-only methods above skip the lookup
+      ((and (jfile-nul? fp) (hashtable-contains? jfile-invalid-answers name))
+       (list (hashtable-ref jfile-invalid-answers name #f)))
       ((string=? name "exists")         (list (if (file-exists? fp) #t #f)))
       ((string=? name "isDirectory")    (list (if (file-directory? fp) #t #f)))
       ;; a regular file, as File.isFile is: a FIFO, a socket or a device is neither
@@ -1846,10 +2244,12 @@
        (list (guard (e (#t #f))
                (set-file-mtime-millis! fp (exact (floor (car args)))))))
       ((string=? name "createNewFile")
+       (jfile-nul-free! fp)
        (list (if (file-exists? fp) #f
                  (guard (e (#t #f)) (close-port (open-output-file fp 'truncate)) #t))))
       ((string=? name "renameTo")
-       (list (let ((dst (jfile-fs (car args)))) (guard (e (#t #f)) (rename-file fp dst) #t))))
+       (list (let ((dst (jfile-fs (car args))))
+               (and (not (jfile-nul? dst)) (guard (e (#t #f)) (rename-file fp dst) #t)))))
       ((string=? name "getParentFile")
        (list (let ((parent (jfile-parent-path p)))
                (if parent (make-jfile parent) jolt-nil))))
@@ -1885,9 +2285,12 @@
           (if r (car r) (dispatch-miss obj method-name rest)))
         'pass)))
 (register-class-arm! embedded-res? (lambda (x) "java.net.URL"))
-;; (str resource) is the resource name, like URL.toString — which also gives the
+;; (str resource) is its jar: URL, like URL.toString — which also gives the
 ;; printer's #object[…] fallback its content.
-(register-str-render! embedded-res? (lambda (x) (embedded-res-name x)))
+(register-str-render! embedded-res? embedded-res-url)
+(register-eq-arm! (lambda (a b) (and (embedded-res? a) (embedded-res? b)))
+                  (lambda (a b) (string=? (embedded-res-name a) (embedded-res-name b))))
+(register-hash-arm! embedded-res? (lambda (x) (string-hash (embedded-res-url x))))
 
 ;; File methods emitted via jolt-host-call (rt.ss) need jfile dispatch, not the
 ;; string-path shims in the base jolt-host-call. Route through
@@ -2041,6 +2444,9 @@
 ;; one: slurp-path used to stat for existence up front and now lets the open
 ;; report it.
 (define (open-path-guarded given resolved thunk)
+  ;; a C path ends at a NUL, so opening this one would open another file
+  (when (jfile-nul? resolved)
+    (throw-jvm (quote java.io.FileNotFoundException) "Invalid file path"))
   (when (file-directory? resolved) (file-open-error given resolved))
   (guard (e ((i/o-error? e) (file-open-error given resolved e)))
     (thunk resolved)))
@@ -2598,6 +3004,7 @@
 (define (jolt-slurp src . opts)
   (io-opts-check! opts)
   (cond
+    ((uri-jhost? src) (apply jolt-slurp (uri->url src) opts))
     ;; slurp is a drain of (apply io/reader src opts) on the JVM, so a charset
     ;; other than UTF-8 on a file, path or URL decodes the way io/reader does.
     ;; The arms below read those as UTF-8 text and ignored :encoding.
@@ -2608,9 +3015,7 @@
        (jolt-close r)
        text))
     ((jfile? src) (slurp-path (jfile-fs src) (jfile-path src)))
-    ((embedded-res? src)
-     (let ((c (embedded-res-content src)))
-       (if (bytevector? c) (utf8->string c) c)))
+    ((embedded-res? src) (utf8->string (embedded-res-bytes src)))
     ((reader-jhost? src) (drain-reader src))
     ((reify-method-ref src "-read-line")
      (drain-ireader src))
@@ -2641,6 +3046,10 @@
     (throw-jvm (quote IllegalArgumentException)
                (string-append "Cannot open <" (jolt-pr-str path) "> as a Writer.")))
   (io-opts-check! opts)
+  (if (uri-jhost? path)
+      (apply jolt-spit (uri->url path) content opts)
+      (apply jolt-spit-target path content opts)))
+(define (jolt-spit-target path content . opts)
   (let* ((given (if (url-jhost? path) (url-write-path path) (file-path-of path)))
          (p (project-relative given))
          (enc (io-encoding opts))
@@ -2670,17 +3079,21 @@
                      (lambda (rp) (open-file-output-port rp (file-options no-fail no-truncate append)
                                                          (buffer-mode block))))
           (lambda (port) (put-bytevector port bytes)))
-        ;; In place, truncating, as the JVM's FileOutputStream does. This used
-        ;; to stage a temp file and rename it over the target, which REPLACED
-        ;; the file rather than writing it: a spit through a symlink turned the
-        ;; link into a regular file and left its target alone, a hard link
-        ;; stopped sharing the data, and the mode was reset from the umask (a
-        ;; 0600 file came back 0644). It also cost four syscalls more than the
-        ;; write, ~250us a spit against ~25us on the JVM.
+        ;; In place, as the JVM's FileOutputStream does: a rename REPLACES the
+        ;; file, which turns a symlink into a regular file, stops a hard link
+        ;; sharing the data and resets the mode. It does not truncate on open,
+        ;; though. Truncating a file with data costs the kernel a free and a
+        ;; reallocation of its blocks (about 70us on Linux on disk, against 6us
+        ;; to overwrite them), so the old tail goes after the write, when there
+        ;; is one. A device or fifo reports length 0 and has no tail.
         (with-port (open-path-guarded given p
-                     (lambda (rp) (open-file-output-port rp (file-options no-fail)
+                     (lambda (rp) (open-file-output-port rp (file-options no-fail no-truncate)
                                                          (buffer-mode block))))
-          (lambda (port) (put-bytevector port bytes))))
+          (lambda (port)
+            (put-bytevector port bytes)
+            (flush-output-port port)
+            (when (> (port-length port) (bytevector-length bytes))
+              (set-port-length! port (bytevector-length bytes))))))
     jolt-nil))
 
 ;; (flush) is (.flush *out*) on the JVM. When *out* holds a real writer — a
@@ -2779,10 +3192,9 @@
     ((reader-jhost? x) x)
     ((jfile? x) (io-note-file-read! (jfile-fs x))
                 (host-new "StringReader" (read-file-string (jfile-fs x) (jfile-path x))))
-    ((embedded-res? x)
-     (let ((c (embedded-res-content x)))
-       (host-new "StringReader" (if (bytevector? c) (utf8->string c) c))))
+    ((embedded-res? x) (host-new "StringReader" (utf8->string (embedded-res-bytes x))))
     ((url-jhost? x) (host-new "StringReader" (url-content x)))
+    ((uri-jhost? x) (apply jolt-io-reader (uri->url x) opts))
     ((string? x) (let ((p (project-relative x)))
                    (io-note-file-read! p)
                    (host-new "StringReader" (if (jar-path? p) (read-file-string p) (read-file-string p x)))))
@@ -2879,8 +3291,14 @@
 ;; against it, which is where this surfaced.) Absolutize against user.dir, the
 ;; base every other filesystem touch uses, dropping a leading "./" so the path
 ;; reads like the JVM's instead of carrying a "/./" segment.
+;; The text is percent-encoded as the class loader's is (ParseUtil.encodePath,
+;; embedded-url-encode): a space, "#", "%", ";", "=" or a non-ASCII character in
+;; the root or the name is escaped, so the URL parses back to the same file and
+;; getPath answers the encoded path, as on the JDK. Every reader of a file: or
+;; jar: URL decodes it (file-url->path, jar-path-entry).
 (define (resource-file-url root nm)
-  (make-url (string-append "file:" (file-uri-path (root-path-abs (string-append root "/" nm))))))
+  (make-url (string-append "file:" (embedded-url-encode
+                                    (file-uri-path (root-path-abs (string-append root "/" nm)))))))
 ;; A path under a source root made absolute for a URL: the roots are spelled as
 ;; deps.edn spells them ("./src", "./lib.jar"), and the JVM's URL for a resource
 ;; carries no "./" segment, so a leading one is dropped before the cwd is put in
@@ -2903,10 +3321,11 @@
             (= (string-length p) 0) (jfile-path-absolute? p) (jar-path? p)
             (windows-root-relative? p))
         (jfile-abs p)
-        (string-append (current-directory) "/" p))))
+        (path-under (current-directory) p))))
 ;; The jar: URL for `nm` inside the jar at root JAR, absolute like the file: one.
 (define (resource-jar-url jar nm)
-  (make-url (make-jar-path (root-path-abs jar) nm)))
+  (make-url (string-append jar-path-prefix (embedded-url-encode (file-uri-path (root-path-abs jar)))
+                           "!/" (embedded-url-encode nm))))
 ;; The candidate for NM on ROOT, as (path-or-#f . url-thunk): a directory root's
 ;; file, or a jar root's entry (loader.ss root-jar-index says which roots are
 ;; jars). The path is what the AOT cache is told about; for a jar it is the
@@ -2916,7 +3335,9 @@
   (let ((d (root-jar-index root)))
     (if d
         (let ((p (make-jar-path (root-path-abs root) nm)))
-          (cons p (and (zipdir-has? d nm) (lambda () (resource-jar-url root nm)))))
+          ;; a directory's entry answers to its name without the "/", as the
+          ;; JDK's JarLoader finds it through JarFile.getJarEntry
+          (cons p (and (zipdir-lookup d nm) (lambda () (resource-jar-url root nm)))))
         (let ((cand (string-append root "/" nm)))
           (cons cand (and (file-exists? cand) (lambda () (resource-file-url root nm))))))))
 
@@ -2952,8 +3373,8 @@
 ;; contributes nothing here.
 (define (resolve-resource name)
   (let* ((nm (resource-name-arg name))
-         (emb (embedded-resource-ref nm)))
-    (if emb (make-embedded-res nm emb)
+         (emb (embedded-resource-url nm)))
+    (if emb emb
         (let loop ((roots (get-source-roots)))
           (if (null? roots)
               jolt-nil
@@ -3059,9 +3480,9 @@
 ;; and every candidate is announced for the reason resolve-resource announces.
 (define (cl-get-resources self name)
   (let* ((nm (resource-name-arg name))
-         (emb (embedded-resource-ref nm)))
+         (emb (embedded-resource-url nm)))
     (let loop ((roots (get-source-roots))
-               (acc (if emb (list (make-embedded-res nm emb)) '())))
+               (acc (if emb (list emb) '())))
       (cond ((null? roots) (list->cseq (reverse acc)))
             (else
              (let ((cand (resource-candidate (car roots) nm)))
@@ -3996,7 +4417,9 @@
       ;; cannot hold an escape, and there is no getRawHost.
       (let ((ssp (substring s ssp-start body-end)))
         (make-jhost "uri"
-          (list (cons 'string s)
+          ;; 'hash memoizes URI.hashCode (uri-hashcode), as the JDK's field does
+          (list (cons 'hash #f)
+                (cons 'string s)
                 (cons 'scheme scheme)
                 (cons 'ssp ssp)
                 (cons 'dec-ssp (uri-decode-keeping-scope-id ssp))
@@ -4161,7 +4584,7 @@
   ;; (jolt-6i6). getScheme, getHost and getPort have no raw counterpart on the
   ;; JVM and are unchanged.
   (list (cons "toString" (lambda (u) (uri-field u 'string)))
-        (cons "toASCIIString" (lambda (u) (uri-field u 'string)))
+        (cons "toASCIIString" (lambda (u) (uri-ascii-string (uri-field u 'string))))
         (cons "getScheme" (lambda (u) (uri-field u 'scheme)))
         (cons "getSchemeSpecificPart" (lambda (u) (uri-field u 'dec-ssp)))
         (cons "getRawSchemeSpecificPart" (lambda (u) (uri-field u 'ssp)))
@@ -4177,21 +4600,15 @@
         (cons "getRawQuery" (lambda (u) (uri-field u 'query)))
         (cons "getFragment" (lambda (u) (uri-field u 'dec-fragment)))
         (cons "getRawFragment" (lambda (u) (uri-field u 'fragment)))
-        ;; URI.toURL = new URL(toString()) (JVM); honors a library-registered
-        ;; URL shim like io/as-url does.
-        (cons "toURL" (lambda (u) (let ((ctor (lookup-class class-ctors-tbl "URL")))
-                                    (if ctor (ctor (uri-field u 'string))
-                                        (make-url (uri-field u 'string))))))
+        (cons "toURL" (lambda (u) (uri->url u)))
         (cons "isAbsolute" (lambda (u) (not (jolt-nil? (uri-field u 'scheme)))))
         (cons "isOpaque" (lambda (u) (uri-opaque? u)))
         (cons "resolve" (lambda (u x) (uri-resolve u (uri-arg->uri x))))
         (cons "normalize" (lambda (u) (uri-normalize u)))
         (cons "relativize" (lambda (u x) (uri-relativize u (uri-arg->uri x))))
-        (cons "compareTo" (lambda (u o) (let ((a (uri-field u 'string)) (b (uri-field o 'string)))
-                                          (cond ((string<? a b) -1) ((string=? a b) 0) (else 1)))))
-        (cons "hashCode" (lambda (u) (string-hash (uri-field u 'string))))
-        (cons "equals" (lambda (u o) (and (jhost? o) (string=? (jhost-tag o) "uri")
-                                          (string=? (uri-field u 'string) (uri-field o 'string)))))))
+        (cons "compareTo" (lambda (u o) (uri-compare u o)))
+        (cons "hashCode" (lambda (u) (uri-hashcode u)))
+        (cons "equals" (lambda (u o) (and (jhost? o) (string=? (jhost-tag o) "uri") (uri-equals? u o))))))
 
 ;; --- resolve / normalize / relativize: RFC 2396 §5.2, as java.net.URI does it --
 ;; A URI is rebuilt from its RAW components — the substrings the parse produced,
@@ -4327,14 +4744,211 @@
                  1234321)))
 (register-hash-arm! jfile? jfile-hashcode)
 
-;; (= u1 u2) is value equality by string form (the .equals method above only
-;; serves explicit (.equals …)); hash matches so a URI works as a map key / set
-;; member (ring/hiccup compare (URI. "/") values).
-(define (uri-jhost? x) (and (jhost? x) (string=? (jhost-tag x) "uri")))
+;; (= u1 u2) is URI.equals (uri-equals? below); hash matches so a URI works as a
+;; map key / set member (ring/hiccup compare (URI. "/") values).
+(define-jhost-tag-pred (uri-jhost? t) (string=? t "uri"))
+;; URI.toURL = new URL(toString()) (JVM), refusing a relative URI as the JVM
+;; does; honors a library-registered URL shim like io/as-url does. It is also
+;; how clojure.java.io's IOFactory opens a URI -- slurp, spit, io/reader,
+;; io/writer, io/input-stream and io/output-stream all go through it, which
+;; jolt's openers did not (each refused a URI outright).
+(define (uri->url u)
+  (when (jolt-nil? (uri-field u 'scheme))
+    (throw-jvm (quote IllegalArgumentException) "URI is not absolute"))
+  (let ((ctor (lookup-class class-ctors-tbl "URL")))
+    (if ctor (ctor (uri-field u 'string)) (make-url (uri-field u 'string)))))
+;; URI.equals / hashCode / compareTo are java.net.URI's, component by component
+;; over the RAW components, not the string form: the scheme and the host ignore
+;; case, a %XX escape compares its hex digits ignoring case, and an empty
+;; authority is no authority, so file:///x and file:/x -- Path.toUri's form and
+;; File.toURI's -- are one URI. Strings compare as UTF-16 units, as String does.
+;; String.compareTo, which a code-point string answers as UTF-16 units do
+(define (uri-u16 s)
+  (let* ((bv (string->utf16 s 'big)) (n (fxquotient (bytevector-length bv) 2)) (v (make-vector n)))
+    (do ((i 0 (fx+ i 1))) ((fx=? i n) v)
+      (vector-set! v i (bytevector-u16-ref bv (fx* 2 i) 'big)))))
+(define (uri-c x) (if (jolt-nil? x) #f x))
+(define (uri-ascii-lower c) (if (and (fx>=? c 65) (fx<=? c 90)) (fx+ c 32) c))
+(define (uri-ascii-upper c) (if (and (fx>=? c 97) (fx<=? c 122)) (fx- c 32) c))
+(define (uri-char-lower c)
+  (if (and (char>=? c #\A) (char<=? c #\Z)) (integer->char (fx+ (char->integer c) 32)) c))
+;; URI.equal: escapes compare their hex digits ignoring case
+(define (uri-c-equal? s t)
+  (cond ((and (not s) (not t)) #t)
+        ((or (not s) (not t)) #f)
+        ((string=? s t) #t)
+        ((not (fx=? (string-length s) (string-length t))) #f)
+        (else
+         (let ((n (string-length s)))
+           (let loop ((i 0))
+             (cond ((fx>=? i n) #t)
+                   ((char=? (string-ref s i) #\%)
+                    (and (char=? (string-ref t i) #\%)
+                         (fx<? (fx+ i 2) n)
+                         (char=? (uri-char-lower (string-ref s (fx+ i 1))) (uri-char-lower (string-ref t (fx+ i 1))))
+                         (char=? (uri-char-lower (string-ref s (fx+ i 2))) (uri-char-lower (string-ref t (fx+ i 2))))
+                         (loop (fx+ i 3))))
+                   ((char=? (string-ref s i) (string-ref t i)) (loop (fx+ i 1)))
+                   (else #f)))))))
+;; equalIgnoringCase: ASCII letters only, as URI.toLower
+(define (uri-c-equal-ci? s t)
+  (cond ((and (not s) (not t)) #t)
+        ((or (not s) (not t)) #f)
+        ((string=? s t) #t)
+        ((not (fx=? (string-length s) (string-length t))) #f)
+        (else (let ((n (string-length s)))
+                (let loop ((i 0))
+                  (or (fx=? i n)
+                      (and (char=? (uri-char-lower (string-ref s i)) (uri-char-lower (string-ref t i)))
+                           (loop (fx+ i 1)))))))))
+;; Fold code point CP into an unsigned 32-bit String.hashCode accumulator X as
+;; its UTF-16 units; fixnum arithmetic, signed once per component.
+(define-syntax uri-u32-step
+  (syntax-rules () ((_ x c) (fxlogand (fx+ (fx* 31 x) c) #xFFFFFFFF))))
+(define-syntax uri-hash-cp
+  (syntax-rules ()
+    ((_ x0 cp0)
+     (let ((x x0) (cp cp0))
+       (if (fx<? cp #x10000)
+           (uri-u32-step x cp)
+           (let ((c (fx- cp #x10000)))
+             (uri-u32-step (uri-u32-step x (fxior #xD800 (fxsra c 10))) (fxior #xDC00 (fxand c #x3FF)))))))))
+(define (uri-u32->i32 x) (if (fx>=? x #x80000000) (fx- x #x100000000) x))
+(define (uri-port u) (let ((p (uri-field u 'port))) (if (jolt-nil? p) -1 p)))
+(define (uri-equals? a b)
+  (let ((f (lambda (u k) (uri-c (uri-field u k)))))
+    (and (eq? (uri-opaque? a) (uri-opaque? b))
+         (uri-c-equal-ci? (f a 'scheme) (f b 'scheme))
+         (uri-c-equal? (f a 'fragment) (f b 'fragment))
+         (if (uri-opaque? a)
+             (uri-c-equal? (f a 'ssp) (f b 'ssp))
+             (and (uri-c-equal? (f a 'path) (f b 'path))
+                  (uri-c-equal? (f a 'query) (f b 'query))
+                  (cond ((f a 'host)
+                         (and (uri-c-equal? (f a 'user-info) (f b 'user-info))
+                              (uri-c-equal-ci? (f a 'host) (f b 'host))
+                              (= (uri-port a) (uri-port b))))
+                        ((f a 'authority) (uri-c-equal? (f a 'authority) (f b 'authority)))
+                        (else (not (f b 'authority)))))))))
+;; URI.hash / normalizedHash / hashIgnoringCase, in 32-bit int arithmetic
+(define (uri-hash h s)
+  (if (not s)
+      h
+      (let ((n (string-length s)))
+        (let loop ((i 0) (x 0) (esc 0))
+          (if (fx>=? i n)
+              (uri-u32->i32 (fxlogand (fx+ (fx* 127 (fxlogand h #xFFFFFFFF)) x) #xFFFFFFFF))
+              (let ((c (char->integer (string-ref s i))))
+                (cond ((fx>? esc 0) (loop (fx+ i 1) (uri-hash-cp x (uri-ascii-upper c)) (fx- esc 1)))
+                      ((fx=? c 37) (loop (fx+ i 1) (uri-hash-cp x c) 2))  ; %: its hex digits upper-cased
+                      (else (loop (fx+ i 1) (uri-hash-cp x c) 0)))))))))
+;; hashIgnoringCase continues from H itself, not from a fresh accumulator
+(define (uri-hash-ci h s)
+  (if (not s)
+      h
+      (let ((n (string-length s)))
+        (let loop ((i 0) (x (fxlogand h #xFFFFFFFF)))
+          (if (fx=? i n)
+              (uri-u32->i32 x)
+              (loop (fx+ i 1) (uri-hash-cp x (uri-ascii-lower (char->integer (string-ref s i))))))))))
+(define (uri-hashcode u)
+  (let ((memo (assq 'hash (jhost-state u))))
+    (or (and memo (cdr memo))
+        (let ((h (uri-hashcode* u)))
+          (when memo (set-cdr! memo h))
+          h))))
+(define (uri-hashcode* u)
+  ;; The state is the alist uri-parse-1 builds, in its order; each field is read
+  ;; by stepping down it, and checked by key, so a state in another order (none
+  ;; is built today) falls back to the lookup instead of reading a wrong field.
+  (let* ((st (jhost-state u))
+         (get (lambda (p k) (if (and (pair? p) (eq? (caar p) k)) (uri-c (cdar p)) (uri-c (uri-field u k)))))
+         (s-scheme (and (pair? st) (pair? (cdr st)) (cddr st)))   ; hash, string, scheme
+         (s-ssp (and (pair? s-scheme) (cdr s-scheme)))
+         (s-auth (and (pair? s-ssp) (pair? (cdr s-ssp)) (cddr s-ssp)))
+         (s-host (and (pair? s-auth) (pair? (cdr s-auth)) (cddr s-auth)))
+         (s-ui (and (pair? s-host) (cdr s-host)))
+         (s-port (and (pair? s-ui) (pair? (cdr s-ui)) (cddr s-ui)))
+         (s-path (and (pair? s-port) (cdr s-port)))
+         (s-query (and (pair? s-path) (pair? (cdr s-path)) (cddr s-path)))
+         (s-frag (and (pair? s-query) (pair? (cdr s-query)) (cddr s-query)))
+         (scheme (get s-scheme 'scheme))
+         (ssp (get s-ssp 'ssp))
+         (h (uri-hash (uri-hash-ci 0 scheme) (get s-frag 'fragment))))
+    ;; opaque: a scheme and a scheme-specific part not starting with /
+    (if (and scheme ssp (or (fx=? 0 (string-length ssp)) (not (char=? (string-ref ssp 0) #\/))))
+        (uri-hash h ssp)
+        (let* ((h (uri-hash h (get s-path 'path)))
+               (h (uri-hash h (get s-query 'query)))
+               (host (get s-host 'host)))
+          (if host
+              (let* ((h (uri-hash h (get s-ui 'user-info)))
+                     (h (uri-hash-ci h host))
+                     (port (or (get s-port 'port) -1)))
+                (uri-u32->i32 (fxlogand (fx+ (fxlogand h #xFFFFFFFF) (fxlogand (fx* 1949 port) #xFFFFFFFF)) #xFFFFFFFF)))
+              (uri-hash h (get s-auth 'authority)))))))
+;; URI.compare / compareIgnoringCase: String.compareTo's own differences, with
+;; an escape's hex digits compared ignoring case once both strings hold one
+(define (uri-cmp s t)
+  (cond ((and (not s) (not t)) 0)
+        ((not t) 1)
+        ((not s) -1)
+        ((string=? s t) 0)
+        (else (let* ((a (uri-u16 s)) (b (uri-u16 t)) (n (min (vector-length a) (vector-length b)))
+                     (esc? (and (memv #\% (string->list s)) (memv #\% (string->list t)) #t))
+                     (at (lambda (v i) (if (fx<? i (vector-length v)) (uri-ascii-lower (vector-ref v i)) 0))))
+                (let loop ((i 0))
+                  (if (fx>=? i n)
+                      (- (vector-length a) (vector-length b))
+                      (let* ((c (vector-ref a i)) (d (vector-ref b i)) (val (- c d)))
+                        (cond ((or (not esc?) (not (fx=? c 37)))
+                               (if (fx=? val 0) (loop (fx+ i 1)) val))
+                              ((not (fx=? val 0)) val)
+                              (else
+                               (let ((v1 (- (at a (fx+ i 1)) (at b (fx+ i 1)))))
+                                 (if (not (fx=? v1 0)) v1
+                                     (let ((v2 (- (at a (fx+ i 2)) (at b (fx+ i 2)))))
+                                       (if (not (fx=? v2 0)) v2 (loop (fx+ i 3)))))))))))))))
+(define (uri-cmp-ci s t)
+  (cond ((and (not s) (not t)) 0)
+        ((not t) 1)
+        ((not s) -1)
+        ((string=? s t) 0)
+        (else (let* ((a (uri-u16 s)) (b (uri-u16 t)) (n (min (vector-length a) (vector-length b))))
+                (let loop ((i 0))
+                  (if (fx=? i n)
+                      (- (vector-length a) (vector-length b))
+                      (let ((c (- (uri-ascii-lower (vector-ref a i)) (uri-ascii-lower (vector-ref b i)))))
+                        (if (fx=? c 0) (loop (fx+ i 1)) c))))))))
+(define (uri-compare a b)
+  (let ((f (lambda (u k) (uri-c (uri-field u k)))))
+    (define (chain . thunks)
+      (let loop ((ts thunks)) (if (null? ts) 0 (let ((c ((car ts)))) (if (eqv? c 0) (loop (cdr ts)) c)))))
+    (chain
+     (lambda () (uri-cmp-ci (f a 'scheme) (f b 'scheme)))
+     (lambda ()
+       (cond ((uri-opaque? a)
+              (if (uri-opaque? b)
+                  (chain (lambda () (uri-cmp (f a 'ssp) (f b 'ssp)))
+                         (lambda () (uri-cmp (f a 'fragment) (f b 'fragment))))
+                  1))
+             ((uri-opaque? b) -1)
+             (else
+              (chain
+               (lambda ()
+                 (if (and (f a 'host) (f b 'host))
+                     (chain (lambda () (uri-cmp (f a 'user-info) (f b 'user-info)))
+                            (lambda () (uri-cmp-ci (f a 'host) (f b 'host)))
+                            (lambda () (- (uri-port a) (uri-port b))))
+                     (uri-cmp (f a 'authority) (f b 'authority))))
+               (lambda () (uri-cmp (f a 'path) (f b 'path)))
+               (lambda () (uri-cmp (f a 'query) (f b 'query)))
+               (lambda () (uri-cmp (f a 'fragment) (f b 'fragment))))))))))
 (register-eq-arm! (lambda (a b) (or (uri-jhost? a) (uri-jhost? b)))
                   (lambda (a b) (and (uri-jhost? a) (uri-jhost? b)
-                                     (string=? (uri-field a 'string) (uri-field b 'string)))))
-(register-hash-arm! uri-jhost? (lambda (x) (string-hash (uri-field x 'string))))
+                                     (or (string=? (uri-field a 'string) (uri-field b 'string))
+                                         (uri-equals? a b)))))
+(register-hash-arm! uri-jhost? uri-hashcode)
 ;; A URL compares by its canonical spec. The JVM's URL.equals also resolves both
 ;; hosts and compares addresses (a blocking DNS lookup inside =); jolt does not,
 ;; so two names for one host stay unequal here.
@@ -4342,12 +4956,9 @@
                   (lambda (a b) (and (url-jhost? a) (url-jhost? b)
                                      (string=? (url-spec a) (url-spec b)))))
 (register-hash-arm! url-jhost? (lambda (x) (java-string-hashcode (url-spec x))))
-;; (compare u1 u2) / (sort uris): URI is Comparable on the JVM, by string form
-;; (its compareTo compares component-wise, which for two well-formed URIs is the
-;; same order as the strings up to the first differing component).
-(register-compare-arm! (lambda (a b) (and (uri-jhost? a) (uri-jhost? b)))
-                       (lambda (a b) (let ((x (uri-field a 'string)) (y (uri-field b 'string)))
-                                       (cond ((string<? x y) -1) ((string=? x y) 0) (else 1)))))
+;; (compare u1 u2) / (sort uris): URI is Comparable on the JVM, component-wise
+;; (uri-compare above).
+(register-compare-arm! (lambda (a b) (and (uri-jhost? a) (uri-jhost? b))) uri-compare)
 ;; str / pr-str of a uri -> its string form.
 (register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "uri")))
                       (lambda (x) (uri-field x 'string)))

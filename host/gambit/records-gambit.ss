@@ -291,7 +291,7 @@
 
 (define (make-jrec-from-existing src ov ov-val ext)
   (let ((desc (jrec-desc src)))
-    (case (jrec-nfields src)
+    (case (jrdesc-nfields desc)
       ((0) (make-jrec0 desc ext 0))
       ((1)
        (make-jrec1
@@ -518,6 +518,7 @@
         (kw-fields (keyword #f "fields"))
         (kw-tags (keyword #f "tags"))
         (kw-type (keyword #f "type"))
+        (kw-record (keyword #f "record"))
         (out (jolt-hash-map)))
     (let-values (((ks vs)
                   (jolt-with-mutex
@@ -550,9 +551,11 @@
                 (jolt-assoc
                   out
                   k
-                  (jolt-hash-map kw-fields (apply jolt-vector fields)
-                    kw-tags (apply jolt-vector rtags) kw-type
-                    type-tag))))))
+                  (let ((m (jolt-hash-map kw-fields (apply jolt-vector fields) kw-tags
+                             (apply jolt-vector rtags) kw-type type-tag)))
+                    (if (hashtable-ref chez-record-type-tbl type-tag #f)
+                        (jolt-assoc m kw-record #t)
+                        m)))))))
         ks
         vs))
     out))
@@ -613,9 +616,20 @@
                 (set! chez-protocol-methods-memo (cons gen m))))
             m)))))
 
+(define (jrec-fkey-scan fk k)
+  (let ((n (vector-length fk)))
+    (let loop ((i 0))
+      (cond
+        ((fx=? i n) #f)
+        ((eq? (vector-ref fk i) k) i)
+        (else (loop (fx+ i 1)))))))
+
 (define (jrec-field-index r k)
-  (let ((i (hashtable-ref (jrdesc-index (jrec-desc r)) k #f)))
-    (and i (if (fx<? i 0) (fx- -1 i) i))))
+  (let* ((d (jrec-desc r)) (fk (jrdesc-fkeys d)))
+    (if (fx<=? (vector-length fk) 8)
+        (jrec-fkey-scan fk k)
+        (let ((i (hashtable-ref (jrdesc-index d) k #f)))
+          (and i (if (fx<? i 0) (fx- -1 i) i))))))
 
 (define (jrec-member-field r k)
   (if (jrec-field-index r k)
@@ -632,15 +646,22 @@
             (else (loop (fx+ i 1))))))))
 
 (define (jrec-get-index r k)
-  (let ((i (hashtable-ref (jrdesc-index (jrec-desc r)) k #f)))
-    (and i (fx>=? i 0) i)))
+  (let* ((d (jrec-desc r)) (fk (jrdesc-fkeys d)))
+    (if (and (not jrdesc-masked-any?)
+             (fx<=? (vector-length fk) 8))
+        (jrec-fkey-scan fk k)
+        (let ((i (hashtable-ref (jrdesc-index d) k #f)))
+          (and i (fx>=? i 0) i)))))
 
 (define (chez-type-owns-lookup? tag)
   (and (find-method-any-protocol tag "valAt")
        (not (hashtable-ref chez-record-type-tbl tag #f))
        #t))
 
+(define jrdesc-masked-any? #f)
+
 (define (jrdesc-mask-fields! desc)
+  (set! jrdesc-masked-any? #t)
   (let ((idx (jrdesc-index desc)))
     (vector-for-each
       (lambda (k)
@@ -665,6 +686,19 @@
           (loop
             (jolt-seq (seq-more s))
             (cons (cons (jolt-nth e 0) (jolt-nth e 1)) acc))))))
+
+(define (jrec-entry-pairs r)
+  (let ((fkeys (jrdesc-fkeys (jrec-desc r)))
+        (ext (jrec-ext r)))
+    (let loop ((i (fx- (jrec-nfields r) 1))
+               (acc (if (jolt-nil? ext) '() (jrec-ext-pairs ext))))
+      (if (fx<? i 0)
+          acc
+          (loop
+            (fx- i 1)
+            (cons
+              (cons (vector-ref fkeys i) (jrec-field-ref r i))
+              acc))))))
 
 (define (jrec-lookup r k d)
   (if (eq? k jolt-deftype-kw)
@@ -819,15 +853,18 @@
     (else (jolt=2 ea eb))))
 
 (define (jrec=? a b)
-  (and (or (eq? (jrec-desc a) (jrec-desc b))
-           (string=? (jrec-tag a) (jrec-tag b)))
-       (let ((n (jrec-nfields a)))
-         (and (= n (jrec-nfields b))
-              (let loop ((i 0))
-                (or (= i n)
-                    (and (jolt=2 (jrec-field-ref a i) (jrec-field-ref b i))
-                         (loop (+ i 1)))))))
-       (jrec-ext=? (jrec-ext a) (jrec-ext b))))
+  (let ((da (jrec-desc a)) (db (jrec-desc b)))
+    (and (or (eq? da db)
+             (string=? (jrdesc-tag da) (jrdesc-tag db)))
+         (let ((n (jrdesc-nfields da)))
+           (and (or (eq? da db) (fx=? n (jrdesc-nfields db)))
+                (let loop ((i 0))
+                  (or (fx=? i n)
+                      (and (jolt=2
+                             (jrec-field-ref a i)
+                             (jrec-field-ref b i))
+                           (loop (fx+ i 1)))))))
+         (jrec-ext=? (jrec-ext a) (jrec-ext b)))))
 
 (define jrdesc-class-hash-tbl (make-weak-eq-hashtable))
 
@@ -872,36 +909,64 @@
 (define (jrec-coll-print-shape r)
   (vector-ref (jrdesc-ifc-of r) 1))
 
-(define (jrec-coll-pr r shape)
-  (if (jolt-print-hash?)
-      "#"
-      (with-deeper-print
-        (if (eq? shape 'map)
-            (string-append
-              "{"
-              (jolt-str-join-comma
-                (jolt-limited-list-strs
-                  (map (lambda (e)
-                         (string-append
-                           (jolt-pr-readable (jolt-nth e 0))
-                           " "
-                           (jolt-pr-readable (jolt-nth e 1))))
-                       (seq->list r))))
-              "}")
-            (let ((body (jolt-str-join
-                          (jolt-limited-seq-strs
-                            (jolt-seq r)
-                            jolt-pr-readable))))
-              (case shape
-                ((seq) (string-append "(" body ")"))
-                ((vec) (string-append "[" body "]"))
-                (else (string-append "#{" body "}"))))))))
+(define (jrec-coll-pr r shape readable?)
+  (cond
+    ((and (memq shape '(jmap jvec jlist jset))
+          (not (jolt-pr-readable?)))
+     (jolt-object-repr r readable?))
+    ((jolt-print-hash?) "#")
+    (else
+     (with-deeper-print
+       (if (memq shape '(map jmap))
+           (string-append
+             "{"
+             (jolt-str-join-comma
+               (jolt-limited-list-strs
+                 (map (lambda (e)
+                        (string-append
+                          (jolt-pr-readable (jolt-nth e 0))
+                          " "
+                          (jolt-pr-readable (jolt-nth e 1))))
+                      (if (eq? shape 'jmap)
+                          (seq->list
+                            (jolt-seq
+                              (record-method-dispatch
+                                r
+                                "entrySet"
+                                jolt-nil)))
+                          (seq->list r)))))
+             "}")
+           (let ((body (jolt-str-join
+                         (jolt-limited-seq-strs
+                           (jolt-seq r)
+                           jolt-pr-readable))))
+             (case shape
+               ((seq jlist) (string-append "(" body ")"))
+               ((vec jvec) (string-append "[" body "]"))
+               (else (string-append "#{" body "}")))))))))
 
-(define (jrec-pr r)
+(define (jrec-pr r readable?)
   (cond
     ((jrec-coll-print-shape r) =>
-     (lambda (shape) (jrec-coll-pr r shape)))
-    (else (jrec-field-pr r))))
+     (lambda (shape) (jrec-coll-pr r shape readable?)))
+    ((or (jrec-record? r)
+         (not (hashtable-ref chez-deftype-tag-set (jrec-tag r) #f)))
+     (jrec-field-pr r))
+    ((rec-coll-method r "deref")
+     (let ((port (open-output-string)))
+       (deref-print-to! port r jrec-deref-print-state readable?)
+       (get-output-string port)))
+    (else (jolt-object-repr r readable?))))
+
+(define (jrec-deref-print-state r)
+  (let ((realized (rec-coll-method r "isRealized")))
+    (if (and realized
+             (not (jolt-truthy? (jolt-invoke realized r))))
+        (cons "pending" jolt-nil)
+        (guard (e (#t (cons "failed" (jolt-unwrap-throw e))))
+          (cons
+            "ready"
+            (jolt-invoke (rec-coll-method r "deref") r))))))
 
 (define (jrec-field-pr r)
   (string-append
@@ -944,8 +1009,14 @@
       "}")))
 
 (define (jrec-equiv=? a b)
-  (let* ((ia (and (jrec? a) (jrdesc-ifc-of a)))
-         (ib (and (jrec? b)
+  (let ((ia (and (jrec? a) (jrdesc-ifc-of a))))
+    (if (and ia (vector-ref ia 14) (jrec? b))
+        (and (or (eq? (jrec-desc a) (jrec-desc b)) (jrec-record? b))
+             (jrec=? a b))
+        (jrec-equiv=?-walk a ia b))))
+
+(define (jrec-equiv=?-walk a ia b)
+  (let* ((ib (and (jrec? b)
                   (if (and ia (eq? (jrec-desc a) (jrec-desc b)))
                       ia
                       (jrdesc-ifc-of b)))))
@@ -1007,6 +1078,8 @@
 
 (define (jrec-hasheq-slow x)
   (cond
+    ((jrec-plain? x)
+     (let ((h (jrec-hash x))) (jrec-hasheq-set! x h) h))
     ((jrec-cl x "hasheq") =>
      (lambda (m) (call-declared-hash m x)))
     ((jrec-cl x "hashCode") =>
@@ -1050,6 +1123,10 @@
              ((jch-isa? tag "clojure.lang.IPersistentVector") 'vec)
              ((jch-isa? tag "clojure.lang.IPersistentSet") 'set)
              ((jch-isa? tag "clojure.lang.IPersistentMap") 'map)
+             ((jch-isa? tag "java.util.Map") 'jmap)
+             ((jch-isa? tag "java.util.RandomAccess") 'jvec)
+             ((jch-isa? tag "java.util.List") 'jlist)
+             ((jch-isa? tag "java.util.Set") 'jset)
              (else #f)))
       (jch-isa? tag "java.lang.CharSequence") record?
       (and (not record?) (tag-declares-coll-iface? tag))
@@ -1078,17 +1155,41 @@
                    (jch-isa? tag "clojure.lang.MapEquivalence"))
                #t)
           (and (jch-isa? tag "java.util.Set") #t)))
-      (make-weak-eq-hashtable))))
+      (make-weak-eq-hashtable)
+      (and record?
+           (not (jch-isa? tag "java.lang.CharSequence"))
+           (not (exists
+                  (lambda (nm) (find-method-any-protocol tag nm))
+                  jrec-map-method-names)))
+      (hashtable-ref chez-record-dbl-tbl tag #f))))
+
+(define jrdesc-ifc-last (cons #f #f))
 
 (define (jrdesc-ifc-of x)
-  (let* ((d (jrec-desc x)) (c (jrdesc-ifc d)))
-    (if (and c (fx=? (vector-ref c 0) (jrdesc-ifc-epoch)))
-        c
-        (let ((fresh (jrdesc-derive-ifc
-                       d
-                       (jrec-record?-uncached x))))
-          (jrdesc-ifc-set! d fresh)
-          fresh))))
+  (let ((d (jrec-desc x)) (l jrdesc-ifc-last))
+    (if (and (eq? (car l) d)
+             (fx=? (vector-ref (cdr l) 0) (jrdesc-ifc-epoch)))
+        (cdr l)
+        (let ((c (jrdesc-ifc d)))
+          (if (and c (fx=? (vector-ref c 0) (jrdesc-ifc-epoch)))
+              (begin (set! jrdesc-ifc-last (cons d c)) c)
+              (let ((fresh (jrdesc-derive-ifc
+                             d
+                             (jrec-record?-uncached x))))
+                (jrdesc-ifc-set! d fresh)
+                (set! jrdesc-ifc-last (cons d fresh))
+                fresh))))))
+
+(define jrec-map-method-names
+  '("count" "containsKey" "contains" "assoc" "assocEx" "without"
+    "seq" "cons" "empty" "valAt" "get" "entryAt" "equiv"
+    "equals" "hasheq" "hashCode" "kvreduce" "reduce" "iterator"
+    "nth" "peek" "pop" "first" "next" "more" "length" "charAt"
+    "size" "isEmpty" "containsValue" "keySet" "values"
+    "entrySet"))
+
+(define (jrec-plain? x)
+  (and (jrec? x) (vector-ref (jrdesc-ifc-of x) 14)))
 
 (define (jrec-method x method)
   (let* ((t (vector-ref (jrdesc-ifc-of x) 7))
@@ -1225,7 +1326,11 @@
      (if nargs
          (jrec-method-arity v method nargs)
          (jrec-method v method)))
-    ((jreify? v) (reify-method-ref v method))
+    ((jreify? v)
+     (or (reify-method-ref v method)
+         (and abstract-class-method-hook
+              (string=? method "iterator")
+              (abstract-class-method-hook v method))))
     (else #f)))
 
 (define (jrec-field-count coll)
@@ -1233,8 +1338,15 @@
      (let ((ext (jrec-ext coll)))
        (if (jolt-nil? ext) 0 (jolt-count ext)))))
 
+(define (jrec-plain-count r)
+  (let ((ext (jrec-ext r)))
+    (fx+ (jrdesc-nfields (jrec-desc r))
+         (if (jolt-nil? ext) 0 (jolt-count ext)))))
+
 (register-count-arm!
-  (lambda (coll) (or (jrec? coll) (jolt-transient? coll)))
+  (lambda (coll)
+    (or (and (jrec? coll) (not (jrec-plain? coll)))
+        (jolt-transient? coll)))
   (lambda (coll)
     (cond
       ((jolt-transient? coll) (t-count coll))
@@ -1245,7 +1357,12 @@
          (cond
            ((vector-ref ifc 3) (jrec-field-count coll))
            ((vector-ref ifc 4)
-            (jrec-abstract-method-error coll "count"))
+            (if (and (jrec-type-isa?
+                       coll
+                       "clojure.lang.IPersistentCollection")
+                     (not (jrec-type-isa? coll "clojure.lang.Counted")))
+                (jolt-count (jolt-seq coll))
+                (jrec-abstract-method-error coll "count")))
            ((vector-ref ifc 2)
             (jolt-invoke (jrec-charseq-length-method coll) coll))
            (else (jrec-field-count coll))))))))
@@ -1269,6 +1386,7 @@
 (register-contains-arm!
   (lambda (coll)
     (and (jrec? coll)
+         (not (jrec-plain? coll))
          (not (jrec-cl coll "containsKey"))
          (not (jrec-cl coll "contains"))))
   (lambda (coll k) (jrec-has? coll k)))
@@ -1310,34 +1428,33 @@
 
 (set! jolt-assoc1
   (lambda (coll k v)
-    (cond
-      ((jrec-cl coll "assoc") =>
-       (lambda (m) (jolt-invoke m coll k v)))
-      ((jrec? coll)
-       (let ((i (and (keyword? k) (jrec-field-index coll k))))
-         (if i
-             (let ((v2 (let ((flags (hashtable-ref
-                                      chez-record-dbl-tbl
-                                      (jrec-tag coll)
-                                      #f)))
-                         (if (and flags
-                                  (fx< i (vector-length flags))
-                                  (vector-ref flags i)
-                                  (number? v)
-                                  (not (flonum? v)))
-                             (exact->inexact v)
-                             v))))
-               (make-jrec-from-existing coll i v2 (jrec-ext coll)))
-             (let ((ext (jrec-ext coll)))
-               (make-jrec-from-existing
-                 coll
-                 #f
-                 #f
-                 (%r-jolt-assoc1
-                   (if (jolt-nil? ext) empty-pmap ext)
-                   k
-                   v))))))
-      (else (%r-jolt-assoc1 coll k v)))))
+    (if (jrec? coll)
+        (let ((ifc (jrdesc-ifc-of coll)))
+          (cond
+            ((and (not (vector-ref ifc 14)) (jrec-cl coll "assoc")) =>
+             (lambda (m) (jolt-invoke m coll k v)))
+            (else
+             (let ((i (and (keyword? k) (jrec-field-index coll k))))
+               (if i
+                   (let ((v2 (let ((flags (vector-ref ifc 15)))
+                               (if (and flags
+                                        (fx< i (vector-length flags))
+                                        (vector-ref flags i)
+                                        (number? v)
+                                        (not (flonum? v)))
+                                   (exact->inexact v)
+                                   v))))
+                     (make-jrec-from-existing coll i v2 (jrec-ext coll)))
+                   (let ((ext (jrec-ext coll)))
+                     (make-jrec-from-existing
+                       coll
+                       #f
+                       #f
+                       (%r-jolt-assoc1
+                         (if (jolt-nil? ext) empty-pmap ext)
+                         k
+                         v))))))))
+        (%r-jolt-assoc1 coll k v))))
 
 (define (jrec->map-without r drop-k)
   (let* ((fkeys (jrdesc-fkeys (jrec-desc r)))
@@ -1381,18 +1498,22 @@
 (set! jolt-dissoc
   (lambda (coll . ks)
     (cond
+      ((jrec-plain? coll)
+       (meta-carry coll (fold-left jrec-dissoc1 coll ks)))
       ((jrec-cl coll "without") =>
        (lambda (m)
          (fold-left (lambda (c k) (jolt-invoke m c k)) coll ks)))
-      ((jrec? coll) (fold-left jrec-dissoc1 coll ks))
+      ((jrec? coll)
+       (meta-carry coll (fold-left jrec-dissoc1 coll ks)))
       (else (apply %r-jolt-dissoc coll ks)))))
 
 (set! jolt-dissoc2
   (lambda (coll k)
     (cond
+      ((jrec-plain? coll) (meta-carry coll (jrec-dissoc1 coll k)))
       ((jrec-cl coll "without") =>
        (lambda (m) (jolt-invoke m coll k)))
-      ((jrec? coll) (jrec-dissoc1 coll k))
+      ((jrec? coll) (meta-carry coll (jrec-dissoc1 coll k)))
       (else (%r-jolt-dissoc2 coll k)))))
 
 (define (jrec-seq-col m which)
@@ -1407,13 +1528,100 @@
 
 (set! jolt-keys
   (lambda (m)
-    (if (jrec? m) (jrec-seq-col m 0) (%r-jolt-keys m))))
+    (cond
+      ((jrec-plain? m)
+       (list->cseq
+         (jrec-plain-fold m (lambda (k v acc) (cons k acc)))))
+      ((jrec? m) (jrec-seq-col m 0))
+      (else (%r-jolt-keys m)))))
 
 (define %r-jolt-vals jolt-vals)
 
 (set! jolt-vals
   (lambda (m)
-    (if (jrec? m) (jrec-seq-col m 1) (%r-jolt-vals m))))
+    (cond
+      ((jrec-plain? m)
+       (list->cseq
+         (jrec-plain-fold m (lambda (k v acc) (cons v acc)))))
+      ((jrec? m) (jrec-seq-col m 1))
+      (else (%r-jolt-vals m)))))
+
+(define (jrec-plain-fold r step)
+  (let* ((fkeys (jrdesc-fkeys (jrec-desc r)))
+         (ext (jrec-ext r))
+         (tail (if (jolt-nil? ext)
+                   '()
+                   (fold-right
+                     (lambda (p acc) (step (car p) (cdr p) acc))
+                     '()
+                     (jrec-ext-pairs ext)))))
+    (let loop ((i (fx- (vector-length fkeys) 1)) (acc tail))
+      (if (fx<? i 0)
+          acc
+          (loop
+            (fx- i 1)
+            (step (vector-ref fkeys i) (jrec-field-ref r i) acc))))))
+
+(define (jrec-plain-entries r)
+  (jrec-plain-fold
+    r
+    (lambda (k v acc) (cons (make-map-entry k v) acc))))
+
+(define (jrec-plain-kv-reduce r f init)
+  (let* ((step (kv-step f))
+         (fkeys (jrdesc-fkeys (jrec-desc r)))
+         (n (vector-length fkeys)))
+    (let loop ((i 0) (acc init))
+      (cond
+        ((jolt-reduced? acc) acc)
+        ((fx=? i n)
+         (let ((ext (jrec-ext r)))
+           (cond
+             ((jolt-nil? ext) acc)
+             ((pmap? ext) (pmap-kv-reduce ext step acc))
+             (else
+              (let eloop ((ps (jrec-ext-pairs ext)) (acc acc))
+                (if (or (null? ps) (jolt-reduced? acc))
+                    acc
+                    (eloop (cdr ps) (step acc (caar ps) (cdar ps)))))))))
+        (else
+         (loop
+           (fx+ i 1)
+           (step acc (vector-ref fkeys i) (jrec-field-ref r i))))))))
+
+(define (jrec-conj-entry c e)
+  (cond
+    ((pvec? e) (jolt-assoc1 c (jolt-nth e 0) (jolt-nth e 1)))
+    ((jolt-host-entry e) =>
+     (lambda (kv) (jolt-assoc1 c (car kv) (cdr kv))))
+    (else
+     (jolt-throw
+       (jolt-host-throwable
+         "java.lang.ClassCastException"
+         (string-append
+           "class "
+           (guard (x (#t "?")) (jolt-class-name e))
+           " cannot be cast to class java.util.Map$Entry"))))))
+
+(define (jrec-plain-conj coll x)
+  (cond
+    ((pmap? x)
+     (pmap-fold-fwd x (lambda (k v c) (jolt-assoc1 c k v)) coll))
+    ((jolt-nil? x) coll)
+    ((or (pvec? x) (jolt-host-entry x))
+     (jrec-conj-entry coll x))
+    (else
+     (let loop ((s (jolt-seq x)) (c coll))
+       (if (jolt-nil? s)
+           c
+           (loop
+             (jolt-seq (seq-more s))
+             (jrec-conj-entry c (seq-first s))))))))
+
+(define (jrec-plain-empty? r)
+  (and (fx=? 0 (jrdesc-nfields (jrec-desc r)))
+       (let ((ext (jrec-ext r)))
+         (or (jolt-nil? ext) (fx=? 0 (jolt-count ext))))))
 
 (define (jrec-entry-list r)
   (let* ((fkeys (jrdesc-fkeys (jrec-desc r)))
@@ -1446,38 +1654,59 @@
       (jrec-cl x "charAt"))))
 
 (register-seq-arm!
-  jrec-record?
+  (lambda (x) (and (jrec-record? x) (not (jrec-plain? x))))
   (lambda (x) (list->cseq (jrec-entry-list x))))
 
+(define (self-seq-method x name)
+  (cond
+    ((jrec? x) (jrec-cl x name))
+    ((jreify? x) (reify-method-ref x name))
+    (else #f)))
+
 (define (jrec-iseq->cseq x)
-  (let ((first-m (jrec-cl x "first"))
-        (next-m (jrec-cl x "next"))
-        (more-m (jrec-cl x "more")))
-    (define (step s)
-      (jolt-make-lazy-seq
-        (lambda ()
-          (let ((tail (cond
-                        (next-m (jolt-invoke next-m s))
-                        (more-m
-                         (let ((r (jolt-invoke more-m s)))
-                           (if (jolt-nil? (jolt-seq r)) jolt-nil r)))
-                        (else jolt-nil))))
-            (jolt-cons
-              (jolt-invoke first-m s)
-              (if (jolt-nil? tail)
-                  jolt-nil
-                  (if (and (jrec? tail) (eq? (jrec-tag tail) (jrec-tag x)))
-                      (step tail)
-                      (jolt-seq tail))))))))
+  (define (step s first-m next-m more-m)
+    (jolt-make-lazy-seq
+      (lambda ()
+        (let ((tail (cond
+                      (next-m (jolt-invoke next-m s))
+                      (more-m
+                       (let ((r (jolt-invoke more-m s)))
+                         (if (jolt-nil? (jolt-seq r)) jolt-nil r)))
+                      (else jolt-nil))))
+          (jolt-cons
+            (jolt-invoke first-m s)
+            (cond
+              ((jolt-nil? tail) jolt-nil)
+              ((and (jrec? tail)
+                    (jrec? s)
+                    (eq? (jrec-tag tail) (jrec-tag s)))
+               (step tail first-m next-m more-m))
+              ((and (jreify? tail)
+                    (self-seq-method tail "first")
+                    (jolt-seq? tail))
+               (step
+                 tail
+                 (self-seq-method tail "first")
+                 (self-seq-method tail "next")
+                 (self-seq-method tail "more")))
+              (else (jolt-seq tail))))))))
+  (let ((first-m (self-seq-method x "first")))
     (if first-m
-        (jolt-seq (step x))
+        (jolt-seq
+          (step
+            x
+            first-m
+            (self-seq-method x "next")
+            (self-seq-method x "more")))
         (jrec-abstract-method-error x "first"))))
+
+(define (self-seq-arm x)
+  (let ((r (jolt-invoke (self-seq-method x "seq") x)))
+    (if (eq? r x) (jrec-iseq->cseq x) (jolt-seq r))))
 
 (register-seq-arm!
   (lambda (x) (jrec-cl x "seq"))
-  (lambda (x)
-    (let ((r (jolt-invoke (jrec-cl x "seq") x)))
-      (if (eq? r x) (jrec-iseq->cseq x) (jolt-seq r)))))
+  self-seq-arm)
 
 (register-conj-arm!
   (lambda (coll) (jrec-cl coll "cons"))
@@ -1486,14 +1715,14 @@
 
 (register-conj-arm!
   (lambda (coll)
-    (and (jrec? coll) (not (jrec-cl coll "cons"))))
-  (lambda (coll x)
-    (if (pmap? x)
-        (pmap-fold-fwd x (lambda (k v c) (jolt-assoc1 c k v)) coll)
-        (jolt-assoc1 coll (jolt-nth x 0) (jolt-nth x 1)))))
+    (and (jrec? coll)
+         (not (jrec-plain? coll))
+         (not (jrec-cl coll "cons"))))
+  jrec-plain-conj)
 
 (register-empty-arm!
-  jrec-collection?
+  (lambda (coll)
+    (and (jrec-collection? coll) (not (jrec-plain? coll))))
   (lambda (coll) (jolt-nil? (jolt-seq coll))))
 
 (define %r-jolt-peek jolt-peek)
@@ -1517,9 +1746,12 @@
 (define (set-jrec-enum-constant-test! f)
   (set! jrec-enum-constant? f))
 
-(register-pr-arm!
-  (lambda (x) (and (jrec? x) (not (jrec-enum-constant? x))))
-  jrec-pr)
+(let ((pred (lambda (x)
+              (and (jrec? x) (not (jrec-enum-constant? x))))))
+  (register-pr-str-arm! pred (lambda (x) (jrec-pr x #f)))
+  (register-pr-readable-arm!
+    pred
+    (lambda (x) (jrec-pr x #t))))
 
 (register-map-pred-arm! jrec-maplike?)
 
@@ -1808,6 +2040,11 @@
 (define jreify-tags-memo (make-weak-eq-hashtable))
 
 (define (jreify-host-tags obj)
+  (let ((tags (jreify-protos-host-tags obj))
+        (c (reify-class-name obj)))
+    (if c (cons c tags) tags)))
+
+(define (jreify-protos-host-tags obj)
   (let* ((ps (jreify-protos obj))
          (e (hashtable-ref jreify-tags-memo ps #f)))
     (if (and e (fx= (car e) jch-graph-epoch))
@@ -1882,7 +2119,8 @@
     ((number? obj) (jch-tags "java.lang.Number"))
     ((string? obj) (jch-tags "java.lang.String"))
     ((boolean? obj) (jch-tags "java.lang.Boolean"))
-    ((char? obj) (jch-tags "java.lang.Character"))
+    ((or (char? obj) (jsurr? obj))
+     (jch-tags "java.lang.Character"))
     ((keyword? obj) (jch-tags "clojure.lang.Keyword"))
     ((jolt-symbol? obj) (jch-tags "clojure.lang.Symbol"))
     ((jolt-map-entry? obj) (jch-tags "clojure.lang.MapEntry"))
@@ -1930,7 +2168,9 @@
     ((regex-t? obj) (jch-tags "java.util.regex.Pattern"))
     ((matcher-t? obj) (jch-tags "java.util.regex.Matcher"))
     ((juuid? obj) (jch-tags "java.util.UUID"))
-    ((jinst? obj) (jch-tags "java.util.Date"))
+    ((jinst? obj)
+     (jch-tags
+       (if (jts? obj) "java.sql.Timestamp" "java.util.Date")))
     ((jbigdec? obj) (jch-tags "java.math.BigDecimal"))
     ((procedure? obj) (jch-tags "clojure.lang.AFunction"))
     ((jolt-nil? obj) '("nil"))
@@ -1964,6 +2204,15 @@
           (loop
             (jolt-seq (seq-more s))
             (jolt-assoc r (jolt-nth e 0) (jolt-nth e 1)))))))
+
+(define-syntax jrec-fixed-ctor
+  (syntax-rules ()
+    ((_ mk desc co slow (a ...) (i ...))
+     (case-lambda
+       ((a ...)
+        (mk desc jolt-nil 0
+            (if (and co (vector-ref co i)) (jolt-rec-dbl a) a) ...))
+       (args (slow args))))))
 
 (define (make-deftype-ctor name-sym field-kws . rest-args)
   (let* ((tag (string-append
@@ -2005,7 +2254,7 @@
                                   (jolt-rec-dbl a)
                                   a))
                             (loop (cdr as) (+ i 1))))))))
-         (ctor (lambda args
+         (slow (lambda (args)
                  (let ((n (length args)))
                    (cond
                      ((= n nf) (build args))
@@ -2025,7 +2274,40 @@
                           "Wrong number of args ("
                           (jvm-arity-count n)
                           ") passed to: "
-                          ctor-name))))))))
+                          ctor-name)))))))
+         (co (and (exists (lambda (x) x) (vector->list dbl-flags))
+                  (let ((v (make-vector nf #f)))
+                    (do ((i 0 (fx+ i 1)))
+                        ((fx=? i (fxmin nf ndbl)) v)
+                      (vector-set! v i (vector-ref dbl-flags i))))))
+         (ctor (case nf
+                 ((0)
+                  (lambda args
+                    (if (null? args)
+                        (make-jrec0 desc jolt-nil 0)
+                        (slow args))))
+                 ((1) (jrec-fixed-ctor make-jrec1 desc co slow (a0) (0)))
+                 ((2)
+                  (jrec-fixed-ctor make-jrec2 desc co slow (a0 a1) (0 1)))
+                 ((3)
+                  (jrec-fixed-ctor make-jrec3 desc co slow (a0 a1 a2)
+                    (0 1 2)))
+                 ((4)
+                  (jrec-fixed-ctor make-jrec4 desc co slow (a0 a1 a2 a3)
+                    (0 1 2 3)))
+                 ((5)
+                  (jrec-fixed-ctor make-jrec5 desc co slow (a0 a1 a2 a3 a4)
+                    (0 1 2 3 4)))
+                 ((6)
+                  (jrec-fixed-ctor make-jrec6 desc co slow
+                    (a0 a1 a2 a3 a4 a5) (0 1 2 3 4 5)))
+                 ((7)
+                  (jrec-fixed-ctor make-jrec7 desc co slow
+                    (a0 a1 a2 a3 a4 a5 a6) (0 1 2 3 4 5 6)))
+                 ((8)
+                  (jrec-fixed-ctor make-jrec8 desc co slow
+                    (a0 a1 a2 a3 a4 a5 a6 a7) (0 1 2 3 4 5 6 7)))
+                 (else (lambda args (slow args))))))
     (class-ctor-set! tag ctor)
     (when (or (not (hashtable-ref
                      class-ctors-tbl
@@ -2355,6 +2637,29 @@
       obj
       rest)))
 
+(define (protocol-direct-impl proto-name method-name obj)
+  (cond
+    ((jrec? obj)
+     (let* ((tag (jrdesc-tag (jrec-desc obj)))
+            (ti (hashtable-ref type-registry tag #f))
+            (pi (and ti (hashtable-ref ti proto-name #f))))
+       (and pi
+            (not (extend-impl-table? pi))
+            (hashtable-ref pi method-name #f))))
+    ((jreify? obj)
+     (and (member proto-name (jreify-protos obj))
+          (reify-method-ref obj method-name)))
+    (else #f)))
+
+(define (protocol-resolve-meta proto-name method-name
+         meta-sym obj)
+  (or (protocol-direct-impl proto-name method-name obj)
+      (let ((m (jolt-meta obj)))
+        (and (not (jolt-nil? m))
+             (let ((f (jolt-get m meta-sym)))
+               (and f (not (jolt-nil? f)) f))))
+      (protocol-resolve proto-name method-name obj)))
+
 (define jolt-pic-n 4)
 
 (define jolt-pic-empty
@@ -2442,6 +2747,63 @@
   (nongenerative jolt-iterator-v1))
 
 (register-seq-arm! jiterator? jiterator-cur)
+
+(define iterator-seq-fills '())
+
+(define (register-iterator-seq-fill! tags fill next)
+  (for-each
+    (lambda (t)
+      (set! iterator-seq-fills
+        (cons (list t fill next) iterator-seq-fills)))
+    tags))
+
+(define (iterator-seq-method it name)
+  (or (and (jhost? it) (host-method-ref (jhost-tag it) name))
+      (lambda (self)
+        (record-method-dispatch self name (jolt-vector)))))
+
+(define (iterator-seq-chunk v more)
+  (let ((chunk (make-pvec v)))
+    (let loop ((i (fx- (vector-length v) 1)) (next #f))
+      (let ((c (make-cseqv (vector-ref v i) next sk-chunked-cons
+                 jolt-nil chunk i more)))
+        (if (fx=? i 0) c (loop (fx- i 1) c))))))
+
+(define (jolt-iterator-seq it)
+  (cond
+    ((jiterator? it) (jolt-seq (jiterator-cur it)))
+    ((not (or (jhost? it) (jreify? it) (jrec? it)))
+     (jolt-seq it))
+    (else
+     (let* ((has-next? (iterator-seq-method it "hasNext"))
+            (next (iterator-seq-method it "next"))
+            (fill (let ((e (and (jhost? it)
+                                (assoc
+                                  (jhost-tag it)
+                                  iterator-seq-fills))))
+                    (and e (eq? (caddr e) next) (cadr e)))))
+       (let chunks ()
+         (if (jolt-truthy? (has-next? it))
+             (jolt-make-lazy-seq
+               (lambda ()
+                 (let* ((buf (make-vector 32))
+                        (n (or (and fill (fill it buf))
+                               (let loop ((n 0))
+                                 (if (and (jolt-truthy? (has-next? it))
+                                          (fx<? n 32))
+                                     (begin
+                                       (vector-set! buf n (next it))
+                                       (loop (fx+ n 1)))
+                                     n))))
+                        (more (chunks)))
+                   (if (fx=? n 0)
+                       more
+                       (iterator-seq-chunk
+                         (if (fx=? n 32) buf (sa-subvector buf 0 n))
+                         more)))))
+             jolt-nil))))))
+
+(def-var! "clojure.core" "iterator-seq" jolt-iterator-seq)
 
 (define (condition->message-string c)
   (if (message-condition? c)
@@ -2552,17 +2914,6 @@
       (cseq? obj)
       (empty-list-t? obj)
       (jolt-lazyseq? obj)))
-
-(define (rd-ireduce-seq? obj)
-  (and (cseq? obj)
-       (or (cseqv? obj)
-           (let ((k (cseq-kind obj)))
-             (or (fx=? k sk-iterate)
-                 (fx=? k sk-cycle)
-                 (fx=? k sk-repeat)
-                 (fx=? k sk-long-range)
-                 (fx=? k sk-range)
-                 (fx=? k sk-list))))))
 
 (define (rd-java-set? obj)
   (or (pset? obj) (htable-sorted-set? obj)))
@@ -3377,10 +3728,17 @@
      (list (jolt-seq obj)))
     ((string=? name "iterator")
      (list (make-jiterator (jolt-seq obj))))
+    ((and (string=? name "spliterator")
+          persistent-spliterator-hook)
+     (list (persistent-spliterator-hook obj)))
     ((string=? name "reduce")
-     (let ((k (dot-coll-kind-fast obj)))
-       (when (and k (not (eq? k 'vec)) (not (rd-ireduce-seq? obj)))
-         (no-method-throw name obj (length args))))
+     (when (and (dot-coll-kind-fast obj)
+                (not (rd-instance-of?
+                       (if (pair? (cdr args))
+                           "clojure.lang.IReduceInit"
+                           "clojure.lang.IReduce")
+                       obj)))
+       (no-method-throw name obj (length args)))
      (list
        (if (pair? (cdr args))
            (jolt-reduce (car args) (cadr args) obj)
@@ -3454,8 +3812,6 @@
 (define arm-priority-date 40)
 
 (define arm-priority-file 41)
-
-(define arm-priority-nio-path 42)
 
 (define arm-priority-htable 43)
 
@@ -3550,8 +3906,8 @@
       (apply jolt-invoke f obj rest)))
 
 (define-record-type jreify
-  (fields methods protos delegate)
-  (nongenerative chez-jreify-v2))
+  (fields methods protos delegate (mutable cname))
+  (nongenerative chez-jreify-v3))
 
 (register-code-value! jreify?)
 
@@ -3600,7 +3956,33 @@
   jreify?
   (lambda (coll k d)
     (let ((m (reify-method-ref coll "valAt")))
-      (if m (jolt-invoke m coll k d) d))))
+      (cond
+        (m
+         (if (and (jolt-nil? d) (proc-accepts? m 2))
+             (jolt-invoke m coll k)
+             (jolt-invoke m coll k d)))
+        ((and (reify-method-ref coll "get")
+              (reify-declares-class?
+                (jreify-protos coll)
+                "java.util.Map"))
+         (let ((g (reify-method-ref coll "get"))
+               (ck (or (reify-method-ref coll "containsKey")
+                       (and abstract-class-method-hook
+                            (abstract-class-method-hook
+                              coll
+                              "containsKey")))))
+           (if ck
+               (if (jolt-truthy? (jolt-invoke ck coll k))
+                   (jolt-invoke g coll k)
+                   d)
+               (let ((v (jolt-invoke g coll k))) (if (jolt-nil? v) d v)))))
+        ((and abstract-class-method-hook
+              (abstract-class-method-hook coll "containsKey")) =>
+         (lambda (ck)
+           (if (jolt-truthy? (ck coll k))
+               (record-method-dispatch coll "get" (list->cseq (list k)))
+               d)))
+        (else d)))))
 
 (define (reify-proto-names proto-names)
   (intern-reify-protos
@@ -3613,6 +3995,13 @@
 
 (define (make-reified-delegating methods-map delegate
          proto-names)
+  (make-reified-delegating/protos
+    methods-map
+    delegate
+    (reify-proto-names proto-names)))
+
+(define (make-reified-delegating/protos methods-map delegate
+         protos)
   (let* ((ks (seq->list (jolt-keys methods-map)))
          (slots (make-hashtable string-hash string=?))
          (fns (make-vector (length ks))))
@@ -3625,10 +4014,7 @@
             i)
           (vector-set! fns i (jolt-get methods-map p jolt-nil))
           (loop (cdr ks) (fx+ i 1)))))
-    (make-jreify
-      (cons slots fns)
-      (reify-proto-names proto-names)
-      delegate)))
+    (make-jreify (cons slots fns) protos delegate #f)))
 
 (define reify-shape-memo (make-weak-eq-hashtable))
 
@@ -3638,25 +4024,44 @@
   (or (hashtable-ref reify-shape-memo shape #f)
       (let* ((names (seq->list (jolt-nth shape 0)))
              (slots (make-hashtable string-hash string=?))
-             (layout (cons
+             (protos (reify-proto-names (seq->list (jolt-nth shape 1))))
+             (layout (vector
                        slots
-                       (reify-proto-names
-                         (seq->list (jolt-nth shape 1))))))
+                       protos
+                       (and (fx>? (jolt-count shape) 2)
+                            (jolt-nth shape 2)))))
         (let loop ((ns names) (i 0))
           (unless (null? ns)
             (hashtable-set! slots (car ns) i)
             (loop (cdr ns) (fx+ i 1))))
+        (when (vector-ref layout 2)
+          (reify-class-graph-hook (vector-ref layout 2) protos))
         (jolt-with-mutex
           reify-shape-mu
           (hashtable-set! reify-shape-memo shape layout))
         layout)))
 
+(define proxy-class-name-hook (lambda (x) #f))
+
+(define (reify-class-name x)
+  (and (jreify? x)
+       (let ((c (jreify-cname x)))
+         (cond
+           ((string? c) c)
+           ((vector? c) (proxy-class-name-hook x))
+           (else #f)))))
+
+(define persistent-spliterator-hook #f)
+
+(define reify-class-graph-hook (lambda (name ifaces) #f))
+
 (define (make-reified-at shape . fns)
   (let ((layout (reify-shape-layout shape)))
     (make-jreify
-      (cons (car layout) (list->vector fns))
-      (cdr layout)
-      #f)))
+      (cons (vector-ref layout 0) (list->vector fns))
+      (vector-ref layout 1)
+      #f
+      (vector-ref layout 2))))
 
 (define reify-protos-table
   (make-hashtable equal-hash equal?))
@@ -3693,6 +4098,10 @@
           (let ((v (record-method-dispatch it "next" jolt-nil)))
             (jolt-cons v (iterator-cursor->seq it)))
           jolt-nil))))
+
+(register-seq-arm!
+  (lambda (x) (and (jreify? x) (reify-method-ref x "seq") #t))
+  self-seq-arm)
 
 (register-seq-arm!
   iface-iterator-cursor
@@ -3847,17 +4256,15 @@
 (register-str-render!
   jrec?
   (lambda (v)
-    (let ((f (find-protocol-method
+    (let ((f (find-method-any-protocol
                (jrec-tag v)
-               "Object"
                "toString")))
-      (cond
-        (f (jolt-invoke f v))
-        ((jrec-coll-print-shape v) =>
-         (lambda (shape) (jrec-coll-pr v shape)))
-        (else
-         (let ((s (jrec-field-pr v)))
-           (substring s 1 (string-length s))))))))
+      (if f
+          (jolt-invoke f v)
+          (string-append
+            (jolt-class-name v)
+            "@"
+            (jolt-hex32 (jolt-java-hashcode v)))))))
 
 (register-str-render!
   (lambda (v) (and (reify-method-ref v "toString") #t))
@@ -3868,6 +4275,22 @@
   "clojure.core"
   "make-deftype-ctor"
   make-deftype-ctor)
+
+(define (register-record-tag! tag)
+  (jolt-with-mutex
+    rec-tbl-mu
+    (hashtable-set! chez-record-type-tbl tag #t))
+  (chez-infer-registry-bump!)
+  (let ((protos (filter
+                  (lambda (s) (not (string=? s "clojure.lang.IType")))
+                  (jch-direct-supers tag))))
+    (jch-set-supers!
+      tag
+      (append
+        protos
+        '("clojure.lang.IRecord" "clojure.lang.IObj" "clojure.lang.IPersistentMap"
+           "java.util.Map" "clojure.lang.IHashEq"
+           "java.io.Serializable")))))
 
 (define (register-record-type! name-sym)
   (let ((tag (string-append
@@ -3963,6 +4386,12 @@
   "clojure.core"
   "protocol-dispatch3"
   (lambda (pn mn obj a b) (protocol-dispatch3 pn mn obj a b)))
+
+(def-var!
+  "clojure.core"
+  "protocol-resolve-meta"
+  (lambda (pn mn msym obj)
+    (protocol-resolve-meta pn mn msym obj)))
 
 (def-var! "clojure.core" "satisfies?" jolt-satisfies?)
 

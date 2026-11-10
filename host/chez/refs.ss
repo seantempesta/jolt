@@ -248,7 +248,8 @@
          (cond
            ((eq? o txn) #t)
            ((ref-held-against ref txn) => values)
-           ((sa-record-cas! ref ref-owner-slot o txn)
+           ;; publishes this txn to other threads, which read its status and age
+           ((begin (memory-order-release) (sa-record-cas! ref ref-owner-slot o txn))
             (jolt-txn-claims-set! txn (cons ref (jolt-txn-claims txn)))
             ;; a commit that landed between the check and the swap
             (if (changed-since? ref txn) 'retry #t))
@@ -264,8 +265,9 @@
          (cond
            ((eq? o txn) #t)
            ((and o (not (pair? o)) (txn-live? o)) o)
-           ((sa-record-cas! ref ref-owner-slot o
-                            (cons txn (if (pair? o) (filter txn-live? o) '())))
+           ((let ((ensurers (cons txn (if (pair? o) (filter txn-live? o) '()))))
+              (memory-order-release)   ; a fresh list and this txn, published
+              (sa-record-cas! ref ref-owner-slot o ensurers))
             (jolt-txn-ensures-set! txn (cons ref (jolt-txn-ensures txn)))
             (if (changed-since? ref txn) 'retry #t))
            (else (loop))))))))
@@ -306,6 +308,9 @@
                    (cur cur)
                    (else
                     (let ((new (stm-make-latch)))
+                      ;; the latch is fresh: its slots must be visible before
+                      ;; the CAS hands it to the owner that releases it
+                      (memory-order-release)
                       (cond ((not new) #f)
                             ((sa-record-cas! owner txn-latch-slot #f new) new)
                             (else (let ((cur (jolt-txn-latch owner)))

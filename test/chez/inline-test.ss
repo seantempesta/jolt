@@ -96,6 +96,36 @@
 ;; flonum 25.0 — matching the called fn, not an exact 25.
 (ok "inlined ^double with int args still returns a flonum" (flonum? (ev "((fn* ([] (dwork 3 4))))")))
 
+;; the cast fast path is decided in the CALLER's context after inlining: a typed
+;; body inlined where the argument is untyped still carries its entry coercion
+;; (lowered), and an untyped body inlined under a ^double argument is lowered too.
+(ev "(def dlong (fn* ([^double d] (long d))))")
+(ev "(def ulong (fn* ([d] (long d))))")
+(ok "inlined ^double cast under an untyped caller is lowered through its entry coercion"
+    (has? (emitf "u" "(fn* ([x] (dlong x)))") "(flonum->fixnum"))
+(ok "inlined untyped cast under a ^double caller is lowered"
+    (has? (emitf "u" "(fn* ([^double x] (ulong x)))") "(flonum->fixnum"))
+(ok "inlined untyped cast under an untyped caller is not lowered"
+    (not (has? (emitf "u" "(fn* ([x] (ulong x)))") "(flonum->fixnum")))
+;; which entry a lowered cast falls back to is the CALLEE's: an untyped param is
+;; boxed at the JVM's call, whatever the caller proves about the argument.
+(ev "(def dbyte (fn* ([^double d] (byte d))))")
+(ev "(def ubyte (fn* ([d] (byte d))))")
+(ev "(def ubyte-copy (fn* ([d] (let* [e d] (byte e)))))")
+(ev "(def ubyte-outer (fn* ([^double d] (ubyte d))))")
+(ok "inlined ^double byte falls back to the primitive entry"
+    (has? (emitf "u" "(fn* ([x] (dbyte x)))") "(jolt-byte-cast-prim "))
+(ok "inlined untyped byte under a ^double caller keeps the fast path"
+    (has? (emitf "u" "(fn* ([^double x] (ubyte x)))") "(flonum->fixnum"))
+(ok "inlined untyped byte under a ^double caller falls back boxed"
+    (not (has? (emitf "u" "(fn* ([^double x] (ubyte x)))") "-prim ")))
+(ok "a let copy of an untyped param stays boxed"
+    (not (has? (emitf "u" "(fn* ([^double x] (ubyte-copy x)))") "-prim ")))
+(ok "boxed survives a second splice"
+    (not (has? (emitf "u" "(fn* ([x] (ubyte-outer x)))") "-prim ")))
+(ok "lowered cast answers: 2.9 -> 2, -2.9 -> -2"
+    (equal? '(2 -2) (list (jnum->exact (ev "(dlong 2.9)")) (jnum->exact (ev "(dlong -2.9)")))))
+
 ;; a ^long fn inlines with long coercion + the checked long ops.
 (ev "(def ^long lsum (fn* ([^long a ^long b] (+ a b))))")
 (let ((e (emitf "u" "(fn* ([] (lsum 3 4)))")))
@@ -193,6 +223,18 @@
   (ok "a map a fn literal captures is not scalar-replaced into it" (has? e "amap-slots->pmap")))
 (let ((e (code-part (emitf "u" "(fn* ([a] (let [m {:x a :y 2}] (+ (:x m) (:y m)))))"))))
   (ok "a map read only in its own scope is still scalar-replaced" (not (has? e "amap-slots->pmap"))))
+;; Moving a value that allocates to two reads made two objects where the map
+;; held one: (identical? (:x m) (:x m)) was false, and a read in a loop body made
+;; one per iteration. The value is bound once instead (records: build-smoke.sh).
+(ok "a field read twice whose value allocates is read as one object"
+    (eq? #t (ev "((fn* ([a] (let [m {:x [a] :y 2}] (identical? (:x m) (:x m))))) 1)")))
+(ok "a field read once per loop iteration whose value allocates is one object"
+    (eq? #t (ev "((fn* ([a] (let [m {:x [a] :y 2}] (loop [i 0 prev (:x m)] (if (< i 2) (recur (inc i) (:x m)) (identical? prev (:x m))))))) 1)")))
+(let ((e (code-part (emitf "u" "(fn* ([a] (let [m {:x [a] :y 2}] (+ (count (:x m)) (:y m)))))"))))
+  (ok "a map with an allocating field is still scalar-replaced" (not (has? e "amap-slots->pmap"))))
+(let ((e (code-part (emitf "u" "(fn* ([a] (let [m {:x [a] :y (nil? a)}] (+ (count (:x m)) (if (:y m) 1 2) (if (:y m) 3 4)))))"))))
+  (ok "a non-allocating field read twice is still scalar-replaced" (not (has? e "amap-slots->pmap"))))
+(ok "a nested map read twice computes the same value" (= 4 (jnum->exact (ev "((fn* ([a] (let [m {:p {:x a :y 2} :q 1}] (+ (:x (:p m)) (:y (:p m)) (:q m))))) 1)"))))
 
 (set-optimize! #f)
 (set-direct-link-flag! #f)

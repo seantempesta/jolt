@@ -37,9 +37,23 @@
     (try (throw (ex-info "x" {}))
          (catch Exception a (+ (:x p) (:y p))))))
 
+
+;; an allocating field value read twice, or once per loop iteration: moved to
+;; each read it made a new object per read where the binding held one
+(defn alloc-twice [a]
+  (let [m {:x [a] :y 2} p (->P [a] 2)]
+    [(identical? (:x m) (:x m)) (identical? (:x p) (:x p)) (:y m) (:y p)]))
+
+(defn alloc-loop [a]
+  (let [m {:x [a] :y 2}]
+    (loop [i 0 prev (:x m)]
+      (if (< i 2) (recur (inc i) (:x m)) (identical? prev (:x m))))))
+
 (defn -main [& _]
   (println (apply closure-capture [1 2]))
   (println (apply let-shadow [1]))
   (println (apply loop-shadow [1]))
   (println (apply param-shadow [1]))
-  (println (apply catch-shadow [1])))
+  (println (apply catch-shadow [1]))
+  (println (apply alloc-twice [1]))
+  (println (apply alloc-loop [1])))

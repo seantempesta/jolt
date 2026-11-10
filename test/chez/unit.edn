@@ -775,7 +775,8 @@
   {:suite "insttime" :expr "(= #inst \"2020-01-01T00:00:00Z\" #inst \"2020-01-01T00:00:01Z\")" :expected "false"}
   {:suite "insttime" :expr "(get {#inst \"2020-01-01T00:00:00Z\" :v} #inst \"2020-01-01T00:00:00.000Z\")" :expected ":v"}
   {:suite "insttime" :expr "(pr-str #inst \"2020-01-01T00:00:00Z\")" :expected "\"#inst \\\"2020-01-01T00:00:00.000-00:00\\\"\""}
-  {:suite "insttime" :expr "(str #inst \"2020-01-01T00:00:00Z\")" :expected "\"2020-01-01T00:00:00.000-00:00\""}
+  ;; str is Date.toString, on the default zone (pinned here); pr stays #inst
+  {:suite "insttime" :expr "(try (java.util.TimeZone/setDefault (java.util.TimeZone/getTimeZone \"UTC\")) (str #inst \"2020-01-01T00:00:00Z\") (finally (java.util.TimeZone/setDefault nil)))" :expected "\"Wed Jan 01 00:00:00 UTC 2020\""}
   {:suite "insttime" :expr "(uuid? #uuid \"550e8400-e29b-41d4-a716-446655440000\")" :expected "true"}
   {:suite "insttime" :expr "(= #uuid \"550E8400-E29B-41D4-A716-446655440000\" #uuid \"550e8400-e29b-41d4-a716-446655440000\")" :expected "true"}
   {:suite "insttime" :expr "(pr-str #uuid \"550e8400-e29b-41d4-a716-446655440000\")" :expected "\"#uuid \\\"550e8400-e29b-41d4-a716-446655440000\\\"\""}
@@ -872,6 +873,14 @@
   ;; symlink to its target, into the data a hard link shares, keeping the mode.
   ;; The temp-and-rename it used to do replaced the file instead — the link came
   ;; back a regular file, the hard link split, and a 0600 file came back 0644.
+  ;; spit overwrites without truncating first, which on disk costs the kernel a
+  ;; free and a reallocation, so the file's tail has to go by other means.
+  {:suite "io" :label "spit cuts the tail of a longer file" :expr "(let [p (str (System/getProperty \"java.io.tmpdir\") \"/jolt-io-shrink.txt\")] (spit p \"a long first version\") (spit p \"short\") [(slurp p) (.length (java.io.File. p))])" :expected "[\"short\" 5]"}
+  {:suite "io" :label "spit grows a shorter file" :expr "(let [p (str (System/getProperty \"java.io.tmpdir\") \"/jolt-io-grow.txt\")] (spit p \"ab\") (spit p \"abcdefgh\") [(slurp p) (.length (java.io.File. p))])" :expected "[\"abcdefgh\" 8]"}
+  {:suite "io" :label "spit of the same length replaces every byte" :expr "(let [p (str (System/getProperty \"java.io.tmpdir\") \"/jolt-io-same.txt\")] (spit p \"aaaa\") (spit p \"bbbb\") (slurp p))" :expected "\"bbbb\""}
+  {:suite "io" :label "spit of nothing empties a file" :expr "(let [p (str (System/getProperty \"java.io.tmpdir\") \"/jolt-io-empty.txt\")] (spit p \"content\") (spit p \"\") [(slurp p) (.length (java.io.File. p))])" :expected "[\"\" 0]"}
+  {:suite "io" :label "spit shrinks through an encoding" :expr "(let [p (str (System/getProperty \"java.io.tmpdir\") \"/jolt-io-enc.txt\")] (spit p \"longer text\" :encoding \"UTF-16LE\") (spit p \"x\" :encoding \"UTF-16LE\") (.length (java.io.File. p)))" :expected "2"}
+  {:suite "io" :label "spit writes to a device" :expr "(do (when (= \"/\" java.io.File/separator) (spit \"/dev/null\" \"x\")) :done)" :expected ":done"}
   {:suite "io" :label "spit writes through a symlink" :expr "(do (require (quote [babashka.fs :as fs])) (let [d (str (fs/create-temp-dir)) t (str d \"/target.txt\") l (str d \"/link.txt\")] (spit t \"old\") (fs/create-sym-link l t) (spit l \"new\") [(fs/sym-link? l) (slurp t)]))" :expected "[true \"new\"]"}
   {:suite "io" :label "spit writes into the data a hard link shares" :expr "(do (require (quote [babashka.fs :as fs])) (let [d (str (fs/create-temp-dir)) t (str d \"/target.txt\") h (str d \"/hard.txt\")] (spit t \"old\") (fs/create-link h t) (spit h \"new\") (slurp t)))" :expected "\"new\""}
   {:suite "io" :label "spit keeps the file's mode" :expr "(do (require (quote [babashka.fs :as fs])) (let [p (str (fs/create-temp-dir) \"/secret.txt\")] (spit p \"old\") (fs/set-posix-file-permissions p (fs/str->posix \"rw-------\")) (spit p \"new\") [(fs/posix->str (fs/posix-file-permissions p)) (slurp p)]))" :expected "[\"rw-------\" \"new\"]"}
@@ -917,10 +926,10 @@
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.read (io/reader (StringReader. \"k\"))))" :expected "107"}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (slurp (io/reader (char-array \"xyz\"))))" :expected "\"xyz\""}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (string? (slurp (io/reader \"README.md\"))))" :expected "true"}
-  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.toString (.toURL (io/file \"/tmp/x\"))))" :expected "\"file:/tmp/x\""}
-  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.toURI (io/file \"/tmp/x\")))" :expected "#object[java.net.URI \"file:/tmp/x\"]"}
-  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (str (.toURI (io/file \"/tmp/x\"))))" :expected "\"file:/tmp/x\""}
-  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (pr-str (.toURI (io/file \"/tmp/x\"))))" :expected "\"#object[java.net.URI \\\"file:/tmp/x\\\"]\""}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.toString (.toURL (io/file \"/tmp/jolt-no-such-dir/x\"))))" :expected "\"file:/tmp/jolt-no-such-dir/x\""}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.toURI (io/file \"/tmp/jolt-no-such-dir/x\")))" :expected "#object[java.net.URI \"file:/tmp/jolt-no-such-dir/x\"]"}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (str (.toURI (io/file \"/tmp/jolt-no-such-dir/x\"))))" :expected "\"file:/tmp/jolt-no-such-dir/x\""}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (pr-str (.toURI (io/file \"/tmp/jolt-no-such-dir/x\"))))" :expected "\"#object[java.net.URI \\\"file:/tmp/jolt-no-such-dir/x\\\"]\""}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (clojure.string/replace (pr-str (io/file \"/tmp/x\")) #\" 0x[0-9a-f]+\" \"\"))" :expected "\"#object[java.io.File \\\"/tmp/x\\\"]\""}
   {:suite "ioreader" :expr "(clojure.string/replace (pr-str (atom 1)) #\" 0x[0-9a-f]+ \" \" \")" :expected "\"#object[clojure.lang.Atom {:status :ready, :val 1}]\""}
  ;; io/resource has two branches — a source root (a jfile) and an embedded resource
@@ -973,7 +982,7 @@
   ;; strips the scheme. All five must hold before io/resource can return a URL.
   ;; Built against a temp file so nothing here depends on a machine path.
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (let [f (java.io.File/createTempFile \"joltres\" \".txt\")] (spit f \"hello\") (let [u (java.net.URL. (str \"file:\" (.getAbsolutePath f))) r (and (= \"hello\" (slurp u)) (= \"hello\" (slurp (.openStream u))) (= \"hello\" (slurp (io/reader u))) (= \"hello\" (slurp (io/input-stream u))) (= (.getAbsolutePath f) (str (io/file u))))] (.delete f) r)))" :expected "true"}
-  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getPath (.toURL (io/file \"/tmp/x\"))))" :expected "\"/tmp/x\""}
+  {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getPath (.toURL (io/file \"/tmp/jolt-no-such-dir/x\"))))" :expected "\"/tmp/jolt-no-such-dir/x\""}
   {:suite "ioreader" :expr "(do (require (quote [clojure.java.io :as io])) (.getAbsolutePath (io/file \"/a/b\")))" :expected "\"/a/b\""}
   ;; Normalizing &form rebuilds the call form, so its reader metadata has to ride
   ;; along — a macro reading (:line (meta &form)) is how a library reports the
@@ -2350,7 +2359,7 @@
   ;; belonged and died in destructuring.
   {:suite "proxy over an interface" :expr "(let [p (proxy [java.io.InputStream] [] (read ([] 65) ([b off len] 7)))] [(.read p) (.read p (byte-array 4) 0 4)])" :expected "[65 7]"}
   {:suite "proxy over an interface" :expr "(let [p (proxy [java.io.InputStream] [] (read ([] 9)) (available ([] 3)))] [(.read p) (.available p)])" :expected "[9 3]"}
-  {:suite "reify class" :expr "(str (class (reify java.lang.Runnable (run [_] nil))))" :expected "\"class clojure.lang.IObj$reify__0\""}
+  {:suite "reify class" :expr "(boolean (re-matches #\"class user\\$reify__\\d+\" (str (class (reify java.lang.Runnable (run [_] nil))))))" :expected "true"}
   {:suite "promise class" :expr "(str (class (promise)))" :expected "\"class clojure.core$promise$reify__0\""}
   {:suite "future class" :expr "(str (class (future 1)))" :expected "\"class clojure.core$future_call$reify__0\""}
   ;; two same-named records in different namespaces: suffix match has >1
@@ -2485,6 +2494,12 @@
   ;; java.time compareTo answers the JDK's field-difference magnitude, and every
   ;; type's compareTo refuses a value of another type (it used to NPE or answer 1)
   {:suite "insttime" :expr "[(compare (java.time.LocalDate/of 2020 1 1) (java.time.LocalDate/of 2025 3 1)) (compare (java.time.LocalDate/of 2020 5 30) (java.time.LocalDate/of 2020 5 1)) (compare (java.time.LocalDateTime/of 2020 1 1 0 0) (java.time.LocalDateTime/of 2023 1 1 0 0)) (compare (java.time.Year/of 2020) (java.time.Year/of 2025)) (compare (java.time.YearMonth/of 2020 1) (java.time.YearMonth/of 2020 7)) (compare (java.time.MonthDay/of 1 5) (java.time.MonthDay/of 1 25)) (compare (java.time.Duration/ofNanos 10) (java.time.Duration/ofNanos 3)) (compare (java.time.Instant/ofEpochSecond -1 5) (java.time.Instant/ofEpochSecond -1 900)) (mapv (fn [f] (try (f) (catch ClassCastException _ :cce))) [#(.compareTo (java.time.LocalDate/of 2020 1 1) 1) #(.compareTo java.time.Month/MAY 1) #(.compareTo (java.time.Duration/ofSeconds 1) 1) #(.compareTo java.time.temporal.ChronoUnit/DAYS java.time.DayOfWeek/MONDAY) #(.compareTo (java.time.MonthDay/of 1 1) 1)])]" :expected "[-5 29 -3 -5 -6 -20 7 -895 [:cce :cce :cce :cce :cce]]"}
+  ;; ZipEntry.getTimeLocal is a java.time.LocalDateTime, and java.time's of
+  ;; refuses an out-of-range field as JDK 21 does (expected values from JDK 21).
+  {:suite "insttime" :expr "(let [e (java.util.zip.ZipEntry. \"a\") t (java.time.LocalDateTime/of 2020 1 2 3 4 5)] (.setTimeLocal e t) (let [l (.getTimeLocal e) e2 (java.util.zip.ZipEntry. \"b\")] (.setTime e2 (.getTime e)) [(str l) (.getName (class l)) (= l t) (= l (.getTimeLocal e)) (.getHour l) (str (.getTimeLocal e2))]))" :expected "[\"2020-01-02T03:04:05\" \"java.time.LocalDateTime\" true true 3 \"2020-01-02T03:04:05\"]"}
+  {:suite "insttime" :expr "(try (.getTimeLocal (java.util.zip.ZipEntry. \"a\")) (catch java.time.DateTimeException e (ex-message e)))" :expected "\"Invalid value for MonthOfYear (valid values 1 - 12): 15\""}
+  {:suite "insttime" :expr "(let [e (java.util.zip.ZipEntry. \"a\") f (java.util.zip.ZipEntry. \"b\") g (java.util.zip.ZipEntry. \"c\")] (.setTimeLocal e (java.time.LocalDateTime/of 2020 1 2 3 4 5 123456789)) (.setTimeLocal f (java.time.LocalDateTime/of 1970 6 2 3 4 5 123456789)) (.setLastModifiedTime g (.getLastModifiedTime f)) [(str (.getTimeLocal e)) (str (.getTimeLocal f)) (str (.getTimeLocal g)) (= (.getLastModifiedTime f) (.getLastModifiedTime g))])" :expected "[\"2020-01-02T03:04:05.123\" \"1970-06-02T03:04:05.123456789\" \"1970-06-02T03:04:05.123456789\" true]"}
+  {:suite "insttime" :expr "(mapv (fn [f] (try (str (f)) (catch java.time.DateTimeException e (ex-message e)))) [#(java.time.LocalDate/of 2020 13 1) #(java.time.LocalTime/of 25 0) #(java.time.LocalDateTime/of 2020 1 1 0 0) #(java.time.LocalDateTime/of 2020 1 1 0 0 0 -1) #(java.time.LocalDate/of 2020 2 30) #(java.time.LocalTime/of 1 60) #(java.time.LocalTime/of 1 1 60) #(java.time.LocalTime/of 1 1 1 1000000000) #(java.time.LocalDate/of 2021 2 29) #(java.time.LocalDate/of 2020 2 29) #(java.time.LocalDate/of 2020 4 31) #(java.time.LocalDate/of 2020 4 0) #(java.time.LocalDate/of 1000000000 4 1) #(java.time.LocalDate/of 2020 java.time.Month/APRIL 31) #(.atTime (java.time.LocalDate/of 2020 1 1) 24 0) #(java.time.LocalDateTime/of 2020 1 32 0 0)])" :expected "[\"Invalid value for MonthOfYear (valid values 1 - 12): 13\" \"Invalid value for HourOfDay (valid values 0 - 23): 25\" \"2020-01-01T00:00\" \"Invalid value for NanoOfSecond (valid values 0 - 999999999): -1\" \"Invalid date 'FEBRUARY 30'\" \"Invalid value for MinuteOfHour (valid values 0 - 59): 60\" \"Invalid value for SecondOfMinute (valid values 0 - 59): 60\" \"Invalid value for NanoOfSecond (valid values 0 - 999999999): 1000000000\" \"Invalid date 'February 29' as '2021' is not a leap year\" \"2020-02-29\" \"Invalid date 'APRIL 31'\" \"Invalid value for DayOfMonth (valid values 1 - 28/31): 0\" \"Invalid value for Year (valid values -999999999 - 999999999): 1000000000\" \"Invalid date 'APRIL 31'\" \"Invalid value for HourOfDay (valid values 0 - 23): 24\" \"Invalid value for DayOfMonth (valid values 1 - 28/31): 32\"]"}
   ;; Stage C — FQN statics share one table with short names
   {:suite "javastatic" :expr "(java.lang.Character/isWhitespace \\ )" :expected "true"}
   {:suite "javastatic" :expr "(= (Character/isWhitespace \\ ) (java.lang.Character/isWhitespace \\ ))" :expected "true"}
@@ -2799,8 +2814,22 @@
   {:suite "class" :expr "[(.removeIf [1 2] (constantly false)) (.removeIf [] (constantly true)) (try (.removeIf [1 2] odd?) :no-throw (catch UnsupportedOperationException e :uoe))]" :expected "[false false :uoe]"}
   ;; File.toURI of (File. "") is the working directory, a directory, so it ends
   ;; in a slash like every other existing directory's; the check used to read the
-  ;; raw "" instead of the resolved path. Path.toUri answers the same URI object.
-  {:suite "class" :expr "(let [u (.toURI (java.io.File. \"\")) p (.toUri (java.nio.file.Paths/get \"\" (into-array String [])))] [(.endsWith (str u) \"/\") (instance? java.net.URI p) (= (str u) (str p))])" :expected "[true true true]"}
+  ;; raw "" instead of the resolved path. Path.toUri names the same directory,
+  ;; in its own "file:///" form (jolt-lang/jolt#1467).
+  {:suite "class" :expr "(let [u (.toURI (java.io.File. \"\")) p (.toUri (java.nio.file.Paths/get \"\" (into-array String [])))] [(.endsWith (str u) \"/\") (instance? java.net.URI p) (= (str u) (str p)) (= (subs (str u) 5) (subs (str p) 7))])" :expected "[true true false true]"}
+  ;; Path.toUri is not File.toURI (jolt-lang/jolt#1467): an empty authority, and
+  ;; every byte outside the RFC 2396 path set escaped, non-ASCII as UTF-8.
+  {:suite "path-touri" :expr "(mapv #(str (.toUri (java.nio.file.Paths/get % (into-array String [])))) [\"/x/plain.clj\" \"/x/\u00fcn\u00ef c\u00f6d\u00e9.clj\" \"/x/a%b[c]#d?e{f}.clj\" \"/x/a:@&=+$,;!~*'()_.-\"])" :expected "[\"file:///x/plain.clj\" \"file:///x/%C3%BCn%C3%AF%20c%C3%B6d%C3%A9.clj\" \"file:///x/a%25b%5Bc%5D%23d%3Fe%7Bf%7D.clj\" \"file:///x/a:@&=+$,;!~*'()_.-\"]"}
+  {:suite "path-touri" :expr "(let [p (java.nio.file.Paths/get \"/x/\u00fc f.clj\" (into-array String [])) u (.toUri p)] [(.getPath u) (.getRawPath u) (.getAuthority u) (= p (java.nio.file.Paths/get u)) (.getPath (java.io.File. u))])" :expected "[\"/x/\u00fc f.clj\" \"/x/%C3%BC%20f.clj\" nil true \"/x/\u00fc f.clj\"]"}
+  ;; A java.net.URI opens through its URL, as clojure.java.io's IOFactory does:
+  ;; slurp, spit, io/reader, io/writer, io/input-stream and io/output-stream all
+  ;; refused one before; a relative URI is refused as the JVM's toURL refuses it.
+  {:suite "uri-io" :expr "(let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt uri ïo\") f (str d \"/ü f.txt\") u (.toUri (java.nio.file.Paths/get f (into-array String []))) u2 (.toURI (java.io.File. f))] (.mkdirs (java.io.File. d)) (spit u \"one\n\") (spit u2 \"two\n\" :append true) (with-open [w (clojure.java.io/writer u :append true)] (.write w \"three\n\")) (with-open [o (clojure.java.io/output-stream u2 :append true)] (.write o (.getBytes \"four\n\"))) [(slurp u) (with-open [r (clojure.java.io/reader u2)] (vec (line-seq r))) (with-open [i (clojure.java.io/input-stream u)] (slurp i))])" :expected "[\"one\\ntwo\\nthree\\nfour\\n\" [\"one\" \"two\" \"three\" \"four\"] \"one\\ntwo\\nthree\\nfour\\n\"]"}
+  {:suite "uri-io" :expr "(mapv #(try (% (java.net.URI. \"a/b\")) (catch IllegalArgumentException e (ex-message e))) [slurp clojure.java.io/reader clojure.java.io/input-stream (fn [u] (.toURL u))])" :expected "[\"URI is not absolute\" \"URI is not absolute\" \"URI is not absolute\" \"URI is not absolute\"]"}
+  ;; URI.toASCIIString percent-encodes every non-ASCII character, NFC first, as
+  ;; UTF-8 in every component (jolt-lang/jolt#1468); toString keeps it raw.
+  {:suite "uri-ascii" :expr "(mapv #(vector (str %) (.toASCIIString %)) [(java.net.URI. \"file\" nil \"/x/\u00fcn\u00ef c\u00f6d\u00e9.clj\" nil) (java.net.URI. \"http\" nil \"/p\u00e4th\" \"q\u00fcery=\u00fc\" \"fr\u00e4gment\") (java.net.URI. \"http://ex\u00e4mple.com/p\u00e4th?q=\u00fc#fr\u00e4\")])" :expected "[[\"file:/x/\u00fcn\u00ef%20c\u00f6d\u00e9.clj\" \"file:/x/%C3%BCn%C3%AF%20c%C3%B6d%C3%A9.clj\"] [\"http:/p\u00e4th?q\u00fcery=\u00fc#fr\u00e4gment\" \"http:/p%C3%A4th?q%C3%BCery=%C3%BC#fr%C3%A4gment\"] [\"http://ex\u00e4mple.com/p\u00e4th?q=\u00fc#fr\u00e4\" \"http://ex%C3%A4mple.com/p%C3%A4th?q=%C3%BC#fr%C3%A4\"]]"}
+  {:suite "uri-ascii" :expr "[(.toASCIIString (java.net.URI. \"http://h/ae\u0301\")) (.toASCIIString (java.net.URI. \"http://h/a%20b?x=1\")) (.toASCIIString (java.net.URI. \"http://h/\ud83d\ude00\"))]" :expected "[\"http://h/a%C3%A9\" \"http://h/a%20b?x=1\" \"http://h/%F0%9F%98%80\"]"}
   {:suite "jolt-version" :label "*jolt-version* is a non-blank string" :expected "true" :expr "(and (string? *jolt-version*) (pos? (count *jolt-version*)))"}
   {:suite "jolt-version" :label "property and host fn match the var" :expected "true" :expr "(= *jolt-version* (System/getProperty \"jolt.version\") (jolt.host/jolt-version))"}
   {:suite "add-deps" :label "inline :local/root dep becomes requirable" :expected ":pong" :expr "(do (require 'jolt.deps) (let [d (str (System/getProperty \"java.io.tmpdir\") \"/jolt-adddep-unit\")] (jolt.host/sh (str \"rm -rf \" d)) (jolt.host/sh (str \"mkdir -p \" d \"/src/adddep\")) (spit (str d \"/deps.edn\") \"{}\") (spit (str d \"/src/adddep/core.clj\") \"(ns adddep.core) (defn ping [] :pong)\") (jolt.deps/add-deps {:deps {'adddep/adddep {:local/root d}}}) (require 'adddep.core) ((resolve 'adddep.core/ping))))"}
@@ -2944,7 +2973,7 @@
   {:suite "shadow-emitted" :expr "(let [case-lambda 5] ((fn ([x] x) ([x y] y)) 1))" :expected "1"}
   {:suite "shadow-emitted" :expr "(let [dynamic-wind 5] (binding [*print-length* 3] 1))" :expected "1"}
   {:suite "shadow-emitted" :expr "(let [host-new 5] (.size (java.util.ArrayList.)))" :expected "0"}
-  {:suite "shadow-emitted" :expr "(do (defrecord Rd [x]) (let [record-method-dispatch 5] (.toString (->Rd 1))))" :expected "\"user.Rd{:x 1}\""}
+  {:suite "shadow-emitted" :expr "(do (defrecord Rd [x]) (let [record-method-dispatch 5] (.toString (->Rd 1))))" :expected "\"user.Rd@3c6f1169\""}
   {:suite "shadow-emitted" :expr "(let [host-static-call 5] (String/valueOf 42))" :expected "\"42\""}
   {:suite "shadow-emitted" :expr "(let [host-static-ref 5] (pos? Long/MAX_VALUE))" :expected "true"}
   ;; hashtable-ref is emitted by the devirt ctor-inlining path; reproduces only
@@ -3425,6 +3454,17 @@
   {:suite "repl-printer" :expr "\"hi\"" :expected "\"hi\""}
   {:suite "repl-printer" :expr "{:a \"x\" :b \\y}" :expected "{:a \"x\", :b \\y}"}
   {:suite "repl-printer" :expr "(symbol (clojure.string/replace (pr-str (java.io.File. \"/tmp/x\")) #\" 0x[0-9a-f]+\" \"\"))" :expected "#object[java.io.File \"/tmp/x\"]"}
+  ;; The print walks are narrowed per type once a value of it has printed
+  ;; (print-arms-for, host-static.ss). An arm or a print-method registered after
+  ;; that first print still decides the next one: the narrowed walk is cached
+  ;; against the registry list, and a library arm is asked live in every walk.
+  {:suite "print-arm-verdict" :expr "(let [f (java.io.File. \"/jolt-print-arm-probe\") p (fn [x] (and (instance? java.io.File x) (= (.getPath x) \"/jolt-print-arm-probe\"))) before [(.startsWith (pr-str f) \"#object[java.io.File\") (str f)]] (__register-pr! p (fn [x] \"#probe\")) (__register-str! p (fn [x] \"probe-str\")) [before (pr-str f) (str f) (pr-str [f]) (print-str f) (str (java.io.File. \"/tmp\")) (.startsWith (pr-str (java.io.File. \"/tmp\")) \"#object[java.io.File\")])" :expected "[[true \"/jolt-print-arm-probe\"] \"#probe\" \"probe-str\" \"[#probe]\" \"#probe\" \"/tmp\" true]"}
+  {:suite "print-arm-verdict" :expr "(let [c (java.util.zip.CRC32.) before (.startsWith (pr-str c) \"#object[java.util.zip.CRC32\")] (defmethod print-method java.util.zip.CRC32 [x w] (.write w \"#crc\")) [before (pr-str c) (pr-str [c c])])" :expected "[true \"#crc\" \"[#crc #crc]\"]"}
+  ;; Identity hashes are minted under a CAS spin lock (hasheq.ss); without its
+  ;; acquire/release fences a second thread minted a second id for an object on
+  ;; arm64. Eight threads hash the same fresh objects in opposite orders and
+  ;; must agree on every one.
+  {:suite "identity-hash" :expr "(let [objs (vec (repeatedly 100000 #(java.io.File. \"x\"))) rs (mapv deref (doall (for [k (range 8)] (future (let [v (if (even? k) objs (vec (rseq objs))) hs (mapv #(System/identityHashCode %) v)] (if (even? k) hs (vec (rseq hs))))))))] [(apply = rs) (> (count (set (first rs))) 99000)])" :expected "[true true]"}
   {:suite "repl-printer" :expr "(str \"hi\" \\c)" :expected "\"hic\""}
   {:suite "repl-printer" :expr "(with-out-str (print [\"hi\" 1]))" :expected "\"[hi 1]\""}
   {:suite "repl-printer" :expr "(with-out-str (println \"hi\"))" :expected "\"hi\\n\""}
@@ -3483,10 +3523,7 @@
   ;; extension point — jolt-lang/time owns java.util.Locale and registers them
   ;; (RFC 0008). These rows register their own ids, proving the seam end to end.
   ;; Expectations read off reference JVM Clojure 1.12.5; 2014-03-01 is a Saturday.
-  ;; Guard: a numeric-only pattern must not move when the name tables do. Not a
-  ;; corpus row — jolt's SimpleDateFormat formats in UTC while the JVM's uses the
-  ;; machine's default zone, so the JVM side of this is machine-dependent and
-  ;; uncertifiable (see the :documented entry in known-divergences).
+  ;; Guard: a numeric-only pattern must not move when the name tables do.
   {:suite "date names" :expr "(.format (doto (java.text.SimpleDateFormat. \"yyyy-MM-dd HH:mm\") (.setTimeZone (java.util.TimeZone/getTimeZone \"GMT\"))) (java.util.Date. 1393632000000))" :expected "\"2014-03-01 00:00\""}
   {:suite "date names" :expr "(do (jolt.host/register-extension! :date-names \"fr-test\" {:months [\"janvier\" \"février\" \"mars\" \"avril\" \"mai\" \"juin\" \"juillet\" \"août\" \"septembre\" \"octobre\" \"novembre\" \"décembre\"] :months-short [\"janv.\" \"févr.\" \"mars\" \"avr.\" \"mai\" \"juin\" \"juil.\" \"août\" \"sept.\" \"oct.\" \"nov.\" \"déc.\"] :days [\"lundi\" \"mardi\" \"mercredi\" \"jeudi\" \"vendredi\" \"samedi\" \"dimanche\"] :days-short [\"lun.\" \"mar.\" \"mer.\" \"jeu.\" \"ven.\" \"sam.\" \"dim.\"]}) [(.format (doto (java.text.SimpleDateFormat. \"MMMM\" \"fr-test\") (.setTimeZone (java.util.TimeZone/getTimeZone \"GMT\"))) (java.util.Date. 1393632000000)) (.format (doto (java.text.SimpleDateFormat. \"EEE\" \"fr-test\") (.setTimeZone (java.util.TimeZone/getTimeZone \"GMT\"))) (java.util.Date. 1393632000000)) (.format (doto (java.text.SimpleDateFormat. \"EEEE\" \"fr-test\") (.setTimeZone (java.util.TimeZone/getTimeZone \"GMT\"))) (java.util.Date. 1393632000000)) (.format (doto (java.text.SimpleDateFormat. \"yyyy-MM-dd\" \"fr-test\") (.setTimeZone (java.util.TimeZone/getTimeZone \"GMT\"))) (java.util.Date. 1393632000000))])" :expected "[\"mars\" \"sam.\" \"samedi\" \"2014-03-01\"]"}
   ;; the ctor renders the locale argument to an id rather than naming a class —
@@ -3524,20 +3561,35 @@
   ;; jolt strings are code-point indexed, so (char n) has to accept the whole
   ;; scalar-value range or it cannot rebuild a char the string layer produced.
   ;; Wider than the JVM's 16-bit char by design, hence a unit row not a corpus
-  ;; one. Surrogates are not scalar values and stay rejected.
-  {:suite "char / code points" :expr "[(int (char 65)) (int (char 128515)) (int (first (str (char 128515)))) (try (char 55296) (catch Exception e (ex-message e))) (try (char 1114112) (catch Exception e (ex-message e)))]" :expected "[65 128515 128515 \"Value out of range for char: 55296\" \"Value out of range for char: 1114112\"]"}
+  ;; one. A surrogate is no scalar value, so (char 55296) is the surrogate-unit
+  ;; value (#1454), a Character whose int is the unit.
+  {:suite "char / code points" :expr "[(int (char 65)) (int (char 128515)) (int (first (str (char 128515)))) (char 55296) (int (char 55296)) (try (char 1114112) (catch Exception e (ex-message e)))]" :expected "[65 128515 128515 \\uD800 55296 \"Value out of range for char: 1114112\"]"}
   ;; The same model seen from the string side: an astral character is ONE element,
   ;; so there is no surrogate half to index out. A JVM string holds two code units
   ;; here, which is why a parser test that expects a lone surrogate to be rejected
   ;; cannot pass — see the :string-model entry in known-divergences.edn.
   {:suite "string / surrogate halves" :expr "(let [c (str (char 128169))] [(count c) (int (first c)) (nil? (second c)) (= c (str (first c)))])" :expected "[1 128169 true true]"}
-  ;; str of a deftype/record with no toString is its print form: the JVM answers
-  ;; Object.toString there ("user.Rec@3c6f0c28"), which jolt has no identity hash
-  ;; for, so it renders the value instead and drops the leading # of the record
-  ;; marker. A COLLECTION deftype prints in its collection's shape, which has no
-  ;; such marker — dropping a character there produced "1 2 3)".
-  {:suite "printing / str of a deftype" :expr "(do (deftype Sq [v] clojure.lang.ISeq (seq [_] (seq v)) (first [_] (first v)) (next [_] (next (seq v))) (more [_] (rest (seq v))) (count [_] (count v)) (equiv [_ o] (= (seq v) o)) (empty [_] nil) (cons [_ o] (cons o (seq v)))) [(str (->Sq [1 2 3])) (format \"%s\" (->Sq [1 2 3])) (str \"x=\" (->Sq [1 2]))])" :expected "[\"(1 2 3)\" \"(1 2 3)\" \"x=(1 2)\"]"}
-  {:suite "printing / str of a deftype" :expr "(do (defrecord Rc [a]) (deftype Dt [a]) [(str (->Rc 1)) (str (->Dt 1))])" :expected "[\"user.Rc{:a 1}\" \"user.Dt{:a 1}\"]"}
+  ;; Strings index by code point everywhere: clojure.core and the String,
+  ;; StringBuilder and Matcher index methods agree, so an offset from one is good
+  ;; for the other (Jonquil hands GTK's code-point offsets to subs). #1472 made
+  ;; the methods count UTF-16 units; these pin the model (known-divergences
+  ;; :string-model).
+  {:suite "string-model / code points" :expr "(let [s \"😀abc\"] [(count s) (.length s) (subs s 1) (int (nth s 0)) (int (.charAt s 0)) (.substring s 1) (.indexOf s \"a\") (.lastIndexOf s \"c\") (mapv int (seq s)) (mapv int (vec s)) (clojure.string/index-of s \"b\") (.codePointAt s 0) (.subSequence s 1 3)])" :expected "[4 4 \"abc\" 128512 128512 \"abc\" 1 3 [128512 97 98 99] [128512 97 98 99] 2 128512 \"ab\"]"}
+  {:suite "string-model / code points" :expr "(let [s \"x😀abc\" m (re-matcher #\"a(b)\" s)] [(re-find #\"b\" s) (.find m) (.start m) (.end m) (.start m 1) (subs s (.start m)) (let [m2 (re-matcher #\"😀\" s)] (.find m2) [(.start m2) (.end m2)])])" :expected "[\"b\" true 2 4 3 \"abc\" [1 2]]"}
+  {:suite "string-model / code points" :expr "(let [sb (StringBuilder.)] (.append sb \"😀\") (.append sb \"ab\") [(.length sb) (int (.charAt sb 0)) (.charAt sb 1) (do (.insert sb 1 \"Z\") (str sb)) (do (.deleteCharAt sb 0) [(.length sb) (str sb)]) (.indexOf sb \"b\")])" :expected "[3 128512 \\a \"😀Zab\" [3 \"Zab\"] 2]"}
+  ;; A surrogate unit is a value, never part of a string (#1454): the joiners
+  ;; pair a high unit with the low one after it (data.json decodes a \uD83D\uDE00
+  ;; escape a unit at a time into a StringBuilder), and a unit left alone is
+  ;; U+FFFD (65533).
+  {:suite "string / surrogate units" :expr "(let [h (char 0xD83D) l (char 0xDE00)] [(str h l) (let [sb (StringBuilder.)] (.append sb h) (.append sb l) [(.length sb) (str sb)]) (String. (char-array [h l])) (let [w (java.io.StringWriter.)] (.write w 0xD83D) (.write w 0xDE00) (str w)) (clojure.string/join [h l]) (String. (Character/toChars 128512)) (mapv int (str h)) (mapv int (str l h)) (mapv int (clojure.string/join \",\" [h l]))])" :expected "[\"😀\" [1 \"😀\"] \"😀\" \"😀\" \"😀\" \"😀\" [65533] [65533 65533] [65533 44 65533]]"}
+  ;; A unit as a Character: printed, formatted and classified like one.
+  {:suite "string / surrogate units" :expr "(let [h (char 0xD83D)] [(with-out-str (print h) (print (char 0xDE00))) (mapv int (print-str h)) (mapv int (format \"%c\" h)) (Character/isWhitespace h) (Character/getType h) (Character/isDefined (char 0xDC00)) (int (Character/toUpperCase h)) (Character/isWhitespace (int 0xD83D)) (with-out-str (print \"a\") (try (with-out-str (print h) (throw (ex-info \"x\" {}))) (catch Exception e nil)) (print \"b\"))])" :expected "[\"😀\" [65533] [65533] false 19 true 55357 false \"ab\"]"}
+  ;; str of a deftype/record with no toString is Object.toString, as on the
+  ;; JVM: "user.Rec@" and the hex of its hashCode, the map hash for a record and
+  ;; the identity hash for a deftype. A COLLECTION deftype too: only pr prints it
+  ;; in its collection's shape.
+  {:suite "printing / str of a deftype" :expr "(do (deftype Sq [v] clojure.lang.ISeq (seq [_] (seq v)) (first [_] (first v)) (next [_] (next (seq v))) (more [_] (rest (seq v))) (count [_] (count v)) (equiv [_ o] (= (seq v) o)) (empty [_] nil) (cons [_ o] (cons o (seq v)))) [(mapv (fn [s] (boolean (re-matches #\"(x=)?user\\.Sq@[0-9a-f]+\" s))) [(str (->Sq [1 2 3])) (format \"%s\" (->Sq [1 2 3])) (str \"x=\" (->Sq [1 2]))]) (pr-str (->Sq [1 2 3]))])" :expected "[[true true true] \"(1 2 3)\"]"}
+  {:suite "printing / str of a deftype" :expr "(do (defrecord Rc [a]) (deftype Dt [a]) (let [d (->Dt 1)] [(str (->Rc 1)) (= (str d) (str \"user.Dt@\" (Integer/toHexString (System/identityHashCode d))))]))" :expected "[\"user.Rc@3c6f0c28\" true]"}
   ;; a declared toString still wins, collection shape or not
   {:suite "printing / str of a deftype" :expr "(do (deftype Sqt [v] clojure.lang.ISeq (seq [_] (seq v)) (first [_] (first v)) (next [_] (next (seq v))) (more [_] (rest (seq v))) (count [_] (count v)) (equiv [_ o] (= (seq v) o)) (empty [_] nil) (cons [_ o] (cons o (seq v))) Object (toString [_] \"MINE\")) (str (->Sqt [1 2])))" :expected "\"MINE\""}
 
@@ -3800,7 +3852,7 @@
   {:suite "pr-on" :expr "(with-out-str (@#'clojure.core/pr-on {:a \"s\"} *out*))" :expected "\"{:a \\\"s\\\"}\""}
   {:suite "pr-on" :expr "(:private (meta #'clojure.core/pr-on))" :expected "true"}
   ;; an imported short name misses with the JDK-provider message, not "Unknown class"
-  {:suite "unknown-class" :expr "(try (load-string \"(ns ucm1 (:import (java.security.cert CertificateFactory))) (CertificateFactory/getInstance \\\"X.509\\\")\") (catch Throwable e (boolean (re-find #\"^No dependency provides java.security.cert.CertificateFactory\" (ex-message e)))))" :expected "true"}
+  {:suite "unknown-class" :expr "(try (load-string \"(ns ucm1 (:import (java.security.cert CertificateFactory))) (CertificateFactory/getInstance \\\"X.509\\\")\") (catch Throwable e (boolean (re-find #\"^No dependency provides java.security.cert.CertificateFactory\" (ex-message (or (ex-cause e) e))))))" :expected "true"}
   ;; jolt-2j3 — the protocol-map keys jolt deliberately does NOT carry. These are
   ;; jolt-side rows, not corpus rows: the reference DOES set every one of them, so
   ;; a corpus row here would only be a certified divergence. What they pin is that
@@ -3812,13 +3864,8 @@
   ;; — so there is no name to report and no Class to hand back.
   {:suite "defprotocol-value" :expr "(do (defprotocol Pu1 \"d\" (mu1 [this])) (sort (keys Pu1)))" :expected "(:doc :method-map :methods :name :sigs :var :jolt/type)"}
   {:suite "defprotocol-value" :expr "(do (defprotocol Pu2 :extend-via-metadata true (mu2 [this])) [(contains? Pu2 :on) (contains? Pu2 :on-interface) (contains? Pu2 :method-builders)])" :expected "[false false false]"}
-  ;; :extend-via-metadata is absent for a different reason: jolt's defprotocol
-  ;; PARSES the option but its dispatch does not consult a value's metadata, so
-  ;; recording the key would advertise a rule that does not hold. These two rows
-  ;; move together — implementing metadata extension means setting the key, and
-  ;; both fail until it does. jolt-2j3.
-  {:suite "defprotocol-value" :expr "(do (defprotocol Pu3 :extend-via-metadata true (mu3 [this])) (contains? Pu3 :extend-via-metadata))" :expected "false"}
-  {:suite "defprotocol-value" :expr "(do (defprotocol Pu4 :extend-via-metadata true (mu4 [this])) (try (mu4 (with-meta {} {(symbol (str *ns*) \"mu4\") (fn [_] :via-meta)})) :honored (catch IllegalArgumentException e :not-honored)))" :expected ":not-honored"}
+  ;; (:extend-via-metadata is supplied and honored; corpus.edn's "protocols /
+  ;; extend-via-metadata" suite certifies it against the reference.)
   ;; the jolt-only keys the overlay itself reads (protocols.ss make-protocol)
   {:suite "defprotocol-value" :expr "(do (defprotocol Pu5 (mu5 [this])) [(:name Pu5) (-> Pu5 :methods :mu5 :name)])" :expected "[user/Pu5 \"mu5\"]"}
   ;; The :jolt/type discriminator is the same keyword every other :jolt/type in the
@@ -3979,4 +4026,24 @@
   {:suite "enum model / java.time" :expr "[(.convert java.util.concurrent.TimeUnit/SECONDS 3000 java.util.concurrent.TimeUnit/MILLISECONDS) (.convert java.util.concurrent.TimeUnit/SECONDS (java.time.Duration/ofMillis 2500)) (.name (java.util.concurrent.TimeUnit/of java.time.temporal.ChronoUnit/MILLIS)) (.name (.toChronoUnit java.util.concurrent.TimeUnit/SECONDS))]" :expected "[3 2 \"MILLISECONDS\" \"SECONDS\"]"}
   {:suite "enum model" :expr "(mapv (fn [v] (try (jolt.host/register-enum! \"user.BadEnum\" [[\"A\" v]]) :registered (catch IllegalArgumentException e (.getMessage e)))) [:a \"s\" 1 nil true \\c (quote sym)])" :expected "[\"user.BadEnum.A is a keyword: an enum constant must be an object of its own\" \"user.BadEnum.A is a string: an enum constant must be an object of its own\" \"user.BadEnum.A is a number: an enum constant must be an object of its own\" \"user.BadEnum.A is nil: an enum constant must be an object of its own\" \"user.BadEnum.A is a boolean: an enum constant must be an object of its own\" \"user.BadEnum.A is a character: an enum constant must be an object of its own\" \"user.BadEnum.A is a symbol: an enum constant must be an object of its own\"]"}
   {:suite "enum model" :expr "(do (deftype ConcE [n]) (let [fs (doall (for [i (range 16)] (future (jolt.host/register-enum! (str \"user.ConcE\" i) [[\"A\" (->ConcE i)] [\"B\" (->ConcE (- i))]]) (.isEnum (class (->ConcE 0))))))] (run! deref fs) (count (filter (fn [i] (= [\"A\" \"B\"] (mapv (fn [c] (.name c)) (.getEnumConstants (Class/forName (str \"user.ConcE\" i)))))) (range 16)))))" :expected "16"}
+  ;; The concurrent collections under contention (jutil-concurrent.ss): adds from
+  ;; several threads all land while a reader walks, and a compound write is
+  ;; atomic (a skip list map without its root lock lost ~25% of these merges).
+  {:suite "concurrent collections" :expr "(let [colls [(java.util.Vector.) (java.util.concurrent.ConcurrentLinkedQueue.) (java.util.concurrent.ConcurrentLinkedDeque.) (java.util.concurrent.CopyOnWriteArrayList.) (java.util.concurrent.CopyOnWriteArraySet.) (java.util.concurrent.ConcurrentSkipListSet.)] rd (future (dotimes [_ 40] (doseq [c colls] (reduce + 0 (seq c))))) fs (doall (for [t (range 8)] (future (doseq [c colls i (range 300)] (.add c (+ (* t 1000) i))))))] (run! deref fs) @rd [(mapv count colls) (= (set (first colls)) (set (last colls)))])" :expected "[[2400 2400 2400 2400 2400 2400] true]"}
+  {:suite "concurrent collections" :expr "(let [m (java.util.concurrent.ConcurrentSkipListMap.) h (java.util.Hashtable.) f (reify java.util.function.BiFunction (apply [_ a b] (+ a b))) fs (doall (for [t (range 8)] (future (dotimes [i 500] (.merge m (mod i 7) 1 f) (.merge h (mod i 7) 1 f) (.putIfAbsent m (+ 100 (mod i 5)) t)))))] (run! deref fs) [(reduce + (map val (.headMap m 100))) (reduce + (vals h)) (count m)])" :expected "[4000 4000 12]"}
+  {:suite "enum model / java.time" :expr "(let [fs (java.time.temporal.ChronoField/values)] [(mapv str (take 4 fs)) (str java.time.temporal.ChronoField/AMPM_OF_DAY) (.toString java.time.temporal.ChronoField/CLOCK_HOUR_OF_AMPM) (.name java.time.temporal.ChronoField/NANO_OF_SECOND) (str java.time.temporal.ChronoField/YEAR) (clojure.string/replace (pr-str [java.time.temporal.ChronoField/ERA]) #\"0x[0-9a-f]+\" \"0xH\")])" :expected "[[\"NanoOfSecond\" \"NanoOfDay\" \"MicroOfSecond\" \"MicroOfDay\"] \"AmPmOfDay\" \"ClockHourOfAmPm\" \"NANO_OF_SECOND\" \"Year\" \"[#object[java.time.temporal.ChronoField 0xH \\\"Era\\\"]]\"]"}
+  ;; java.time's localized names read the :date-names and :field-names points
+  ;; (jolt-lang/time fills them in); core carries ROOT's, and no narrow or
+  ;; standalone table of its own (jolt-3iw73)
+  {:suite "enum model / java.time" :expr "(let [d (jolt.host/extension-value :date-names \"\") f (jolt.host/extension-value :field-names \"\")] [(:months-narrow d) (:days-short-standalone d) (get (:names f) \"DAY_OF_WEEK\") (get (:names f) \"YEAR\") (count (:names f))])" :expected "[nil nil \"Day of the Week\" nil 6]"}
+  ;; (seq an-iterator) is a jolt superset (the JVM throws); every registered
+  ;; iterator answers it, ArrayDeque's included (their tags lacked the jx- prefix
+  ;; the registry looks for, so seq and iterator-seq over them threw)
+  {:suite "java.util / iterators" :expr "[(seq (.iterator (java.util.ArrayDeque. [1 2]))) (seq (.descendingIterator (java.util.ArrayDeque. [1 2 3]))) (seq (.iterator (java.util.ArrayDeque.))) (let [it (.iterator (java.util.ArrayDeque. [1 2 3]))] (.next it) (seq it))]" :expected "[(1 2) (3 2 1) nil (2 3)]"}
+  ;; A plain defrecord answers the collection ops from its slots, ahead of the
+  ;; arm walk (records-coll.ss jrec-plain?, #1470): the answers are the ones the
+  ;; walk gave, extension keys and reduced included.
+  {:suite "record-fast" :expr "(do (defrecord Rf1 [x y]) (let [r (assoc (->Rf1 1 2) :w 3)] [(count r) (contains? r :w) (contains? r :q) (seq r) (keys r) (vals r) (into {} r)]))" :expected "[3 true false ([:x 1] [:y 2] [:w 3]) (:x :y :w) (1 2 3) {:x 1, :y 2, :w 3}]"}
+  {:suite "record-fast" :expr "(do (defrecord Rf2 [x y]) [(reduce-kv (fn [a k v] (if (= k :y) (reduced v) a)) nil (->Rf2 1 2)) (reduce (fn [a e] (+ a (val e))) 0 (->Rf2 1 2)) (empty? (->Rf2 1 2))])" :expected "[2 3 false]"}
+  {:suite "record-fast" :expr "(do (defrecord Rf3 [x]) [(map->Rf3 {:x 1}) (map->Rf3 {:x 1 :y 2}) (map->Rf3 {}) (Rf3. 1 {:m 1} {:z 9}) (meta (Rf3. 1 {:m 1} nil))])" :expected "[#user.Rf3{:x 1} #user.Rf3{:x 1, :y 2} #user.Rf3{:x nil} #user.Rf3{:x 1, :z 9} {:m 1}]"}
 ]

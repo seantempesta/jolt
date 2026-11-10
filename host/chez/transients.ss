@@ -18,8 +18,8 @@
 ;;         a lookup answers with the stored element (which carries the metadata)
 ;;         and not the equal key it was probed with — the JVM's
 ;;         ITransientMap-of-val->val.
-;;   cow : fallback for anything else (e.g. a sorted coll) — copy-on-write over
-;;         the persistent ops, preserving jolt's superset of Clojure's transients.
+;;   cow : fallback for a list, a seq or a record — copy-on-write over the
+;;         persistent ops, preserving jolt's superset of Clojure's transients.
 ;;
 ;; get/count/contains?/nth see THROUGH a transient (frequencies/group-by read a
 ;; transient map; a transient is callable). vector? on a transient is false (it's
@@ -84,10 +84,11 @@
     ;; find-method-any-protocol is a forward ref to records.ss (bound by call time).
     ((and (jrec? coll) (find-method-any-protocol (jrec-tag coll) "asTransient"))
      => (lambda (m) (jolt-invoke m coll)))
-    ;; RFC 0003: any COLLECTION transients (the sorted/list/seq superset rides
-    ;; the copy-on-write fallback); a non-collection is the JVM's cast failure.
-    ((or (cseq? coll) (empty-list-t? coll) (jolt-lazyseq? coll)
-         (htable? coll) (jrec? coll))
+    ;; RFC 0003: a list or seq transients too (jolt's superset rides the
+    ;; copy-on-write fallback); anything else is the JVM's cast failure. That
+    ;; includes a sorted map or set: PersistentTreeMap/Set are not
+    ;; IEditableCollection, and the reference has no sorted transient.
+    ((or (cseq? coll) (empty-list-t? coll) (jolt-lazyseq? coll) (jrec? coll))
      (make-jolt-transient 'cow coll 0 #t #f))
     (else
      (jolt-throw (jolt-host-throwable
@@ -417,7 +418,7 @@
          (case (jolt-transient-kind t)
            ((vec map) #t)
            ((set) #f)
-           (else (let ((c (jolt-transient-buf t))) (or (jrec? c) (htable? c))))))))
+           (else (jrec? (jolt-transient-buf t)))))))
 
 (def-var! "clojure.core" "transient" jolt-transient-new)
 (def-var! "clojure.core" "transient?" jolt-transient?)

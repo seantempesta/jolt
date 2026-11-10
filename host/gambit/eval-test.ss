@@ -81,8 +81,10 @@
                       " (first [_] (first v)) (next [_] (next (seq v))) (more [_] (rest (seq v)))"
                       " (count [_] (count v)) (equiv [_ o] (= (seq v) o)) (empty [_] nil)"
                       " (cons [_ o] (cons o (seq v))))"
-                      " [(pr-str (->Psq [1 2 3])) (str (->Psq [1 2 3]))])")
-       "[\"(1 2 3)\" \"(1 2 3)\"]")
+                      " [(pr-str (->Psq [1 2 3])) (clojure.string/replace (str (->Psq [1 2 3])) #\"@[0-9a-f]+\" \"@H\")])")
+       ;; str is toString, which a deftype implementing ISeq does not override:
+       ;; Object's Class@hash, as on the JVM
+       "[\"(1 2 3)\" \"user.Psq@H\"]")
 ;; the runtime target must never emit chez unsafe spellings
 (check "(count \"gambit\")" "6")
 
@@ -275,6 +277,18 @@
       (begin (printf "  FAIL   ^double emission contains #3%\n")
              (set! failures (+ failures 1)))
       (printf "  ok     ^double emission carries no #3% (target-prims :gambit)\n")))
+
+;; a cast on a proven double takes the inline window + flonum->fixnum (the
+;; back end's :fl-arg branch); the emitted fl>=?/fl<=? and flonum->fixnum
+;; are prelude-shims names on this host. Edges: the window keeps the cast's
+;; results, out of it the runtime cast still answers.
+(check "(let [f (fn [^double d] (long d)) i (fn [^double d] (int d)) c (fn [^double d] (char d)) u (fn [^double d] (unchecked-int d)) m (fn [t] (try (t) (catch IllegalArgumentException e (ex-message e))))] [(f 2.9) (f -2.9) (f 1.152921504606847E18) (f ##NaN) (i 2147483647.0) (m (fn [] (i 2147483647.9))) (int (c 55295.0)) (int (c 55296.0)) (u 4294967296.5)])"
+       "[2 -2 1152921504606846976 0 2147483647 \"Value out of range for int: 2.1474836479E9\" 55295 55296 2147483647]")
+
+;; outside the window a primitive double takes the cast's -prim entry and a boxed
+;; one the helper: RT's two overloads differ on NaN and on a fractional edge.
+(check "(let [b (fn [^double d] (byte d)) c (fn [^double d] (char d)) m (fn [t] (try (t) (catch IllegalArgumentException e (ex-message e))))] [(m (fn [] (b ##NaN))) (m (fn [] (b 127.9))) (m (fn [] (c ##NaN))) (byte (identity ##NaN)) (byte (identity 127.9)) (m (fn [] (byte (identity ##Inf)))) (m (fn [] (byte (float ##NaN))))])"
+       "[\"Value out of range for byte: NaN\" \"Value out of range for byte: 127.9\" \"Value out of range for char: NaN\" 0 127 \"Value out of range for long: Infinity\" \"Value out of range for byte: NaN\"]")
 
 (printf "eval-test: ~a failure(s)\n" failures)
 (if (= failures 0)

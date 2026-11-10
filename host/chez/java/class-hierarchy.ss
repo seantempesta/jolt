@@ -75,7 +75,41 @@
                         (cond ((null? ss) acc)
                               ((member (car ss) acc) (add (cdr ss) acc))
                               (else (add (cdr ss) (append acc (list (car ss)))))))))
+    ;; the name tables are derived from the rows too (jch-set-supers! resets
+    ;; them the same way); left alone, jch-known? missed a class registered here
+    (set! jch-known-cache #f)
+    (set! jch-simple->fqn-cache #f)
+    (set! jch-jvm-name-cache #f)
     (jch-invalidate!/locked)))
+
+;; Register a class no other class can name as a super yet — a reify form's or a
+;; proxy's generated class, made the moment it is first asked for. Adding such a
+;; leaf changes no other class's ancestry, so nothing derived from the graph goes
+;; stale: the epoch is not bumped (which would flush every dispatch cache, once
+;; per reify form evaluated), only the new name's own memo entries are dropped,
+;; and the name tables take it in place. A name the graph already has goes the
+;; ordinary way.
+(define (jch-register-leaf! name supers)
+  (let ((new? (jolt-with-mutex jch-cache-mutex
+                (and (not (hashtable-contains? jvm-class-parents name))
+                     (begin
+                       (hashtable-set! jvm-class-parents name supers)
+                       (hashtable-delete! jch-closure-cache name)
+                       (hashtable-delete! jch-tags-cache name)
+                       ;; the known-name table is published whole and read with no
+                       ;; lock: add to a copy and publish that
+                       (let ((k jch-known-cache))
+                         (when k
+                           (let ((c (hashtable-copy k #t)))
+                             (for-each (lambda (n) (hashtable-set! c n #t) (hashtable-set! c (jch-last-segment n) #t))
+                                       (cons name supers))
+                             (set! jch-known-cache c))))
+                       (set! jch-simple->fqn-cache #f)
+                       (set! jch-jvm-name-cache #f)
+                       #t)))))
+    (if new?
+        (jch-class-registered-hook name)
+        (jch-register-supers! name supers))))
 
 ;; A munged fn class name "ns$name" (jolt-class for a def'd fn) isn't in the
 ;; table; like the JVM (a fn extends clojure.lang.AFunction) its super is
@@ -168,12 +202,15 @@
 ;; ancestors? Object is every class's root. Matched by full name or last segment so
 ;; "IOException" and "java.io.IOException" both hit.
 (define (jch-isa? child wanted)
-  (let ((wseg (jch-last-segment wanted)))
+  ;; by simple name only when one side is a simple name: two dotted names are
+  ;; two classes unless they are the same name (a.R is not b.R)
+  (let ((wseg (jch-last-segment wanted)) (wdot? (memv #\. (string->list wanted))))
     (or (string=? wanted "java.lang.Object") (string=? wanted "Object")
         (let loop ((names (cons child (jch-closure child))))
           (cond ((null? names) #f)
                 ((or (string=? wanted (car names))
-                     (string=? wseg (jch-last-segment (car names)))) #t)
+                     (and (not (and wdot? (memv #\. (string->list (car names)))))
+                          (string=? wseg (jch-last-segment (car names))))) #t)
                 (else (loop (cdr names))))))))
 
 ;; Does the graph model WANTED at all (as a class or as any class's ancestor)? Used
@@ -315,19 +352,30 @@
 (define (jch-mark-interface! name)
   (unless (or (string=? name "java.lang.Object") (string=? name "Object"))
     (jolt-with-mutex jch-cache-mutex (hashtable-set! jch-interface-set name #t))))
-(define (jch-interface? name) (hashtable-ref jch-interface-set name #f))
+;; an interface the graph marked, or one of java.base's (jdk-interfaces.ss)
+(define (jch-interface? name)
+  (or (hashtable-ref jch-interface-set name #f) (hashtable-ref jdk-public-interfaces name #f)))
+;; a java.* / javax.* / com.sun.* / jdk.* name that is not an interface: a JDK
+;; class, whether or not the graph models it (a proxy over java.util.TimerTask
+;; extends it). The interface table covers the com.sun.* and jdk.* packages
+;; the JDK exports, which are the ones a program can name.
+(define (jch-jdk-class? name)
+  (define (prefix? p) (let ((k (string-length p))) (and (fx>? (string-length name) k) (string=? (substring name 0 k) p))))
+  (and (string? name)
+       (or (prefix? "java.") (prefix? "javax.") (prefix? "com.sun.") (prefix? "jdk."))
+       (not (jch-interface? name))))
 (for-each jch-mark-interface!
           '("clojure.lang.Seqable" "clojure.lang.Sequential" "clojure.lang.Sorted"
             "clojure.lang.Reversible" "clojure.lang.Indexed" "clojure.lang.Counted"
             "clojure.lang.Named" "clojure.lang.Fn" "clojure.lang.IFn"
             "clojure.lang.IPersistentCollection" "clojure.lang.ISeq"
-            "clojure.lang.IChunkedSeq" "clojure.lang.IChunk"
+            "clojure.lang.IChunkedSeq" "clojure.lang.IChunk" "clojure.lang.IndexedSeq"
             "clojure.lang.IPending" "clojure.lang.IRef" "clojure.lang.IAtom"
             "clojure.lang.IAtom2" "clojure.lang.IBlockingDeref" "clojure.lang.IMapEntry"
             "clojure.lang.Associative" "clojure.lang.ILookup"
             "clojure.lang.IPersistentStack" "clojure.lang.IPersistentVector"
             "clojure.lang.IPersistentMap" "clojure.lang.IPersistentSet"
-            "clojure.lang.IPersistentList" "clojure.lang.IObj" "clojure.lang.IMeta"
+            "clojure.lang.IPersistentList" "clojure.lang.IObj" "clojure.lang.IMeta" "clojure.lang.IProxy"
             "clojure.lang.IDeref" "clojure.lang.IRecord" "clojure.lang.IType"
             "clojure.lang.IHashEq" "clojure.lang.IEditableCollection"
             "clojure.lang.IReference"
@@ -345,6 +393,7 @@
             ;; graph models, not by eye.
             "java.util.Queue" "java.util.Deque" "java.util.Map$Entry"
             "java.nio.file.Path" "java.nio.file.PathMatcher" "java.nio.file.Watchable"
+            "java.nio.file.DirectoryStream"
             ;; the typed.clojure rows (probed the same way)
             "java.util.RandomAccess" "java.util.Comparator" "java.util.SequencedCollection"
             ;; the one interface java.util.regex.Matcher implements (#998)
@@ -466,6 +515,8 @@
 ;; the interface chunk-first / chunk-rest are the contract of — a chunked seq is a
 ;; Sequential ISeq that can also hand out a whole block at a time
 (jch-register-supers! "clojure.lang.IChunkedSeq" '("clojure.lang.ISeq" "clojure.lang.Sequential"))
+;; an ISeq that knows its position; a deftype or reify declaring it is a seq
+(jch-register-supers! "clojure.lang.IndexedSeq" '("clojure.lang.ISeq" "clojure.lang.Sequential" "clojure.lang.Counted"))
 (jch-register-supers! "clojure.lang.Associative" '("clojure.lang.IPersistentCollection" "clojure.lang.ILookup"))
 (jch-register-supers! "clojure.lang.IPersistentStack" '("clojure.lang.IPersistentCollection"))
 (jch-register-supers! "clojure.lang.IPersistentVector" '("clojure.lang.Associative" "clojure.lang.Sequential"
@@ -549,7 +600,13 @@
                                              "clojure.lang.Obj" "clojure.lang.IHashEq"))
 (jch-register-supers! "clojure.lang.PersistentList" '("clojure.lang.ASeq" "clojure.lang.IPersistentList" "java.util.List" "clojure.lang.Counted"
                                                       "clojure.lang.IReduce"))
-(jch-register-supers! "clojure.lang.PersistentList$EmptyList" '("clojure.lang.PersistentList"))
+;; EmptyList is a static nested class of PersistentList, not a subclass: it
+;; extends Obj and implements the list interfaces itself, so () is not a
+;; PersistentList, an ASeq or an IReduce, and a protocol extended to either does
+;; not reach it.
+(jch-register-supers! "clojure.lang.PersistentList$EmptyList"
+                      '("clojure.lang.Obj" "clojure.lang.IPersistentList" "java.util.List" "clojure.lang.ISeq"
+                        "clojure.lang.Counted" "clojure.lang.IHashEq"))
 (jch-register-supers! "clojure.lang.LazySeq" '("clojure.lang.ISeq" "clojure.lang.Sequential" "java.util.List" "clojure.lang.IObj"
                                                  "clojure.lang.Obj" "clojure.lang.IHashEq"))
 (jch-register-supers! "clojure.lang.Cons" '("clojure.lang.ASeq"))
@@ -569,7 +626,7 @@
 ;; A vector's own seq: Counted is real here — jolt-count reads (pvec-count - ci)
 ;; without walking, exactly what Counted promises (collections.ss jolt-count).
 (jch-register-supers! "clojure.lang.PersistentVector$ChunkedSeq"
-                      '("clojure.lang.ASeq" "clojure.lang.Counted"))
+                      '("clojure.lang.ASeq" "clojure.lang.Counted" "clojure.lang.IReduce"))
 ;; A standalone chunk plus an arbitrary, possibly lazy rest. NOT Counted — its
 ;; length is unknown without forcing, and ChunkedCons is not Counted on the JVM either.
 (jch-register-supers! "clojure.lang.ChunkedCons" '("clojure.lang.ASeq"))
@@ -578,15 +635,16 @@
 ;; walking, as Counted promises — the JVM's ArraySeq and StringSeq are Counted
 ;; through IndexedSeq, and RSeq directly. IndexedSeq itself is not claimed: it
 ;; also promises index(), which nothing here answers.
-(jch-register-supers! "clojure.lang.ArraySeq" '("clojure.lang.ASeq" "clojure.lang.Counted"))
+(jch-register-supers! "clojure.lang.ArraySeq" '("clojure.lang.ASeq" "clojure.lang.Counted" "clojure.lang.IReduce"))
 (for-each (lambda (prim) (jch-register-supers! (string-append "clojure.lang.ArraySeq$ArraySeq_" prim)
                                                '("clojure.lang.ArraySeq")))
           '("int" "long" "short" "double" "float" "boolean" "byte" "char"))
-(jch-register-supers! "clojure.lang.StringSeq" '("clojure.lang.ASeq" "clojure.lang.Counted"))
+;; StringSeq reduces itself only from an init: IReduceInit, not IReduce
+(jch-register-supers! "clojure.lang.StringSeq" '("clojure.lang.ASeq" "clojure.lang.Counted" "clojure.lang.IReduceInit"))
 (jch-register-supers! "clojure.lang.APersistentVector$RSeq" '("clojure.lang.ASeq" "clojure.lang.Counted"))
 ;; The map/set seq views. PersistentArrayMap$Seq is Counted on the JVM; jolt
 ;; materializes it into a cell chain, so it is not claimed here either.
-(jch-register-supers! "clojure.lang.PersistentArrayMap$Seq" '("clojure.lang.ASeq"))
+(jch-register-supers! "clojure.lang.PersistentArrayMap$Seq" '("clojure.lang.ASeq" "clojure.lang.IReduce"))
 (jch-register-supers! "clojure.lang.PersistentHashMap$NodeSeq" '("clojure.lang.ASeq"))
 (jch-register-supers! "clojure.lang.PersistentTreeMap$Seq" '("clojure.lang.ASeq"))
 (jch-register-supers! "clojure.lang.APersistentMap$KeySeq" '("clojure.lang.ASeq"))
@@ -697,6 +755,8 @@
 (jch-register-supers! "java.lang.Exception" '("java.lang.Throwable"))
 (jch-register-supers! "java.lang.RuntimeException" '("java.lang.Exception"))
 (jch-register-supers! "clojure.lang.ExceptionInfo" '("java.lang.RuntimeException" "clojure.lang.IExceptionInfo"))
+;; what load-string / load-file raise for a form whose run threw (compile-eval.ss)
+(jch-register-supers! "clojure.lang.Compiler$CompilerException" '("java.lang.RuntimeException" "clojure.lang.IExceptionInfo"))
 ;; what a read from a LineNumberingPushbackReader raises (reader.ss
 ;; rdr-reader-exception); only the LispReader one carries ex-data
 (jch-register-supers! "clojure.lang.LispReader$ReaderException" '("java.lang.RuntimeException" "clojure.lang.IExceptionInfo"))
@@ -757,6 +817,18 @@
 (jch-register-supers! "java.nio.file.NotLinkException" '("java.nio.file.FileSystemException"))
 (jch-register-supers! "java.nio.file.DirectoryNotEmptyException" '("java.nio.file.FileSystemException"))
 (jch-register-supers! "java.nio.file.FileSystemNotFoundException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.nio.file.FileSystemAlreadyExistsException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.nio.file.ProviderNotFoundException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.nio.file.ProviderMismatchException" '("java.lang.IllegalArgumentException"))
+(jch-register-supers! "java.nio.file.InvalidPathException" '("java.lang.IllegalArgumentException"))
+(jch-register-supers! "java.nio.file.ClosedFileSystemException" '("java.lang.IllegalStateException"))
+(jch-register-supers! "java.nio.file.ClosedWatchServiceException" '("java.lang.IllegalStateException"))
+(jch-register-supers! "java.nio.file.ReadOnlyFileSystemException" '("java.lang.UnsupportedOperationException"))
+(jch-register-supers! "java.nio.channels.ClosedChannelException" '("java.io.IOException"))
+(jch-register-supers! "java.nio.channels.SeekableByteChannel" '("java.nio.channels.Channel"))
+(jch-mark-interface! "java.nio.channels.SeekableByteChannel")
+(jch-register-supers! "java.nio.channels.FileChannel" '("java.nio.channels.SeekableByteChannel"))
+(jch-register-supers! "java.net.JarURLConnection" '("java.net.URLConnection"))
 (jch-register-supers! "java.net.UnknownHostException" '("java.io.IOException"))
 (jch-register-supers! "java.net.SocketException" '("java.io.IOException"))
 (jch-register-supers! "java.net.ConnectException" '("java.net.SocketException"))
@@ -862,7 +934,16 @@
 (jch-register-supers! "java.io.Writer" '("java.io.Closeable" "java.io.Flushable" "java.lang.Appendable"))
 (jch-register-supers! "java.io.File" '("java.io.Serializable" "java.lang.Comparable"))
 (jch-register-supers! "java.io.StringReader" '("java.io.Reader"))
-(jch-register-supers! "java.io.PushbackReader" '("java.io.Reader"))
+(jch-register-supers! "java.io.FilterReader" '("java.io.Reader"))
+(jch-register-supers! "java.io.PushbackReader" '("java.io.FilterReader"))
+;; the classes Files.newInputStream/newOutputStream and Process's streams are
+;; (JDK 21; the Windows ProcessImpl answers buffered streams over its pipes)
+(jch-register-supers! "sun.nio.ch.ChannelInputStream" '("java.io.InputStream"))
+(jch-register-supers! "sun.nio.ch.ChannelOutputStream" '("java.io.OutputStream"))
+(jch-register-supers! "java.lang.ProcessImpl$ProcessPipeInputStream" '("java.io.BufferedInputStream"))
+(jch-register-supers! "java.lang.ProcessImpl$ProcessPipeOutputStream" '("java.io.BufferedOutputStream"))
+(jch-register-supers! "java.lang.ProcessBuilder$NullInputStream" '("java.io.InputStream"))
+(jch-register-supers! "java.lang.ProcessBuilder$NullOutputStream" '("java.io.OutputStream"))
 (jch-register-supers! "clojure.lang.LineNumberingPushbackReader" '("java.io.PushbackReader"))
 (jch-register-supers! "java.io.PrintWriter" '("java.io.Writer"))
 ;; System/out and System/err are PrintStreams — byte streams, not the PrintWriter
@@ -879,6 +960,11 @@
 (jch-register-supers! "java.util.zip.Inflater" '())
 (jch-register-supers! "java.util.zip.Deflater" '())
 (jch-register-supers! "java.util.zip.ZipEntry" '("java.lang.Cloneable"))
+(jch-register-supers! "java.util.jar.JarEntry" '("java.util.zip.ZipEntry"))
+(jch-register-supers! "java.util.jar.JarFile$JarFileEntry" '("java.util.jar.JarEntry"))
+(jch-register-supers! "java.util.jar.JarFile" '("java.util.zip.ZipFile"))
+(jch-register-supers! "java.util.jar.Attributes" '("java.util.Map" "java.lang.Cloneable"))
+(jch-register-supers! "java.util.jar.Manifest" '("java.lang.Cloneable"))
 (jch-register-supers! "java.util.zip.InflaterInputStream" '("java.io.FilterInputStream"))
 (jch-register-supers! "java.util.zip.DeflaterInputStream" '("java.io.FilterInputStream"))
 (jch-register-supers! "java.util.zip.GZIPInputStream" '("java.util.zip.InflaterInputStream"))
@@ -960,6 +1046,11 @@
 (jch-register-supers! "java.util.LinkedList" '("java.util.List" "java.util.Deque"))
 (jch-register-supers! "java.util.ArrayDeque" '("java.util.Deque"))
 (jch-register-supers! "java.util.HashMap" '("java.util.Map"))
+(jch-register-supers! "java.util.concurrent.ConcurrentMap" '("java.util.Map"))
+(jch-register-supers! "java.util.WeakHashMap" '("java.util.AbstractMap" "java.util.Map"))
+(jch-register-supers! "java.util.IdentityHashMap" '("java.util.AbstractMap" "java.util.Map" "java.io.Serializable" "java.lang.Cloneable"))
+(jch-register-supers! "java.util.concurrent.ConcurrentHashMap"
+                      '("java.util.AbstractMap" "java.util.concurrent.ConcurrentMap" "java.io.Serializable"))
 (jch-register-supers! "java.util.LinkedHashMap" '("java.util.HashMap" "java.util.SequencedMap"))
 ;; Properties is a Hashtable, which is a Map — System/getProperties answers
 ;; (instance? java.util.Map …) as well as (instance? java.util.Properties …).
@@ -1288,6 +1379,9 @@
                       '("java.util.concurrent.locks.Lock" "java.io.Serializable"))
 (jch-register-supers! "java.util.concurrent.CountDownLatch" '())
 (jch-register-supers! "java.util.concurrent.Semaphore" '("java.io.Serializable"))
+(jch-register-supers! "java.util.Timer" '())
+(jch-register-supers! "java.util.TimerTask" '("java.lang.Runnable"))
+(jch-mark-abstract! "java.util.TimerTask")
 ;; AtomicInteger and AtomicLong extend Number on the JVM; AtomicBoolean and
 ;; AtomicReference extend Object. (instance? Number an-atomic) has to tell them
 ;; apart, which is why the four carry four tags.
@@ -1390,9 +1484,8 @@
 (jch-register-supers! "java.util.Locale" '())
 (jch-register-supers! "java.util.TimeZone" '())
 ;; #inst / (Date.) classes. java.sql.Date and java.sql.Timestamp are Date
-;; subclasses (jolt's one #inst value reports Date only — see inst-time.ss, which
-;; answers instance? Timestamp #f — so these rows exist for the sql-date shim and
-;; for isa?/supers of the class tokens, not for the #inst value's dispatch tags).
+;; subclasses: the sql-date shim and the jts child of the #inst record report
+;; them, and their dispatch tags walk up to java.util.Date from here.
 (jch-register-supers! "java.util.Date" '("java.lang.Comparable" "java.io.Serializable"))
 (jch-register-supers! "java.sql.Date" '("java.util.Date"))
 (jch-register-supers! "java.sql.Timestamp" '("java.util.Date"))
@@ -1403,6 +1496,7 @@
 ;; java.io shims report java.io.Reader rather than a subclass.
 (jch-register-supers! "java.nio.file.Path" '("java.lang.Comparable" "java.lang.Iterable" "java.nio.file.Watchable"))
 (jch-register-supers! "java.nio.file.Watchable" '())
+(jch-register-supers! "java.nio.file.DirectoryStream" '("java.io.Closeable" "java.lang.Iterable"))
 (jch-register-supers! "java.nio.file.FileSystem" '())
 (jch-register-supers! "java.nio.file.PathMatcher" '())
 ;; the option interfaces, and the option enums that implement them (declared
@@ -1488,6 +1582,9 @@
     ("linkedlist" . "java.util.LinkedList")
     ("arraydeque" . "java.util.ArrayDeque")
     ("hashmap" . "java.util.HashMap")
+    ("chm" . "java.util.concurrent.ConcurrentHashMap")
+    ("jx-weak-hashmap" . "java.util.WeakHashMap")
+    ("jx-identity-hashmap" . "java.util.IdentityHashMap")
     ("linkedhashmap" . "java.util.LinkedHashMap")
     ("properties" . "java.util.Properties")
     ("hashset" . "java.util.HashSet")
@@ -1581,6 +1678,7 @@
     ("reentrant-lock" . "java.util.concurrent.locks.ReentrantLock")
     ("count-down-latch" . "java.util.concurrent.CountDownLatch")
     ("semaphore" . "java.util.concurrent.Semaphore")
+    ("timer" . "java.util.Timer")
     ("random" . "java.util.Random")
     ("splittable-random" . "java.util.SplittableRandom")
     ("securerandom" . "java.security.SecureRandom")

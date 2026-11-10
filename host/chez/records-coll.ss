@@ -36,8 +36,15 @@
 ;; slot 5 its declared Sequential, slot 3 whether it is a defrecord — where the
 ;; arm used to look equiv and equals up by name on every compare.
 (define (jrec-equiv=? a b)
-  (let* ((ia (and (jrec? a) (jrdesc-ifc-of a)))
-         (ib (and (jrec? b)
+  (let ((ia (and (jrec? a) (jrdesc-ifc-of a))))
+    (if (and ia (vector-ref ia 14) (jrec? b))
+        ;; what the walk below answers for a plain record on the left — its
+        ;; equiv is the generated field-wise one, against a record of the same
+        ;; type — without deriving the other side's interface vector
+        (and (or (eq? (jrec-desc a) (jrec-desc b)) (jrec-record? b)) (jrec=? a b))
+        (jrec-equiv=?-walk a ia b))))
+(define (jrec-equiv=?-walk a ia b)
+  (let* ((ib (and (jrec? b)
                   (if (and ia (eq? (jrec-desc a) (jrec-desc b))) ia (jrdesc-ifc-of b)))))
     (cond ((if ia (vector-ref (vector-ref ia 12) 2) (jrec-eq-other-coll? a))
            (jrec-ipc-equiv a ia b ib))
@@ -106,7 +113,9 @@
 ;; double store is benign. The slot never travels — the image dump starts it
 ;; unset (state-image.ss), the way the JVM marks __hasheq transient.
 (define (jrec-hasheq-slow x)
-  (cond ((jrec-cl x "hasheq") => (lambda (m) (call-declared-hash m x)))
+  (cond ((jrec-plain? x)
+         (let ((h (jrec-hash x))) (jrec-hasheq-set! x h) h))
+        ((jrec-cl x "hasheq") => (lambda (m) (call-declared-hash m x)))
         ((jrec-cl x "hashCode") => (lambda (m) (call-declared-hash m x)))
         ((jrec-record? x)
          (let ((h (jrec-hash x))) (jrec-hasheq-set! x h) h))
@@ -184,6 +193,14 @@
                        ((jch-isa? tag "clojure.lang.IPersistentVector") 'vec)
                        ((jch-isa? tag "clojure.lang.IPersistentSet") 'set)
                        ((jch-isa? tag "clojure.lang.IPersistentMap") 'map)
+                       ;; print-method's java.util arms: a deftype that is a
+                       ;; java.util.Map prints as a map, over its entrySet; a
+                       ;; RandomAccess one as [..] (preferred over List), a List
+                       ;; as (..) and a Set as #{..}, over its seq
+                       ((jch-isa? tag "java.util.Map") 'jmap)
+                       ((jch-isa? tag "java.util.RandomAccess") 'jvec)
+                       ((jch-isa? tag "java.util.List") 'jlist)
+                       ((jch-isa? tag "java.util.Set") 'jset)
                        (else #f)))
             (jch-isa? tag "java.lang.CharSequence")
             record?
@@ -248,15 +265,61 @@
                            #t)
                       (and (jch-isa? tag "java.util.Set") #t)))
             ;; slot 13: jrec-dash-field-index's answers, "-name" -> slot or #f
-            (make-weak-eq-hashtable))))
+            (make-weak-eq-hashtable)
+            ;; slot 14: a PLAIN record — see jrec-plain? below
+            (and record?
+                 (not (jch-isa? tag "java.lang.CharSequence"))
+                 (not (exists (lambda (nm) (find-method-any-protocol tag nm))
+                              jrec-map-method-names)))
+            ;; slot 15: the type's ^double field flags (chez-record-dbl-tbl), or
+            ;; #f — what assoc widens a replaced field by, read here rather than
+            ;; through a string-keyed lookup on every assoc
+            (hashtable-ref chez-record-dbl-tbl tag #f))))
+;; The derived vector of the descriptor asked last, as (desc . vector). Every
+;; record op opens with jrdesc-ifc-of, and a weak-table probe is most of what a
+;; plain record's count or contains? costs; a loop over one record type asks the
+;; same descriptor every time. The pair is replaced whole, never mutated, so a
+;; racing reader sees either the old pair or the new one, both consistent; the
+;; epoch is still checked on the vector, so a hit can never outlive a change.
+(define jrdesc-ifc-last (cons #f #f))
 (define (jrdesc-ifc-of x)
-  (let* ((d (jrec-desc x))
-         (c (jrdesc-ifc d)))
-    (if (and c (fx=? (vector-ref c 0) (jrdesc-ifc-epoch)))
-        c
-        (let ((fresh (jrdesc-derive-ifc d (jrec-record?-uncached x))))
-          (jrdesc-ifc-set! d fresh)
-          fresh))))
+  (let ((d (jrec-desc x))
+        (l jrdesc-ifc-last))
+    (if (and (eq? (car l) d) (fx=? (vector-ref (cdr l) 0) (jrdesc-ifc-epoch)))
+        (cdr l)
+        (let ((c (jrdesc-ifc d)))
+          (if (and c (fx=? (vector-ref c 0) (jrdesc-ifc-epoch)))
+              (begin (set! jrdesc-ifc-last (cons d c)) c)
+              (let ((fresh (jrdesc-derive-ifc d (jrec-record?-uncached x))))
+                (jrdesc-ifc-set! d fresh)
+                (set! jrdesc-ifc-last (cons d fresh))
+                fresh))))))
+;; A PLAIN record is a defrecord that declares none of the methods the generic
+;; collection ops consult on a record — no count, containsKey, assoc, seq, valAt,
+;; equiv, hasheq, kvreduce, reduce, iterator… of its own, under any protocol or
+;; interface — and is not a CharSequence. That is nearly every defrecord, and for
+;; it the map behaviour is fixed: its fields in declared order, then the
+;; extension map. Clojure's defrecord compiles exactly that behaviour into the
+;; class, so count/containsKey/valAt/assoc are direct methods there; here the
+;; core dispatchers (count, contains?, seq, empty?, conj, assoc, dissoc,
+;; keys/vals, reduce-kv, reduce, into, =, hash) test this flag BEFORE their arm
+;; walk and answer from the slots, instead of walking every host arm and then
+;; asking the type's method table by name (a string-keyed lookup per method,
+;; several per op). Anything that is not plain — a deftype, a record overriding
+;; one of these — keeps the arm walk unchanged.
+;;
+;; Sound because no arm but this file's own claims a plain record (the
+;; records-coll arms below exclude one explicitly, and recfast-test.ss asserts
+;; every registry is clear of it), so answering ahead of the walk cannot preempt
+;; anything. Revalidated with the rest of the derived vector: an extend-type that
+;; adds one of these methods later bumps the protocol epoch, and the type stops
+;; being plain on its next op.
+(define jrec-map-method-names
+  '("count" "containsKey" "contains" "assoc" "assocEx" "without" "seq" "cons"
+    "empty" "valAt" "get" "entryAt" "equiv" "equals" "hasheq" "hashCode"
+    "kvreduce" "reduce" "iterator" "nth" "peek" "pop" "first" "next" "more"
+    "length" "charAt" "size" "isEmpty" "containsValue" "keySet" "values" "entrySet"))
+(define (jrec-plain? x) (and (jrec? x) (vector-ref (jrdesc-ifc-of x) 14)))
 ;; The impl a record type declares for METHOD (any protocol), or #f. Every
 ;; collection op on a record asks this first — equality asks it for equiv and
 ;; equals on both operands, hashing for hasheq and hashCode, meta/assoc/nth/count
@@ -407,13 +470,24 @@
 (define (iface-method v method nargs)
   (cond ((jrec? v)
          (if nargs (jrec-method-arity v method nargs) (jrec-method v method)))
-        ((jreify? v) (reify-method-ref v method))
+        ;; a reify answers the methods it writes. Its iterator may also be one an
+        ;; abstract class it declares supplies (a proxy over java.util.AbstractList
+        ;; inherits one), which is what the seqable check asks; any other
+        ;; inherited member is asked for by calling it (an abstract class's table
+        ;; also holds stubs for what it leaves abstract, which are no answer here)
+        ((jreify? v) (or (reify-method-ref v method)
+                         (and abstract-class-method-hook (string=? method "iterator")
+                              (abstract-class-method-hook v method))))
         (else #f)))
 ;; a record counts its declared fields plus anything assoc'd on beyond them
 (define (jrec-field-count coll)
   (+ (jrec-nfields coll)
      (let ((ext (jrec-ext coll))) (if (jolt-nil? ext) 0 (jolt-count ext)))))
-(register-count-arm! (lambda (coll) (or (jrec? coll) (jolt-transient? coll)))
+(define (jrec-plain-count r)
+  (let ((ext (jrec-ext r)))
+    (fx+ (jrdesc-nfields (jrec-desc r)) (if (jolt-nil? ext) 0 (jolt-count ext)))))
+(register-count-arm! (lambda (coll) (or (and (jrec? coll) (not (jrec-plain? coll)))
+                                        (jolt-transient? coll)))
   (lambda (coll)
     (cond
       ((jolt-transient? coll) (t-count coll))
@@ -424,7 +498,14 @@
        (let ((ifc (jrdesc-ifc-of coll)))
          (cond
            ((vector-ref ifc 3) (jrec-field-count coll))
-           ((vector-ref ifc 4) (jrec-abstract-method-error coll "count"))
+           ;; RT.countFrom: an IPersistentCollection that is not Counted is
+           ;; counted by walking its seq; only a declared Counted reaches the
+           ;; missing method
+           ((vector-ref ifc 4)
+            (if (and (jrec-type-isa? coll "clojure.lang.IPersistentCollection")
+                     (not (jrec-type-isa? coll "clojure.lang.Counted")))
+                (jolt-count (jolt-seq coll))
+                (jrec-abstract-method-error coll "count")))
            ;; RT.count reaches CharSequence.length once Counted and
            ;; IPersistentCollection have both missed — a declared `count` above
            ;; therefore outranks `length`, as it does on the JVM.
@@ -444,6 +525,7 @@
 ;; either — else contains?/find on a map-like (OrderedMap: containsKey) or set-like
 ;; (OrderedSet: contains) deftype reads field presence, not the type's membership.
 (register-contains-arm! (lambda (coll) (and (jrec? coll)
+                                            (not (jrec-plain? coll))
                                             (not (jrec-cl coll "containsKey"))
                                             (not (jrec-cl coll "contains"))))
   (lambda (coll k) (jrec-has? coll k)))
@@ -478,19 +560,22 @@
 ;; the extension map (the value vector is shared — fields are immutable).
 (define %r-jolt-assoc1 jolt-assoc1)
 (set! jolt-assoc1 (lambda (coll k v)
-  (cond ((jrec-cl coll "assoc") => (lambda (m) (jolt-invoke m coll k v)))
-        ((jrec? coll)
-         (let ((i (and (keyword? k) (jrec-field-index coll k))))
-            (if i
-                (let ((v2 (let ((flags (hashtable-ref chez-record-dbl-tbl (jrec-tag coll) #f)))
-                            (if (and flags (fx< i (vector-length flags)) (vector-ref flags i)
-                                     (number? v) (not (flonum? v)))
-                                (exact->inexact v) v))))
-                  (make-jrec-from-existing coll i v2 (jrec-ext coll)))
-                (let ((ext (jrec-ext coll)))
-                  (make-jrec-from-existing coll #f #f
-                             (%r-jolt-assoc1 (if (jolt-nil? ext) empty-pmap ext) k v))))))
-        (else (%r-jolt-assoc1 coll k v)))))
+  (if (jrec? coll)
+      (let ((ifc (jrdesc-ifc-of coll)))
+        (cond ((and (not (vector-ref ifc 14)) (jrec-cl coll "assoc"))
+               => (lambda (m) (jolt-invoke m coll k v)))
+              (else
+               (let ((i (and (keyword? k) (jrec-field-index coll k))))
+                 (if i
+                     (let ((v2 (let ((flags (vector-ref ifc 15)))
+                                 (if (and flags (fx< i (vector-length flags)) (vector-ref flags i)
+                                          (number? v) (not (flonum? v)))
+                                     (exact->inexact v) v))))
+                       (make-jrec-from-existing coll i v2 (jrec-ext coll)))
+                     (let ((ext (jrec-ext coll)))
+                       (make-jrec-from-existing coll #f #f
+                                  (%r-jolt-assoc1 (if (jolt-nil? ext) empty-pmap ext) k v))))))))
+      (%r-jolt-assoc1 coll k v))))
 ;; dissoc: a deftype implementing IPersistentMap/without answers through it.
 ;; Removing a declared field downgrades a plain record to a map (JVM parity); an
 ;; extension key drops from the ext map (normalized back to jolt-nil when empty).
@@ -515,15 +600,19 @@
                   (let ((ne (%r-jolt-dissoc ext k)))
                     (make-jrec-from-existing coll #f #f
                                 (if (= 0 (jolt-count ne)) jolt-nil ne)))))))))
+;; The record's metadata stays on what dissoc answers — the record, or the map a
+;; field's removal downgrades it to — as defrecord's without does on the JVM.
 (set! jolt-dissoc (lambda (coll . ks)
-  (cond ((jrec-cl coll "without")
+  (cond ((jrec-plain? coll) (meta-carry coll (fold-left jrec-dissoc1 coll ks)))
+        ((jrec-cl coll "without")
          => (lambda (m) (fold-left (lambda (c k) (jolt-invoke m c k)) coll ks)))
-        ((jrec? coll) (fold-left jrec-dissoc1 coll ks))
+        ((jrec? coll) (meta-carry coll (fold-left jrec-dissoc1 coll ks)))
         (else (apply %r-jolt-dissoc coll ks)))))
 (set! jolt-dissoc2
   (lambda (coll k)
-    (cond ((jrec-cl coll "without") => (lambda (m) (jolt-invoke m coll k)))
-          ((jrec? coll) (jrec-dissoc1 coll k))
+    (cond ((jrec-plain? coll) (meta-carry coll (jrec-dissoc1 coll k)))
+          ((jrec-cl coll "without") => (lambda (m) (jolt-invoke m coll k)))
+          ((jrec? coll) (meta-carry coll (jrec-dissoc1 coll k)))
           (else (%r-jolt-dissoc2 coll k)))))
 ;; keys/vals over a jrec read its entry seq (jolt-seq is method-first, so a
 ;; map-like deftype delegates to its Seqable; a defrecord's seq is its fields, so
@@ -533,9 +622,69 @@
     (if (jolt-nil? s) (list->cseq (reverse acc))
         (loop (jolt-seq (seq-more s)) (cons (jolt-nth (seq-first s) which) acc)))))
 (define %r-jolt-keys jolt-keys)
-(set! jolt-keys (lambda (m) (if (jrec? m) (jrec-seq-col m 0) (%r-jolt-keys m))))
+(set! jolt-keys (lambda (m) (cond ((jrec-plain? m) (list->cseq (jrec-plain-fold m (lambda (k v acc) (cons k acc)))))
+                                   ((jrec? m) (jrec-seq-col m 0))
+                                   (else (%r-jolt-keys m)))))
 (define %r-jolt-vals jolt-vals)
-(set! jolt-vals (lambda (m) (if (jrec? m) (jrec-seq-col m 1) (%r-jolt-vals m))))
+(set! jolt-vals (lambda (m) (cond ((jrec-plain? m) (list->cseq (jrec-plain-fold m (lambda (k v acc) (cons v acc)))))
+                                   ((jrec? m) (jrec-seq-col m 1))
+                                   (else (%r-jolt-vals m)))))
+;; A plain record's entries, as a right fold: STEP is called (k v acc) from the
+;; LAST entry back to the first, so consing builds the entries in seq order —
+;; the declared fields, then the extension map in its own order — with no
+;; reverse and no intermediate pair list.
+(define (jrec-plain-fold r step)
+  (let* ((fkeys (jrdesc-fkeys (jrec-desc r)))
+         (ext (jrec-ext r))
+         (tail (if (jolt-nil? ext)
+                   '()
+                   (fold-right (lambda (p acc) (step (car p) (cdr p) acc)) '() (jrec-ext-pairs ext)))))
+    (let loop ((i (fx- (vector-length fkeys) 1)) (acc tail))
+      (if (fx<? i 0)
+          acc
+          (loop (fx- i 1) (step (vector-ref fkeys i) (jrec-field-ref r i) acc))))))
+(define (jrec-plain-entries r)
+  (jrec-plain-fold r (lambda (k v acc) (cons (make-map-entry k v) acc))))
+;; reduce-kv over a plain record: the fields in declared order, then the
+;; extension map, stopping at a reduced accumulator (jolt-reduce-kv unwraps it).
+(define (jrec-plain-kv-reduce r f init)
+  (let* ((step (kv-step f))
+         (fkeys (jrdesc-fkeys (jrec-desc r)))
+         (n (vector-length fkeys)))
+    (let loop ((i 0) (acc init))
+      (cond ((jolt-reduced? acc) acc)
+            ((fx=? i n)
+             (let ((ext (jrec-ext r)))
+               (cond ((jolt-nil? ext) acc)
+                     ((pmap? ext) (pmap-kv-reduce ext step acc))
+                     (else (let eloop ((ps (jrec-ext-pairs ext)) (acc acc))
+                             (if (or (null? ps) (jolt-reduced? acc)) acc
+                                 (eloop (cdr ps) (step acc (caar ps) (cdar ps)))))))))
+            (else (loop (fx+ i 1) (step acc (vector-ref fkeys i) (jrec-field-ref r i))))))))
+;; conj onto a record, as defrecord's cons (imap-cons) does it: a map entry or
+;; a vector assocs its first two elements, nil leaves the record as it is, and
+;; anything else seqs into entries assoc'd in turn — any map (a sorted one, a
+;; record), or a seq of entries. A native map folds directly, the same rule. The
+;; plain-record path and the conj arm below both answer through this.
+(define (jrec-conj-entry c e)
+  (cond ((pvec? e) (jolt-assoc1 c (jolt-nth e 0) (jolt-nth e 1)))
+        ((jolt-host-entry e) => (lambda (kv) (jolt-assoc1 c (car kv) (cdr kv))))
+        (else (jolt-throw
+               (jolt-host-throwable
+                "java.lang.ClassCastException"
+                (string-append "class " (guard (x (#t "?")) (jolt-class-name e))
+                               " cannot be cast to class java.util.Map$Entry"))))))
+(define (jrec-plain-conj coll x)
+  (cond ((pmap? x) (pmap-fold-fwd x (lambda (k v c) (jolt-assoc1 c k v)) coll))
+        ((jolt-nil? x) coll)
+        ((or (pvec? x) (jolt-host-entry x)) (jrec-conj-entry coll x))
+        (else (let loop ((s (jolt-seq x)) (c coll))
+                (if (jolt-nil? s)
+                    c
+                    (loop (jolt-seq (seq-more s)) (jrec-conj-entry c (seq-first s))))))))
+(define (jrec-plain-empty? r)
+  (and (fx=? 0 (jrdesc-nfields (jrec-desc r)))
+       (let ((ext (jrec-ext r))) (or (jolt-nil? ext) (fx=? 0 (jolt-count ext))))))
 ;; a record's seq is its field map-entries in declared order, then any extensions.
 (define (jrec-entry-list r)
   (let* ((fkeys (jrdesc-fkeys (jrec-desc r))) (n (vector-length fkeys)))
@@ -564,53 +713,64 @@
   (lambda (x) (jrec-abstract-method-error x "seq")))
 (register-seq-arm! (lambda (x) (jrec-charseq-method x "charAt"))
   (lambda (x) (jrec-charseq->seq x (jrec-charseq-length-method x) (jrec-cl x "charAt"))))
-(register-seq-arm! jrec-record?
+(register-seq-arm! (lambda (x) (and (jrec-record? x) (not (jrec-plain? x))))
   (lambda (x) (list->cseq (jrec-entry-list x))))
 ;; A deftype that IS a seq (clojure.lang.ISeq: its seq method answers itself)
 ;; walks through its own first and next into a lazy cseq — nil from next ends
 ;; it, and a `more` without a `next` ends on an empty rest. Re-asking the
 ;; answer for its seq, as the general arm below does, would ask forever; and
 ;; only the cseq shape gives count/nth/reduce and the printer their walk.
+;; A reify that is a seq walks the same way (its methods are read through
+;; reify-method-ref, records-dispatch.ss, resolved at call time; its seq arm is
+;; registered there, once jreify? exists).
+(define (self-seq-method x name)
+  (cond ((jrec? x) (jrec-cl x name))
+        ((jreify? x) (reify-method-ref x name))
+        (else #f)))
+;; A reify's methods are closures of the instance, so each cell of a reify seq
+;; reads its own; a deftype's are its type's, read once.
 (define (jrec-iseq->cseq x)
-  (let ((first-m (jrec-cl x "first"))
-        (next-m (jrec-cl x "next"))
-        (more-m (jrec-cl x "more")))
-    (define (step s)
-      (jolt-make-lazy-seq
-        (lambda ()
-          (let ((tail (cond (next-m (jolt-invoke next-m s))
-                            (more-m (let ((r (jolt-invoke more-m s)))
-                                      (if (jolt-nil? (jolt-seq r)) jolt-nil r)))
-                            (else jolt-nil))))
-            (jolt-cons (jolt-invoke first-m s)
-                       (if (jolt-nil? tail) jolt-nil
-                           (if (and (jrec? tail) (eq? (jrec-tag tail) (jrec-tag x)))
-                               (step tail)
-                               (jolt-seq tail))))))))
-    (if first-m (jolt-seq (step x)) (jrec-abstract-method-error x "first"))))
-(register-seq-arm! (lambda (x) (jrec-cl x "seq"))
-  (lambda (x)
-    (let ((r (jolt-invoke (jrec-cl x "seq") x)))
-      (if (eq? r x) (jrec-iseq->cseq x) (jolt-seq r)))))
+  (define (step s first-m next-m more-m)
+    (jolt-make-lazy-seq
+      (lambda ()
+        (let ((tail (cond (next-m (jolt-invoke next-m s))
+                          (more-m (let ((r (jolt-invoke more-m s)))
+                                    (if (jolt-nil? (jolt-seq r)) jolt-nil r)))
+                          (else jolt-nil))))
+          (jolt-cons (jolt-invoke first-m s)
+                     (cond ((jolt-nil? tail) jolt-nil)
+                           ((and (jrec? tail) (jrec? s) (eq? (jrec-tag tail) (jrec-tag s)))
+                            (step tail first-m next-m more-m))
+                           ;; walked here, not through jolt-seq: that would force
+                           ;; the tail's first cell, and its tail's, eagerly
+                           ((and (jreify? tail) (self-seq-method tail "first") (jolt-seq? tail))
+                            (step tail (self-seq-method tail "first")
+                                  (self-seq-method tail "next") (self-seq-method tail "more")))
+                           (else (jolt-seq tail))))))))
+  (let ((first-m (self-seq-method x "first")))
+    (if first-m
+        (jolt-seq (step x first-m (self-seq-method x "next") (self-seq-method x "more")))
+        (jrec-abstract-method-error x "first"))))
+(define (self-seq-arm x)
+  (let ((r (jolt-invoke (self-seq-method x "seq") x)))
+    (if (eq? r x) (jrec-iseq->cseq x) (jolt-seq r))))
+(register-seq-arm! (lambda (x) (jrec-cl x "seq")) self-seq-arm)
+
 (register-conj-arm! (lambda (coll) (jrec-cl coll "cons"))
   (lambda (coll x) (jolt-invoke (jrec-cl coll "cons") coll x)))
 ;; A plain defrecord (no IPersistentCollection.cons of its own) conjs a [k v] pair
 ;; or map. Guarded to skip a deftype that declares its own cons — that method wins
 ;; (registered above but checked after this newer arm), so the guard preserves the
 ;; deftype's collection semantics (flatland.ordered's OrderedSet conjs a scalar).
-(register-conj-arm! (lambda (coll) (and (jrec? coll) (not (jrec-cl coll "cons"))))
-  (lambda (coll x)
-    (if (pmap? x)
-        ;; a map folds its entries (JVM parity): (conj record {:k v ...}) merges them.
-        ;; Otherwise x is a [k v] pair / MapEntry — assoc the two elements.
-        (pmap-fold-fwd x (lambda (k v c) (jolt-assoc1 c k v)) coll)
-        (jolt-assoc1 coll (jolt-nth x 0) (jolt-nth x 1)))))
+(register-conj-arm! (lambda (coll) (and (jrec? coll) (not (jrec-plain? coll)) (not (jrec-cl coll "cons"))))
+  jrec-plain-conj)
 ;; peek/pop on a deftype implementing IPersistentStack (data.priority-map, which
 ;; core.cache's LRU/LU caches lean on) dispatch to its methods.
 ;; empty? over a jrec: a map-like deftype is empty iff its entry seq is (data
 ;; .priority-map's peek calls (.isEmpty this) -> empty?). jolt-seq is method-first,
 ;; so this asks the type's own seq/count rather than counting the jrec's fields.
-(register-empty-arm! jrec-collection? (lambda (coll) (jolt-nil? (jolt-seq coll))))
+(register-empty-arm! (lambda (coll) (and (jrec-collection? coll) (not (jrec-plain? coll))))
+  (lambda (coll) (jolt-nil? (jolt-seq coll))))
 (define %r-jolt-peek jolt-peek)
 (set! jolt-peek (lambda (coll)
   (cond ((jrec-cl coll "peek") => (lambda (m) (jolt-invoke m coll)))
@@ -624,7 +784,9 @@
 ;; installs the test, which answers #f until a record constant is declared.
 (define jrec-enum-constant? (lambda (x) #f))
 (define (set-jrec-enum-constant-test! f) (set! jrec-enum-constant? f))
-(register-pr-arm! (lambda (x) (and (jrec? x) (not (jrec-enum-constant? x)))) jrec-pr)
+(let ((pred (lambda (x) (and (jrec? x) (not (jrec-enum-constant? x))))))
+  (register-pr-str-arm! pred (lambda (x) (jrec-pr x #f)))
+  (register-pr-readable-arm! pred (lambda (x) (jrec-pr x #t))))
 
 ;; records are map? and coll? (Clojure: a record IS an associative map). The
 ;; predicates.ss vars hold a snapshot, so re-def-var! after extending. record? is

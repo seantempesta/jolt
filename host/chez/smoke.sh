@@ -225,6 +225,10 @@ check '(require [clojure.java.io :as io] [clojure.string :as s])
 # is asserted in deps-alias-smoke.sh, which has fixture projects with real roots.
 # Here jolt-core/stdlib are baked into the binary, so this takes the embedded-
 # resource branch instead and never builds a file: URL at all.)
+# With nothing embedded there is no archive, so the empty resource name is never
+# a jar: URL -- the archive's root is not an entry a lookup can find.
+check '(let [u (clojure.java.io/resource "")] (or (nil? u) (= "file" (.getProtocol u))))' 'true'
+check '(every? #(= "file" (.getProtocol %)) (enumeration-seq (.getResources (clojure.lang.RT/baseLoader) "")))' 'true'
 check '(eval (quote (+ 1 2)))' '3'
 check '(load-string "(def y 5) (* y y)")' '25'
 check '(defmacro add1 [x] (list (quote +) x 1)) (add1 10)' '11'
@@ -605,20 +609,50 @@ rm -rf "$help_dir"
 nr_dir="$(mktemp -d)"
 mkdir -p "$nr_dir/sub"
 nr_jolt="$(cd "$(dirname "$jolt_bin")" && pwd)/$(basename "$jolt_bin")"
+# nr_start waits for the banner while the server is alive, and stops waiting
+# the moment it dies, keeping its exit status. A row that fails says which of
+# the three it was — the server exited (with what), it was still running with
+# no banner, or the banner came — and shows the server's whole output, which
+# is stdout and stderr together. CI once saw an empty output with nothing else
+# to go on (jolt-qr7o5).
 nr_start() {
+  rm -f "$nr_dir/out"
   (cd "$nr_dir" && JOLT_PWD="$nr_dir" exec "$nr_jolt" nrepl-server "$@" </dev/null >"$nr_dir/out" 2>&1) &
   nr_pid=$!
+  nr_status=""
   nr_i=0
-  while [ $nr_i -lt 120 ] && ! grep -q 'started on port' "$nr_dir/out" 2>/dev/null; do
+  while [ $nr_i -lt 240 ] && ! grep -q 'started on port' "$nr_dir/out" 2>/dev/null; do
+    if ! kill -0 "$nr_pid" 2>/dev/null; then
+      wait "$nr_pid" 2>/dev/null; nr_status=$?
+      break
+    fi
     sleep 0.5; nr_i=$((nr_i + 1))
   done
 }
-nr_stop() { kill "$nr_pid" 2>/dev/null; wait "$nr_pid" 2>/dev/null; }
+nr_why() {
+  if [ -n "$nr_status" ]; then
+    printf 'server exited %s after %s polls' "$nr_status" "$nr_i"
+  elif kill -0 "$nr_pid" 2>/dev/null; then
+    printf 'server still running after %s polls' "$nr_i"
+  else
+    printf 'server gone after %s polls' "$nr_i"
+  fi
+  printf '; output: [%s]' "$(cat "$nr_dir/out" 2>/dev/null)"
+}
+# a server that hung before its banner may not answer TERM either; KILL it
+# rather than let the wait wedge the gate
+nr_stop() {
+  kill "$nr_pid" 2>/dev/null
+  nr_j=0
+  while [ $nr_j -lt 40 ] && kill -0 "$nr_pid" 2>/dev/null; do sleep 0.5; nr_j=$((nr_j + 1)); done
+  kill -9 "$nr_pid" 2>/dev/null
+  wait "$nr_pid" 2>/dev/null
+}
 nr_start 0 --no-port-file
 if grep -q 'started on port' "$nr_dir/out" && [ ! -e "$nr_dir/.nrepl-port" ]; then
   pass=$((pass + 1))
 else
-  echo "  FAIL: nrepl-server --no-port-file should start and write no .nrepl-port: $(head -2 "$nr_dir/out")"
+  echo "  FAIL: nrepl-server --no-port-file should start and write no .nrepl-port: $(nr_why)"
   fails=$((fails + 1))
 fi
 nr_stop
@@ -628,7 +662,7 @@ if [ -n "$nr_port" ] && [ "$nr_port" != 0 ] && [ "$(cat "$nr_dir/sub/p.txt" 2>/d
    && [ ! -e "$nr_dir/.nrepl-port" ]; then
   pass=$((pass + 1))
 else
-  echo "  FAIL: nrepl-server --port-file sub/p.txt 0 should write the bound port there: $(head -2 "$nr_dir/out")"
+  echo "  FAIL: nrepl-server --port-file sub/p.txt 0 should write the bound port there: $(nr_why); sub/p.txt: [$(cat "$nr_dir/sub/p.txt" 2>/dev/null)]"
   fails=$((fails + 1))
 fi
 nr_stop
@@ -638,6 +672,17 @@ else
   echo "  FAIL: nrepl-server should delete its --port-file on the way out"
   fails=$((fails + 1))
 fi
+# a port file that cannot be written (its directory is missing) still starts
+# the server, and says so instead of starting as if nothing were wrong
+nr_start --port-file nodir/p.txt 0
+if grep -q 'started on port' "$nr_dir/out" && grep -q 'could not write nodir/p.txt' "$nr_dir/out" \
+   && ! grep -q 'p.txt written' "$nr_dir/out"; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: nrepl-server --port-file into a missing directory should warn: $(nr_why)"
+  fails=$((fails + 1))
+fi
+nr_stop
 if (cd "$nr_dir" && JOLT_PWD="$nr_dir" $jolt_timeout "$nr_jolt" nrepl-server --port-file </dev/null 2>&1) | grep -q -- '--port-file needs a path'; then
   pass=$((pass + 1))
 else
@@ -680,6 +725,25 @@ else
   echo "  FAIL: the REPL prompt should name the current namespace (got \`$repl_ns\`)"
   fails=$((fails + 1))
 fi
+# load-string binds *ns* for its load (Compiler.load), so the REPL and nREPL no
+# longer get their namespace switch from it leaking: an (ns …) entry still has
+# to switch the session, and -e still evaluates its forms in one namespace.
+repl_nsf="$(printf '(ns foo)\n(str *ns*)\n(load-string "(ns bar)")\n(str *ns*)\n' | $jolt repl 2>/dev/null)"
+if printf '%s' "$repl_nsf" | grep -q '^foo=> "foo"' && ! printf '%s' "$repl_nsf" | grep -q '^bar=>'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: an (ns foo) REPL entry should switch the session, a load-string should not (got \`$repl_nsf\`)"
+  fails=$((fails + 1))
+fi
+e_nsf="$($jolt -e '(ns foo) (println *ns*)' 2>/dev/null | tail -1)"
+if [ "$e_nsf" = "foo" ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: -e \"(ns foo) (println *ns*)\" should print foo (got \`$e_nsf\`)"
+  fails=$((fails + 1))
+fi
+check '(do (require (quote jolt.nrepl)) (let [r1 (jolt.nrepl/evaluate "(ns nr-sw.a)" "user") r2 (jolt.nrepl/evaluate "(str *ns*)" (:ns r1)) r3 (jolt.nrepl/evaluate "(in-ns (quote nr-sw.b))" (:ns r2)) r4 (jolt.nrepl/evaluate "(str *ns*)" (:ns r3))] [(:ns r1) (:value r2) (:ns r3) (:value r4) (str *ns*)]))' '["nr-sw.a" "\"nr-sw.a\"" "nr-sw.b" "\"nr-sw.b\"" "user"]'
+check '(do (require (quote jolt.nrepl)) (let [sent (atom [])] ((var jolt.nrepl/built-in-handler) {"op" "load-file" "file" "(ns nr-lf.a) (def z 3)" "ns" "user" :reply #(swap! sent conj %)}) [(get (last @sent) "ns") @(resolve (quote nr-lf.a/z))]))' '["user" 3]'
 nsm="$(mktemp -d)"
 mkdir -p "$nsm/src/nsm"
 printf '{:paths ["src"]}\n' > "$nsm/deps.edn"
@@ -954,6 +1018,42 @@ if printf '%s' "$rc_out" | grep -q 'REQUIRE-CONTENTION OK'; then
 else
   echo "  FAIL: a parked load contended by fibers on many carriers and a thread"
   echo "    $(printf '%s' "$rc_out" | tail -1)"
+  fails=$((fails + 1))
+fi
+
+# A require on another thread does not move this thread's *ns* (jolt-1gk): the
+# loader binds *ns* for the load, so a conveyed frame is never written. The
+# contention case above hit it on some runs; this one pins it every run.
+ni_out="$($jolt run test/chez/require-ns-isolation.clj 2>&1)"
+if printf '%s' "$ni_out" | grep -q 'REQUIRE-NS-ISOLATION OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: a require on another thread moved this thread's *ns*"
+  echo "    $(printf '%s' "$ni_out" | tail -1)"
+  fails=$((fails + 1))
+fi
+
+# Object.wait's release zeroes the monitor's count BEFORE it frees the word
+# (jolt-are): zeroed after, it could clobber a fast enter's count, and that
+# owner's exit left the monitor held for good. One-key ConcurrentHashMap.merge
+# from four threads hung within a few rounds before the fix.
+mw_out="$($jolt run test/chez/monitor-wait-count.clj 2>&1)"
+if printf '%s' "$mw_out" | grep -q 'MONITOR-WAIT-COUNT OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: a monitor wait clobbered the next owner's hold count"
+  echo "    $(printf '%s' "$mw_out" | tail -1)"
+  fails=$((fails + 1))
+fi
+
+# tryLock on a free lock never refuses: the claim retries a weak CAS that
+# failed spuriously (arm64) instead of answering false.
+tl_out="$($jolt run test/chez/trylock-free.clj 2>&1)"
+if printf '%s' "$tl_out" | grep -q 'TRYLOCK-FREE OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: tryLock refused a free lock"
+  echo "    $(printf '%s' "$tl_out" | tail -1)"
   fails=$((fails + 1))
 fi
 
@@ -1303,6 +1403,22 @@ else
   fails=$((fails + 1))
 fi
 
+# clojure.data.json is bundled the same way: jolt's copy escapes a character
+# above U+FFFF as its surrogate pair, which upstream's per-.charAt escaper cannot
+# do over code-point strings. A project pulling org.clojure/data.json in still
+# gets jolt's copy, so the JSON it writes stays valid.
+mkdir -p "$bbshadow/src/clojure/data"
+printf '(ns clojure.data.json)\n(def marker :decoy)\n' > "$bbshadow/src/clojure/data/json.clj"
+djs_out="$(cd "$bbshadow" && JOLT_NO_DEVCACHE=1 "$bbs_jolt" -e '(do (require (quote [clojure.data.json :as j])) [(nil? (resolve (quote clojure.data.json/marker))) (j/write-str (str "a" (char 128077) (char 233)))])' 2>&1 | tail -1)"
+if [ "$djs_out" = '[true "\"a\\ud83d\\udc4d\\u00e9\""]' ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: bundled clojure.data.json (shadowed, or an astral char not escaped as a pair)"
+  echo "    want \`[true \"\\\"a\\\\ud83d\\\\udc4d\\\\u00e9\\\"\"]\` got \`$djs_out\`"
+  fails=$((fails + 1))
+fi
+rm -f "$bbshadow/src/clojure/data/json.clj"; rmdir "$bbshadow/src/clojure/data" "$bbshadow/src/clojure" 2>/dev/null
+
 # ...and the escape hatch: a project that DECLARES it supplies the namespace
 # itself gets its own copy, with no supplement interned over it. Without one,
 # "jolt always wins" would be a thing a project could not get out of.
@@ -1370,6 +1486,34 @@ if printf '%s' "$profile_env_err" | grep 'profile-fixture/fib' | grep -q '177'; 
 else
   echo "  FAIL: JOLT_PROFILE report at exit"
   printf '%s\n' "$profile_env_err" | head -8 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
+# jolt.debug — frames with their locals for a caught throwable, from code loaded
+# under jolt.profile's :debug mode, and the break hook. The file self-checks.
+debug_out="$($jolt run test/chez/debug-test.clj 2>/dev/null)"
+if printf '%s' "$debug_out" | grep -q 'DEBUG-TEST OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: jolt.debug"
+  printf '%s\n' "$debug_out" | grep FAIL | head -5 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
+# JOLT_PROFILE=debug compiles the whole run for jolt.debug. As with the counters,
+# a fasl of the fixture an earlier plain run left in the AOT cache must not stand
+# in for the debug compile, or the throwing frame has no locals.
+debug_cache="$(mktemp -d)"
+JOLT_CACHE_DIR="$debug_cache" JOLT_AOT_ASYNC=0 \
+  $jolt -Sdeps "$profile_roots" run test/chez/fixtures/debug_env_main.clj >/dev/null 2>&1
+debug_env_out="$(JOLT_CACHE_DIR="$debug_cache" JOLT_PROFILE=debug \
+  $jolt -Sdeps "$profile_roots" run test/chez/fixtures/debug_env_main.clj 2>&1)"
+rm -rf "$debug_cache"
+if [ "$debug_env_out" = '{x 21, y 42}' ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: JOLT_PROFILE=debug keeps locals"
+  printf '%s\n' "$debug_env_out" | head -8 | sed 's/^/    /'
   fails=$((fails + 1))
 fi
 
@@ -1593,14 +1737,45 @@ else
   fails=$((fails + 1))
 fi
 
-# Core reads no system file for its default zone: with TZ unset and no provider
-# registered it is UTC on every machine; a provider (jolt.time registers its
-# machine-zone lookup) is consulted before that; TZ wins over both.
-tzdefault_out="$(unset TZ; $jolt -e '[(.getID (java.util.TimeZone/getDefault)) (.format (java.text.SimpleDateFormat. "HH:mm zzz") (java.util.Date. 0)) (do (jolt.host/set-default-zone-provider! (fn [] "Asia/Tokyo")) (.getID (java.util.TimeZone/getDefault))) (.format (java.text.SimpleDateFormat. "HH:mm zzz") (java.util.Date. 0))]' 2>&1 | tail -1)"
-if [ "$tzdefault_out" = '["UTC" "00:00 UTC" "Asia/Tokyo" "09:00 JST"]' ]; then
+# The default zone is the machine's, as on the JVM: TimeZone/setDefault, else
+# TZ when set (empty TZ is UTC, as libc reads it), else the zone the system's
+# /etc/localtime link (or /etc/timezone) names, else a registered provider,
+# else UTC. It was UTC
+# here unless jolt.time happened to load first, so a zone-less
+# SimpleDateFormat parse moved by five hours depending on whether some
+# java.time class had been touched. The machine's zone is worked out the way
+# libc finds it, and a run with TZ unset must match one with TZ naming it.
+machine_zone_link="$(readlink /etc/localtime 2>/dev/null)"
+case "$machine_zone_link" in
+  (*/zoneinfo/*) machine_zone="${machine_zone_link##*/zoneinfo/}" ;;
+  (*) if [ -f /etc/timezone ]; then machine_zone="$(tr -d ' \n' < /etc/timezone)"; else machine_zone=; fi ;;
+esac
+# with no zone named by the system, core answers a provider's, else UTC
+machine_found="${machine_zone:+yes}"
+machine_zone="${machine_zone:-UTC}"
+tzmachine_expr='[(.getID (java.util.TimeZone/getDefault)) (.format (java.text.SimpleDateFormat. "yyyy-MM-dd HH:mm zzz Z") (java.util.Date. 1393632000000)) (.getHours (java.util.Date. 1393632000000)) (.get (doto (java.util.Calendar/getInstance) (.setTime (java.util.Date. 1393632000000))) java.util.Calendar/HOUR_OF_DAY) (.getTime (.parse (java.text.SimpleDateFormat. "dd-MM-yyyy HH:mm:ss") "24-03-2006 15:49:00")) (.getTimezoneOffset (java.util.Date. 0))]'
+tzmachine_out="$(unset TZ; $jolt -e "$tzmachine_expr" 2>&1 | tail -1)"
+tzmachine_ref="$(TZ="$machine_zone" $jolt -e "$tzmachine_expr" 2>&1 | tail -1)"
+case "$tzmachine_out" in
+  "[\"$machine_zone\" "*)
+    if [ "$tzmachine_out" = "$tzmachine_ref" ]; then pass=$((pass + 1))
+    else echo "  FAIL: default zone with TZ unset differs from TZ=$machine_zone: $tzmachine_out vs $tzmachine_ref"; fails=$((fails + 1)); fi ;;
+  *) echo "  FAIL: default zone with TZ unset is not the machine's ($machine_zone): $tzmachine_out"; fails=$((fails + 1)) ;;
+esac
+
+# A set but empty TZ is UTC (libc's reading), not the machine's zone. A
+# registered provider answers only where the system names no zone; TZ beats
+# it, and TimeZone/setDefault beats TZ.
+tzdefault_out="$(TZ= $jolt -e '[(.getID (java.util.TimeZone/getDefault)) (.format (java.text.SimpleDateFormat. "HH:mm zzz") (java.util.Date. 0))]' 2>&1 | tail -1)"
+tzprov_out="$(unset TZ; $jolt -e '(do (jolt.host/set-default-zone-provider! (fn [] "Asia/Tokyo")) (.getID (java.util.TimeZone/getDefault)))' 2>&1 | tail -1)"
+tzprovtz_out="$(TZ=UTC $jolt -e '(do (jolt.host/set-default-zone-provider! (fn [] "Asia/Tokyo")) (.getID (java.util.TimeZone/getDefault)))' 2>&1 | tail -1)"
+tzset_out="$(TZ=UTC $jolt -e '(do (java.util.TimeZone/setDefault (java.util.TimeZone/getTimeZone "Asia/Tokyo")) [(.getID (java.util.TimeZone/getDefault)) (.format (java.text.SimpleDateFormat. "HH:mm zzz") (java.util.Date. 0)) (do (java.util.TimeZone/setDefault nil) (.getID (java.util.TimeZone/getDefault)))])' 2>&1 | tail -1)"
+if [ -n "$machine_found" ]; then tzprov_want="\"$machine_zone\""; else tzprov_want='"Asia/Tokyo"'; fi
+if [ "$tzdefault_out" = '["UTC" "00:00 UTC"]' ] && [ "$tzprov_out" = "$tzprov_want" ] && [ "$tzprovtz_out" = '"UTC"' ] \
+   && [ "$tzset_out" = '["Asia/Tokyo" "09:00 JST" "UTC"]' ]; then
   pass=$((pass + 1))
 else
-  echo "  FAIL: default zone without TZ is UTC, then the provider's: $tzdefault_out"
+  echo "  FAIL: empty TZ is UTC, the machine over a provider, TZ over both, setDefault over TZ: $tzdefault_out / $tzprov_out (want $tzprov_want) / $tzprovtz_out / $tzset_out"
   fails=$((fails + 1))
 fi
 
@@ -2250,7 +2425,71 @@ check '(do (require (quote jolt.nrepl)) (let [e (ex-info "boom" {:a 1})] [(jolt.
 # a reference to nothing. A forward reference across evals takes a declare.
 check '(do (require (quote jolt.nrepl)) (let [r (jolt.nrepl/evaluate "(zqx-undefined 1)" "user") d (jolt.nrepl/evaluate "(defn zqx-f [] zqx-later)" "user") ok (jolt.nrepl/evaluate "(declare zqx-fwd) (defn zqx-g [] zqx-fwd)" "user")] [(:value r) (:err r) (:value d) (some? (:err d)) (:value ok) (:err ok) (some? (resolve (quote user/zqx-undefined)))]))' '[nil "Unable to resolve symbol: zqx-undefined in this context" nil true "#'"'"'user/zqx-g" nil false]'
 check '(do (require (quote jolt.nrepl)) (let [sent (atom [])] ((var jolt.nrepl/built-in-handler) {"op" "eval" "code" "(zqx-undefined 1)" :reply #(swap! sent conj %)}) (mapv #(into (sorted-map) %) @sent)))' '[{"err" "Syntax error compiling at (REPL:1:1).\nUnable to resolve symbol: zqx-undefined in this context\n"} {"ex" "class clojure.lang.Compiler$CompilerException", "root-ex" "class clojure.lang.Compiler$CompilerException", "status" ["eval-error"]} {"status" ["done"]}]'
+# *eval-wrapper*: evaluate calls it with a thunk of the evaluation, for an eval
+# and a load, inside its *ns* binding and its own try, so a throw reaches the
+# wrapper before evaluate catches it (a break handler before the stack unwinds
+# sits there). Unbound, nil, it evaluates directly.
+check '(do (require (quote jolt.nrepl)) (def seen (atom [])) (binding [jolt.nrepl/*eval-wrapper* (fn [thunk] (swap! user/seen conj (str *ns*)) (thunk))] [(:value (jolt.nrepl/evaluate "(+ 1 2)" "user")) (:value (jolt.nrepl/evaluate "(+ 2 2)" "user" {:load true})) @user/seen]))' '["3" "4" ["user" "user"]]'
+check '(do (require (quote jolt.nrepl)) (def seen (atom nil)) (let [r (binding [jolt.nrepl/*eval-wrapper* (fn [thunk] (try (thunk) (catch Throwable t (reset! user/seen (ex-message t)) (throw t))))] (jolt.nrepl/evaluate "(/ 1 0)" "user"))] [@user/seen (:err r)]))' '["Divide by zero" "Divide by zero"]'
+check '(do (require (quote jolt.nrepl)) (nil? jolt.nrepl/*eval-wrapper*))' 'true'
+# eval-string / load-string with a source path, as Compiler.load takes one: the
+# forms carry it as :file and *file* / *source-path* are the path and its name;
+# without one nothing changes. clojure.core/load-string still takes the string
+# alone. evaluate's :file and the load-file op's file-path go the same way.
+check '(do (jolt.host/eval-string "(defn nes-f [] 1)" "/tmp/nes/a.clj") [(:file (meta (var user/nes-f))) (:line (meta (var user/nes-f))) (jolt.host/eval-string "*file*" "/tmp/nes/a.clj") (jolt.host/eval-string "*source-path*" "/tmp/nes/a.clj")])' '["/tmp/nes/a.clj" 1 "/tmp/nes/a.clj" "a.clj"]'
+check '(do (jolt.host/eval-string "(defn nes-g [] 1)") [(nil? (:file (meta (var user/nes-g)))) (nil? (jolt.host/eval-string "*file*"))])' '[true true]'
+check '(do (jolt.host/load-string "(ns nes.b) (defn h [] 2)" "/tmp/nes/b.clj") [(:file (meta (resolve (quote nes.b/h)))) (str *ns*)])' '["/tmp/nes/b.clj" "user"]'
+check '(try (load-string "1" "/tmp/nes/c.clj") :no-throw (catch Throwable _ :arity))' ':arity'
+check '(do (require (quote jolt.nrepl)) (jolt.nrepl/evaluate "(ns nes.d) (defn k [] 3)" "user" {:load true :file "/tmp/nes/d.clj"}) (:file (meta (resolve (quote nes.d/k)))))' '"/tmp/nes/d.clj"'
+check '(do (require (quote jolt.nrepl)) ((var jolt.nrepl/built-in-handler) {"op" "load-file" "file" "(ns nes.e) (defn m [] 4)" "file-path" "/tmp/nes/e.clj" "file-name" "e.clj" :reply (fn [_])}) (:file (meta (resolve (quote nes.e/m)))))' '"/tmp/nes/e.clj"'
+# A third argument names the source, as Compiler.load's sourceName: *source-path*
+# is that name, nil included. The load-file op passes the request's file-name, as
+# JVM nREPL does, rather than a name cut from file-path.
+check '[(jolt.host/eval-string "*source-path*" "/tmp/nes/a.clj" "zz.clj") (jolt.host/eval-string "*source-path*" "/tmp/nes/a.clj" nil) (jolt.host/load-string "[*file* *source-path*]" "src/nes/b.clj" "b2.clj")]' '["zz.clj" nil ["src/nes/b.clj" "b2.clj"]]'
+check '(do (require (quote jolt.nrepl)) (let [sent (atom [])] ((var jolt.nrepl/built-in-handler) {"op" "load-file" "file" "[*file* *source-path*]" "file-path" "src/nes/f.clj" "file-name" "zz.clj" :reply #(swap! sent conj %)}) ((var jolt.nrepl/built-in-handler) {"op" "load-file" "file" "[*file* *source-path*]" "file-path" "/tmp/nes/g.clj" :reply #(swap! sent conj %)}) (keep #(get % "value") @sent)))' '("[\"src/nes/f.clj\" \"zz.clj\"]" "[\"/tmp/nes/g.clj\" nil]")'
+# Compiler.load wraps what a form's RUN throws in a CompilerException under
+# :execution, at the reader's position before the form (whitespace and commas
+# skipped, comments not), with the throw as its cause: load-string, load-reader
+# and load-file do, eval and eval-string do not. A compile diagnostic and a
+# CompilerException a nested load raised go through as they are.
+check '(try (load-string "nil\n (let [x 0] (/ 1 x))") (catch Throwable e [(str (class e)) (ex-message e) (ex-data e) (str (class (ex-cause e))) (ex-message (ex-cause e))]))' '["class clojure.lang.Compiler$CompilerException" "Syntax error macroexpanding at (2:2)." #:clojure.error{:phase :execution, :line 2, :column 2} "class java.lang.ArithmeticException" "Divide by zero"]'
+check '[(try (load-string "(/ 1 0)") (catch ArithmeticException e :arith) (catch RuntimeException e :rte)) (try (load-string "(/ 1 0)") (catch clojure.lang.Compiler$CompilerException e :ce)) (try (load-string "(/ 1 0)") (catch clojure.lang.ExceptionInfo e :ei) (catch Exception e :ex)) (instance? clojure.lang.IExceptionInfo (try (load-string "(/ 1 0)") (catch Exception e e)))]' '[:rte :ce :ex true]'
+check '[(str (try (load-string "(throw (ex-info \"boom\" {}))") (catch Exception e e))) (str (try (load-string "(/ 1 0)") (catch Exception e e))) (ex-data (try (load-string "\r\n;; c\n,, (/ 1 0)") (catch Exception e e))) (ex-message (try (load-string "1 2 (/ 1 0)") (catch Exception e e)))]' '["Syntax error macroexpanding at (1:1).\nboom" "Syntax error macroexpanding at (1:1)." #:clojure.error{:phase :execution, :line 2, :column 1} "Syntax error macroexpanding at (1:5)."]'
+check '[(try (load-string "(zqx)") (catch Throwable e (:clojure.error/phase (ex-data e)))) (try (eval (quote (/ 1 0))) (catch ArithmeticException e :arith)) (try (jolt.host/eval-string "(/ 1 0)") (catch ArithmeticException e :arith)) (let [e (try (load-string "1\n(load-string \"\\n(/ 1 0)\")") (catch Exception e e))] [(ex-message e) (str (class (ex-cause e)))]) (try (load-string "(ns zz)\n(/ 1 0)") (catch Exception e (str *ns*))) (try (load-reader (java.io.StringReader. "\n(/ 1 0)")) (catch Exception e (ex-message e)))]' '[:compile-syntax-check :arith :arith ["Syntax error macroexpanding at (2:1)." "class java.lang.ArithmeticException"] "user" "Syntax error macroexpanding at (2:1)."]'
+check '(let [f (java.io.File/createTempFile "lfw" ".clj") p (.getAbsolutePath f)] (spit f "(ns lfw)\n(/ 1 0)") (let [e (try (load-file p) (catch Exception e e))] [(= (ex-message e) (str "Syntax error macroexpanding at (" p ":2:1).")) (= p (:clojure.error/source (ex-data e))) (:clojure.error/phase (ex-data e)) (str (class (ex-cause e)))]))' '[true true :execution "class java.lang.ArithmeticException"]'
+check '(do (require (quote clojure.main)) (let [e (try (load-string "nil\n(/ 1 0)") (catch Exception e e))] [(str (class (clojure.main/root-cause e))) (subs (clojure.main/err->msg e) 0 36)]))' '["class clojure.lang.Compiler$CompilerException" "Execution error (ArithmeticException"]'
+check '(do (require (quote jolt.nrepl)) (let [sent (atom [])] ((var jolt.nrepl/built-in-handler) {"op" "load-file" "file" "(ns nrx.a)\n(defn f [] (/ 1 0))\n(f)" "file-path" "/tmp/nrx/a.clj" "file-name" "a.clj" :reply #(swap! sent conj %)}) (mapv #(into (sorted-map) %) @sent)))' '[{"err" "Execution error (ArithmeticException) at nrx.a/f (a.clj:2).\nDivide by zero\n"} {"ex" "class clojure.lang.Compiler$CompilerException", "root-ex" "class clojure.lang.Compiler$CompilerException", "status" ["eval-error"]} {"status" ["done"]}]'
 check '(do (require (quote jolt.nrepl)) (let [stop (with-out-str (def st (jolt.nrepl/start 0 nil {:port-file nil}))) port (:port (meta st)) s (java.net.Socket. "127.0.0.1" (int port)) out (.getOutputStream s) in (.getInputStream s) code "(zqx-undefined 1)" msg (str "d4:code" (count code) ":" code "2:op4:evale") buf (byte-array 4096)] (.write out (.getBytes msg "ISO-8859-1")) (Thread/sleep 500) (let [n (.read in buf) r (String. buf 0 (max 0 n) "ISO-8859-1")] (.close s) (st) [(boolean (re-find #"Syntax error compiling at \(REPL:1:1\)\.\nUnable to resolve symbol: zqx-undefined in this context\n" r)) (boolean (re-find #"2:ex45:class clojure\.lang\.Compiler\$CompilerException" r)) (boolean (re-find #"5:value" r))])))' '[true true false]'
+# A diagnostic in text evaluated under a source path shows that text in its
+# snippet, not what the file on disk holds (an editor's unsaved buffer).
+check_loc '(let [f (java.io.File/createTempFile "esnip" ".clj")] (spit f "(ns es)\n\n(defn old-content [] 1)\n") (jolt.host/eval-string "(ns es)\n\n(defn h [] (zqx-snip 1))" (.getPath f)))' ' 3 | (defn h \[\] (zqx-snip 1))'
+check_no '(let [f (java.io.File/createTempFile "esnip" ".clj")] (spit f "(ns es)\n\n(defn old-content [] 1)\n") (jolt.host/eval-string "(ns es)\n\n(defn h [] (zqx-snip 1))" (.getPath f)))' 'old-content'
+# require is RT.load, which wraps the same way, naming the classpath file; a
+# required ns's own failure reaches its requirer's requirer as it is.
+rq="$(mktemp -d)"; mkdir -p "$rq/src/rqa"
+printf '{:paths ["src"]}\n' > "$rq/deps.edn"
+printf '(ns rqa.b)\n\n(/ 1 0)\n' > "$rq/src/rqa/b.clj"
+printf '(ns rqa.c (:require [rqa.b]))\n' > "$rq/src/rqa/c.clj"
+printf '%s\n' '(ns rqa.main (:require [clojure.main]))' '(defn -main [& _]' '  (let [e (try (require (quote rqa.b)) (catch Throwable e e))]' '    (prn [(str (class e)) (ex-message e) (ex-data e) (str (class (ex-cause e))) (str (class (clojure.main/root-cause e)))]))' '  (prn (try (require (quote rqa.b) :reload) (catch ArithmeticException _ :arith) (catch Exception _ :ex))))' > "$rq/src/rqa/main.clj"
+printf '%s\n' '(ns rqa.nest)' '(defn -main [& _] (prn (ex-message (try (require (quote rqa.c)) (catch Throwable e e)))))' > "$rq/src/rqa/nest.clj"
+rq_want='["class clojure.lang.Compiler$CompilerException" "Syntax error macroexpanding at (rqa/b.clj:3:1)." #:clojure.error{:phase :execution, :line 3, :column 1, :source "rqa/b.clj"} "class java.lang.ArithmeticException" "class clojure.lang.Compiler$CompilerException"]
+:ex'
+jx_check "require wraps a form's runtime throw" "$rq_want" \
+         "$(JOLT_CACHE_DIR="$rq/cache" JOLT_PWD="$rq" $jolt run -m rqa.main 2>/dev/null)"
+jx_check "a nested require's wrapper passes through" '"Syntax error macroexpanding at (rqa/b.clj:3:1)."' \
+         "$(JOLT_CACHE_DIR="$rq/cache" JOLT_PWD="$rq" $jolt run -m rqa.nest 2>/dev/null | tail -1)"
+# A namespace the AOT cache holds from a clean load, failing on a later run: the
+# hit throws, the namespace recompiles from source, and that load wraps.
+printf '(ns rqa.env)\n\n(when (System/getenv "RQ_BOOM") (/ 1 0))\n' > "$rq/src/rqa/env.clj"
+printf '%s\n' '(ns rqa.envm)' '(defn -main [& _] (let [e (try (require (quote rqa.env)) :ok (catch Throwable e e))] (prn (if (keyword? e) e [(ex-message e) (str (class (ex-cause e)))]))))' > "$rq/src/rqa/envm.clj"
+jx_check "a clean load fills the cache" ':ok' \
+         "$(JOLT_CACHE_DIR="$rq/cache" JOLT_PWD="$rq" $jolt run -m rqa.envm 2>/dev/null | tail -1)"
+jx_check "a warm hit that throws still wraps" '["Syntax error macroexpanding at (rqa/env.clj:3:1)." "class java.lang.ArithmeticException"]' \
+         "$(RQ_BOOM=1 JOLT_CACHE_DIR="$rq/cache" JOLT_PWD="$rq" $jolt run -m rqa.envm 2>/dev/null | tail -1)"
+rm -rf "$rq"
+# nREPL's err for a load's failure with no frame of the user's names the failing
+# form in the loaded text, from the wrapper: (REPL:2) for line 2 of the string.
+check '(do (require (quote jolt.nrepl)) (let [sent (atom [])] ((var jolt.nrepl/built-in-handler) {"op" "eval" "code" "(load-string \"nil\\n(/ 1 0)\")" :reply #(swap! sent conj %)}) (get (first @sent) "err")))' '"Execution error (ArithmeticException) at (REPL:2).\nDivide by zero\n"'
 # The err text is the JVM's: jolt's "(did you mean …?)" stays on :err and the
 # exception's message, and is left out of err->msg.
 check '(do (require (quote jolt.nrepl)) (let [r (jolt.nrepl/evaluate "(mapp inc [1])" "user")] [(:err-msg r) (boolean (re-find #"did you mean map" (:err r)))]))' '["Syntax error compiling at (REPL:1:1).\nUnable to resolve symbol: mapp in this context\n" true]'

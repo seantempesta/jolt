@@ -49,9 +49,11 @@
 (define (make-time-unit nm nanos) (make-jhost "time-unit" (vector nm nanos)))
 (define (time-unit? x) (and (jhost? x) (string=? (jhost-tag x) "time-unit")))
 (define (time-unit-scale u) (vector-ref (jhost-state u) 1))
-;; JVM conversions TRUNCATE toward zero (SECONDS.toMinutes(90) is 1).
+;; JVM conversions TRUNCATE toward zero (SECONDS.toMinutes(90) is 1) and
+;; saturate at Long's range (DAYS.toMicros(Long.MAX_VALUE) is Long.MAX_VALUE);
+;; tu-saturate is below, read only when a conversion runs.
 (define (tu-convert self n per)
-  (quotient (* (jnum->exact n) (time-unit-scale self)) per))
+  (tu-saturate (quotient (* (jnum->exact n) (time-unit-scale self)) per)))
 
 ;; (amount, unit) -> milliseconds. A missing or non-TimeUnit unit leaves the amount
 ;; alone, which is the plain-milliseconds shape awaitTermination has always taken.
@@ -86,7 +88,9 @@
          (hit (find (lambda (p) (string=? (cdr p) nm)) time-unit-chrono-names)))
     (if hit
         (cdr (assoc (car hit) time-unit-constants))
-        (throw-jvm 'IllegalArgumentException (string-append "No TimeUnit equivalent for " nm)))))
+        ;; named by the ChronoUnit's toString (Weeks), as TimeUnit.of words it
+        (throw-jvm 'IllegalArgumentException
+                   (string-append "No TimeUnit equivalent for " (jolt-final-str (record-method-dispatch cu "toString" jolt-nil)))))))
 ;; convert(duration, unit) and convert(Duration): truncated toward zero and
 ;; saturated at Long's range, as TimeUnit.convert is
 (define (tu-saturate n)
@@ -172,6 +176,9 @@
 ;; FutureTask cancelled before run() never runs.
 ;; A future runs on the agent system's cached pool on the JVM, so after
 ;; shutdown-agents it is refused.
+;; *ns*'s root, what a thread that conveys nothing reads (RT's CURRENT_NS is
+;; interned with clojure.core as its root; clojure.main binds user over it)
+(define thread-root-ns "clojure.core")
 (define (jolt-future-call thunk)
   (when (jolt-agents-shutdown?)
     (jolt-throw (jolt-host-throwable "java.util.concurrent.RejectedExecutionException" jolt-nil)))
@@ -1665,13 +1672,19 @@
 ;; section. Here bk is dropped before the caller runs a line of its body, so
 ;; jolt-locks-held is zero inside the section and the section is preemptible.
 (define (monitor-try-enter! m)
-  (let* ((me (monitor-self)) (w (vector-ref m monitor-i-owner)))
-    (cond
-      ((not w) (monitor-claim! m me))
-      ((eq? (monitor-word-id w) me)
-       (vector-set! m monitor-i-count (fx+ 1 (vector-ref m monitor-i-count)))
-       #t)
-      (else #f))))
+  ;; vector-cas! is weak on arm64 (see "the owner word"): a claim of a word
+  ;; that still reads free can fail spuriously, and there is no slow path here
+  ;; to absorb it, so a free lock answered #f now and then. Re-read and retry;
+  ;; only a word someone else holds is a refusal.
+  (let ((me (monitor-self)))
+    (let retry ()
+      (let ((w (vector-ref m monitor-i-owner)))
+        (cond
+          ((not w) (or (monitor-claim! m me) (retry)))
+          ((eq? (monitor-word-id w) me)
+           (vector-set! m monitor-i-count (fx+ 1 (vector-ref m monitor-i-count)))
+           #t)
+          (else #f))))))
 
 ;; The three questions ReentrantLock exposes. All strict eq? against monitor-self,
 ;; NOT monitor-owner?: that predicate's second arm exists so a TERMINAL fiber's own
@@ -1907,8 +1920,13 @@
                    (fs (vector-ref m monitor-i-fibers)))
                (vector-set! m monitor-i-waiters
                             (append (vector-ref m monitor-i-waiters) (list w)))
-               (monitor-release-word! m)
+               ;; the count BEFORE the word, as monitor-exit-slow! orders them: a
+               ;; fast enter claims a free word without bk and then writes its own
+               ;; count of 1, so a 0 written after the release could land on top of
+               ;; it, and that owner's exit then took the count to -1 and never
+               ;; freed the word -- every later contender blocked for good (jolt-are)
                (vector-set! m monitor-i-count 0)
+               (monitor-release-word! m)
                (vector-set! m monitor-i-fibers '())
                (jolt-cv-wake! (vector-ref m monitor-i-cv))
                (cons saved fs)))))
@@ -2488,6 +2506,8 @@
                ;; a snapshot restored here used to make a body read the caller's
                ;; binding where the JVM reads the root.
                (dyn-binding-stack '())
+               ;; and *ns* is its root, clojure.core, not the forking thread's
+               (chez-current-ns-param thread-root-ns)
                ;; surface a thread body's throw like the JVM's default uncaught-
               ;; exception handler; the thread still completes (isAlive/join
               ;; semantics unchanged). Reporting failures are swallowed.
@@ -2621,6 +2641,23 @@
             (cond ((vector-ref st 1) jolt-nil)
                   ((vector-ref st 11) => values)
                   (else (thread-group-of self))))))))
+
+;; Thread.toString as JDK 21 writes it: Thread[#id,name,priority,group], the
+;; group left empty once the thread has terminated; a virtual thread is
+;; VirtualThread[#id,name]/state (the JDK adds @carrier while it is mounted,
+;; which jolt's carriers have no name for). Through the methods, so a thread
+;; whose name or priority changed reports what they answer now.
+(define (jthread-to-string self)
+  (let ((id (number->string (jnum->exact (record-method-dispatch self "threadId" jolt-nil))))
+        (nm (jolt-final-str (record-method-dispatch self "getName" jolt-nil))))
+    (if (jthread-fiber (jhost-state self))
+        (string-append "VirtualThread[#" id (if (string=? nm "") "" (string-append "," nm)) "]/"
+                       (string-downcase (jolt-final-str (record-method-dispatch (record-method-dispatch self "getState" jolt-nil) "name" jolt-nil))))
+        (let ((g (thread-group-of self)))
+          (string-append "Thread[#" id "," nm ","
+                         (number->string (jnum->exact (record-method-dispatch self "getPriority" jolt-nil))) ","
+                         (if (jolt-nil? g) "" (vector-ref (jhost-state g) 0)) "]")))))
+(register-host-methods! "user-thread" (list (cons "toString" jthread-to-string)))
 
 ;; --- uncaught exceptions ---------------------------------------------------
 ;; A throw that ends a thread goes to that thread's handler if it has one, else
@@ -2787,6 +2824,10 @@
          (r (vector-ref st 0))
          (thunk (lambda ()
                   (*txn* #f)
+                  ;; a fiber starts with its spawner's slice; a Thread starts with
+                  ;; none, virtual or not: no bindings, *ns* at its root
+                  (dyn-binding-stack '())
+                  (chez-current-ns-param thread-root-ns)
                   (guard (e (#t (jolt-thread-uncaught! obj e "Exception in virtual thread:\n")))
                     (when r (jolt-invoke (runnable->thunk r))))
                   jolt-nil)))
@@ -2866,7 +2907,157 @@
                                      (else jolt-cv-again))))))
               ;; await() is void; await(timeout, unit) answers whether it reached zero
               (if ms reached jolt-nil)))))
-         (cons "getCount" (lambda (self) (vector-ref (jhost-state self) 0)))))
+         (cons "getCount" (lambda (self) (vector-ref (jhost-state self) 0)))
+         (cons "toString" (lambda (self)
+           (string-append (host-object-tostring self) "[Count = " (number->string (vector-ref (jhost-state self) 0)) "]")))))
+
+;; --- java.util.Timer / java.util.TimerTask ----------------------------------
+;; One background thread per Timer runs its tasks in due order, as the JDK's
+;; TimerThread does: due times are wall-clock milliseconds, a period > 0 is fixed
+;; rate (the next run is the previous DUE time plus the period) and a period < 0
+;; fixed delay (the next run is when this one started, plus the period). A task
+;; that throws kills the thread and cancels the timer, as on the JVM.
+;;
+;; A TimerTask is a proxy over the abstract class, so its own state -- VIRGIN,
+;; SCHEDULED, EXECUTED or CANCELLED, plus its period and next due time -- lives in
+;; a weak table keyed by the task, and cancel / scheduledExecutionTime are the
+;; class's concrete methods (register-abstract-methods!).
+;; timer state: #(mu cv queue accepting? name daemon?); queue: tasks, due order
+(define timer-serial 0)
+(define-process-local timer-serial-mu (make-mutex)) ; merge: upstream's new lock, made process-local as ours are (16d668c5)
+(define timertask-states (make-weak-eq-hashtable))     ; task -> #(state next period)
+(define-process-local timertask-mu (make-mutex)) ; merge: upstream's new lock, made process-local as ours are (16d668c5)
+(define (timertask-state task)
+  (jolt-with-mutex timertask-mu
+    (or (hashtable-ref timertask-states task #f)
+        (let ((v (vector 'virgin 0 0)))
+          (hashtable-set! timertask-states task v)
+          v))))
+(define (timer-next-name)
+  (jolt-with-mutex timer-serial-mu
+    (let ((n timer-serial)) (set! timer-serial (+ n 1)) (string-append "Timer-" (number->string n)))))
+(define (timer-insert q task ts)
+  (cond ((null? q) (list task))
+        ((< (vector-ref ts 1) (vector-ref (timertask-state (car q)) 1)) (cons task q))
+        (else (cons (car q) (timer-insert (cdr q) task ts)))))
+(define (timer-wait-ms st ms)
+  (jolt-condition-wait (vector-ref st 1) (vector-ref st 0)
+    (make-time 'time-duration (* 1000000 (remainder ms 1000)) (quotient ms 1000))))
+(define (timer-main-loop st)
+  (let loop ()
+    (let ((task
+           (jolt-with-mutex (vector-ref st 0)
+             (let wait ()
+               (cond
+                 ((and (null? (vector-ref st 2)) (vector-ref st 3))
+                  (jolt-condition-wait (vector-ref st 1) (vector-ref st 0)) (wait))
+                 ((null? (vector-ref st 2)) #f)          ; cancelled and drained
+                 (else
+                  (let* ((task (car (vector-ref st 2))) (ts (timertask-state task)))
+                    (if (eq? (vector-ref ts 0) 'cancelled)
+                        (begin (vector-set! st 2 (cdr (vector-ref st 2))) (wait))
+                        (let ((now (now-millis)) (due (vector-ref ts 1)) (period (vector-ref ts 2)))
+                          (if (<= due now)
+                              (begin
+                                (vector-set! st 2 (cdr (vector-ref st 2)))
+                                (if (= period 0)
+                                    (vector-set! ts 0 'executed)
+                                    (begin
+                                      (vector-set! ts 1 (if (< period 0) (- now period) (+ due period)))
+                                      (vector-set! st 2 (timer-insert (vector-ref st 2) task ts))))
+                                task)
+                              (begin (timer-wait-ms st (- due now)) (wait))))))))))))
+      (when task
+        (guard (e (#t (jolt-with-mutex (vector-ref st 0)
+                        (vector-set! st 3 #f)
+                        (vector-set! st 2 '()))
+                      (raise e)))
+          (record-method-dispatch task "run" jolt-nil))
+        (loop)))))
+(define (make-jtimer name daemon?)
+  (let* ((st (vector (make-mutex) (jolt-make-cv) '() #t name daemon?))
+         (timer (make-jhost "timer" st))
+         (t (make-jthread (lambda () (timer-main-loop st) jolt-nil) name)))
+    (vector-set! (jhost-state t) 8 daemon?)
+    ((host-method-ref "user-thread" "start") t)
+    timer))
+(for-each (lambda (nm)
+            (register-class-ctor! nm
+              (lambda args
+                (cond ((null? args) (make-jtimer (timer-next-name) #f))
+                      ((and (null? (cdr args)) (boolean? (car args))) (make-jtimer (timer-next-name) (car args)))
+                      ((and (string? (car args)) (null? (cdr args))) (make-jtimer (car args) #f))
+                      ((and (string? (car args)) (pair? (cdr args)) (boolean? (cadr args)) (null? (cddr args)))
+                       (make-jtimer (car args) (cadr args)))
+                      ((jolt-nil? (car args)) (jolt-throw (jolt-host-throwable "java.lang.NullPointerException" jolt-nil)))
+                      (else (jolt-throw (jolt-host-throwable "java.lang.IllegalArgumentException"
+                                                             "No matching ctor found for class java.util.Timer")))))))
+          '("Timer" "java.util.Timer"))
+;; A due time: a delay in ms from now, or a java.util.Date's instant.
+(define (timer-due-of x)
+  (if (number? x)
+      (let ((d (jnum->exact x)))
+        (when (< d 0) (throw-jvm (quote IllegalArgumentException) "Negative delay."))
+        (+ (now-millis) d))
+      (let ((ms (jolt-invoke1 (var-deref "clojure.core" "inst-ms") x)))
+        (when (< ms 0) (throw-jvm (quote IllegalArgumentException) "Illegal execution time."))
+        ms)))
+(define (timer-schedule! self task due period)
+  (let ((st (jhost-state self)))
+    (jolt-with-mutex (vector-ref st 0)
+      (unless (vector-ref st 3)
+        (throw-jvm (quote IllegalStateException) "Timer already cancelled."))
+      (let ((ts (timertask-state task)))
+        (jolt-with-mutex timertask-mu
+          (unless (eq? (vector-ref ts 0) 'virgin)
+            (throw-jvm (quote IllegalStateException) "Task already scheduled or cancelled"))
+          (vector-set! ts 0 'scheduled)
+          (vector-set! ts 1 due)
+          (vector-set! ts 2 period))
+        (vector-set! st 2 (timer-insert (vector-ref st 2) task ts))
+        (jolt-cv-wake! (vector-ref st 1)))))
+  jolt-nil)
+(define (timer-period p)
+  (let ((p (jnum->exact p)))
+    (when (<= p 0) (throw-jvm (quote IllegalArgumentException) "Non-positive period."))
+    p))
+(register-host-methods! "timer"
+  (list (cons "schedule"
+              (lambda (self task when . rest)
+                (if (null? rest)
+                    (timer-schedule! self task (timer-due-of when) 0)
+                    (timer-schedule! self task (timer-due-of when) (- (timer-period (car rest)))))))
+        (cons "scheduleAtFixedRate"
+              (lambda (self task when period)
+                (timer-schedule! self task (timer-due-of when) (timer-period period))))
+        (cons "cancel"
+              (lambda (self)
+                (let ((st (jhost-state self)))
+                  (jolt-with-mutex (vector-ref st 0)
+                    (vector-set! st 3 #f)
+                    (vector-set! st 2 '())
+                    (jolt-cv-wake! (vector-ref st 1))))
+                jolt-nil))
+        (cons "purge"
+              (lambda (self)
+                (let ((st (jhost-state self)))
+                  (jolt-with-mutex (vector-ref st 0)
+                    (let* ((q (vector-ref st 2))
+                           (keep (filter (lambda (t) (not (eq? 'cancelled (vector-ref (timertask-state t) 0)))) q)))
+                      (vector-set! st 2 keep)
+                      (- (length q) (length keep)))))))))
+(register-abstract-methods! "java.util.TimerTask"
+  (list (cons "cancel"
+              (lambda (self)
+                (let ((ts (timertask-state self)))
+                  (jolt-with-mutex timertask-mu
+                    (let ((was (eq? (vector-ref ts 0) 'scheduled)))
+                      (vector-set! ts 0 'cancelled)
+                      was)))))
+        (cons "scheduledExecutionTime"
+              (lambda (self)
+                (let* ((ts (timertask-state self)) (p (vector-ref ts 2)))
+                  (if (< p 0) (+ (vector-ref ts 1) p) (- (vector-ref ts 1) p)))))))
 
 ;; --- java.util.concurrent.Semaphore -----------------------------------------
 ;; A counting semaphore: #(permits mutex cv). acquire takes n permits (1 by default), waiting
@@ -3124,7 +3315,7 @@
                                   '() #f 0
                                   (and (pair? spec) (car spec) #t)
                                   (and (pair? spec) (pair? (cdr spec)) (cadr spec))
-                                  '() #f #f))))
+                                  '() #f #f 0))))
     (let ((st (jhost-state self)))
       ;; The core workers, eagerly. Above core, a worker appears when a task
       ;; arrives with nobody idle to take it, and not before: a cached pool that
@@ -3195,6 +3386,8 @@
     ;; nil gets the same).
     (let* ((worker (lambda ()
                      (*txn* #f)                ; not the creating thread's txn
+                     (dyn-binding-stack '())   ; nor its bindings: a pool thread
+                     (chez-current-ns-param thread-root-ns) ; starts at the roots
                      (rdr-default-modes!)      ; nor the reader modes of a read it forked from
                      (executor-worker-loop st)
                      jolt-nil))
@@ -3386,7 +3579,8 @@
     ;; back and, unless the pool is stopping, starts its replacement, as the
     ;; JVM's processWorkerExit does; then the throw goes on to end this thread,
     ;; where its uncaught-exception handler sees it (executor-spawn-worker!).
-    (guard (e (#t (let ((again? (jolt-with-mutex (vector-ref st 2)
+    (guard (e (#t (executor-task-done! st)
+                  (let ((again? (jolt-with-mutex (vector-ref st 2)
                                   (arrived!) (executor-worker-exit! st)
                                   (and (not (executor-stopping? st))
                                        (executor-claim-worker! st)))))
@@ -3406,6 +3600,7 @@
           (when job
             (unless (executor-stopping? st) (set-box! (current-interrupt-box) #f))
             (job)
+            (executor-task-done! st)
             (loop)))))))
 
 ;; shutdown: stop accepting, let what is queued drain — the delayed one-shots
@@ -3451,6 +3646,13 @@
 ;; Slot 20: STOP, which only shutdownNow reaches — the state in which a worker
 ;; keeps its interrupt rather than having it cleared before a task.
 (define (executor-stopping? st) (vector-ref st 20))
+;; Slot 21: the tasks the workers have finished, normally or not, which is
+;; ThreadPoolExecutor's completedTaskCount. Counted without the queue mutex, by
+;; a CAS retried until it lands (vector-cas! may fail spuriously on arm64).
+(define (executor-task-done! st)
+  (let loop ()
+    (let ((n (vector-ref st 21)))
+      (unless (vector-cas! st 21 n (fx+ n 1)) (loop)))))
 (define (executor-shutdown-now! st)
   ;; STOP, and the queue drained, under ONE hold of the queue mutex, and the
   ;; workers interrupted only after it. A worker takes its next task under that
@@ -3787,7 +3989,7 @@
   (when (< cap 1) (throw-jvm (quote IllegalArgumentException) jolt-nil))
   (make-jhost tag (vector cap (make-mutex) (jolt-make-cv) (cons '() '()) 0)))
 (define (make-abq cap) (make-abq* "abq" cap))
-(define (abq? x) (and (jhost? x) (member (jhost-tag x) '("abq" "lbq")) #t))
+(define-jhost-tag-pred (abq? t) (or (string=? t "abq") (string=? t "lbq")))
 ;; the mutators run under the mutex (jolt-cv-wait's decide, or jolt-with-mutex)
 (define (abq-enq! st v)
   (let ((q (vector-ref st 3)))
@@ -4096,11 +4298,26 @@
         ;; getMaximumPoolSize of a cached pool answers Integer/MAX_VALUE, which is
         ;; the number the JVM's own newCachedThreadPool passes.
         (cons "getPoolSize" (lambda (self) (vector-ref (jhost-state self) 4)))
+        ;; neither an idle worker nor one still starting (st 12, not yet at the
+        ;; queue) is running a task
         (cons "getActiveCount" (lambda (self)
           (let ((st (jhost-state self)))
-            (max 0 (fx- (vector-ref st 4) (vector-ref st 9))))))
+            (max 0 (fx- (vector-ref st 4) (fx+ (vector-ref st 9) (vector-ref st 12)))))))
         (cons "getCorePoolSize" (lambda (self) (vector-ref (jhost-state self) 6)))
-        (cons "getMaximumPoolSize" (lambda (self) (vector-ref (jhost-state self) 7)))))
+        (cons "getMaximumPoolSize" (lambda (self) (vector-ref (jhost-state self) 7)))
+        (cons "getCompletedTaskCount" (lambda (self) (vector-ref (jhost-state self) 21)))
+        (cons "toString" (lambda (self) (executor-to-string self)))))
+;; ThreadPoolExecutor.toString: Object's, then the run state and the four counts
+(define (executor-to-string self)
+  (let ((st (jhost-state self)))
+    (string-append (host-object-tostring self)
+                   "[" (cond ((not (vector-ref st 0)) "Running")
+                             ((jolt-truthy? (record-method-dispatch self "isTerminated" jolt-nil)) "Terminated")
+                             (else "Shutting down"))
+                   ", pool size = " (number->string (vector-ref st 4))
+                   ", active threads = " (number->string (record-method-dispatch self "getActiveCount" jolt-nil))
+                   ", queued tasks = " (number->string (executor-queue-depth self))
+                   ", completed tasks = " (number->string (vector-ref st 21)) "]")))
 
 ;; --- ScheduledExecutorService ------------------------------------------------
 ;; schedule, scheduleAtFixedRate and scheduleWithFixedDelay on the scheduled pools
@@ -4917,7 +5134,32 @@
         (cons "isLocked" (lambda (self) (monitor-locked? (rlock-monitor self))))
         (cons "getHoldCount" (lambda (self) (monitor-self-count (rlock-monitor self))))
         (cons "isHeldByCurrentThread"
-              (lambda (self) (monitor-held-by-self? (rlock-monitor self))))))
+              (lambda (self) (monitor-held-by-self? (rlock-monitor self))))
+        (cons "toString" (lambda (self) (rlock-tostring self)))))
+
+;; ReentrantLock.toString: Object's, then [Unlocked] or [Locked by thread NAME].
+;; The owner word is a fiber or a thread's interrupt box, not a Thread, so the
+;; name is found from it when asked rather than recorded on every lock: a fiber
+;; has its thread object, and a live thread's box is in thread-boxes-by-id. A
+;; thread that ended while holding the lock has left that table.
+(define (rlock-owner-name owner)
+  (cond
+    ((jolt-fiber? owner)
+     (jolt-str-render-one (record-method-dispatch (fiber-thread-object owner) "getName" jolt-nil)))
+    ((let-values (((ids boxes) (jolt-with-mutex thread-boxes-mu (hashtable-entries thread-boxes-by-id))))
+       (let loop ((i 0))
+         (cond ((fx= i (vector-length ids)) #f)
+               ((eq? (vector-ref boxes i) owner) (vector-ref ids i))
+               (else (loop (fx+ i 1))))))
+     => jolt-thread-name)
+    (else "<terminated>")))
+(define (rlock-tostring self)
+  (let ((owner (let ((m (rlock-monitor self)))
+                 (jolt-with-mutex (vector-ref m monitor-i-bk) (monitor-owner-id m)))))
+    (string-append (host-object-tostring self)
+                   (if owner
+                       (string-append "[Locked by thread " (rlock-owner-name owner) "]")
+                       "[Unlocked]"))))
 
 ;; --- main-thread executor ---------------------------------------------------
 ;; Lets a worker thread (e.g. an nREPL eval future) run a thunk on the thread
@@ -5236,21 +5478,36 @@
 (define jolt-shutdown-ran (box #f))
 
 (define (jolt-register-shutdown-hook! key thunk)
-  ;; A registered hook is a second mutator: the watcher thread runs it, and it can
-  ;; touch whatever jolt value the program can. That is what jolt-mt? guards, and
-  ;; the watcher does not flip it itself — it is forked dormant so a program with
-  ;; no hooks keeps the single-threaded lazy path (lazy-bridge.ss). Flipping HERE
-  ;; is race-free for the same reason the fork does it: the registering thread is
-  ;; either registering or forcing a cell, never both, and if any other thread
-  ;; exists the flag is already on.
+  ;; A program's hook is a second mutator: on a signal the watcher thread runs it
+  ;; while the program's own threads are still running, and it can touch whatever
+  ;; jolt value they can. That is what jolt-mt? guards. Flipping HERE is race-free
+  ;; for the same reason the fork does it: the registering thread is either
+  ;; registering or forcing a cell, never both, and if any other thread exists the
+  ;; flag is already on. Flipping later, as the watcher wakes, is not: the program
+  ;; may be halfway through realizing a cell the hook goes on to force, and what it
+  ;; published on the single-threaded path went out without a release fence.
   (jolt-mark-mt!)
+  (jolt-enlist-shutdown-hook! key thunk))
+
+(define (jolt-add-shutdown-hook thunk) (jolt-register-shutdown-hook! thunk thunk))
+
+;; A hook of the runtime's own: the JOLT_PROFILE reports and the block-count dump
+;; a --profile-gen binary writes (sampler.ss, cli-core.ss). Every built binary's
+;; launcher registers the dump, so marking the process multi-threaded for it put
+;; every such program's lazy seqs on the claim path, up to 1.45x slower. These
+;; read only what the runtime keeps for them (sample tables, block counters) and
+;; values they build themselves, never a cell or atom the program could be in the
+;; middle of, so they are not a second mutator of anything the flag guards. They
+;; run on the exiting thread, or on the watcher, which marks the process
+;; multi-threaded as it wakes so that its own reads take the guarded paths.
+(define (jolt-add-runtime-shutdown-hook thunk) (jolt-enlist-shutdown-hook! thunk thunk))
+
+(define (jolt-enlist-shutdown-hook! key thunk)
   (jolt-with-mutex jolt-shutdown-mutex
     (set-box! jolt-shutdown-hooks (cons (cons key thunk) (unbox jolt-shutdown-hooks))))
   ;; outside the mutex: arming takes it to test the watcher's flag
   (jolt-arm-shutdown!)
   jolt-nil)
-
-(define (jolt-add-shutdown-hook thunk) (jolt-register-shutdown-hook! thunk thunk))
 
 ;; #t when a hook keyed by KEY was registered and is now removed, matching
 ;; Runtime.removeShutdownHook's boolean.
@@ -5374,6 +5631,19 @@
   (jolt-with-sigmask jolt-sig-block-how jolt-shutdown-sigset fork))
 (set! jolt-fork-sigmask-guard jolt-fork-with-shutdown-blocked)
 (define c-sigwait (jolt-foreign-proc-blocking "sigwait" '(void* void*) 'int))
+;; What a sigwait answered: its signal when it is one of ours, else #f and the
+;; watcher asks again. The answer is checked, not taken on a zero return: on
+;; macOS, libsystem_pthread's sigwait turns the kernel's EINTR into a return of
+;; 0 WITHOUT writing the signal number (disassembled: a `cmp w19, #4` on errno
+;; selects 0), so a handled signal outside the set that lands on the watcher
+;; thread, a profiling timer's SIGPROF, read as signal 0 and the watcher ended
+;; the process with status 128 and the hooks unrun. The buffer is zeroed before
+;; each wait so a stale number from an earlier answer can't be taken for a new
+;; one, and 0 is no signal.
+(define (jolt-sigwait-signal r sigbuf)
+  (and (eqv? r 0)
+       (let ((sig (sa-foreign-ref 'int sigbuf 0)))
+         (and (memv sig jolt-shutdown-signals) sig))))
 ;; The watcher cannot leave through Chez's (exit): called off the main thread it
 ;; never returns. It has already run the hooks and flushed by then, so _exit is
 ;; the whole of what is left to do.
@@ -5461,20 +5731,28 @@
               (let loop ()
                 ;; recorded as waiting: a main carrier that reads every other thread asleep before it
                 ;; tells its waiters nothing can wake them (fibers.ss) never takes this one for running
-                (if (= 0 (call-with-thread-state 'WAITING
-                           (lambda () (jolt-asleep-while #f #f (lambda () (c-sigwait jolt-shutdown-sigset sigbuf))))))
+                ;; merge: upstream's jolt-sigwait-signal (an error number, or 0 with no signal of ours,
+                ;; asks again) around our asleep/WAITING wrapper
+                (sa-foreign-set! 'int sigbuf 0 0)
+                (if (jolt-sigwait-signal
+                      (call-with-thread-state 'WAITING
+                        (lambda () (jolt-asleep-while #f #f (lambda () (c-sigwait jolt-shutdown-sigset sigbuf)))))
+                      sigbuf)
                     (let ((sig (sa-foreign-ref 'int sigbuf 0))
                           (target (unbox jolt-sigint-target)))
                       (if (and (= sig 2) target (jolt-sigint-trip! target))
                           (loop)
                           (begin
+                            ;; this thread now runs jolt code alongside the
+                            ;; program's (jolt-add-runtime-shutdown-hook)
+                            (jolt-mark-mt!)
                             (guard (_ (#t #f)) (jolt-run-shutdown-hooks!))
                             (guard (_ (#t #f)) (flush-output-port (current-output-port)))
                             (guard (_ (#t #f)) (flush-output-port (current-error-port)))
                             ;; 128+signal is the status a shell reports for a process
                             ;; killed by that signal, and what the JVM exits with here.
                             (c-underscore-exit (+ 128 sig)))))
-                    (loop))))))) ; EINTR — ask again
+                    (loop))))))) ; an error number, or 0 with no signal of ours — ask again
           "jolt-shutdown"))))
   jolt-nil)
 

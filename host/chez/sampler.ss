@@ -269,7 +269,7 @@
   (let ((e (getenv "JOLT_PROFILE")))
     (when (and (string? e) (string=? e "sample")
                (jolt-sample-start! jolt-sample-interval jolt-sample-depth))
-      (jolt-add-shutdown-hook jolt-sample-report-at-exit))))
+      (jolt-add-runtime-shutdown-hook jolt-sample-report-at-exit))))
 
 ;; --- jolt build --profile-gen ------------------------------------------------------
 ;; A binary built with --profile-gen carries Chez's block counters in every unit,
@@ -281,7 +281,7 @@
 ;; and the build averages them. TAG is the build mode, which --profile-use has
 ;; to match.
 (define (jolt-block-profile-at-exit! tag)
-  (jolt-add-shutdown-hook
+  (jolt-add-runtime-shutdown-hook
     (lambda ()
       (let ((path (let ((e (getenv "JOLT_PROFILE_DATA"))
                         ;; asked of the OS (loader.ss): a binary's argv[0] is empty

@@ -689,7 +689,9 @@
           ;; refuses to reference ("var: a/hidden is not public"), as the JVM's
           ;; Compiler.resolveIn / isMacro do. (var a/hidden) still takes it.
           (if (and (not (string=? (var-cell-ns cell) (chez-actx-cns ctx)))
-                   (hc-private-var? ctx cell))
+                   (hc-private-var? ctx cell)
+                   (not (and (string=? (var-cell-ns cell) "clojure.core")
+                             (hashtable-ref hc-native-op-name-table (var-cell-name cell) #f))))
               (jolt-assoc base hc-kw-private #t)
               base))
         (cond
@@ -1030,12 +1032,25 @@
 ;; name -- a defmulti or defn over it, or a fresh var after ns-unmap -- replaces
 ;; that metadata, so the inference's protocol-method registry entry is only good
 ;; while this holds.
+;;
+;; A method of a protocol defined :extend-via-metadata answers no here either: its
+;; shim consults the receiver's metadata between the type's own impls and extend's
+;; (protocols.ss protocol-resolve-meta), so the receiver's type alone does not
+;; decide the impl, and a PIC or devirtualized resolve in place of the shim would
+;; skip the metadata. The protocol value is read now, through its var, so a
+;; redefinition with or without the option is what the next compile sees.
 (define hc-kw-protocol (keyword #f "protocol"))
+(define hc-kw-extend-via-metadata (keyword #f "extend-via-metadata"))
 (define (hc-protocol-method-var? ctx ns-name nm)
   (let ((c (var-cell-lookup ns-name nm)))
     (if (and c
-             (let ((m (var-cell-meta c)))
-               (and (pmap? m) (jolt-truthy? (jolt-get m hc-kw-protocol jolt-nil)))))
+             (let* ((m (var-cell-meta c))
+                    (pv (and (pmap? m) (jolt-get m hc-kw-protocol jolt-nil))))
+               (and pv (jolt-truthy? pv)
+                    (not (and (var-cell? pv)
+                              (let ((p (var-cell-root pv)))
+                                (and (pmap? p)
+                                     (jolt-truthy? (jolt-get p hc-kw-extend-via-metadata jolt-nil)))))))))
         #t jolt-nil)))
 ;; Is the var dynamic NOW? A direct-linked def can be made dynamic after it ran
 ;; (.setDynamic), and a form compiled after that must read it through the var
@@ -1201,7 +1216,7 @@
 ;; clojure.core names. The emitter lowers each of these inline, so the declared
 ;; cell's unbound root is never deref'd. host/chez/manifest-check.sh fails CI if
 ;; this list drifts from native-ops.
-(for-each (lambda (nm) (declare-var! "clojure.core" nm))
+(define hc-native-op-names
   '("+" "-" "*" "/" "<" ">" "<=" ">=" "=" "inc" "dec" "not" "min" "max"
     "mod" "rem" "quot" "vector" "hash-map" "hash-set" "conj" "get" "nth" "count"
     "assoc" "dissoc" "contains?" "find" "empty?" "peek" "pop" "first" "rest" "next" "seq"
@@ -1214,11 +1229,22 @@
     "__deftype-field" "__deftype-slot" "__deftype-mslot" "__deftype-slot-set!" "__record-get"
     ;; the `lazy-seq` macro's two halves (lazy-bridge.ss): internal names too
     "make-lazy-seq" "coll->cells" "chunked-seq?"
+    ;; doseq's chunk walk (natives-transduce.ss): internal names too
+    "__chunk-vec" "__chunk-start" "__chunk-end" "__chunk-after" "__chunk-nth"
     "aget" "aset" "alength"
     "bit-and" "bit-or" "bit-xor" "bit-not"
     "bit-shift-left" "bit-shift-right" "unsigned-bit-shift-right"
     "unchecked-add" "unchecked-subtract" "unchecked-multiply"
     "unchecked-inc" "unchecked-dec" "unchecked-negate"))
+(for-each (lambda (nm) (declare-var! "clojure.core" nm)) hc-native-op-names)
+;; A ^:private one of these (doseq's __chunk-* walk helpers) is plumbing a core
+;; macro's expansion calls from the user's namespace: the back end lowers the
+;; call to its procedure and never reads the var, so the not-public check that
+;; guards a var reference does not apply to it (hc-resolve-global).
+(define hc-native-op-name-table
+  (let ((t (make-hashtable string-hash string=?)))
+    (for-each (lambda (nm) (hashtable-set! t nm #t)) hc-native-op-names)
+    t))
 
 
 ;; --- install: bind the contract into the jolt.host namespace -----------------

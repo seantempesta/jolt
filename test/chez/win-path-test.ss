@@ -306,6 +306,12 @@
   (set! fails (+ fails 1))
   (printf "FAIL: GetFinalPathNameByHandleW prefixes\n"))
 
+;; a relative path under the root directory gets one separator, not two: "//src"
+;; as a URL path is file://src/, a host named "src"
+(ok "path under the root" (string=? (path-under "/" "src") "/src"))
+(ok "path under a directory" (string=? (path-under "/a" "src") "/a/src"))
+(ok "path under a drive root" (string=? (path-under "C:\\" "src") "C:\\src"))
+
 (if (> fails 0)
     (begin (printf "WIN-PATH FAILURES: ~a of ~a\n" fails total) (exit 1))
     (printf "WIN-PATH OK (~a checks)\n" total))

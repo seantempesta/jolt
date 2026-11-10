@@ -130,8 +130,11 @@
 ;; message/ex-data/cause + a mapped Clojure backtrace come from the shared
 ;; renderer (source-registry.ss); this adds the top-level source location. Under
 ;; JOLT_DIAG=edn the human report is replaced by one EDN diagnostic line.
-(define (jolt-report-uncaught raw)
-  (let ((v (jolt-unwrap-throw raw))
+(define (jolt-report-uncaught raw0)
+  ;; A load-file's CompilerException wrapper reports the throw it wraps, as
+  ;; clojure.main's report names the cause's class, message and frames.
+  (let* ((raw (jolt-load-wrap-origin raw0))
+         (v (jolt-unwrap-throw raw))
         (port (current-error-port)))
     (if (jolt-diag-machine?)
         ;; jolt-pr-readable, not jolt-pr-str: strings must be quoted so the line
@@ -402,11 +405,14 @@
                (not (and (pair? cli-args)
                          (member (car cli-args) '("--aot-worker" "--build-worker")))))
       (load-namespace "jolt.profile")
-      (if (string=? e "sample")
-          (jolt-sample-init-from-env!)
+      (cond
+        ((string=? e "sample") (jolt-sample-init-from-env!))
+        ;; jolt.debug's locals for the whole run; there is nothing to report
+        ((string=? e "debug") (jolt-profile-instrument! (jolt-keyword "debug")))
+        (else
           (let ((at-exit (var-deref "jolt.profile" "report-at-exit")))
             (when (jolt-profile-instrument! #t)
-              (jolt-add-shutdown-hook (lambda () (jolt-invoke at-exit)))))))))
+              (jolt-add-runtime-shutdown-hook (lambda () (jolt-invoke at-exit))))))))))
 
 (define (jolt-cli-run cli-args prepare-build!)
   ;; Every entry starts in user, as clojure.main's does. The image bakes jolt.main

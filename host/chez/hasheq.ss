@@ -61,8 +61,8 @@
 ;; declares its own HAMT operators through this same form.
 ;;
 ;; The test runs on the COMPILING Chez, which for a native build is the target.
-;; Cross-compiling to a target narrower than the host would have to consult the
-;; target's fixnum width here instead.
+;; A cross build to a narrower target sets JOLT_NARROW_HASH in its compile script
+;; (build.ss bld-cross-compile-prelude).
 ;;
 ;; JOLT_NARROW_HASH=1 in the compiling environment forces the narrow arm on a
 ;; wide machine. That is what makes the generic arms executable under the
@@ -578,7 +578,9 @@
 (define (hasheq-caches)
   (let ((c (virtual-register jolt-vreg-hasheq-caches)))
     (if (eq? c 0)
-        (let ((v (cons (make-weak-eq-hashtable) (make-eq-hashtable))))
+        ;; both weak: the string cache must not keep a string alive (a
+        ;; WeakHashMap keyed by a string would never lose the entry)
+        (let ((v (cons (make-weak-eq-hashtable) (make-weak-eq-hashtable))))
           (set-virtual-register! jolt-vreg-hasheq-caches v)
           v)
         c)))
@@ -682,7 +684,6 @@
 ;; hash it structurally and let equal-field instances collide as map keys).
 ;; One shared table: the id is per OBJECT, whatever its type.
 (define proc-hasheq-tbl (make-weak-eq-hashtable))
-(define-process-local proc-hasheq-mu (make-mutex))
 (define proc-hasheq-counter 0)
 ;; An id already handed out is read without the lock: only writers corrupt a
 ;; Chez hashtable, and a reader racing one sees at worst a stale miss, which
@@ -690,14 +691,42 @@
 (define (jolt-identity-hasheq p)
   (or (hashtable-ref proc-hasheq-tbl p #f)
       (jolt-identity-hasheq/locked p)))
+;; The id for the Nth object: murmured so neighbours spread, and kept to 31
+;; bits, as HotSpot's identity hashes are — System/identityHashCode and the
+;; hash of a fn or a plain deftype are never negative there.
+(define (identity-hash-id n) (fxand (murmur3-hash-long-flat n) #x7fffffff))
+;; Writers take a spin lock, a box claimed by CAS, and hold it with interrupts
+;; off. #object printing mints an id for every fresh object it prints (jolt-28we),
+;; and the mutex with its dynamic-wind cost more than the insert itself. The
+;; critical section is one lookup and one insert: it cannot block or park, and
+;; with interrupts off neither a fiber switch nor a collection can land inside
+;; it, so a holder always finishes promptly. A waiter spins with interrupts ON
+;; between attempts, so it still reaches a collection's rendezvous while the
+;; holder is busy. box-cas! may fail spuriously on arm64; that is one more spin.
+;; box-cas! orders nothing around itself on arm64, so the claim is followed by
+;; an acquire fence and the release preceded by a release fence: without them
+;; a second writer read the table from before the first one's insert and minted
+;; a second id for the same object (a 400k-object, 8-thread stress row did it
+;; a few times per run).
+(define proc-hasheq-lock (box #f))
+(define (proc-hasheq-claim!)
+  (and (box-cas! proc-hasheq-lock #f #t) (begin (memory-order-acquire) #t)))
+(define (proc-hasheq-release!)
+  (memory-order-release)
+  (let retry () (unless (box-cas! proc-hasheq-lock #t #f) (retry))))
 (define (jolt-identity-hasheq/locked p)
-  (jolt-with-mutex proc-hasheq-mu
-    (or (hashtable-ref proc-hasheq-tbl p #f)
-        (begin
-          (set! proc-hasheq-counter (fx+ proc-hasheq-counter 1))
-          (let ((h (murmur3-hash-long-flat proc-hasheq-counter)))
-            (hashtable-set! proc-hasheq-tbl p h)
-            h)))))
+  (disable-interrupts)
+  (if (proc-hasheq-claim!)
+      (let ((h (or (hashtable-ref proc-hasheq-tbl p #f)
+                   (begin
+                     (set! proc-hasheq-counter (fx+ proc-hasheq-counter 1))
+                     (let ((h (identity-hash-id proc-hasheq-counter)))
+                       (hashtable-set! proc-hasheq-tbl p h)
+                       h)))))
+        (proc-hasheq-release!)
+        (enable-interrupts)
+        h)
+      (begin (enable-interrupts) (jolt-identity-hasheq/locked p))))
 (define (procedure-hasheq p) (jolt-identity-hasheq p))
 ;; Pin a procedure's identity hash to a value chosen by the caller, before
 ;; anything asks for one. A deftype/defrecord type token is = to its Class (they
@@ -709,9 +738,14 @@
 ;; A content-derived seed also travels better than the counter: it is the same
 ;; number in the next process, where a counter-assigned id is not.
 (define (jolt-identity-hasheq-seed! p h)
-  (jolt-with-mutex proc-hasheq-mu
-    (unless (hashtable-ref proc-hasheq-tbl p #f)
-      (hashtable-set! proc-hasheq-tbl p h))))
+  (disable-interrupts)
+  (if (proc-hasheq-claim!)
+      (begin
+        (unless (hashtable-ref proc-hasheq-tbl p #f)
+          (hashtable-set! proc-hasheq-tbl p h))
+        (proc-hasheq-release!)
+        (enable-interrupts))
+      (begin (enable-interrupts) (jolt-identity-hasheq-seed! p h))))
 
 ;; pvec hasheq, cached in the field the record has carried since chez-pvec-v3
 ;; (mk-pvec inits it 0 = unset; pvec-with-ent already forwards it) but nothing

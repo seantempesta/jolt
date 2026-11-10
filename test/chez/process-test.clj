@@ -3,6 +3,7 @@
 (ns process-test
   (:require [jolt.process :as p :refer [process sh check pipeline]]
             [jolt.fs :as fs]
+            [jolt.scheme :as scm]
             [clojure.string :as str]))
 
 (def failures (atom []))
@@ -357,6 +358,24 @@
                                         " (println \"MAIN\") (System/exit 0)")]))]
   (check-eq "shutdown hook runs on System/exit" (str/split-lines out) ["MAIN" "HOOK"]))
 
+;; The watcher takes only a signal from its set (HUP, INT, TERM). macOS's sigwait
+;; answers 0 for a kernel EINTR without writing the signal number, so a handled
+;; signal outside the set landing on the watcher thread (a profiling timer's
+;; SIGPROF) read as signal 0, and the watcher ended the process with status 128,
+;; hooks unrun. A buffer holding what the last answer left, or nothing, is the
+;; case: jolt-sigwait-signal's answer decides whether the watcher acts or waits
+;; again. The kernel path can't be staged from here (it needs the signal to land
+;; on that thread), so the decision is checked on its own.
+(let [answer (fn [r n]
+               (scm/eval-string (str "(let ([b (sa-foreign-alloc 4)])"
+                                     " (sa-foreign-set! 'int b 0 " n ")"
+                                     " (let ([s (jolt-sigwait-signal " r " b)]) (sa-foreign-free b) s))")))]
+  (check-eq "sigwait answer: SIGTERM from the set" (answer 0 15) 15)
+  (check-eq "sigwait answer: SIGINT from the set" (answer 0 2) 2)
+  (check-eq "sigwait answer: 0 returned with no signal written (macOS EINTR)" (answer 0 0) false)
+  (check-eq "sigwait answer: a signal outside the set" (answer 0 27) false)
+  (check-eq "sigwait answer: an error number" (answer 4 15) false))
+
 ;; Chez's exit-handler is a THREAD parameter, so a hook registered from a worker
 ;; installs the wrapper on that worker and nowhere else. The main thread has to
 ;; carry one of its own or this hook would be dropped on the way out.
@@ -646,17 +665,26 @@
 ;; rest of the program has to keep running. A future stopped ticking the moment a
 ;; prompt was reached, which is not what a JVM does with a thread in
 ;; System.in.read() (jolt-p9ua).
+;;
+;; The future APPENDS a line per tick and the row counts lines. It used to spit
+;; the tick number over the file, and a read landing between spit's truncate and
+;; its write saw an empty file, which counted as tick 0 and failed "keeps
+;; running" on a loaded runner (jolt-nb5ng); so did a fixed 400ms window that a
+;; starved future could miss. The file only grows now, and each wait polls for
+;; progress under a deadline far past anything a running future needs, so only
+;; a future that has really stopped can fail the row.
 (let [tickf (str (fs/create-temp-file {:prefix "jp-ticks-" :suffix ".txt"}))
-      nested (str "(future (dotimes [i 100] (Thread/sleep 50) (spit \"" tickf "\" (str i))))"
+      nested (str "(future (dotimes [i 600] (Thread/sleep 50) (spit \"" tickf "\" \"t\\n\" :append true)))"
                   " (read-line)")
       proc (process [jolt-bin "-e" nested])
-      tick (fn [] (let [s (str/trim (slurp tickf))] (when-not (str/blank? s) (parse-long s))))]
-  (loop [n 0] (when (and (< n 200) (nil? (tick))) (Thread/sleep 50) (recur (inc n))))
-  (check-eq "a future runs while the main thread waits on stdin" (some? (tick)) true)
+      ticks (fn [] (count (re-seq #"t\n" (slurp tickf))))
+      wait-past (fn [n] (loop [i 0]
+                          (when (and (< i 400) (<= (ticks) n)) (Thread/sleep 50) (recur (inc i))))
+                  (ticks))]
+  (check-eq "a future runs while the main thread waits on stdin" (pos? (wait-past 0)) true)
   ;; and keeps running, rather than getting one tick in before the read parks
-  (let [before (or (tick) 0)]
-    (Thread/sleep 400)
-    (check-eq "and keeps running" (> (or (tick) 0) before) true))
+  (let [before (ticks)]
+    (check-eq "and keeps running" (> (wait-past (+ before 2)) (+ before 2)) true))
   (.destroyForcibly (:proc proc))
   (fs/delete-if-exists tickf))
 

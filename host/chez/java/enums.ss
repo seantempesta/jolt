@@ -170,11 +170,6 @@
                       (find (cdr es))))))
          (and enum-jrec-declared? (jrec? x) (enum-jrec-render x)))))
 (set-jrec-enum-constant-test! (lambda (x) (and enum-jrec-declared? (enum-of x) #t)))
-;; an enum constant prints its identity hash whatever it is (rt.ss jolt-object-repr)
-(define enum-nonjhost-declared? #f)
-(set! jolt-object-repr-hash?
-  (let ((prior jolt-object-repr-hash?))
-    (lambda (x) (or (prior x) (and enum-nonjhost-declared? (enum-of x) #t)))))
 
 ;; ---- registration ---------------------------------------------------------------
 ;; What a value shared by every equal value is, for the refusal below, or #f.
@@ -229,7 +224,6 @@
           (when (fx<? i (vector-length consts))
             (hashtable-set! consts-tbl (vector-ref consts i) (cons info i))
             (when (jrec? (vector-ref consts i)) (set! enum-jrec-declared? #t))
-            (unless (jhost? (vector-ref consts i)) (set! enum-nonjhost-declared? #t))
             (loop (fx+ i 1))))
         ;; the copies are complete before either becomes visible
         (memory-order-release)

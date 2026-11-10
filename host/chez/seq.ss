@@ -446,6 +446,10 @@
            ;; other forcer of the cell waited on it for good.
            (let ((claim (cons force-claim-token me)) (lv (jolt-locks-held)))
              (jolt-locks-enter!)
+             ;; the claim is a fresh pair: release its stores before the CAS
+             ;; publishes it, or a reader can see the pointer before the token
+             ;; and take a live claim for a stale one
+             (memory-order-release)
              (if (sa-record-cas! cell jolt-lazyseq-lock-index #f claim)
                  ;; A compare-and-swap orders nothing but its own word: the acquire
                  ;; makes every store the previous holder released visible to this
@@ -553,6 +557,8 @@
            ;; returns, so the far edge needs nothing.
            (let ((claim (make-tail-claim w me force-claim-token)))
              (jolt-locks-enter!)
+             ;; a fresh record, published by the CAS: release its fields first
+             (memory-order-release)
              (if (sa-record-cas! s cseq-tail-index w claim)
                  (begin
                    (memory-order-acquire)
@@ -683,6 +689,10 @@
 (define (register-seq-arm! pred handler)
   (seq-arm-reject-fast-type! 'register-seq-arm! pred)
   (set! jolt-seq-arms (cons (cons pred handler) jolt-seq-arms)))
+;; At the END of the walk, for a family of rare values (the arms run newest first).
+(define (register-seq-arm-last! pred handler)
+  (seq-arm-reject-fast-type! 'register-seq-arm-last! pred)
+  (set! jolt-seq-arms (append jolt-seq-arms (list (cons pred handler)))))
 
 ;; A map's entries, keys or vals, and a set's elements, as a seq of the given
 ;; flavor. MODE picks what each element is: 0 the entry, 1 the key, 2 the value.
@@ -780,6 +790,9 @@
     ;; a set's seq is RT.keys over its backing map, i.e. an APersistentMap$KeySeq
     ((pset? x) (pmap-view-seq (pset-m x) 1 sk-key-seq))
     ((string? x) (str->seq x 0))
+    ;; a plain defrecord's entries, ahead of the arm walk (records-coll.ss
+    ;; jrec-plain?, loaded later — resolved at call time)
+    ((and (jrec? x) (jrec-plain? x)) (list->cseq (jrec-plain-entries x)))
     (else (let loop ((as jolt-seq-arms))
             (cond ((null? as) (jolt-throw (jolt-host-throwable "java.lang.IllegalArgumentException"
                                           (string-append "Don't know how to create ISeq from: "
@@ -1619,8 +1632,8 @@
 ;; takes exactly one argument and a map or keyword takes one or two, so
 ;; jolt-invoke2 answers fewer types than jolt-invoke1 and the rest fall through to
 ;; get their typed ArityException from jolt-invoke, unchanged.
-(define (jolt-invoke0 f) (if (procedure? f) (if (fxlogbit? 0 (procedure-arity-mask f)) (f) (jolt-proc-arity-error f 0)) (jolt-invoke f)))
-(define (jolt-invoke1 f a)
+(define (jolt-invoke-t0 f) (if (procedure? f) (if (fxlogbit? 0 (procedure-arity-mask f)) (f) (jolt-proc-arity-error f 0)) (jolt-invoke f)))
+(define (jolt-invoke-t1 f a)
   (cond
     ((procedure? f) (if (fxlogbit? 1 (procedure-arity-mask f)) (f a) (jolt-proc-arity-error f 1)))
     ((keyword? f) (jolt-get a f))            ; (:k m) -> (get m :k)
@@ -1629,15 +1642,59 @@
     ((pvec? f) (pvec-nth! f (pvec-key-index! a)))  ; (v i) -> nth at (.intValue i)
     ((pset? f) (jolt-get f a))               ; (s x)  -> (get s x)
     (else (jolt-invoke f a))))
-(define (jolt-invoke2 f a b)
+(define (jolt-invoke-t2 f a b)
   (cond
     ((procedure? f) (if (fxlogbit? 2 (procedure-arity-mask f)) (f a b) (jolt-proc-arity-error f 2)))
     ((keyword? f) (jolt-get a f b))          ; (:k m d) -> (get m :k d)
     ((pmap? f) (jolt-get f a b))             ; (m k d)  -> (get m k d)
     ((jolt-symbol? f) (jolt-get a f b))      ; ('s m d) -> (get m 's d)
     (else (jolt-invoke f a b))))
-(define (jolt-invoke3 f a b c) (if (procedure? f) (if (fxlogbit? 3 (procedure-arity-mask f)) (f a b c) (jolt-proc-arity-error f 3)) (jolt-invoke f a b c)))
-(define (jolt-invoke4 f a b c d) (if (procedure? f) (if (fxlogbit? 4 (procedure-arity-mask f)) (f a b c d) (jolt-proc-arity-error f 4)) (jolt-invoke f a b c d)))
+(define (jolt-invoke-t3 f a b c) (if (procedure? f) (if (fxlogbit? 3 (procedure-arity-mask f)) (f a b c) (jolt-proc-arity-error f 3)) (jolt-invoke f a b c)))
+(define (jolt-invoke-t4 f a b c d) (if (procedure? f) (if (fxlogbit? 4 (procedure-arity-mask f)) (f a b c d) (jolt-proc-arity-error f 4)) (jolt-invoke f a b c d)))
+
+;; jolt-invoke0..4: the same calls, from code that is not traced -- clojure.core,
+;; the runtime's own Scheme -- calling a fn value that may be. A traced fn's tail
+;; call stores its site pair in the slot (vreg 2, rt.ss jolt-vreg-site), and it
+;; stands for that fn only while the tail call runs. When the call returns to
+;; untraced code, nothing put the slot back, so a throw the caller raised after it
+;; (into's conj on a callback's value, swap!'s validator) found the returned
+;; callback's pair and either named it as its innermost frame or had to be
+;; second-guessed by the report (jolt-gqtdc). So these put the slot back as it was
+;; when the call returns: one load before the call and one store after
+;; (jolt-site-kept, rt.ss; on a host that records no site it is the call alone). Traced
+;; code's non-tail calls restore it themselves (backend site-restore), and every
+;; emitted call in tail position must stay a tail call, so the back end emits
+;; jolt-invoke-tN there and these only at an untraced non-tail site.
+(define (jolt-invoke0 f)
+  (if (procedure? f)
+      (if (fxlogbit? 0 (procedure-arity-mask f))
+          (jolt-site-kept (f))
+          (jolt-proc-arity-error f 0))
+      (jolt-site-kept (jolt-invoke-t0 f))))
+(define (jolt-invoke1 f a)
+  (if (procedure? f)
+      (if (fxlogbit? 1 (procedure-arity-mask f))
+          (jolt-site-kept (f a))
+          (jolt-proc-arity-error f 1))
+      (jolt-site-kept (jolt-invoke-t1 f a))))
+(define (jolt-invoke2 f a b)
+  (if (procedure? f)
+      (if (fxlogbit? 2 (procedure-arity-mask f))
+          (jolt-site-kept (f a b))
+          (jolt-proc-arity-error f 2))
+      (jolt-site-kept (jolt-invoke-t2 f a b))))
+(define (jolt-invoke3 f a b c)
+  (if (procedure? f)
+      (if (fxlogbit? 3 (procedure-arity-mask f))
+          (jolt-site-kept (f a b c))
+          (jolt-proc-arity-error f 3))
+      (jolt-site-kept (jolt-invoke-t3 f a b c))))
+(define (jolt-invoke4 f a b c d)
+  (if (procedure? f)
+      (if (fxlogbit? 4 (procedure-arity-mask f))
+          (jolt-site-kept (f a b c d))
+          (jolt-proc-arity-error f 4))
+      (jolt-site-kept (jolt-invoke-t4 f a b c d))))
 
 ;; ============================================================================
 ;; chunked-seq accessors — the host side of the Clojure IChunkedSeq contract
@@ -1687,8 +1744,11 @@
 ;; crest (the after-chunk seq); for a vector seq it is the seq at the next block.
 (define (na-chunk-rest s)
   (cond
+    ;; the rest as it stands, unrealized, as ChunkedCons.chunkedMore hands it
+    ;; back: realizing it here read the NEXT chunk before the walk reached it
+    ;; (a doseq stopped by :while realized a chunk the JVM never touches)
     ((and (cseq? s) (cseq-crest s))
-     (let ((r (jolt-seq (cseq-crest s)))) (if (jolt-nil? r) jolt-empty-list r)))
+     (let ((r (cseq-crest s))) (if (jolt-nil? r) jolt-empty-list r)))
     ((na-vblock s) => (lambda (vb)
        (if (fx>=? (cdr vb) (pvec-count (car vb))) jolt-empty-list
            (vec->seq/k (car vb) (cdr vb) (cseq-kind s)))))
@@ -1715,11 +1775,11 @@
     (if (fx<=? (fx+ off len) (vector-length node))
         (let loop ((j 0))
           (if (fx<? j len)
-              (begin (vector-set! out j (g (vector-ref node (fx+ off j)))) (loop (fx+ j 1)))
+              (begin (vector-set! out j (jolt-site-kept (g (vector-ref node (fx+ off j))))) (loop (fx+ j 1)))
               (make-pvec out)))
         (let loop ((j 0))
           (if (fx<? j len)
-              (begin (vector-set! out j (g (pvec-nth-d pv (fx+ i j) jolt-nil))) (loop (fx+ j 1)))
+              (begin (vector-set! out j (jolt-site-kept (g (pvec-nth-d pv (fx+ i j) jolt-nil)))) (loop (fx+ j 1)))
               (make-pvec out))))))
 ;; Returns the kept-elements chunk pvec, or #f when the whole block is rejected
 ;; (so the caller recurses straight into chunk-rest, emitting no empty cell).
@@ -1762,7 +1822,7 @@
        (cseq-chunked (na-chunk-map-first s g) 0
                      (jolt-make-lazy-src lz-map-chunk f s)))
       (else
-       (cseq-lazy (g (seq-first s)) (make-lazy-src lz-map-more f s))))))
+       (cseq-lazy (jolt-site-kept (g (seq-first s))) (make-lazy-src lz-map-more f s))))))
 (define (map-seq* f seqs)              ; multi-collection map; stops at the shortest
   (if (any-nil? seqs) jolt-empty-list
       (cseq-lazy (apply jolt-invoke f (map seq-first seqs))
@@ -1792,8 +1852,8 @@
   ;; common case), wrapped in jolt-truthy?; else jolt-invoke then jolt-truthy?.
   ;; Bound once per call, consulted in both loops below.
   (let ((tp (if (procedure? pred)
-                (lambda (x) (jolt-truthy? (pred x)))
-                (lambda (x) (jolt-truthy? (jolt-invoke pred x))))))
+                (lambda (x) (jolt-truthy? (jolt-site-kept (pred x))))
+                (lambda (x) (jolt-truthy? (jolt-invoke1 pred x))))))
     (cond
       ((jolt-nil? s) jolt-empty-list)         ; empty result is () (see map-seq)
       ((na-chunked-seq? s)
@@ -1865,7 +1925,7 @@
                    (let inner ((j offset) (k i) (acc acc))
                      (cond ((jolt-reduced? acc) acc)
                            ((fx>=? j clen) (outer k acc))
-                           (else (inner (fx+ j 1) (fx+ k 1) (f acc (vector-ref chunk j))))))))))
+                           (else (inner (fx+ j 1) (fx+ k 1) (jolt-site-kept (f acc (vector-ref chunk j)))))))))))
         (let outer ((i start) (acc acc))
           (cond ((jolt-reduced? acc) acc)
                 ((fx>=? i n) acc)
@@ -1875,7 +1935,7 @@
                    (let inner ((j offset) (k i) (acc acc))
                      (cond ((jolt-reduced? acc) acc)
                            ((fx>=? j clen) (outer k acc))
-                           (else (inner (fx+ j 1) (fx+ k 1) (jolt-invoke f acc (vector-ref chunk j)))))))))))))
+                           (else (inner (fx+ j 1) (fx+ k 1) (jolt-invoke2 f acc (vector-ref chunk j)))))))))))))
 (define (reduce-seq f acc s)
   ;; direct? is bound once (a boolean, no allocation) and consulted in the
   ;; non-chunked step so a raw fn steps with (f acc x) instead of jolt-invoke.
@@ -1895,10 +1955,37 @@
                  (else acc2))))
         ;; the step's answer is tested BEFORE the rest of the seq is realized: forcing (seq-more s)
         ;; first calls a lazy seq's producer once past a `reduced` (JVM: seq-reduce asks reduced? before next)
-        (else (let ((acc2 (if direct? (f acc (seq-first s)) (jolt-invoke f acc (seq-first s)))))
+        (else (let ((acc2 (if direct? (jolt-site-kept (f acc (seq-first s))) (jolt-invoke2 f acc (seq-first s)))))
                 (if (jolt-reduced? acc2)
                     (jolt-reduced-val acc2)
                     (rec acc2 (jolt-seq (seq-more s))))))))))
+;; A host collection that hands its elements out as a list (the java.util views,
+;; jutil-views.ss) reduces over that list directly rather than through a seq of
+;; it, as a Java Iterable reduces over its iterator. #f until a host sets it.
+(define jolt-reduce-elems-hook #f)
+;; A fail-fast java.util collection (one that keeps a modCount) reduces over its
+;; own iterator, hasNext / next per element, as clojure.core.protocols'
+;; iter-reduce does on the JVM, so a change the reducing fn makes is the next
+;; next()'s ConcurrentModificationException. The hook answers a stepper — a
+;; procedure that runs hasNext / next once and answers the element or
+;; reduce-iter-done — or #f. #f until a host sets it.
+(define jolt-reduce-iter-hook #f)
+(define reduce-iter-done (list 'reduce-iter-done))
+(define (reduce-iterator f acc step)
+  (let ((direct? (procedure? f)))
+    (let rec ((acc acc))
+      (if (jolt-reduced? acc)
+          (jolt-reduced-val acc)
+          (let ((x (step)))
+            (if (eq? x reduce-iter-done)
+                acc
+                (rec (if direct? (jolt-site-kept (f acc x)) (jolt-invoke2 f acc x)))))))))
+(define (reduce-list f acc xs)
+  (let ((direct? (procedure? f)))
+    (let rec ((acc acc) (xs xs))
+      (cond ((jolt-reduced? acc) (jolt-reduced-val acc))
+            ((null? xs) acc)
+            (else (rec (if direct? (jolt-site-kept (f acc (car xs))) (jolt-invoke2 f acc (car xs))) (cdr xs)))))))
 (define jolt-reduce
   (case-lambda
     ((f coll)
@@ -1908,9 +1995,18 @@
      ;; IReduceInit and its one reduce method takes an init, so driving it from
      ;; here would pass the wrong arity — it seqs instead, as on the JVM.
      (cond
+       ;; a plain defrecord reduces its entries (records-coll.ss jrec-plain?)
+       ((and (jrec? coll) (jrec-plain? coll))
+        (let ((es (jrec-plain-entries coll)))
+          (if (null? es) (jolt-invoke f) (reduce-list f (car es) (cdr es)))))
        ((and (declares-ireduce? coll) (iface-method coll "reduce" 2))
         => (lambda (m) (let ((r (jolt-invoke m coll f)))
                          (if (jolt-reduced? r) (jolt-reduced-val r) r))))
+       ((and jolt-reduce-iter-hook (jolt-reduce-iter-hook coll))
+        => (lambda (step) (let ((x (step)))
+                            (if (eq? x reduce-iter-done) (jolt-invoke f) (reduce-iterator f x step)))))
+       ((and jolt-reduce-elems-hook (jolt-reduce-elems-hook coll))
+        => (lambda (xs) (if (null? xs) (jolt-invoke f) (reduce-list f (car xs) (cdr xs)))))
        (else (let ((s (jolt-seq coll)))
                (if (jolt-nil? s) (jolt-invoke f)          ; (reduce f []) -> (f)
                    (reduce-seq f (seq-first s) (jolt-seq (seq-more s))))))))
@@ -1919,9 +2015,12 @@
      ;; the reduction, e.g. (reduce f init (reify clojure.lang.IReduceInit
      ;; (reduce [_ f i] ...))) or the same on a deftype.
      (cond
+       ((and (jrec? coll) (jrec-plain? coll)) (reduce-list f init (jrec-plain-entries coll)))
        ((iface-method coll "reduce" 3)
         => (lambda (m) (let ((r (jolt-invoke m coll f init)))
                          (if (jolt-reduced? r) (jolt-reduced-val r) r))))
+       ((and jolt-reduce-iter-hook (jolt-reduce-iter-hook coll)) => (lambda (it) (reduce-iterator f init it)))
+       ((and jolt-reduce-elems-hook (jolt-reduce-elems-hook coll)) => (lambda (xs) (reduce-list f init xs)))
        (else (reduce-seq f init (jolt-seq coll)))))))
 
 ;; Fold through a transient so a pvec/pmap/pset target is built in O(n): a
@@ -1945,9 +2044,11 @@
 ;; like 3-arity reduce.
 (define (into-fold f acc from)
   (cond
+    ((and (jrec? from) (jrec-plain? from)) (reduce-list f acc (jrec-plain-entries from)))
     ((iface-method from "reduce" 3)
      => (lambda (m) (let ((r (jolt-invoke m from f acc)))
                       (if (jolt-reduced? r) (jolt-reduced-val r) r))))
+    ((and jolt-reduce-iter-hook (jolt-reduce-iter-hook from)) => (lambda (it) (reduce-iterator f acc it)))
     (else (reduce-seq f acc (jolt-seq from)))))
 (define (jolt-into to from)
   (cond
@@ -1973,6 +2074,13 @@
      (meta-carry to
        (let ((t (jolt-transient-new to)))
          (pmap-fold-fwd from (lambda (k v acc) (tmap-put! t k v) acc) #f)
+         (jolt-persistent! t))))
+    ;; ...and a plain record into a map the same way: its slots and extension
+    ;; map straight into the transient, no entry objects (records-coll.ss)
+    ((and (pmap? to) (jrec? from) (jrec-plain? from))
+     (meta-carry to
+       (let ((t (jolt-transient-new to)))
+         (jrec-plain-kv-reduce from (lambda (acc k v) (tmap-put! t k v) acc) #f)
          (jolt-persistent! t))))
     ;; only an editable collection rides the transient path; anything else
     ;; (PersistentQueue, sorted colls, seqs) folds through conj, like RT's
@@ -2014,7 +2122,7 @@
 ;; kvreduce (the JVM method name is lowercase); any other map-like value (a
 ;; record, a sorted map, a host map arm) folds over its keys, the reference's
 ;; IPersistentMap arm. nil folds to init.
-(define (kv-step f) (if (procedure? f) f (lambda (acc k v) (jolt-invoke f acc k v))))
+(define (kv-step f) (if (procedure? f) (lambda (acc k v) (jolt-site-kept (f acc k v))) (lambda (acc k v) (jolt-invoke3 f acc k v))))
 (define (pmap-kv-reduce m f init)
   (let ((step (kv-step f)) (root (pmap-root m)))
     (if (not (hnode? root))
@@ -2056,11 +2164,58 @@
 ;; for anything else. The java layer (java/jutil-colls.ss) set!s this; it is a
 ;; hook rather than a predicate list here because the shims are its to know.
 (define jolt-reduce-kv-entries (lambda (x) #f))
+;; reduce-kv with an init that is already reduced, as each reference kvreduce
+;; treats one: an array map, a vector, a sorted map and a record (its seq walk)
+;; call f with it and test only what f returns; a hash map tests it first and
+;; unwraps it; a type's own kvreduce gets it and is answered as it returns.
+;; Empty, an array map, a vector and nil hand the init back still wrapped, while
+;; a sorted map unwraps it. Off the hot path: jolt-reduce-kv asks once.
+(define (reduce-kv-reduced-init f init coll)
+  (let ((step (kv-step f)))
+    (define (walk-entries s acc)            ; s: a seq of entries, nil when done
+      (if (jolt-nil? s)
+          acc
+          (let* ((e (seq-first s))
+                 (r (step acc (jolt-nth e 0) (jolt-nth e 1))))
+            (if (jolt-reduced? r) (jolt-reduced-val r) (walk-entries (jolt-seq (seq-more s)) r)))))
+    (cond
+      ((jolt-nil? coll) init)
+      ((pmap? coll) (if (pmap-array? coll) (walk-entries (jolt-seq coll) init) (jolt-reduced-val init)))
+      ((pvec? coll)
+       (let ((n (jolt-count coll)))
+         (let loop ((i 0) (acc init))
+           (if (fx>=? i n)
+               acc
+               (let ((r (step acc i (jolt-nth coll i))))
+                 (if (jolt-reduced? r) (jolt-reduced-val r) (loop (fx+ i 1) r)))))))
+      ((htable-sorted-map? coll)
+       (let ((r (walk-entries (jolt-seq coll) init)))
+         (if (jolt-reduced? r) (jolt-reduced-val r) r)))
+      ((iface-method coll "kvreduce" 3) => (lambda (m) (jolt-invoke m coll f init)))
+      ((or (jrec? coll) (jolt-map? coll)) (walk-entries (jolt-seq coll) init))
+      (else (jolt-reduce-kv-walk f init coll)))))
 (define (jolt-reduce-kv f init coll)
+  (if (jolt-reduced? init)
+      (reduce-kv-reduced-init f init coll)
+      (jolt-reduce-kv-walk f init coll)))
+(define (jolt-reduce-kv-walk f init coll)
+  (cond
+    ;; a type's own kvreduce answers as it returns — reduced or not, as the
+    ;; reference's IKVReduce arm hands back .kvreduce's value untouched
+    ((and (not (pmap? coll)) (not (pvec? coll)) (not (jolt-nil? coll))
+          (not (and (jrec? coll) (jrec-plain? coll)))
+          (not (jolt-reduce-kv-entries coll))
+          (iface-method coll "kvreduce" 3))
+     => (lambda (m) (jolt-invoke m coll f init)))
+    (else (jolt-reduce-kv-fold f init coll))))
+(define (jolt-reduce-kv-fold f init coll)
   (let ((r (cond
              ((pmap? coll) (pmap-kv-reduce coll f init))
              ((pvec? coll) (vec-kv-reduce coll f init))
              ((jolt-nil? coll) init)
+             ;; a plain defrecord folds its slots, then its extension map, with
+             ;; no entry objects (records-coll.ss, resolved at call time)
+             ((and (jrec? coll) (jrec-plain? coll)) (jrec-plain-kv-reduce coll f init))
              ((jolt-reduce-kv-entries coll)
               => (lambda (es)
                    (let ((step (kv-step f)))

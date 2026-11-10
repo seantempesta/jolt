@@ -47,16 +47,24 @@ probe='(require (quote mylib.where) (quote clojure.java.io))
          (println mylib.where/baked)
          (println (some? (clojure.java.io/resource file))))'
 
+# JOLT_AOT_ASYNC=0 on every run. By default a miss hands its .so compile to a
+# detached worker and exits without waiting, so the fasl (b) fills the cache with
+# lands some time AFTER (b) returns. (c) starts at once and hit only when the
+# worker had already finished: true on an idle machine, not always on a loaded CI
+# runner, where (c) then failed "recompiled instead of hitting the cache" with an
+# empty cache dir. In-process, the fasl is on disk when the run exits. This test
+# is about the NAME a cached namespace gets; aot-cache-smoke.sh (z) covers the
+# worker itself.
 # $1 = cwd, $2 = JOLT_AOT_CACHE, rest = extra jolt args before -M
 run_in() {
   dir="$1"; aot="$2"; shift 2
-  (cd "$dir" && JOLT_AOT_CACHE="$aot" JOLT_CACHE_DIR="$cache" JOLT_QUIET=1 \
+  (cd "$dir" && JOLT_AOT_CACHE="$aot" JOLT_AOT_ASYNC=0 JOLT_CACHE_DIR="$cache" JOLT_QUIET=1 \
      "$jolt" "$@" -M -e "$probe" 2>&1) || true
 }
 # The same run with the cache's report on stderr, for whether it hit.
 hit_in() {
   dir="$1"; shift
-  (cd "$dir" && JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache" JOLT_QUIET=1 JOLT_DEBUG=1 \
+  (cd "$dir" && JOLT_AOT_CACHE=1 JOLT_AOT_ASYNC=0 JOLT_CACHE_DIR="$cache" JOLT_QUIET=1 JOLT_DEBUG=1 \
      "$jolt" "$@" -M -e "$probe" 2>&1 >/dev/null) > "$tmp/hit.log"
   grep -c '\[jolt.aot\] hit mylib.where' "$tmp/hit.log" || true
 }
@@ -111,6 +119,20 @@ if [ "$out" = "$want_lf" ]; then
   echo "PASS: (e) load-file names the file by its absolute path"; pass=$((pass+1))
 else
   echo "FAIL: (e) load-file"
+  echo "  got:";  printf '%s\n' "$out"    | sed 's/^/    /'
+  echo "  want:"; printf '%s\n' "$want_lf" | sed 's/^/    /'
+  fails=$((fails+1))
+fi
+
+# (f) ...and a leading ./ stays in it, as File.getAbsolutePath keeps it
+out="$(cd "$tmp/moved" && JOLT_CACHE_DIR="$cache" JOLT_QUIET=1 "$jolt" -M -e \
+  '(load-file "./src/mylib/where.clj") (println (:file (meta (var mylib.where/f)))) (println mylib.where/baked)' 2>&1 || true)"
+want_lf="$tmp/moved/./src/mylib/where.clj
+$tmp/moved/./src/mylib/where.clj"
+if [ "$out" = "$want_lf" ]; then
+  echo "PASS: (f) load-file keeps a leading ./"; pass=$((pass+1))
+else
+  echo "FAIL: (f) load-file ./"
   echo "  got:";  printf '%s\n' "$out"    | sed 's/^/    /'
   echo "  want:"; printf '%s\n' "$want_lf" | sed 's/^/    /'
   fails=$((fails+1))

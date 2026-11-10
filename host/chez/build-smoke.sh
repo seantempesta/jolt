@@ -846,15 +846,16 @@ fi
 # dropped local, so the image maker the site calls hit an unbound variable (the
 # ray tracer's "variable vertical is not bound"); moved under a let/loop/fn/catch
 # binder that rebinds a local they read, they computed the wrong value (12 and
-# 5 for 3 and 6). Every build gets the pass, so the default build is the one
-# checked.
+# 5 for 3 and 6). A field value that allocates, moved to two reads (or one read
+# in a loop body), made a new object per read where the binding held one.
+# Every build gets the pass, so the default build is the one checked.
 scalar_capture_app="$root/test/chez/scalar-capture-app"
 scalar_capture_out="$(dirname "$out")/scalar-capture-bin"
 if ! JOLT_PWD="$scalar_capture_app" "$jolt" build -m app.core -o "$scalar_capture_out" >/dev/null 2>&1; then
   echo "  FAIL: scalar-capture build exited non-zero"; exit 1
 fi
 scalar_capture_got="$(cd "$scalar_capture_app" && "$scalar_capture_out" 2>&1)"
-scalar_capture_want="$(printf '16\n3\n6\n[3 3]\n3')"
+scalar_capture_want="$(printf '16\n3\n6\n[3 3]\n3\n[true true 2 2]\ntrue')"
 if [ "$scalar_capture_got" != "$scalar_capture_want" ]; then
   echo "  FAIL: scalar-replace moved field args out of scope — got \`$scalar_capture_got\`, want \`$scalar_capture_want\`"; exit 1
 fi
@@ -1638,6 +1639,52 @@ if ! printf '%s' "$stray_err" | grep -q 'Unmatched delimiter'; then
 fi
 if [ -x "$(dirname "$out")/stray-bin" ]; then
   echo "  FAIL: build produced a binary from a file it could not read"; exit 1
+fi
+
+# (char x) is a :coerce node with no numeric kind (the analyzer's cast table).
+# The types pass, which only a BUILD runs, once answered such a node with its
+# operand's type: (number? (char 97)) folded to true, a char param got a
+# ^double seed from its callers and threw on the first fixnum, and a record
+# field holding a char took the unsafe fl+ (invalid memory reference). jolt run
+# never showed it. The four shapes below are the ones that broke.
+echo "build smoke: a char cast is typed as a char by the build's inference"
+chcast="$(dirname "$out")/chcast"; mkdir -p "$chcast/src/app"
+printf '{}\n' > "$chcast/deps.edn"
+{ echo '(ns app.core)'
+  echo '(defrecord P [c])'
+  echo '(defn f1 [x] (let [c (char x)] [(number? c) (char? c)]))'
+  echo '(defn f2 [^double d] (let [c (char d)] [(number? c) (char? c)]))'
+  echo '(defn kind [x n] (if (pos? n) (kind x (dec n)) (if (char? x) :char :other)))'
+  echo '(defn sumc [p q n] (if (pos? n) (sumc p q (dec n)) (+ (:c p) (:c q))))'
+  echo '(defn -main [& _]'
+  echo '  (println (f1 97) (f2 97.0) (kind (char 97.0) 3)'
+  echo '           (try (sumc (->P (char 99.0)) (->P (char 100.0)) 3) (catch ClassCastException _ :cce))))'
+} > "$chcast/src/app/core.clj"
+JOLT_PWD="$chcast" "$joltabs" build -m app.core -o "$(dirname "$out")/chcast-bin" > /dev/null 2>&1 || { echo "  FAIL: the char-cast app did not build"; exit 1; }
+chcast_out="$(cd /tmp && "$(dirname "$out")/chcast-bin" 2>&1 || true)"
+if [ "$chcast_out" != "[false true] [false true] :char :cce" ]; then
+  echo "  FAIL: a built (char x) is not typed as a char"
+  echo "--- expected ---"; echo "[false true] [false true] :char :cce"
+  echo "--- got ---"; echo "$chcast_out"; exit 1
+fi
+
+# A build types a hintless param :double when every caller passes a double, and
+# that fact is worth the fast path, but the JVM still boxes such a param: outside
+# the window the cast answers as a boxed one, as `jolt run` of the same code does.
+echo "build smoke: a param seeded :double keeps the boxed cast's answers"
+seedcast="$(dirname "$out")/seedcast"; mkdir -p "$seedcast/src/app"
+printf '{}\n' > "$seedcast/deps.edn"
+{ echo '(ns app.core)'
+  echo '(defn nb [x n] (if (pos? n) (nb x (dec n)) (byte x)))'
+  echo '(defn nc [x n] (if (pos? n) (nc x (dec n)) (let [y x] (int (char y)))))'
+  echo '(defn -main [& _] (println (nb 127.9 3) (nb (/ 0.0 0.0) 3) (nc (/ 0.0 0.0) 3)))'
+} > "$seedcast/src/app/core.clj"
+JOLT_PWD="$seedcast" "$joltabs" build -m app.core -o "$(dirname "$out")/seedcast-bin" > /dev/null 2>&1 || { echo "  FAIL: the seeded-cast app did not build"; exit 1; }
+seedcast_out="$(cd /tmp && "$(dirname "$out")/seedcast-bin" 2>&1 || true)"
+if [ "$seedcast_out" != "127 0 0" ]; then
+  echo "  FAIL: a seeded param's cast answered as a primitive one"
+  echo "--- expected ---"; echo "127 0 0"
+  echo "--- got ---"; echo "$seedcast_out"; exit 1
 fi
 
 # A set literal mixing an auto keyword with a plain one of the same alias text

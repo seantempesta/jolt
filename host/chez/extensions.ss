@@ -15,6 +15,10 @@
 ;;   (register-extension! :currency-data "de" {:symbol "€"})
 ;;   (extension-value :currency-data "de")   ; => {:symbol "€" :frac-digits 2}
 ;;
+;; A string-keyed point may declare :parent, a separator: a key with no provider
+;; then narrows by dropping its last subtag ("de-DE" -> "de") and tries again
+;; before :fallback decides, as a locale falls back to its language.
+;;
 ;; :fallback :strict is the reason this exists rather than a map with a default.
 ;; It says the default answers the :root key and nothing else, so an unregistered
 ;; key RAISES naming the point and the key instead of quietly handing back a
@@ -52,10 +56,11 @@
 (define-record-type ext-point
   (fields id key-kind root fallback
           hint                      ; string appended to a strict miss, or #f
+          parent                    ; subtag separator a missed key narrows at, or #f
           (mutable fields)          ; alist (field-name . type-name), declaration order
           (mutable default)         ; jolt map, total over fields
           providers)                ; hashtable: normalized key string -> jolt map
-  (nongenerative chez-ext-point-v1))
+  (nongenerative chez-ext-point-v2))
 
 (define (ext-bad! msg) (throw-jvm (quote IllegalArgumentException) msg))
 (define (ext-get m k) (jolt-get-dispatch m k jolt-nil))
@@ -146,8 +151,9 @@
 ;; library declaring a point core also declares). Re-declaring it DIFFERENTLY is
 ;; drift — two sources disagreeing about one contract — and raises rather than
 ;; letting last-write-wins pick silently.
-(define (ext-same-declaration? p key-kind root fallback hint fields default)
+(define (ext-same-declaration? p key-kind root fallback hint parent fields default)
   (and (string=? (ext-point-key-kind p) key-kind)
+       (equal? (ext-point-parent p) parent)
        (string=? (ext-point-fallback p) fallback)
        (equal? (ext-point-hint p) hint)
        (jolt=2 (ext-point-root p) root)
@@ -170,7 +176,14 @@
                    (cond ((jolt-nil? h) #f)
                          ((string? h) h)
                          (else (ext-bad! (string-append "extension point " (ext-show-id idn)
-                                                        " :hint must be a string")))))))
+                                                        " :hint must be a string"))))))
+           (parent (let ((s (ext-kw spec "parent")))
+                     (cond ((jolt-nil? s) #f)
+                           ((and (string? s) (fx=? (string-length s) 1)) s)
+                           (else (ext-bad! (string-append "extension point " (ext-show-id idn)
+                                                          " :parent must be a one-character separator string")))))))
+      (when (and parent (not (string=? key-kind "string")))
+        (ext-bad! (string-append "extension point " (ext-show-id idn) " :parent needs :key :string")))
       (unless (member key-kind '("string" "keyword"))
         (ext-bad! (string-append "extension point " (ext-show-id idn)
                                  " :key must be :string or :keyword, got :" key-kind)))
@@ -194,13 +207,13 @@
       (jolt-with-mutex ext-mu
         (let ((prior (hashtable-ref extension-points-tbl idn #f)))
           (cond
-            ((and prior (ext-same-declaration? prior key-kind root fallback hint fields default)) jolt-nil)
+            ((and prior (ext-same-declaration? prior key-kind root fallback hint parent fields default)) jolt-nil)
             (prior
              (ext-bad! (string-append "extension point " (ext-show-id idn)
                                       " is already declared with a different contract")))
             (else
              (hashtable-set! extension-points-tbl idn
-               (make-ext-point idn key-kind root fallback hint fields default
+               (make-ext-point idn key-kind root fallback hint parent fields default
                                (make-hashtable string-hash string=?)))
              (bump-extension-epoch!)
              jolt-nil)))))))
@@ -271,10 +284,20 @@
 (define (ext-merge default provider)
   (pmap-fold-fwd provider (lambda (k v acc) (jolt-assoc1 acc k v)) default))
 
+;; The provider for KS, or for the nearest key it narrows to under :parent.
+(define (ext-provider p ks)
+  (let ((providers (ext-point-providers p)) (sep (ext-point-parent p)))
+    (let loop ((ks ks))
+      (or (hashtable-ref providers ks #f)
+          (and sep
+               (let scan ((i (fx- (string-length ks) 1)))
+                 (cond ((fx<=? i 0) #f)
+                       ((char=? (string-ref ks i) (string-ref sep 0)) (loop (substring ks 0 i)))
+                       (else (scan (fx- i 1))))))))))
 (define (jolt-extension-value id k)
   (let* ((p (ext-point-of id "extension-value"))
          (ks (ext-key->string p k))
-         (hit (hashtable-ref (ext-point-providers p) ks #f)))
+         (hit (ext-provider p ks)))
     (cond
       (hit (ext-merge (ext-point-default p) hit))
       ((string=? (ext-point-fallback p) "default") (ext-point-default p))
@@ -294,7 +317,7 @@
 (define (jolt-extension-has? id k)
   (let* ((p (ext-point-of id "extension-has?"))
          (ks (ext-key->string p k)))
-    (or (and (hashtable-ref (ext-point-providers p) ks #f) #t)
+    (or (and (ext-provider p ks) #t)
         (string=? (ext-point-fallback p) "default")
         (jolt=2 (ext-point-root p) k))))
 

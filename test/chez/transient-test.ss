@@ -30,7 +30,8 @@
 (is "collection key"     "(get (persistent! (assoc! (transient {}) [1 2] :v)) [1 2])" ":v")
 (is "dangling key pads"  "(= {:a 1 :b nil} (persistent! (assoc! (transient {}) :a 1 :b)))" "true")
 (is "vector? is false"   "(vector? (transient []))" "false")
-(is "transient sorted (cow)" "(persistent! (assoc! (transient (sorted-map :b 2)) :a 1))" "{:a 1, :b 2}")
+(ok "transient refuses a sorted map" (guard (e (#t #t)) (ev "(transient (sorted-map :b 2))") #f))
+(ok "transient refuses a sorted set" (guard (e (#t #t)) (ev "(transient (sorted-set 1))") #f))
 (ok "lone key throws"        (guard (e (#t #t)) (ev "(persistent! (assoc! (transient {}) :a))") #f))
 (ok "use after persistent!"  (guard (e (#t #t)) (ev "(let [t (transient [])] (persistent! t) (conj! t 1))") #f))
 

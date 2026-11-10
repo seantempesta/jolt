@@ -121,8 +121,12 @@
                  ans)
                hit)))
         ((and (jreify? val) (not (jreify-delegate val)))
-         (reify-declares-class? (jreify-protos val) tname))
+         (or (reify-declares-class? (jreify-protos val) tname) (reify-class-isa? val tname)))
         (else #f)))
+;; a reify form's or proxy's generated class and what the class graph puts above
+;; it (a proxy is an IProxy, and is its abstract superclass)
+(define (reify-class-isa? val tname)
+  (let ((c (reify-class-name val))) (and c (jch-isa? c tname) #t)))
 
 ;; swap!, reset!, add-watch and the rest of atoms.ss's reference fns reach a
 ;; deftype, record or reify through the interface it declares, as instance? sees
@@ -140,7 +144,7 @@
              ;; the class graph: a declared interface's own ancestry answers too
              ;; (IPersistentMap is an Associative is an IPersistentCollection).
              (jch-isa? tag tname))))
-      ((jreify? val) (reify-declares-class? (jreify-protos val) tname))
+      ((jreify? val) (or (reify-declares-class? (jreify-protos val) tname) (reify-class-isa? val tname)))
       ((ex-info-map? val) (exception-isa? (last-dot (ex-info-class val)) (last-dot tname)))
       (else (case-string tname val)))))
 
@@ -365,7 +369,7 @@
     ((member tname '("Ratio" "clojure.lang.Ratio")) (and (number? val) (exact? val) (rational? val) (not (integer? val))))
     ((member tname '("String" "java.lang.String" "CharSequence" "java.lang.CharSequence")) (string? val))
     ((member tname '("Boolean" "java.lang.Boolean")) (boolean? val))
-    ((member tname '("Character" "java.lang.Character")) (char? val))
+    ((member tname '("Character" "java.lang.Character")) (or (char? val) (jsurr? val)))
     ((member tname '("Keyword" "clojure.lang.Keyword")) (keyword? val))
     ((member tname '("Symbol" "clojure.lang.Symbol")) (jolt-symbol? val))
     ((member tname '("Atom" "clojure.lang.Atom")) (jolt-atom? val))

@@ -60,5 +60,89 @@
     (let ((r (one-round)))
       (ok (format "round ~a: the holder's collect finished and the waiter got the lock" i) r)
       (if r (loop (+ i 1)) (begin (printf "masked-acquire: ~a checks, ~a failures\n" total fails) (exit 1))))))
+;; The same for a condition wait (locks.ss jolt-condition-wait): Chez's
+;; condition-wait deactivates the thread only with interrupts enabled too
+;; (thread.c S_condition_wait), so WAITER, interrupts disabled, waiting on cv
+;; for a flag that COLLECTOR sets only after its collection, held that
+;; collection up while the collection held up the flag. TIMEOUT is #f for the
+;; untimed wait, else the timed one's (longer than the round's deadline, so only
+;; a wake ends it).
+(define (one-cv-round timeout)
+  (let ((mu (make-mutex)) (cv (make-condition))
+        (waiting? #f) (go? #f) (collected? #f) (done? #f))
+    (fork-thread
+      (lambda ()
+        (disable-interrupts)
+        (jolt-with-mutex mu
+          (set! waiting? #t)
+          (let loop ()
+            (unless go?
+              (if timeout (jolt-condition-wait cv mu timeout) (jolt-condition-wait cv mu))
+              (loop))))
+        (enable-interrupts)
+        (set! done? #t)))
+    (fork-thread
+      (lambda ()
+        (wait-until (lambda () waiting?) 5.0)
+        ;; let the waiter reach its blocking wait
+        (sleep (make-time 'time-duration 20000000 0))
+        (collect-rendezvous)
+        (set! collected? #t)
+        (jolt-with-mutex mu (set! go? #t) (condition-broadcast cv))))
+    (and (wait-until (lambda () (and collected? done?)) 10.0) #t)))
+
+(printf "== masked condition wait: a wait with interrupts off does not stall a collection ==\n")
+(for-each
+  (lambda (timeout)
+    (let loop ((i 0))
+      (when (< i 5)
+        (let ((r (one-cv-round timeout)))
+          (ok (format "~a wait, round ~a: the collect finished and the waiter was woken"
+                      (if timeout "timed" "untimed") i)
+              r)
+          (if r (loop (+ i 1)) (begin (printf "masked-acquire: ~a checks, ~a failures\n" total fails) (exit 1)))))))
+  (list #f (make-time 'time-duration 0 60)))
+
+;; And when COLLECTOR collects while HOLDING the waiter's mutex: a sliced
+;; condition-wait takes mu back inside the call at the end of each slice, still
+;; counted as active, so it blocked on mu while the collection waited for it.
+(define (one-cv-hold-round timeout)
+  (let ((mu (make-mutex)) (cv (make-condition))
+        (waiting? #f) (go? #f) (collected? #f) (done? #f))
+    (fork-thread
+      (lambda ()
+        (disable-interrupts)
+        (jolt-with-mutex mu
+          (set! waiting? #t)
+          (let loop ()
+            (unless go?
+              (if timeout (jolt-condition-wait cv mu timeout) (jolt-condition-wait cv mu))
+              (loop))))
+        (enable-interrupts)
+        (set! done? #t)))
+    (fork-thread
+      (lambda ()
+        (wait-until (lambda () waiting?) 5.0)
+        (sleep (make-time 'time-duration 20000000 0))
+        (jolt-with-mutex mu
+          ;; longer than a slice, so the waiter wants mu back while it is held
+          (sleep (make-time 'time-duration 20000000 0))
+          (collect-rendezvous)
+          (set! collected? #t)
+          (set! go? #t)
+          (condition-broadcast cv))))
+    (and (wait-until (lambda () (and collected? done?)) 10.0) #t)))
+
+(printf "== masked condition wait: a collect by the mutex's holder does not stall it ==\n")
+(for-each
+  (lambda (timeout)
+    (let loop ((i 0))
+      (when (< i 5)
+        (let ((r (one-cv-hold-round timeout)))
+          (ok (format "~a wait, round ~a: the holder's collect finished and the waiter was woken"
+                      (if timeout "timed" "untimed") i)
+              r)
+          (if r (loop (+ i 1)) (begin (printf "masked-acquire: ~a checks, ~a failures\n" total fails) (exit 1)))))))
+  (list #f (make-time 'time-duration 0 60)))
 (printf "masked-acquire: ~a checks, ~a failures\n" total fails)
 (exit (if (= fails 0) 0 1))

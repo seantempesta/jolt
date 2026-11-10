@@ -173,7 +173,7 @@
   '("clojure.core/eval" "clojure.core/resolve" "clojure.core/ns-resolve"
     "clojure.core/requiring-resolve" "clojure.core/find-var" "clojure.core/intern"
     "clojure.core/load-string" "clojure.core/load-file" "clojure.core/load-reader"
-    "clojure.core/load"
+    "clojure.core/load" "jolt.host/eval-string"
     ;; Reflective enumeration — a program that walks a namespace's var table at
     ;; runtime via ns-publics/ns-interns/&c finds vars invisible to the static
     ;; IR graph, so any such reference bails the shake.
@@ -224,6 +224,8 @@
 (define dce-compile-refs
   '("clojure.core/eval" "clojure.core/load-string" "clojure.core/load-file"
     "clojure.core/load-reader" "clojure.core/load"
+    ;; load-string without its *ns* binding, for a REPL's own entries
+    "jolt.host/eval-string"
     ;; Images. Restoring one compiles the fn SOURCES it carries (state-image.ss
     ;; image-compile-eval-seam), so a program that reads one back needs the
     ;; compiler as surely as one that evals; and WRITING one goes through the
@@ -260,6 +262,9 @@
     "clojure.core/-read-line"
      ;; post-prelude taxonomy wrappers close over the overlay versions
      "clojure.core/ifn?" "clojure.core/seqable?"
+     ;; post-prelude's coll? (deftype and reify collections) closes over the
+     ;; overlay version too
+     "clojure.core/coll?"
      ;; post-prelude's native sequential? closes over the overlay version for
      ;; the exotic-value fallback
      "clojure.core/sequential?"
@@ -268,6 +273,8 @@
      "clojure.core/counted?"
     ;; the fn print form wraps the overlay __print1
     "clojure.core/__print1"
+    ;; load-reader (compile-eval.ss) drains its reader through slurp
+    "clojure.core/slurp"
     ;; the multimethod dispatch cache resolves the hierarchy value per call
     ;; (mm-current-hierarchy, multimethods.ss); mm-prefers? walks parents
     "clojure.core/global-hierarchy" "clojure.core/parents"

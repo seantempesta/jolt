@@ -167,6 +167,14 @@
    ;; generic invoke each time. The overlay's placeholder (21-coll.clj) still binds
    ;; the var until post-prelude.ss re-asserts it.
    "chunked-seq?"  {:call "na-chunked-seq?" :arity #(= % 1) :bool? true :pure? true}
+   ;; doseq's chunk walk (00-syntax.clj, natives-transduce.ss): its expansion is
+   ;; their only caller, so nothing rebinds them, and through their vars each
+   ;; step would pay a deref and a generic invoke
+   "__chunk-vec"   {:call "doseq-chunk-vec" :arity #(= % 1)}
+   "__chunk-start" {:call "doseq-chunk-start" :arity #(= % 1) :num-result? true}
+   "__chunk-end"   {:call "doseq-chunk-end" :arity #(= % 1) :num-result? true}
+   "__chunk-after" {:call "doseq-chunk-after" :arity #(= % 1)}
+   "__chunk-nth"   {:call "doseq-chunk-nth" :arity #(= % 2)}
    "empty?"      {:call "jolt-empty?"   :arity #(= % 1) :bool? true}
    "peek"        {:call "jolt-peek"    :arity #(= % 1)}
    "pop"         {:call "jolt-pop"     :arity #(= % 1)}

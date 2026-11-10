@@ -31,7 +31,8 @@
 ;; --- (2) a namespace whose load THROWS is not left marked loaded ----------
 (spit (str root "/b.clj") "(ns b) (throw (ex-info \"B-BOOM\" {}))")
 (let [e (try (require 'b) (catch :default e (in-ns 'loader-test) e))]
-  (chk "rollback: first load surfaces B-BOOM" (= (ex-message e) "B-BOOM")))
+  ;; as RT.load does: a CompilerException naming b.clj, the throw its cause
+  (chk "rollback: first load surfaces B-BOOM" (= (ex-message (ex-cause e)) "B-BOOM")))
 (chk "rollback: b/v undefined while b throws" (nil? (vof 'b 'v)))
 (spit (str root "/b.clj") "(ns b) (def v :fixed)")
 (require 'b)                                   ; plain require, no :reload
@@ -150,6 +151,12 @@
 (spit (str root "/lfc.clj") "(ns lfc) (throw (ex-info \"LFC\" {}))")
 (try (load-file (str root "/lfc.clj")) (catch :default _ nil))
 (chk "load-file: *ns* is restored when the file throws" (= "loader-test" (str *ns*)))
+;; and it answers the value of the file's last form, as Compiler.load does
+;; (jolt answered nil); an empty file answers nil
+(spit (str root "/lfd.clj") "(def lfd-x 1)\n(+ lfd-x 2)\n(* 3 4)")
+(spit (str root "/lfe.clj") "")
+(chk "load-file: answers the last form's value" (= 12 (load-file (str root "/lfd.clj"))))
+(chk "load-file: an empty file answers nil" (nil? (load-file (str root "/lfe.clj"))))
 
 ;; --- (10) :reload-all reloads the image's stdlib into ITS OWN namespaces ----
 ;; clojure.string, clojure.walk and clojure.set are baked into the seed and had

@@ -121,14 +121,14 @@ export JOLT_CC := $(GCC)
 endif
 
 JOLT-TARGETS-NEEDING-DEPS := \
-  aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke reprobuildsmoke profilebuildsmoke \
-  aotcachepathsmoke aotcachesourcepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
+  aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke reprobuildsmoke profilebuildsmoke embeddedresources \
+  aotcachepathsmoke aotcachesourcepathsmoke aotcachestarfilesmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling zipmemory lazyscaling \
   devbootsmoke devirt directlink mintgate ffi fibers fiberspoll fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inferscaling inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance libperf mandelbrot-num mathfl mvnhttp defmetacells staticsite gcpolicy stacklimit lazyretain \
   deadhost recordshadow emittedheads mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa regexanchor regexanchorprims regexanchorcheck regexsyntax regexbacktrack \
-  hostarity enummodel enumregistrymodel imagecoverage narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
+  hostarity enummodel enumregistrymodel cowpublishmodel doseqperf failfastmodel imagecoverage narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit vfaslceiling \
   shakesmoke smoke sortedcoll staticnativesmoke stateimage test testbin transient unit unitcontext zlibregistersmoke zlibnativesmoke noexecsmoke \
   threadsafety maskedacquire ioerrno values wp ci
@@ -185,14 +185,14 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling gcpolicy stacklimit footprint lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
-  smoke tracesmoke errorreport errorkinds buildsmoke reprobuildsmoke profilebuildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym ffiloadfail continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke systemexitsmoke ziparchiveerrors zipreadscopepark zipindexpreempt \
+  CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling gcpolicy stacklimit footprint lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio stdlibratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
+  smoke tracesmoke errorreport errorkinds buildsmoke embeddedresources reprobuildsmoke profilebuildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym ffiloadfail continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke systemexitsmoke ziparchiveerrors zipreadscopepark zipindexpreempt \
   transient sortedcoll rrbprop rrbscaling stateimage infer inferscaling wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
-  protoret accfix pic narrow directlink mintgate directcall defmetacells staticsite arraymap arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flonumdisp flarr \
+  protoret accfix pic narrow directlink mintgate directcall defmetacells staticsite arraymap recfast recfold arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flonumdisp flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost recordshadow emittedheads adaptercheck hostprops normalizecheck hostregistry hostarity enummodel imagecoverage foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke numequivalloc analyzealloc emitalloc treeseqcost imagefnforms \
-  gatebootsmoke aotcachesmoke aotcachepathsmoke aotcachesourcepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck buildunitwrite threadeddeadlock forkheldlocks oomafterrendezvous heaphistogram siginfodump \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotcachesourcepathsmoke aotcachestarfilesmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck buildunitwrite threadeddeadlock forkheldlocks oomafterrendezvous heaphistogram siginfodump \
   systemstreams closedstdout stderrsplit userdirpaths utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer ticks interruptnest monitorescape windescape threadsafety maskedacquire ioerrno cas flow tickbudget remotechan
 TEST-GATES := submodules selfhost ci
@@ -271,11 +271,28 @@ ci:
 bionic-ci:
 	$(call run-gate,bionic-ci,$(CI-GATES))
 
+# Gates that judge a constant-factor timing ratio, run on their own once every
+# other gate of the run has finished. Under make -j they shared a 4-core runner
+# with the rest of the gate list, and a neighbour's burst landing on one arm
+# moved a ratio by 1.5-3x: over 134 CI jobs (2026-11-03..04) fastpathratio put
+# a row over its ceiling in 9, 7 of them x86, with no step change in any row and
+# the same commit's other run passing where there was one. A quiet machine reads
+# well inside every ceiling. A scaling gate (n vs 4n of the same work) is not
+# listed: interference moves both of its arms alike.
+QUIET-GATES := fastpathratio
+# Runs the QUIET-GATES of $(1) one at a time. -j1 takes the sub-make off the
+# jobserver, so nothing else this make started is running beside them.
+define run-quiet
++@$(if $(filter $(QUIET-GATES),$(1)),$(MAKE) --no-print-directory -j1 $(filter $(QUIET-GATES),$(1)),:)
+endef
+
 # The prerequisite-only targets the wrappers drive. Not meant to be run directly:
 # they pass silently, which is the thing the wrappers exist to prevent.
 gate-run-test: $(TEST-GATES)
-gate-run-ci: $(CI-GATES)
-gate-run-bionic-ci: $(CI-GATES)
+gate-run-ci: $(filter-out $(QUIET-GATES),$(CI-GATES))
+	$(call run-quiet,$(CI-GATES))
+gate-run-bionic-ci: $(filter-out $(QUIET-GATES),$(CI-GATES))
+	$(call run-quiet,$(CI-GATES))
 
 # One shard of a gate, so CI can run a gate as parallel jobs. SHARD-SET is test
 # (selfhost plus CI-GATES) or ci (CI-GATES alone, what bionic-ci runs), and
@@ -302,7 +319,8 @@ ci-shard:
 	  echo "        so nothing here is evidence the rest of the shard passes."; \
 	  exit $$st; \
 	fi
-gate-run-ci-shard: $(SHARD-GATES)
+gate-run-ci-shard: $(filter-out $(QUIET-GATES),$(SHARD-GATES))
+	$(call run-quiet,$(SHARD-GATES))
 ci-shard-list:
 	@printf '%s\n' $(SHARD-GATES)
 
@@ -423,6 +441,9 @@ fibers:
 	@bin/jolt run test/chez/main-carrier-load-ns-test.clj
 	@bin/jolt run test/chez/nested-budget-test.clj
 	@bin/jolt run test/chez/process-fiber-reap-test.clj
+	@out="$$($(CHEZ) --script host/chez/cli.ss test/chez/sync-classes-test.clj 2>&1)"; \
+	  if printf '%s' "$$out" | grep -q 'SYNC-CLASSES-TEST OK'; then echo "fibers: sync-classes-test OK"; \
+	  else printf '%s\n' "$$out" | tail -20; echo "fibers: sync-classes-test FAILED"; exit 1; fi
 
 # The one (timeout ms) timer thread (jolt-pe84): a timeout closes on its own
 # deadline however far away the pending ones are, and the thread is forked once.
@@ -573,6 +594,13 @@ seeddefs:
 buildsmoke: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/build-smoke.sh
 
+embeddedresources: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/embedded-resource-smoke.sh
+	@set -e; for mode in --url --resource-url --jar-full --jar-base --fs-full --files-full --archive-lifecycle; do \
+		JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/embedded-java-smoke.sh "$$mode"; \
+	done
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh test/chez/embedded-resource-oracle.sh
+
 # Building the same sources twice gives every compiled unit identical text, the
 # ground profile-guided builds stand on (RFC 0015 P1).
 reprobuildsmoke: testbin
@@ -636,6 +664,7 @@ httpsfetch:
 libconformance: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" \
 	 JOLT_NO_USER_DEPS=1 target/release/jolt run test/conformance/libs/run.clj $(LIBS)
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/embedded-migratus-upstream-smoke.sh
 
 # OPT-IN: time the same library suites per test on jolt and on JVM Clojure, and
 # list the tests more than JOLT_LIBPERF_THRESHOLD (default 5) times slower on
@@ -841,6 +870,13 @@ ioscaling: testbin
 fastpathratio: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/fastpath_ratio_test.clj
 
+# A stdlib fn against the same source compiled from a user file, as a ratio in
+# one process. The embedded stdlib fasls and the seed-embedded namespaces are
+# compiled by paths a user file never takes; build-jolt once captured the fasls
+# with var-cache off (every var ref looked up by name, 2-7x slower).
+stdlibratio: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/stdlib_compile_ratio_test.clj
+
 # The 2026-08 sweep's remaining hot-path shapes in one gate: split-with-limit,
 # core.async timeout arming, ArrayDeque/StringTokenizer draining, ns-publics/
 # refer var-table independence, set/intersection smaller-side walk.
@@ -1004,6 +1040,7 @@ ffi:
 	@sh test/chez/ffi-widths-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-layout-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-aggregate-test.sh "$(CHEZ)"
+	@sh test/chez/ffi-stack-args-test.sh "$(CHEZ)"
 	@bin/jolt run test/chez/jolt-ffi-scoped-test.clj
 	@bin/jolt run test/chez/jolt-ffi-arena-test.clj
 	@bin/jolt run test/chez/jolt-ffi-typed-array-test.clj
@@ -1110,7 +1147,8 @@ threadsafety:
 	@$(CHEZ) --script test/chez/thread-safety-test.ss
 
 # A lock a fiber park takes with interrupts disabled must not stall a collection
-# whose requester holds it (locks.ss jolt-mutex-acquire!). The failure is a hang
+# whose requester holds it (locks.ss jolt-mutex-acquire!), nor may a condition
+# wait made with them disabled (locks.ss jolt-condition-wait). The failure is a hang
 # of the whole process, so the script runs the gate under an outside deadline.
 maskedacquire:
 	@sh host/chez/masked-acquire-gate.sh $(CHEZ)
@@ -1252,6 +1290,19 @@ staticsite:
 # is a lazy chunked walk of its trie (test/chez/arraymap-test.ss).
 arraymap:
 	@$(CHEZ) --script test/chez/arraymap-test.ss
+
+# A plain defrecord (no collection methods of its own) answers count, contains?,
+# seq, assoc, reduce-kv, into, = and hash from its slots ahead of the arm walk
+# (records-coll.ss jrec-plain?): which types are plain, that no arm claims one,
+# and that every op answers what the walk did (#1470).
+recfast:
+	@$(CHEZ) --script test/chez/recfast-test.ss
+
+# What an optimizing compile emits for (R. …) and for record?/seq? over a proven
+# record: the inlined ctor, the defrecord-only folds, and map destructuring that
+# keeps reading slots (host/chez/run-recfold.ss, #1470).
+recfold:
+	@$(CHEZ) --script host/chez/run-recfold.ss
 
 # Array backings: which Chez vector type each element kind stores its elements
 # in (fxvector / bytevector / flvector / boxed vector), the fixnum-range
@@ -1783,6 +1834,21 @@ enumregistrymodel:
 	@command -v swipl >/dev/null || { echo "enumregistrymodel: needs swipl (SWI-Prolog)" >&2; exit 1; }
 	@swipl -q -g main -t halt tools/enum-registry-model.pl
 
+# Copy-on-write publication (CopyOnWriteArrayList/Set, ConcurrentSkipListMap/Set):
+# no torn read, no deadlock, no lost update over every interleaving, and four
+# broken protocols caught. Manual, like monitormodel: needs swipl.
+cowpublishmodel:
+	@command -v swipl >/dev/null || { echo "cowpublishmodel: needs swipl (SWI-Prolog)" >&2; exit 1; }
+	@swipl -q -g main -t halt tools/cow-publish-model.pl
+
+# Fail-fast iteration (ArrayList/LinkedList modCount, the ArrayDeque ring buffer):
+# no false or missed ConcurrentModificationException, no element skipped or
+# handed out twice, the ring refines a list, and nine broken versions caught.
+# Manual, like cowpublishmodel: needs swipl.
+failfastmodel:
+	@command -v swipl >/dev/null || { echo "failfastmodel: needs swipl (SWI-Prolog)" >&2; exit 1; }
+	@swipl -q -g main -t halt tools/failfast-model.pl
+
 # Install the repository's git hooks into .git/hooks (copies, so a clone that
 # never runs this is unaffected; re-run after a hook changes).
 hooks:
@@ -2164,6 +2230,12 @@ aotcachepathsmoke: testbin
 aotcachesourcepathsmoke: testbin
 	@sh test/chez/aot-cache-source-path-smoke.sh
 
+# Inside a required namespace *file* and *source-path* name its own source, cold
+# or from the AOT cache: the compiled entrances bind them as a source load does,
+# instead of leaving the requirer's binding in place (#1466).
+aotcachestarfilesmoke: testbin
+	@sh test/chez/aot-cache-star-file-smoke.sh
+
 # Perf measurement: cold (recompile) vs warm (cache hit) for a multi-library
 # require. Needs Maven jars locally; NOT in the default ci gate (timing budget).
 aotcacheperf:
@@ -2183,3 +2255,8 @@ printperf:
 # the default gate free of timing. See the script header.
 sbperf:
 	@$(CHEZ) --script test/chez/string-builder-perf.ss
+
+# doseq over a chunked seq (a vector, a range) must cost no more than 1.5x a list
+# of the same elements, measured as a ratio in one process. Manual, like sbperf.
+doseqperf:
+	@$(CHEZ) --script test/chez/doseq-perf.ss

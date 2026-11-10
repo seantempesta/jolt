@@ -1,0 +1,12 @@
+Manifest-Version: 1.0
+Multi-Release: true
+Main-Name: Example
+Long-Header: first
+  second
+X-Unicode: café
+
+Name: greeting.txt
+X-Entry: yes
+
+Name: plain.txt
+X-Entry: yes

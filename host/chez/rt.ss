@@ -1464,6 +1464,12 @@
             (guard (_ (#t #f)) (reporter seconds unreached callbacks message))
             (jolt-eprint message))))))
 
+;; CALL, then the site slot (vreg 2, jolt-vreg-site below) put back as it was
+;; before it: seq.ss's jolt-invoke0..4, for untraced code calling a fn value that
+;; may be traced. The literal 2 compiles to a load and a store.
+(define-syntax jolt-site-kept
+  (syntax-rules ()
+    ((_ call) (let* ((s (virtual-register 2)) (r call)) (set-virtual-register! 2 s) r))))
 (load "host/chez/collections.ss")
 (load "host/chez/seq.ss")
 
@@ -1891,6 +1897,44 @@
   (let loop ((i (fx- (vector-length env) 1)))
     (when (fx>? i 0) (vector-set! env i jolt-nil) (loop (fx- i 1)))))
 
+;; jolt.debug (#1464): a debug-compiled scope's locals. Code compiled under
+;; jolt.profile/instrument! :debug binds one of these per scope -- an arity's
+;; params, each let binding, a loop iteration, a catch local -- and keeps the
+;; innermost live across every call it makes (backend_scheme *dbg-scope*), so a
+;; captured continuation's frame holds it as a variable. PARENT is the enclosing
+;; scope's record, #f at a fn's root; NAMES and VALS are a name and its value, or
+;; a vector of each. Opaque, so a frame printed by the inspector stays readable.
+(define-record-type jolt-dbg
+  (fields parent names vals)
+  (nongenerative jolt-dbg-v1) (sealed #t) (opaque #t))
+(define (jolt-dbg-new parent names vals) (make-jolt-dbg parent names vals))
+(define (jolt-dbg-new1 parent name val) (make-jolt-dbg parent name val))
+;; The chain's (name . value) pairs, outermost scope first, so a later pair
+;; shadows an earlier one with its name, as the source does.
+(define (jolt-dbg-locals d)
+  (let gather ((d d) (scopes '()))
+    (if (jolt-dbg? d)
+        (gather (jolt-dbg-parent d) (cons d scopes))
+        (let loop ((ss scopes) (acc '()))
+          (if (null? ss)
+              (reverse acc)
+              (let ((ns (jolt-dbg-names (car ss))) (vs (jolt-dbg-vals (car ss))))
+                (loop (cdr ss)
+                      (if (vector? ns)
+                          (let add ((i 0) (acc acc))
+                            (if (fx=? i (vector-length ns))
+                                acc
+                                (add (fx+ i 1) (cons (cons (vector-ref ns i) (vector-ref vs i)) acc))))
+                          (cons (cons ns vs) acc)))))))))
+(define (jolt-dbg-depth d)
+  (let loop ((d d) (n 0)) (if (jolt-dbg? d) (loop (jolt-dbg-parent d) (fx+ n 1)) n)))
+;; Whether code compiled now is debug-instrumented. The emitter has its own flag
+;; (backend set-debug-locals!); this one is the host's, which the loader reads to
+;; keep such code out of the AOT cache. Set by jolt-profile-instrument!.
+(define jolt-debug-locals-on? #f)
+(define (jolt-debug-locals-set! on?) (set! jolt-debug-locals-on? (and on? #t)))
+(define (jolt-debug-locals-instrumenting?) jolt-debug-locals-on?)
+
 (define (jolt-throw v)
   ;; The throw takes its own capture for the per-thread slots the uncaught-error
   ;; report reads: it rebuilds frames a tail call erased from the throw-time site,
@@ -1905,6 +1949,42 @@
 (define (jolt-raise-thrown v)
   (raise (condition (make-message-condition (jolt-throw-message v))
                     (make-jolt-throw-condition v))))
+
+;; Compiler.load's wrap (compile-eval.ss jolt-load-run-form). load-string,
+;; load-reader and load-file are Compiler.load, which raises what a top-level
+;; form's RUN threw as a CompilerException under :execution, the throw as its
+;; cause. jolt-load-wrap is #f, or #(source) for the load about to start: the
+;; load that is entered reads it and binds it #f for its forms, so only that one
+;; load wraps, never a require (RT.load wraps too on the JVM; jolt's require
+;; leaves the throw as it is). Here, not in compile-eval.ss: rt.ss reads it for
+;; the uncaught report in a binary built without the compiler.
+(define jolt-load-wrap (make-thread-parameter #f))
+;; The text eval-string / load-string last evaluated under a source path, by
+;; that path, so a diagnostic's snippet shows what was compiled (an editor's
+;; unsaved buffer) and not the file on disk. A load of the file from disk
+;; forgets it (loader.ss load-jolt-file*): the disk is what that compiled.
+(define jolt-eval-source-texts (make-hashtable string-hash string=?))
+(define-process-local jolt-eval-text-mutex (make-mutex)) ; merge: upstream's new lock, made process-local as ours are (16d668c5)
+(define (jolt-eval-source-text-set! path text)
+  (jolt-with-mutex jolt-eval-text-mutex (hashtable-set! jolt-eval-source-texts path text)))
+(define (jolt-eval-source-text-forget! path)
+  (when (string? path)
+    (jolt-with-mutex jolt-eval-text-mutex (hashtable-delete! jolt-eval-source-texts path))))
+(define (jolt-eval-source-text path)
+  (and (string? path)
+       (jolt-with-mutex jolt-eval-text-mutex (hashtable-ref jolt-eval-source-texts path #f))))
+
+;; wrapper -> the raise it wraps, so the uncaught report and the raise-time
+;; position records describe the throw itself, as clojure.main's report does.
+(define jolt-load-wrap-origins (make-weak-eq-hashtable))
+(define-process-local jolt-load-wrap-mutex (make-mutex)) ; merge: upstream's new lock, made process-local as ours are (16d668c5)
+(define (jolt-load-wrap-origin raw)
+  (let ((v (jolt-unwrap-throw raw)))
+    (or (and (jolt-ex-info-record? v)
+             (equal? (jolt-ex-info-record-class-name v) "clojure.lang.Compiler$CompilerException")
+             (jolt-with-mutex jolt-load-wrap-mutex
+               (hashtable-ref jolt-load-wrap-origins v #f)))
+        raw)))
 ;; A throwable's frames are those of where it was CONSTRUCTED, as the JVM fills
 ;; them in (Throwable's constructor calls fillInStackTrace): one built here and
 ;; never thrown -- handed to a callback, logged, returned as a value -- has its
@@ -2741,6 +2821,11 @@
 ;; lacks the binding, and only a caller that actually asks for a thread id should
 ;; fail there rather than the whole runtime failing to load.
 (def-var! "jolt.host" "thread-id" (lambda () (get-thread-id)))
+;; Whether the runtime has left its single-threaded lazy path (values.ss
+;; jolt-mt?): #t once a second thread could run jolt code, never #f again. A gate
+;; reads it to pin that a program which starts no thread of its own keeps the
+;; cheap path.
+(def-var! "jolt.host" "multi-threaded?" (lambda () jolt-mt?))
 ;; The underlying runtime's identity, as strings. A telemetry resource has to name
 ;; the runtime and machine it is reporting from (process.runtime.*, host.arch);
 ;; System/getProperty answers neither here, since jolt has no JVM behind it.
@@ -2979,6 +3064,19 @@
   (reject-fast-type-claim! who pred pr-fast-probes
                            "the printer fast path (see pr-fast-type? in rt.ss)"))
 
+;; The arms of the three print registries — pr-str's (below), pr's (printing.ss)
+;; and str's (converters.ss) — that can claim X, in walk order. A value no arm
+;; claims (every #object) asks every predicate of all three, and each family a
+;; host adds lengthens the walk for all of them. Here the answer is the whole
+;; registry; a host whose values carry a type key narrows it per type
+;; (host-static.ss on Chez). WHICH names the registry: 0 pr-str, 1 pr, 2 str.
+(define print-arms-for (lambda (which arms x) arms))
+(define (set-print-arms-for! f) (set! print-arms-for f))
+;; What a host narrowing the walks must retire its answers on, besides a new arm:
+;; a change to anything an arm's predicate reads (a tag table, jutil-colls.ss).
+(define print-arms-epoch 0)
+(define (print-arms-invalidate!) (set! print-arms-epoch (fx+ print-arms-epoch 1)))
+
 ;; A host shim registers a type's str-style rendering via register-pr-str-arm! (or
 ;; register-pr-arm! in printing.ss for both printers at once) instead of
 ;; set!-wrapping jolt-pr-str. Disjoint types, checked before the base cases.
@@ -3000,25 +3098,33 @@
 ;; going through it would recurse. Types with no str arm print bare, like the
 ;; JVM's default Object.toString. readable? quotes the content unless
 ;; *print-readably* is off, which is the (pr x) vs (print x) difference on the JVM. The class is
-;; followed by the identity hash where jolt-object-repr-hash? (below) says so.
+;; followed by the identity hash.
 (define (jolt-object-content x)
   (or (str-render-by-identity x)
-      (let loop ((rs str-render-registry))
+      (let loop ((rs (print-arms-for 2 str-render-registry x)))
         (cond ((null? rs) #f)
               (((caar rs) x) ((cdar rs) x))
               (else (loop (cdr rs)))))))
-;; Which values print their identity hash, as the JVM's #object form does:
-;; a host shim object and, once the enum model has said so, an enum constant.
-;; Naming one costs an insert into the identity-hash table, which a record
-;; printed in bulk (a java.io.File) would pay per object; those print without it.
-(define jolt-object-repr-hash? (lambda (x) (jhost? x)))
+;; Every value printed this way carries its identity hash, as the JVM's
+;; print-object writes (System/identityHashCode o) for any object (jolt-28we).
 (define (jolt-object-repr x readable?)
   (let* ((cls (guard (e (#t #f)) (jolt-class-name x)))
-         (content (guard (e (#t #f)) (jolt-object-content x)))
-         (head (and (string? cls)
-                    (if (jolt-object-repr-hash? x)
-                        (string-append "#object[" cls " 0x" (jolt-identity-hex x))
-                        (string-append "#object[" cls)))))
+         (hex (and (string? cls) (jolt-identity-hex x)))
+         ;; a deftype with neither toString nor hashCode of its own is
+         ;; Object.toString over its identity hash: the class and hex already in
+         ;; hand, rather than a second class-name lookup and a walk of the str
+         ;; registry to reach them. One that declares either (user code, which may
+         ;; do anything), and an enum constant (its name), go through the registry.
+         (content (if (and hex (jrec? x) (not (enum-constant? x))
+                           ;; under whatever name it was declared: Object or java.lang.Object
+                           (not (find-method-any-protocol (jrec-tag x) "toString"))
+                           (not (find-method-any-protocol (jrec-tag x) "hashCode")))
+                      (string-append cls "@" hex)
+                      (guard (e (#t #f)) (jolt-object-content x))))
+         ;; an array's class name is quoted, as Clojure's print-method writes it
+         (array? (and hex (fx>? (string-length cls) 0) (char=? (string-ref cls 0) #\[)))
+         (content (if (and array? (not (string? content))) (string-append cls "@" hex) content))
+         (head (and hex (string-append "#object[" (if array? (string-append "\"" cls "\"") cls) " 0x" hex))))
     (cond ((not head) (format "~a" x))
           ((not (string? content)) (string-append head "]"))
           ((and readable? (jolt-pr-readable?))
@@ -3061,7 +3167,7 @@
 (define (jolt-pr-str/readable x readable?)
   (if (pr-fast-type? x)
       (jolt-pr-str-base/readable x readable?)
-      (let loop ((as jolt-pr-str-arms))
+      (let loop ((as (print-arms-for 0 jolt-pr-str-arms x)))
         (cond ((null? as) (jolt-pr-str-base/readable x readable?))
               (((caar as) x) ((cdar as) x))
               (else (loop (cdr as)))))))
@@ -3227,6 +3333,7 @@
 ;; the single JVM class/interface graph — value-host-tags, instance?, isa?/supers,
 ;; and the exception hierarchy all derive from it. Before records.ss so
 ;; value-host-tags can build on jch-tags.
+(load "host/chez/java/jdk-interfaces.ss")   ; java.base's public interfaces (generated)
 (load "host/chez/java/class-hierarchy.ss")
 
 ;; records + protocols: defrecord/deftype/defprotocol/
@@ -3395,6 +3502,17 @@
 ;; java.util.function default methods (negate/andThen/…) for every implementer,
 ;; the lambdas they answer, and Function/identity & co. After streams.ss.
 (load "host/chez/java/fi-defaults.ss")
+;; AbstractCollection / AbstractList / Map / Queue defaults every java.util shim
+;; inherits (containsAll, indexOf, subList, getOrDefault, …), at the end of the
+;; dispatch chain behind fi-defaults.ss's.
+(load "host/chez/java/coll-defaults.ss")
+;; Collections.unmodifiable* / synchronized* views and List/Set/Map.of — after
+;; coll-defaults.ss, whose inherited members the views reach through.
+(load "host/chez/java/jutil-views.ss")
+;; Vector, Stack, Hashtable, BitSet, PriorityQueue and the java.util.concurrent
+;; collections, over the jx registry jutil-views.ss keeps.
+(load "host/chez/java/jutil-concurrent.ss")
+(load "host/chez/java/array-deque.ss")        ; java.util.ArrayDeque, a ring buffer
 
 ;; java.io byte/char streams (FileInputStream/…/ByteArrayOutputStream/Buffered*)
 ;; over Chez ports. After io.ss (extends its slurp/__close/reader-jhost?) and
@@ -3433,8 +3551,20 @@
 ;; ZipFile, and the central-directory index the loader's jar roots share.
 (load "host/chez/java/zip-file.ss")
 
+;; The application image's resources as a read-only NIO filesystem.
+(load "host/chez/java/embedded-archive.ss")
+
+;; Manifest and Attributes values used by archives and connections.
+(load "host/chez/java/embedded-manifest.ss")
+
+;; URLConnection and JarURLConnection over those resources.
+(load "host/chez/java/embedded-url.ss")
+
 ;; ZipOutputStream on the out-stream frame.
 (load "host/chez/java/zip-out-entries.ss")
+
+;; JarInputStream and JarOutputStream on the two zip streams, with the Manifest.
+(load "host/chez/java/jar-streams.ss")
 
 ;; java.lang.ProcessBuilder / Process. After io-streams (make-in-stream /
 ;; make-out-stream) and host-static-methods (all-env-pairs).
@@ -3460,6 +3590,11 @@
 ;; thread-local binding stack (dyn-binding.ss) into workers. pmap/pcalls/pvalues
 ;; (overlay, over `future`) light up once future-call exists here.
 (load "host/chez/java/concurrency.ss")
+
+;; Semaphore and ReentrantReadWriteLock on the same wait protocol (jolt-cv-wait),
+;; and AtomicIntegerArray / AtomicLongArray beside the scalar atomics.
+(load "host/chez/java/concurrency-sync.ss")
+(load "host/chez/java/atomic-arrays.ss")
 
 ;; clojure.core.async: real-thread blocking channels + go/go-loop/
 ;; thread macros, def-var!'d into clojure.core.async. After concurrency.ss (reuses
@@ -3503,6 +3638,7 @@
 ;; outermost over every earlier extension.
 (load "host/chez/java/bigdec.ss")
 (load "host/chez/float.ss")                       ; java.lang.Float as a value (jfloat)
+(load "host/chez/surrogates.ss")                  ; a UTF-16 surrogate unit as a Character (jsurr)
 
 ;; The library seam for extending / overriding a class jolt already part-shims.
 ;; After every java shim and after bigdec.ss's class-arm wraps, so the class name

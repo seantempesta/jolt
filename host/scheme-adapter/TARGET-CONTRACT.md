@@ -96,6 +96,8 @@ misbehavior, not a crash.
 - **profile**: `sa-profile-instrument!` answers #f for on → `jolt.profile`
   reports unsupported; the counts and releases are empty, a block-profile dump writes nothing and a unit load finds no data and `sa-profile-compile` just
   calls its thunk.
+  Its `:debug` mode is refused the same way, and `jolt.debug` then finds no
+  frames on a throwable and never calls a break handler.
 - **sample**: `sa-stack-walk` answers #f → `jolt.profile/sample!` reports
   unsupported; frame sources and code names are #f, the thread clock 0.
 - **threads**: absence is a designed mode, not a raise — THREADS.md specifies
