@@ -112,8 +112,12 @@
                              ((char=? (string-ref fqn i) #\/) i)
                              (else (loop (fx+ i 1)))))))
          ;; A def nothing registered (eval'd code) still names its anonymous fn:
-         ;; the label is jfn$<ns>/<def>$<n>, so ns and def are in it.
-         (and (or (vector? rec) (and slash (fx>? slash 0)))
+         ;; the label is jfn$<ns>/<def>$<n>, so ns and def are in it. A literal
+         ;; outside any def, jfn$<ns>/$<n> (a top-level form's fn, a defmethod's
+         ;; body, a record's method), has no def to name it by: #f, as for any
+         ;; label no def covers.
+         (and (or (vector? rec)
+                  (and slash (fx>? slash 0) (fx<? (fx+ slash 1) (string-length fqn))))
               (list (if (vector? rec) (vector-ref rec 0) (substring fqn 0 slash))
                     (if (vector? rec) (vector-ref rec 1)
                         (substring fqn (fx+ slash 1) (string-length fqn)))
