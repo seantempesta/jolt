@@ -555,22 +555,10 @@
 ;; next require — the very bug the load protocol below exists to stop, reached
 ;; through the other table.
 ;;
-;; A LOAD MUST NEVER ACQUIRE stm-lock. jolt-sync holds stm-lock across the whole
-;; body of a transaction (refs.ss), so (dosync (require 'x)) is inside require while
-;; holding it — and if that require parks in step 2, condition-wait releases
-;; ldr-load-mu and NOTHING else, so it sits there holding stm-lock until the load it
-;; is waiting for completes. A loading thread that then needed stm-lock could not
-;; complete, and the two would wait on each other forever:
-;;
-;;   stm-lock -> ns_load   the parked dosync cannot release stm-lock until the load
-;;                         it is waiting for finishes
-;;   ns_load  -> stm-lock  the loader cannot finish without stm-lock
-;;
-;; That is not hypothetical. It reproduces on the rollback path, where a failed load
-;; re-takes this lock to unmark before releasing its claim, and in the window between
-;; claiming a namespace and marking it. So the mark goes through a leaf mutex of our
-;; own that no transaction ever waits on, and the edge ns_load -> stm-lock does not
-;; exist.
+;; The mark goes through a leaf mutex of our own rather than a transaction, so a
+;; load never waits on the STM: the rollback path, where a failed load re-takes
+;; this lock to unmark before releasing its claim, and the window between claiming
+;; a namespace and marking it, take nothing a transaction holds.
 ;;
 ;; NOT through the ambient transaction's log when there is one, which is what this
 ;; did first. It looks like the better answer — transactional, and it takes no lock
@@ -586,9 +574,8 @@
 ;; reload. Narrow, one-directional, and the alternatives are a hang or the two bugs
 ;; above.
 ;;
-;; Call with NO loader mutex held either. A (dosync (require ...)) reaches ldr-tbl-mu
-;; while holding stm-lock, so the loader taking these in the other order would be the
-;; same cycle by another route. Sequential, never nested, is what keeps them apart.
+;; Call with NO loader mutex held either. Sequential, never nested, is what keeps
+;; the loader's locks apart.
 (define-process-local ldr-libs-mu (make-mutex))
 (define (ldr-libs-update! f)
   (let* ((libs-cell (var-cell-lookup "clojure.core" "*loaded-libs*"))
@@ -2233,6 +2220,10 @@
          ;; embedded fasl registered but failed to load: fall back to source.
          (load-jolt-file file))))
     ((and (aot-cache-enabled?) (not force?) (not (ldr-reload-all?))
+          ;; jolt.profile counts code it compiled itself: a cached fasl carries no
+          ;; counters, and what an instrumented compile would write to the cache
+          ;; is the slower code every later run would load
+          (not (sa-profile-instrumenting?))
           (or (not (ldr-source-only?)) (ldr-build-aot-cache?))
           (not (ldr-install-file? file))
           ;; no fingerprint = we can't tell this runtime from another one, so
@@ -2306,7 +2297,7 @@
 ;; (dosync …) should force the reload from the next form onward, not from the
 ;; commit. Outside a transaction txn-read IS jolt-ref-val, so the ordinary path is
 ;; unchanged, and it acquires nothing, so this stays safe to call under ldr-load-mu
-;; (see ldr-libs-update!'s "a load must never take stm-lock"). The loader's own
+;; (see ldr-libs-update!). The loader's own
 ;; marks are not in any log — ldr-libs-update! writes the ref directly, for the
 ;; reasons set out there — so this sees them whether a transaction is open or not.
 (define (ns-dedup-loaded? name)
@@ -2678,12 +2669,9 @@
 ;;                      its resume, which runs in the scheduler and puts every fiber
 ;;                      on that carrier behind it. That edge is gone rather than
 ;;                      argued about — the switch happens with the lock released, and
-;;                      locks.ss checks it at both switch points (jolt-04ee). The one
-;;                      edge that is not the loader's to remove is stm-lock -> the load a parked
-;;                      transaction is waiting for, because jolt-sync holds
-;;                      stm-lock across a whole dosync body. So no load may acquire
-;;                      stm-lock — see ldr-libs-update!, where that cycle was real
-;;                      and hung.
+;;                      locks.ss checks it at both switch points (jolt-04ee). A
+;;                      transaction holds no lock while its code runs (refs.ss), so a
+;;                      dosync waiting on a load adds no edge.
 (define-process-local ldr-load-mu (make-mutex))
 (define-process-local ldr-load-cv (make-condition))
 (define ldr-loading (make-hashtable string-hash string=?))  ; ns -> the context loading it

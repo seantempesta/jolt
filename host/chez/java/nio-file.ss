@@ -646,9 +646,18 @@
         (cons "deleteIfExists"(lambda (p) (nio-delete1 (nfp p) #t (nio-shown p))))
         (cons "readAllBytes"  (lambda (p) (na-bv->bytearray (nio-read-bv (nfp p) (nio-shown p)))))
         (cons "readAllLines"  (lambda (p . _) (nio-read-lines (nfp p) (nio-shown p))))
-        (cons "newInputStream"(lambda (p . _) (let ((fp (nfp p)))
-                                                (io-note-file-read! fp)
-                                                (make-in-stream (nio-open-input-port fp (nio-shown p))))))
+        (cons "newInputStream"(lambda (p . opts)
+                                (let ((fp (nfp p)))
+                                  ;; a read stream refuses the two write options
+                                  (for-each (lambda (o)
+                                              (when (memq (oopt-sym o) '(write append))
+                                                (throw-jvm 'UnsupportedOperationException
+                                                           (string-append "'" (enum-name o) "' not allowed"))))
+                                            (npath-spread-args opts))
+                                  (io-note-file-read! fp)
+                                  (let ((port (nio-open-input-port fp (nio-shown p))))
+                                    (nio-delete-on-close! fp port opts)
+                                    (make-in-stream port)))))
         (cons "createTempFile"      (lambda args (nio-files-create-temp args #f)))
         (cons "createTempDirectory" (lambda args (nio-files-create-temp args #t))))))
   (set! files-accum-chunks (cons files-statics files-accum-chunks)))
@@ -795,19 +804,10 @@
 (let ((files-walk (list (cons "walkFileTree" nio-walk-file-tree)
                         (cons "newDirectoryStream" nio-new-directory-stream))))
   (set! files-accum-chunks (cons files-walk files-accum-chunks)))
-(let ((fvr-statics (list (cons "CONTINUE" fvr-continue) (cons "SKIP_SUBTREE" fvr-skip-subtree)
-                         (cons "SKIP_SIBLINGS" fvr-skip-siblings) (cons "TERMINATE" fvr-terminate))))
-  (register-class-statics! "FileVisitResult" fvr-statics)
-  (register-class-statics! "java.nio.file.FileVisitResult" fvr-statics))
-(let ((fvo-statics (list (cons "FOLLOW_LINKS" fvo-follow-links))))
-  (register-class-statics! "FileVisitOption" fvo-statics)
-  (register-class-statics! "java.nio.file.FileVisitOption" fvo-statics))
-(register-instance-check-arm!
-  (lambda (type-sym val)
-    (if (and (symbol-t? type-sym) (fvr? val))
-        (let ((n (symbol-t-name type-sym)))
-          (if (or (string=? n "FileVisitResult") (string=? n "java.nio.file.FileVisitResult")) #t 'pass))
-        'pass)))
+(register-enum-class! "java.nio.file.FileVisitResult"
+  (list (cons "CONTINUE" fvr-continue) (cons "TERMINATE" fvr-terminate)
+        (cons "SKIP_SUBTREE" fvr-skip-subtree) (cons "SKIP_SIBLINGS" fvr-skip-siblings)))
+(register-enum-class! "java.nio.file.FileVisitOption" (list (cons "FOLLOW_LINKS" fvo-follow-links)))
 
 ;; ---- FileTime + attributes + POSIX permissions + symlinks -------------------
 ;; A FileTime is the JDK's (value, unit) pair: state (VALUE . SCALE), SCALE the
@@ -978,7 +978,8 @@
                       "GROUP_READ" "GROUP_WRITE" "GROUP_EXECUTE"
                       "OTHERS_READ" "OTHERS_WRITE" "OTHERS_EXECUTE"))
 (define posix-bits '(#o400 #o200 #o100 #o40 #o20 #o10 #o4 #o2 #o1))
-(define (make-pfp name) (make-jhost "posix-perm" name))
+(define pfp-constants (map (lambda (nm) (cons nm (make-jhost "posix-perm" nm))) posix-order))
+(define (make-pfp name) (cdr (assoc name pfp-constants)))
 (define (pfp? x) (and (jhost? x) (string=? (jhost-tag x) "posix-perm")))
 ;; A permission set is a mutable java.util.Set (like the JVM): callers do
 ;; (.add perms OWNER_WRITE) before setPosixFilePermissions.
@@ -1007,12 +1008,6 @@
                          (cons "fromString" (lambda (s) (posix-str->set (npath-string-of s)))))))
   (register-class-statics! "PosixFilePermissions" pfp-statics)
   (register-class-statics! "java.nio.file.attribute.PosixFilePermissions" pfp-statics))
-(register-host-methods! "posix-perm"
-  (list (cons "toString" (lambda (self) (jhost-state self)))
-        (cons "name"     (lambda (self) (jhost-state self)))))
-(register-str-render! pfp? (lambda (p) (jhost-state p)))
-(register-eq-arm! (lambda (a b) (and (pfp? a) (pfp? b))) (lambda (a b) (string=? (jhost-state a) (jhost-state b))))
-(register-hash-arm! pfp? (lambda (p) (string-hash (jhost-state p))))
 
 ;; symlinks + hard links + chmod, via libc (jolt-foreign-proc-safe resolves the
 ;; already-loaded process symbol; a literal foreign-procedure would be a fasl
@@ -1099,12 +1094,10 @@
                                                (nio-posix-view!)
                                                (when c-chmod (c-chmod (nfp p) (posix-set->mode perms))) (->path p))))))
   (set! files-accum-chunks (cons files-attr files-accum-chunks)))
-(let ((lo-statics (list (cons "NOFOLLOW_LINKS" fvo-nofollow))))
-  (register-class-statics! "LinkOption" lo-statics)
-  (register-class-statics! "java.nio.file.LinkOption" lo-statics))
+(register-enum-class! "java.nio.file.LinkOption" (list (cons "NOFOLLOW_LINKS" fvo-nofollow)))
 
 ;; ---- option enums (CopyOption / OpenOption / PosixFilePermission) -----------
-;; The enum values are tokens the Files ops inspect; an op receives them as a
+;; The constants carry a symbol the Files ops inspect; an op receives them as a
 ;; trailing CopyOption[] / OpenOption[] (from into-array), which is spread here.
 (define (make-copt sym) (make-jhost "copy-option" sym))
 (define (copt-sym x) (and (jhost? x) (string=? (jhost-tag x) "copy-option") (jhost-state x)))
@@ -1113,22 +1106,22 @@
 (define (nio-opts-have? args sym-of want)
   (exists (lambda (x) (eq? (sym-of x) want)) (npath-spread-args args)))
 
-(let ((sco (list (cons "REPLACE_EXISTING" (make-copt 'replace-existing))
-                 (cons "COPY_ATTRIBUTES"  (make-copt 'copy-attributes))
-                 (cons "ATOMIC_MOVE"      (make-copt 'atomic-move)))))
-  (register-class-statics! "StandardCopyOption" sco)
-  (register-class-statics! "java.nio.file.StandardCopyOption" sco))
-(let ((soo (list (cons "READ"              (make-oopt 'read))
-                 (cons "WRITE"             (make-oopt 'write))
-                 (cons "APPEND"            (make-oopt 'append))
-                 (cons "CREATE"            (make-oopt 'create))
-                 (cons "CREATE_NEW"        (make-oopt 'create-new))
-                 (cons "TRUNCATE_EXISTING" (make-oopt 'truncate-existing)))))
-  (register-class-statics! "StandardOpenOption" soo)
-  (register-class-statics! "java.nio.file.StandardOpenOption" soo))
-(let ((pfp-perms (map (lambda (nm) (cons nm (make-pfp nm))) posix-order)))
-  (register-class-statics! "PosixFilePermission" pfp-perms)
-  (register-class-statics! "java.nio.file.attribute.PosixFilePermission" pfp-perms))
+(register-enum-class! "java.nio.file.StandardCopyOption"
+  (list (cons "REPLACE_EXISTING" (make-copt 'replace-existing))
+        (cons "COPY_ATTRIBUTES"  (make-copt 'copy-attributes))
+        (cons "ATOMIC_MOVE"      (make-copt 'atomic-move))))
+(register-enum-class! "java.nio.file.StandardOpenOption"
+  (list (cons "READ"              (make-oopt 'read))
+        (cons "WRITE"             (make-oopt 'write))
+        (cons "APPEND"            (make-oopt 'append))
+        (cons "TRUNCATE_EXISTING" (make-oopt 'truncate-existing))
+        (cons "CREATE"            (make-oopt 'create))
+        (cons "CREATE_NEW"        (make-oopt 'create-new))
+        (cons "DELETE_ON_CLOSE"   (make-oopt 'delete-on-close))
+        (cons "SPARSE"            (make-oopt 'sparse))
+        (cons "SYNC"              (make-oopt 'sync))
+        (cons "DSYNC"             (make-oopt 'dsync))))
+(register-enum-class! "java.nio.file.attribute.PosixFilePermission" pfp-constants)
 
 ;; copy / move honor REPLACE_EXISTING; write honors APPEND. newOutputStream's
 ;; options need a fuller mapping because CREATE_NEW is an atomic filesystem
@@ -1143,11 +1136,17 @@
        (cond
          ((eq? sym 'read)
           (throw-jvm (quote IllegalArgumentException) "READ not allowed"))
-         ((not (memq sym '(write append create create-new truncate-existing)))
+         ((not (memq sym '(write append create create-new truncate-existing
+                           delete-on-close sparse sync dsync)))
           (throw-jvm (quote UnsupportedOperationException)
                      "unsupported output option"))))
      syms)
+    ;; SPARSE is a hint the JDK may ignore, and does on most filesystems; the
+    ;; three others act on the port (nio-open-output-port). Any option at all,
+    ;; one of these four included, replaces the CREATE + TRUNCATE_EXISTING +
+    ;; WRITE default.
     (let* ((defaults? (null? syms))
+           (syms (filter (lambda (s) (not (memq s '(delete-on-close sparse sync dsync)))) syms))
            (append? (memq 'append syms))
            (truncate? (or defaults? (memq 'truncate-existing syms)))
            (create-new? (memq 'create-new syms))
@@ -1170,8 +1169,39 @@
         (truncate? (file-options no-create no-fail))
         (else (file-options no-create no-fail no-truncate))))))
 
-(define (nio-open-output-port fp options . shown)
-  (apply nio-fs-call fp (lambda () (open-file-output-port fp options)) shown))
+;; SYNC / DSYNC: every write reaches the device before it returns, as the JDK
+;; opens with O_SYNC / O_DSYNC — here an unbuffered port whose writes fsync.
+(define c-fsync (jolt-foreign-proc-safe "fsync" '(int) 'int))
+(define (nio-sync-port port fp opt)
+  (let ((fd (and c-fsync (guard (_ (#t #f)) (port-file-descriptor port)))))
+    (unless fd
+      (close-port port)
+      (throw-jvm 'UnsupportedOperationException (string-append opt " not supported")))
+    (parameterize ((custom-port-buffer-size 1))
+      (make-custom-binary-output-port fp
+        (lambda (bv start n)
+          (put-bytevector port bv start n)
+          (flush-output-port port)
+          (when (fx<? (c-fsync fd) 0)
+            (throw-jvm 'IOException (string-append fp ": fsync failed")))
+          n)
+        #f #f
+        (lambda () (close-port port))))))
+;; DELETE_ON_CLOSE: unlinked as soon as it is open, which is what the JDK does on
+;; a POSIX filesystem; the open port keeps the data until it is closed. Windows
+;; cannot unlink an open file.
+(define (nio-delete-on-close! fp port opts)
+  (when (nio-opts-have? opts oopt-sym 'delete-on-close)
+    (when (nio-windows?)
+      (close-port port)
+      (throw-jvm 'UnsupportedOperationException "DELETE_ON_CLOSE not supported"))
+    (guard (_ (#t #f)) (delete-file fp))))
+(define (nio-open-output-port fp options opts . shown)
+  (let ((port (apply nio-fs-call fp (lambda () (open-file-output-port fp options)) shown)))
+    (nio-delete-on-close! fp port opts)
+    (cond ((nio-opts-have? opts oopt-sym 'sync) (nio-sync-port port fp "SYNC"))
+          ((nio-opts-have? opts oopt-sym 'dsync) (nio-sync-port port fp "DSYNC"))
+          (else port))))
 
 (let ((files-opt
        (list (cons "write" (lambda (p data . opts)
@@ -1180,14 +1210,14 @@
                                     ;; macro this scope still needs to mean itself
                                     (fopts (nio-output-file-options opts))
                                     (bytes (nio-output-data->bv data))
-                                    (port (nio-open-output-port fp fopts (nio-shown p))))
+                                    (port (nio-open-output-port fp fopts opts (nio-shown p))))
                                (put-bytevector port bytes)
                                (close-port port)
                                (->path p))))
              (cons "newOutputStream" (lambda (p . opts)
                                       (make-out-stream
                                        (nio-open-output-port
-                                        (nfp p) (nio-output-file-options opts) (nio-shown p))))))))
+                                        (nfp p) (nio-output-file-options opts) opts (nio-shown p))))))))
   (set! files-accum-chunks (cons files-opt files-accum-chunks)))
 
 ;; ---- stat-backed perms + real path (increment: what the fs suite exercises) --
@@ -1560,19 +1590,31 @@
 
 ;; java.nio.channels.FileChannel/open — babashka.fs/touch uses it only to create
 ;; a file (CREATE + WRITE) inside with-open, so support open+close of a channel.
+;; State: #(path size-at-open|#f). DELETE_ON_CLOSE unlinks the file as the
+;; channel opens, as the stream opens do (nio-delete-on-close!); nothing writes
+;; through this channel, so the size it had then is its size.
+(define (fc-close! self) jolt-nil)
 (let ((fc-statics
        (list (cons "open" (lambda (path . opts)
                             (let ((fp (nfp path)))
                               (when (and (nio-opts-have? opts oopt-sym 'create) (not (file-exists? fp)))
                                 (close-port (open-file-output-port fp (file-options no-fail))))
-                              (make-jhost "file-channel" fp)))))))
+                              (if (nio-opts-have? opts oopt-sym 'delete-on-close)
+                                  (begin
+                                    (when (nio-windows?)
+                                      (throw-jvm 'UnsupportedOperationException "DELETE_ON_CLOSE not supported"))
+                                    (let ((size (nio-size fp (nio-shown path))))
+                                      (guard (_ (#t #f)) (delete-file fp))
+                                      (make-jhost "file-channel" (vector fp size))))
+                                  (make-jhost "file-channel" (vector fp #f)))))))))
   (register-class-statics! "FileChannel" fc-statics)
   (register-class-statics! "java.nio.channels.FileChannel" fc-statics))
 (register-host-methods! "file-channel"
-  (list (cons "close" (lambda (self) jolt-nil))
-        (cons "size" (lambda (self) (nio-size (jhost-state self))))))
+  (list (cons "close" fc-close!)
+        (cons "size" (lambda (self) (or (vector-ref (jhost-state self) 1)
+                                        (nio-size (vector-ref (jhost-state self) 0)))))))
 (let ((prev jolt-close))
-  (set! jolt-close (lambda (x) (if (and (jhost? x) (string=? (jhost-tag x) "file-channel")) jolt-nil (prev x))))
+  (set! jolt-close (lambda (x) (if (and (jhost? x) (string=? (jhost-tag x) "file-channel")) (fc-close! x) (prev x))))
   (def-var! "clojure.core" "__close" jolt-close))
 
 ;; A missing target makes the time setters throw NoSuchFileException, as

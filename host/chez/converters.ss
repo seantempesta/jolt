@@ -14,6 +14,13 @@
   (pr-arm-reject-fast-type! 'register-str-render! pred)
   (set! str-render-registry (cons (cons pred render) str-render-registry)))
 
+;; A rendering decided by WHICH object v is, ahead of the registry walk: the
+;; string, or #f. The registry is newest-first and linear, so a type whose arm
+;; was registered early pays for every arm after it; this answers by a pointer
+;; test before any of them. The java layer's enum model installs it.
+(define str-render-by-identity (lambda (v) #f))
+(define (set-str-render-by-identity! f) (set! str-render-by-identity f))
+
 ;; str: nil -> "", string raw, char bare (not \c), regex -> raw source, a
 ;; registered host type via its arm, else the printer (which renders collections
 ;; with readable elements).
@@ -51,6 +58,7 @@
     ;; numbers and booleans reach the printer without an arm ever claiming them
     ;; (pr-fast-type?, rt.ss); the cases above already cover the rest of that set.
     ((pr-fast-type? v) (jolt-pr-str v))
+    ((str-render-by-identity v))
     (else
      (let loop ((rs str-render-registry))
        (cond

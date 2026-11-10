@@ -159,8 +159,9 @@
 (define (sa-gc-reserve-ratio! r)
   (heap-reserve-ratio (inexact r)))
 
-;; (sa-gc-tight! on?) -> void
-;; Collect TIGHT while ON?: objects already in the older generations are marked
+;; (sa-gc-tight! limit) -> void
+;; Collect TIGHT while LIMIT is a byte count (#f: not): objects already in the
+;; older generations are marked
 ;; where they are rather than copied, so a collection needs little memory beyond
 ;; what the heap already holds. Copying needs a second copy's worth of room for
 ;; everything it moves -- a 100MB structure promoted by a scheduled collection
@@ -169,12 +170,14 @@
 ;; 2.8GB with it on throughout), so the heap ceiling turns it on only near the
 ;; limit. Chez's in-place-minimum-generation at 2 (1 fragmented worse: 380MB for
 ;; that program against 343MB), and back to the maximum generation, its default.
-;; Degradation: a target without the choice ignores it.
+;; LIMIT is the total heap the young collections keep their copies within
+;; (sa-collect-young!): the heap ceiling. Degradation: a target without the
+;; choice ignores it.
 (define sa-gc-tight-generation 2)
-(define (sa-gc-tight! on?)
-  (set! sa-young-tight? on?)
+(define (sa-gc-tight! limit)
+  (set! sa-young-tight? limit)
   (in-place-minimum-generation
-    (if on? (min sa-gc-tight-generation (collect-maximum-generation)) (collect-maximum-generation))))
+    (if limit (min sa-gc-tight-generation (collect-maximum-generation)) (collect-maximum-generation))))
 
 ;; (sa-make-large-bytevector n) -> bytevector
 ;; A fresh zero-filled bytevector of N bytes that the collector marks where it is
@@ -790,11 +793,12 @@
         #f)))
 
 ;; (sa-stats) -> #(cpu-nanos real-nanos gc-count gc-cpu-nanos gc-real-nanos
-;;                gc-bytes)
-;; One statistics snapshot as the six exact-integer fields rt.ss reads into
-;; the jolt.host telemetry vars (time fields pre-converted to nanos). Contract:
-;; the six fields in this order. Degradation: a zero vector — the OTel layer
-;; maps zeros to absent metrics.
+;;                gc-bytes allocated-bytes)
+;; One statistics snapshot as the seven exact-integer fields rt.ss reads into
+;; the jolt.host telemetry vars (time fields pre-converted to nanos).
+;; allocated-bytes is every byte allocated since the process started, freed or
+;; not. Contract: the seven fields in this order. Degradation: a zero vector —
+;; the OTel layer maps zeros to absent metrics.
 (define (sa-stats)
   (let ((s (statistics)))
     (vector (time->nanos (sstats-cpu s))
@@ -802,7 +806,8 @@
             (sstats-gc-count s)
             (time->nanos (sstats-gc-cpu s))
             (time->nanos (sstats-gc-real s))
-            (sstats-gc-bytes s))))
+            (sstats-gc-bytes s)
+            (sstats-bytes s))))
 
 ;; (sa-continuation-frames k) -> list of frame inspectors | '()
 ;; The continuation's frames, innermost first, each an inspector object the
@@ -821,6 +826,59 @@
               (reverse acc)
               (loop (guard (e (#t #f)) (io 'link)) (fx+ n 1) (cons io acc))))
         '())))
+
+;; ---- stack sampling (capability: sample) -----------------------------------
+;; (sa-stack-walk k cap proc) -> frames walked | #f
+;; Calls (proc code offset frame) on each frame of continuation k, innermost
+;; first, at most cap of them. code is the frame's code object and offset its
+;; return offset: together they identify where the frame is stopped, the same
+;; pair for every visit to that call. frame is a continuation holding just that
+;; frame, for sa-frame-source-pair. Built for a timer handler: it splits one
+;; frame at a time off the continuation (the inspector does the same) and keeps
+;; nothing, so a sampled stack is not retained. Contract: the walk, innermost
+;; first. Degradation: #f — there are no stacks to sample, and jolt.profile
+;; reports sampling unsupported.
+(define (sa-stack-walk k cap proc)
+  (let loop ((k k) (n 0))
+    (if (or (fx>=? n cap) (not (#%$continuation? k)) (eq? k #%$null-continuation))
+        n
+        (let ((k1 (#%$split-continuation k 0)))
+          (if (not (#%$continuation? k1))
+              n
+              (begin
+                (proc (#%$continuation-return-code k1) (#%$continuation-return-offset k1) k1)
+                (loop (#%$continuation-link k1) (fx+ n 1))))))))
+
+;; (sa-frame-source-pair frame) -> (source-name . byte-offset) | #f
+;; Where a frame from sa-stack-walk is stopped, as the source object of its call
+;; site: the file (or eval source name) and the byte offset in it. Contract: the
+;; pair. Degradation: #f — the sampler then names frames without lines.
+(define (sa-frame-source-pair frame)
+  (guard (e (#t #f))
+    (and (sa-introspect-enabled?)
+         (call-with-values (lambda () ((inspect/object frame) 'source-object))
+           (case-lambda
+             ((so) (and so
+                        (let ((path (source-file-descriptor-path (source-object-sfd so)))
+                              (bfp (source-object-bfp so)))
+                          (and (string? path) (fixnum? bfp) (cons path bfp)))))
+             (_ #f))))))
+
+;; (sa-code-name code) -> string | #f: the name a code object from sa-stack-walk
+;; carries, the variable its lambda was bound under. Contract: the name.
+;; Degradation: #f.
+(define (sa-code-name code)
+  (let ((n (#%$code-name code)))
+    (cond ((string? n) n)
+          ((symbol? n) (symbol->string n))
+          (else #f))))
+
+;; (sa-thread-cpu-nanos) -> exact integer: CPU time the calling thread has used.
+;; A sampler weighs each sample by it, so time a thread spent blocked counts for
+;; nothing. Contract: monotonic per thread, nanoseconds. Degradation: 0.
+(define (sa-thread-cpu-nanos)
+  (let ((t (current-time 'time-thread)))
+    (+ (* 1000000000 (time-second t)) (time-nanosecond t))))
 
 ;; (sa-procedure-info x) -> (name . ((free-name . value) ...)) | #f
 ;; A procedure's inspector name and live free-variable captures, in
@@ -1134,10 +1192,12 @@
 ;; Compile the Scheme source file SRC to the native object SO under PROFILE:
 ;; #f = target defaults, or an alist with TARGET-NEUTRAL keys
 ;; (optimize . 0..3), (inspector-info . bool), (source-info . bool),
-;; (compressed . bool). The Chez impl parameterizes optimize-level /
-;; generate-inspector-information / generate-procedure-source-information /
-;; fasl-compressed and calls compile-file; a target maps the keys it has and
-;; ignores the rest. Contract: native compilation of SRC to SO. Degradation:
+;; (compressed . bool), (block-profile . bool). The Chez impl parameterizes
+;; optimize-level / generate-inspector-information /
+;; generate-procedure-source-information / fasl-compressed, and compile-profile
+;; to 'block when block-profile is true (the counters --profile-gen builds
+;; carry), and calls compile-file; a target maps the keys it has and ignores the
+;; rest. Contract: native compilation of SRC to SO. Degradation:
 ;; raise a message-carrying condition ((error 'sa-compile-file "...")), never a
 ;; bare raise — the AOT cache (loader.ss) treats the raise as a cache disable
 ;; and falls back to loading from source (verified with the entry point forced
@@ -1149,9 +1209,143 @@
         (parameterize ((optimize-level (pv 'optimize))
                        (generate-inspector-information (pv 'inspector-info))
                        (generate-procedure-source-information (pv 'source-info))
-                       (fasl-compressed (pv 'compressed)))
+                       (fasl-compressed (pv 'compressed))
+                       (compile-profile (let ((b (assq 'block-profile profile)))
+                                          (and b (cdr b) 'block))))
           (compile-file src so)))
       (compile-file src so)))
+
+;; ---- block profiles (capability: profile) -----------------------------------
+;; A build compiled with (block-profile . #t) counts every basic block; the
+;; binary dumps the counts, and a later build loads them before compiling the
+;; same code, which lays out the hot blocks first and gives their variables the
+;; registers. Chez matches the data to code by source descriptor: the checksum
+;; of the text, its length and the last component of its file name. Text that
+;; changed matches nothing and Chez compiles it without the data, silently, so
+;; loading is per unit and says whether the unit had any.
+;;
+;; The dump is jolt's own format, not Chez's profile-dump-data: that one writes
+;; each block with its whole source descriptor, ~370 bytes a block, which for
+;; the runtime's 680,000 blocks is 255 MB a run, and it is a fasl-write, which a
+;; binary that dropped the compiler cannot do. Here a block is three numbers,
+;; and the build turns one unit's worth into Chez's format just before compiling
+;; that unit. A block's source is a pseudo source object: bfp is the block's
+;; number, negative, and efp a checksum of its shape.
+;;
+;;   (jolt-block-profile 1 TAG)
+;;   ("app-0.ss" CHECKSUM #(BFP EFP COUNT  BFP EFP COUNT ...))   ; one per source
+;;
+;; TAG is the caller's: jolt's says which build mode compiled the code.
+
+;; (sa-block-profile-dump! path tag) -> count
+;; Write this process's block counters to PATH, under TAG, and answer how many
+;; there were.
+;; With none, no file is written: code compiled without counters has nothing to
+;; say. Contract: PATH holds what sa-block-profile-load-unit! reads.
+;; Degradation: 0.
+(define (sa-block-profile-dump! path tag)
+  ;; by name and checksum, not by descriptor: one unit's code carries several
+  ;; descriptor objects that are equal but not eq
+  (let ((by-sfd (make-hashtable equal-hash equal?)) (n 0))
+    (for-each
+      (lambda (p)
+        (let ((so (car p)))
+          (when (fx<? (source-object-bfp so) 0)   ; a block, not an expression
+            (set! n (fx+ n 1))
+            (let ((sfd (source-object-sfd so)))
+              (hashtable-update! by-sfd
+                (cons (path-last (source-file-descriptor-path sfd)) (source-file-descriptor-checksum sfd))
+                (lambda (l) (cons (cdr p) (cons (source-object-efp so) (cons (source-object-bfp so) l))))
+                '())))))
+      (profile-dump))
+    (when (fx>? n 0)
+      (let ((op (open-file-output-port path (file-options no-fail) (buffer-mode block) (native-transcoder))))
+        (put-datum op (list 'jolt-block-profile 1 tag))
+        (newline op)
+        (let-values (((keys lists) (hashtable-entries by-sfd)))
+          (vector-for-each
+            (lambda (k l)
+              (put-datum op (list (car k) (cdr k) (list->vector (reverse l))))
+              (newline op))
+            keys lists))
+        (close-port op)))
+    n))
+
+;; Each dump in PATHS read once per process: path -> (tag . hashtable of
+;; (name . checksum) -> flat vector).
+(define sa-block-profile-cache (make-hashtable string-hash string=?))
+(define (sa-block-profile-file path)
+  (or (hashtable-ref sa-block-profile-cache path #f)
+      (let* ((ip (open-input-file path))
+             (head (read ip))
+             (h (make-hashtable equal-hash equal?)))
+        (unless (and (list? head) (= (length head) 3) (equal? (list-head head 2) '(jolt-block-profile 1)))
+          (close-port ip)
+          (error 'sa-block-profile "not a jolt block profile" path))
+        (let loop ()
+          (let ((x (read ip)))
+            (unless (eof-object? x)
+              (hashtable-update! h (cons (car x) (cadr x))
+                (lambda (v) (if v (vector-append v (caddr x)) (caddr x)))
+                #f)
+              (loop))))
+        (close-port ip)
+        (let ((r (cons (caddr head) h)))
+          (hashtable-set! sa-block-profile-cache path r)
+          r))))
+(define (sa-block-profile-read path) (cdr (sa-block-profile-file path)))
+;; (sa-block-profile-tag path) -> the TAG the dump at PATH was written under.
+;; Contract: what sa-block-profile-dump! was given. Degradation: raise.
+(define (sa-block-profile-tag path) (car (sa-block-profile-file path)))
+
+;; (sa-block-profile-load-unit! paths src) -> #t | #f
+;; Load the data PATHS hold for the source file SRC, for the compile of SRC that
+;; follows: #f when no dump covers SRC's current text, which is the caller's to
+;; report. Runs are merged the way Chez merges its own dumps: each run's counts
+;; as a fraction of its largest, averaged over the runs that saw the block. The
+;; largest is the unit's rather than the whole run's, which changes nothing:
+;; Chez weighs a block against the others of its own lambda. Contract: a later
+;; sa-compile-file of SRC uses the data. Degradation: #f.
+(define (sa-block-profile-load-unit! paths src)
+  (let* ((ip (open-file-input-port src))
+         (sfd (make-source-file-descriptor src ip))
+         (key (cons (path-last src) (source-file-descriptor-checksum sfd)))
+         (runs (filter values (map (lambda (p) (hashtable-ref (sa-block-profile-read p) key #f)) paths))))
+    (close-port ip)
+    (and (pair? runs)
+         ;; bfp -> #(efp weight-sum runs): a block's number is unique in its unit
+         (let ((merged (make-eqv-hashtable)))
+           (for-each
+             (lambda (v)
+               (let ((top (fixnum->flonum
+                            (let loop ((i 2) (m 1))
+                              (if (fx>=? i (vector-length v)) m (loop (fx+ i 3) (max m (vector-ref v i))))))))
+                 (do ((i 0 (fx+ i 3))) ((fx>=? i (vector-length v)))
+                   (let ((a (or (hashtable-ref merged (vector-ref v i) #f)
+                                (let ((a (vector (vector-ref v (fx+ i 1)) 0.0 0)))
+                                  (hashtable-set! merged (vector-ref v i) a)
+                                  a))))
+                     (vector-set! a 1 (fl+ (vector-ref a 1)
+                                           (fl/ (inexact (vector-ref v (fx+ i 2))) top)))
+                     (vector-set! a 2 (fx+ (vector-ref a 2) 1))))))
+             runs)
+           ;; A block's source object: Chez's own record, built through its type
+           ;; because make-source-object refuses the negative position a block's
+           ;; number is.
+           (let* ((make-block-source (record-constructor (record-rtd (make-source-object sfd 0 0))))
+                  (dump (let-values (((ks as) (hashtable-entries merged)))
+                          (map (lambda (bfp a)
+                                 (cons (make-block-source sfd bfp (vector-ref a 0))
+                                       ;; profile-dump-data takes exact counts
+                                       (exact (round (fl* 1073741824.0
+                                                          (fl/ (vector-ref a 1)
+                                                               (fixnum->flonum (vector-ref a 2))))))))
+                               (vector->list ks) (vector->list as))))
+                  (tmp (string-append src ".chez-profile")))
+             (profile-dump-data tmp dump)
+             (profile-load-data tmp)
+             (delete-file tmp)
+             #t)))))
 
 ;; (sa-make-boot-file out base-boots) -> void
 ;; Assemble the boot file OUT from the base boot files BASE-BOOTS — exactly the
@@ -1338,15 +1532,25 @@
 ;; and 404MB -> 320MB). The maximum generation is never on this schedule: the
 ;; policy's own full collections take it (rt.ss, heap growth and the ceiling).
 ;;
-;; Near a heap ceiling (sa-gc-tight!) the collection copies only generation 0,
-;; Chez's own: copying generation 1 as well needs room the ceiling may not have
-;; (the gcpolicy gate peaked 30% over a 256MB ceiling that way).
+;; Near a heap ceiling (sa-gc-tight!) the collection is Chez's own, which takes
+;; generation 1 only every fourth time: copying it at every one needs room the
+;; ceiling may not have (the gcpolicy gate peaked 30% over a 256MB ceiling that
+;; way). Generation 1 is copied (in-place marking starts at 2), and a collection
+;; peaks at the total plus what it copies, since sources are freed only when it
+;; ends; so when generations 0 and 1 together would carry the total past the
+;; limit, only generation 0 is collected, and generation 1 waits for the ceiling's
+;; full collection, which marks it in place (sa-collect-tight). Chez's schedule
+;; had copied a 24MB generation 1 into a 251MB total under a 256MB ceiling, one
+;; collection before that full one: 282MB, and on which collection it fell
+;; depended on a few hundred KB of boot live set (jolt-exoj).
 (define sa-young-count 0)
 (define sa-young-tight? #f)
 (define (sa-collect-young!)
   (set! sa-young-count (fx+ sa-young-count 1))
   (if sa-young-tight?
-      (collect)
+      (if (> (+ (current-memory-bytes) (bytes-allocated 0) (bytes-allocated 1)) sa-young-tight?)
+          (collect 0 1 1)
+          (collect))
       (let* ((cmg (collect-maximum-generation))
              (radix (collect-generation-radix))
              (g (let loop ((g (fx- cmg 1)))
@@ -1611,6 +1815,84 @@
 ;; externals through EXTS. Degradation: raise — same story as sa-fasl-write.
 (define (sa-fasl-read port . rest)
   (apply fasl-read port rest))
+
+;; ---- execution-count profiling (capability: profile) -----------------------
+;; jolt.profile's counters are Chez's compile-profile instrumentation: code
+;; compiled while it is on carries a counter per source-annotated expression, and
+;; profile-dump reads every counter back as (source-object . count).
+;;
+;; (sa-profile-instrument! on?) -> #t | #f
+;; Instrument code compiled from now on (on? true) or stop (false), in every
+;; thread. compile-profile is a THREAD parameter, so setting it here would miss a
+;; loader or future thread forked earlier; the switch is a process-wide flag that
+;; sa-profile-compile reads at each compile instead. Contract: #t when the target
+;; did what was asked. Degradation: #f for on? true — jolt.profile then reports
+;; profiling as unsupported; turning it off always succeeds.
+(define sa-profile-on? #f)
+(define (sa-profile-instrument! on?)
+  (set! sa-profile-on? (and on? #t))
+  #t)
+(define (sa-profile-instrumenting?) sa-profile-on?)
+
+;; (sa-profile-compile thunk) -> thunk's values
+;; Run THUNK, which compiles code (the eval of an emitted form), instrumented when
+;; the flag is on and not when it is off. Bound both ways: the parameter is the
+;; thread's, and an instrumented form that turns the flag off, then compiles
+;; more, must not hand those compiles its own setting; with both off there is
+;; nothing to bind. Contract: THUNK's result
+;; either way. Degradation: call THUNK.
+(define (sa-profile-compile thunk)
+  (if (or sa-profile-on? (compile-profile))
+      (parameterize ((compile-profile (and sa-profile-on? 'source))) (thunk))
+      (thunk)))
+
+;; One profile-dump entry as #(source-name start end count), or #f for a counter
+;; on code that was never annotated (it carries no name).
+(define (sa-profile-entry p)
+  (let* ((so (car p))
+         (path (guard (e (#t #f)) (source-file-descriptor-path (source-object-sfd so)))))
+    (and (string? path)
+         (vector path (source-object-bfp so) (source-object-efp so) (cdr p)))))
+
+;; (sa-profile-counts) -> list of #(source-name start end count)
+;; Every counter in the process, by the source object it was attached to: the
+;; source-name is the sfd path the code was read under, start and end the byte
+;; span of the expression the counter is on. Contract: one entry per live
+;; counter. Degradation: '().
+(define (sa-profile-counts)
+  (fold-left (lambda (acc p) (let ((v (sa-profile-entry p))) (if v (cons v acc) acc)))
+             '()
+             (profile-dump)))
+
+;; (sa-profile-release!) -> list of #(source-name start end count)
+;; Give back the counters of code the collector has reclaimed, and answer them
+;; with their final counts. Chez keeps a counter until it is released, so code
+;; compiled and dropped (an eval in a loop) would otherwise hold its counters,
+;; and their source objects, for the life of the process. The released ones are
+;; the dump before the release less the dump after: a source object is the same
+;; object in both, and two counters can share one (an inlined copy), so it is a
+;; multiset difference. Contract: each released counter once, with the count it
+;; ended with. Degradation: '().
+(define (sa-profile-release!)
+  (let* ((before (profile-dump))
+         (after (begin (profile-release-counters) (profile-dump)))
+         (live (make-eq-hashtable)))
+    (for-each (lambda (p) (hashtable-update! live (car p) fx1+ 0)) after)
+    (fold-left
+      (lambda (acc p)
+        (let ((k (hashtable-ref live (car p) 0)))
+          (if (fx>? k 0)
+              (begin (hashtable-set! live (car p) (fx1- k)) acc)
+              (let ((v (sa-profile-entry p))) (if v (cons v acc) acc)))))
+      '()
+      before)))
+
+;; (sa-profile-clear!) -> void
+;; Zero every counter. Contract: a later sa-profile-counts reads 0 for code that
+;; has not run since. Degradation: no-op.
+(define (sa-profile-clear!)
+  (profile-clear))
+
 
 ;; ---- fibers R1: coroutines tier (capability: coroutines) --------------------
 ;; The fiber primitive + single-carrier scheduler (fibers epic, R1 jolt-nvpr.2).
@@ -2010,6 +2292,8 @@
 ;; is a macro, so it must be defined before this load rather than captured at
 ;; run time the way the sa-* seams are.
 (load "host/chez/locks.ss")
+;; ticks.ss before fibers.ss: jolt-tick-preempt! is syntax the scheduler expands.
+(load "host/chez/ticks.ss")
 (load "host/chez/fibers.ss")
 
 ;; (sa-thread-id-of t) -> fixnum | #f

@@ -433,16 +433,18 @@
 (define rp-b
   (sa-fiber-spawn
    (lambda ()
-     ;; read on entry: this is the handler the carrier hands the NEXT fiber
+     ;; read on entry: the carrier hands the NEXT fiber its own handler and no
+     ;; poll left over from A's borrow, which would run A's check here
      (set-box! rp-b-handler
-               (if (eq? (timer-interrupt-handler) jolt-fiber-preempt-handler)
+               (if (and (eq? (timer-interrupt-handler) jolt-tick-fire)
+                        (not (jolt-tick-demand jolt-tick-slot-poll)))
                    'scheduler 'borrowed))
      (set-box! rp-b-ran #t)
      (spin-until rp-stop))))
 (jolt-fiber-ensure-carrier!)
 (wait-until (lambda () (unbox rp-b-ran)) 5.0 "11b. the queued fiber runs while A is parked")
 (ok "11b. A parked inside the borrow" (eq? 'parked (jolt-fiber-state rp-a)))
-(ok "11b. the carrier got its own handler back" (eq? 'scheduler (unbox rp-b-handler)))
+(ok "11b. the carrier got its own handler back and no poll" (eq? 'scheduler (unbox rp-b-handler)))
 (define rp-before (jolt-fiber-preempts))
 (sleep (make-time 'time-duration 300000000 0))   ; 0.3s: many quanta at 20k ticks
 (ok "11b. and the spinner behind it is still preemptible"
@@ -483,7 +485,11 @@
 (ok "11b. an interrupt for a parked fiber does not resume it"
     (eq? 'parked (jolt-fiber-state rp-a2)))
 (set-box! rp-stop2 #t)
-(wait-until (lambda () (unbox rp-c-done)) 5.0 "11b. the running fiber is not abandoned")
+;; Both halves are waited for: C sets the box as its body's last act and the
+;; scheduler publishes 'done after the body returns, so a check of the state as
+;; soon as the box flips raced that publish (seen on a loaded CI runner).
+(wait-until (lambda () (and (unbox rp-c-done) (eq? 'done (jolt-fiber-state rp-c)))) 5.0
+            "11b. the running fiber is not abandoned")
 (ok "11b. the fiber that owned the carrier still finished"
     (and (unbox rp-c-done) (eq? 'done (jolt-fiber-state rp-c))))
 ;; and the interrupt is not lost — the resume re-takes BOTH halves of the borrow,
@@ -719,10 +725,31 @@
 (ok "14. an interrupt inside a fiber still aborts the body" (unbox rb-aborted))
 (ok "14. and the fiber survives it" (eq? 'done (jolt-fiber-state rb-int)))
 
-;; The handler is the scheduler's again once the borrow is over — the borrow must
-;; hand it back on the REAL exit as well as on a park.
-(ok "14. the borrow returns the scheduler's handler on the real exit"
-    (eq? (timer-interrupt-handler) jolt-fiber-preempt-handler))
+;; An interrupt that escapes on a quantum's fire must leave the quantum behind.
+;; The token is set before the borrow, so its first check aborts, and with the
+;; quantum shorter than the poll interval that check runs riding the quantum's
+;; fire. The escape used to skip the preemption the fire had already taken off
+;; the books, and the borrow's exit then left the timer disarmed: the fiber ran
+;; on unpreempted until it next parked.
+(define rb-tok2 (jolt-make-interrupt))
+(define rb-after (box #f))
+(define rb-int2
+  (sa-fiber-spawn
+   (lambda ()
+     (jolt-interrupt! rb-tok2)
+     (guard (e (#t #t))
+       (jolt-run-interruptible rb-tok2 (lambda () (rb-spin RB-N))))
+     (set-box! rb-after (jolt-fiber-preempts))
+     (rb-spin RB-N))))
+(sa-fiber-run-all)
+(ok "14. a fiber is still preempted after an interrupt escaped its borrow"
+    (and (unbox rb-after) (> (jolt-fiber-preempts) (unbox rb-after))))
+
+;; The poll is gone once the borrow is over, on the REAL exit as well as on a
+;; park, and the handler is still the tick scheduler's.
+(ok "14. the borrow leaves no poll and the scheduler's handler on the real exit"
+    (and (eq? (timer-interrupt-handler) jolt-tick-fire)
+         (not (jolt-tick-demand jolt-tick-slot-poll))))
 
 ;; Off a fiber nothing changes: there is no quantum to hand back, and the borrow
 ;; leaves the timer disarmed.

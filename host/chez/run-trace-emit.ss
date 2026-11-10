@@ -322,4 +322,53 @@
   (gate-check "(13) tracing off: no restore" (gate-sub? e "virtual-register") #f))
 (set-trace-frames! #t)
 
+;; --- (14) the restore is spelled once per fn clause, not once per site ---------
+;; With inspector information on (jolt build's release mode), Chez keeps every
+;; lambda's whole expanded body as data (code-info sexpr), so each inline restore
+;; was ~30 pairs of it per site and per enclosing lambda: 0.8.22's restore made a
+;; 4,000-fn app's binary 32% bigger (#1423). A site is now a call to a helper the
+;; outermost fn's clause binds once, which cp0 inlines back to the same code.
+(define (count-sub s sub)
+  (let ((m (string-length sub)))
+    (let loop ((i 0) (n 0))
+      (let ((j (find-sub (substring s i (string-length s)) sub)))
+        (if j (loop (+ i j m) (+ n 1)) n)))))
+(define site-call-head "(jolt-site-call (lambda () ")
+;; four non-tail sites (g m) (h xs) (g a) (h a); (h b) and (g …) are tail calls
+(define rt14-src "(def _ (fn rt14 [g h m xs] (let [a (g m) b (h xs)] (if (g a) (h b) (g (h a))))))")
+(let ((e (emit-num rt14-src)))
+  (gate-check "(14) the restore is spelled once in the fn" (count-sub e "(virtual-register 12)") 1)
+  (gate-check "(14) each non-tail site calls it" (count-sub e site-call-head) 4))
+;; a nested fn's sites use the binding of the clause it sits in
+(let ((e (emit-num "(def _ (fn rt14b [g xs] (g (map (fn [x] (+ 1 (g x))) xs))))")))
+  (gate-check "(14) a nested fn shares the outer clause's restore" (count-sub e "(virtual-register 12)") 1)
+  (gate-check "(14) ...and its site calls it" (gate-sub? e site-call-head) #t))
+;; each arity is its own clause, and binds the helper only if it has a site
+(let ((e (emit-num "(def _ (fn rt14c ([g] (+ 1 (g 1))) ([g x] (+ 1 (g x) (g x))) ([g x y] x)))")))
+  (gate-check "(14) one restore per clause with a site" (count-sub e "(virtual-register 12)") 2))
+;; outside any fn there is no clause to bind it in, so the site keeps the inline form
+(let ((e (emit-num "(def x14 (str (identity 1)))")))
+  (gate-check "(14) a top-level site still restores inline" (gate-sub? e "(virtual-register 12)") #t)
+  (gate-check "(14) ...without the helper" (gate-sub? e "jolt-site-call") #f))
+;; cp0 must fold every helper call away: what runs is the inline restore, with no
+;; closure per site
+(let* ((e (emit-num rt14-src))
+       (opt (format "~s" (expand/optimize (read (open-input-string e))))))
+  (gate-check "(14) cp0 inlines the helper at every site" (gate-sub? opt "jolt-site-call") #f)
+  (gate-check "(14) ...leaving no thunk behind" (gate-sub? opt "(lambda ()") #f)
+  (gate-check "(14) ...and the restore inline" (count-sub opt "virtual-register) 12)") 4))
+;; also where the helper is free in a nested fn, and bound in several arities
+(for-each
+  (lambda (src)
+    (let ((opt (format "~s" (expand/optimize (read (open-input-string (emit-num src)))))))
+      (gate-check (string-append "(14) cp0 inlines every helper call: " src)
+                  (gate-sub? opt "jolt-site-call") #f)
+      (gate-check (string-append "(14) ...and every thunk: " src)
+                  (gate-sub? opt "(lambda ()") #f)))
+  '("(def _ (fn rt14e [g xs] (g (map (fn [x] (+ 1 (g x))) xs))))"
+    "(def _ (fn rt14f ([g] (+ 1 (g 1))) ([g x] (+ 1 (g x) (g x))) ([g x y] x)))"))
+;; and it still runs
+(ev "(defn rt14d [g h m xs] (let [a (g m) b (h xs)] (if (g a) (h b) (g (h a)))))")
+(gate-check "(14) a fn with helper sites runs" (ev "(rt14d identity identity 3 7)") 7)
+
 (gate-summary "trace-emit")

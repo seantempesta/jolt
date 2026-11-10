@@ -584,6 +584,13 @@
           (set! jolt-fiber-carriers #f)
           (set! jolt-fiber-rr 0)
           (set! jolt-fiber-pool-started? #f)))
+    ;; MERGE-REVIEW(deep-fixes): upstream d2daa30d (slice 1) runs futures on a cached solo pool
+    ;; (concurrency.ss solo-pool) instead of a thread each; its workers are threads fork(2) did not
+    ;; copy, so a child's future would be handed to a parked worker that does not exist (shell's sh
+    ;; reads a child's pipes with futures). Added, not in either side: the child forgets the
+    ;; parent's pool, so its first future makes a fresh one (as cf-default-pool below would need if
+    ;; it is a thread pool: check). Gate: fork-child-test with a future in the child.
+    (set! solo-pool #f)
     (jolt-with-mutex live-threads-mutex
       (vector-for-each (lambda (id) (unless (eqv? id self) (hashtable-delete! live-threads id)))
                        (hashtable-keys live-threads))
@@ -650,10 +657,17 @@
 (def-var! "jolt.host" "ticks" (lambda () (jolt-ticks)))
 ;; (jolt.host/ticks-of thunk) -> the engine ticks (thunk) ran. The count advances only
 ;; while the timer is armed (a budget, a fiber's quantum); with nothing armed, the
-;; measure arms one too far off ever to fire, counts itself open on the thread (so a
-;; bounded run inside it re-arms that on its way out, fibers.ss jolt-fiber-rearm-preempt!),
-;; and on every way out (a throw too) closes and disarms. Off a fiber only: on one the
-;; quantum is always armed.
+;; measure arms one too far off ever to fire, counts itself open on the thread, and on
+;; every way out (a throw too) closes and disarms. Off a fiber only: on one the quantum is
+;; always armed.
+;; MERGE-REVIEW(deep-fixes): ours armed the measure with jolt-set-timer! and relied on our
+;; jolt-fiber-rearm-preempt! to keep it after a bounded run inside it; upstream 8620bef7
+;; removed rearm (the timer is ticks.ss's scheduler's). Chosen: the measure is a demand in
+;; the scheduler's preempt slot (off a fiber that slot is otherwise unused): solo it is the
+;; same jolt-set-timer!, and a run-interruptible inside it moves it into the state vector
+;; (jolt-tick-go-multi! keeps the remaining arm as the preempt demand) and back. A measure
+;; opened while another demand is armed (idle? false) stops counting if that demand ends
+;; inside it, as before. Gate: nested-budget-test's ticks-of cases.
 (def-var! "jolt.host" "ticks-of"
   (lambda (thunk)
     (let* ((s (jolt-ticks-cell))
@@ -663,11 +677,11 @@
         (lambda ()
           (when idle?
             (vector-set! s 4 (fx+ (vector-ref s 4) 1))
-            (jolt-set-timer! (most-positive-fixnum)))
+            (jolt-tick-preempt! (most-positive-fixnum)))
           (unless t0 (set! t0 (jolt-ticks))))
         thunk
         (lambda ()
           (when idle?
             (vector-set! s 4 (fx- (vector-ref s 4) 1))
-            (when (fx=? 0 (vector-ref s 4)) (jolt-set-timer! 0)))))
+            (when (fx=? 0 (vector-ref s 4)) (jolt-tick-preempt! 0)))))
       (- (jolt-ticks) t0))))

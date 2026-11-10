@@ -93,6 +93,11 @@ misbehavior, not a crash.
   report unsupported. A target with its own serializer can implement them,
   but note the format contract: raw-traveling nongenerative record layouts
   are image-format surface.
+- **profile**: `sa-profile-instrument!` answers #f for on → `jolt.profile`
+  reports unsupported; the counts and releases are empty, a block-profile dump writes nothing and a unit load finds no data and `sa-profile-compile` just
+  calls its thunk.
+- **sample**: `sa-stack-walk` answers #f → `jolt.profile/sample!` reports
+  unsupported; frame sources and code names are #f, the thread clock 0.
 - **threads**: absence is a designed mode, not a raise — THREADS.md specifies
   synchronous agents/futures per construct: what stays observably honest,
   what must raise instead of faking concurrency.

@@ -16,6 +16,7 @@
 (define (jolt-volatile! x) (make-jvol x))
 (define (jolt-vreset! vol x) (jvol-v-set! vol x) x)
 (define (jolt-volatile-pred? x) (jvol? x))
+(register-deref-print! jvol? (lambda (v) (cons "ready" (jvol-v v))))
 ;; deref reads a volatile too (partition-all/-by transducers @-deref their box).
 (define %xf-deref jolt-deref)
 (set! jolt-deref (lambda (x) (if (jvol? x) (jvol-v x) (%xf-deref x))))

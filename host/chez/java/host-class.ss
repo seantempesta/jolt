@@ -17,8 +17,12 @@
 ;; register-class-arm! instead of set!-wrapping jolt-class (cf. register-hash-arm!).
 ;; The entry is stable, so the var cell bound below stays current as arms register.
 (define jolt-class-arms '())
+;; the last class name the arm walk answered (jolt-class-name, below); a new arm
+;; may change an answer, so it clears
+(define jolt-class-name-last (cons #f #f))
 (define (register-class-arm! pred handler)
   (set! instance-arms-epoch (fx+ instance-arms-epoch 1))
+  (set! jolt-class-name-last (cons #f #f))
   (set! jolt-class-arms (cons (cons pred handler) jolt-class-arms)))
 ;; A LIBRARY's arm (__register-class!) is probed as it registers: it arrives at
 ;; runtime, after the whole runtime has loaded, so its predicate can be run
@@ -260,12 +264,25 @@
                 ;; Compiler.munge; dots stay.
                 (string-append (class-munge-name (car p)) "$" (class-munge-name (cdr p))))))
 
+;; The arm walk's answer for the last value it named, as one (value . name)
+;; pair replaced whole: an object's class does not change, and one print asks
+;; several times (the print-method lookup, #object[cls … "cls@hash"]). The pair
+;; holds its value WEAKLY where the host has weak pairs (host-static.ss installs
+;; weak-cons), so the memo keeps nothing alive; with no such pair it is off.
+(define class-name-memo-cons (lambda (x n) #f))
+(define (set-class-name-memo-cons! f) (set! class-name-memo-cons f))
 (define (jolt-class-name x)
   (or (class-fast-name x)
-      (let loop ((as jolt-class-arms))
-        (cond ((null? as) (jolt-class-base x))
-              (((caar as) x) ((cdar as) x))
-              (else (loop (cdr as)))))))
+      (let ((c jolt-class-name-last))
+        (if (eq? (car c) x)
+            (cdr c)
+            (let ((n (let loop ((as jolt-class-arms))
+                       (cond ((null? as) (jolt-class-base x))
+                             (((caar as) x) ((cdar as) x))
+                             (else (loop (cdr as)))))))
+              (let ((m (class-name-memo-cons x n)))
+                (when m (set! jolt-class-name-last m)))
+              n)))))
 ;; A Class is ONE object per class, as on the JVM: (class 1) and (class 2) hand
 ;; back the same token, and it is the same token the class-name symbol Long
 ;; evaluates to. That makes identical? on two Class values a class-equality test,
@@ -371,7 +388,10 @@
 ;; unsigned over 32 bits is what Integer.toHexString does; the old (abs …)
 ;; collapsed h and -h onto one string.
 (define (jolt-identity-hex x)
-  (string-downcase (number->string (bitwise-and (jolt-identity-hasheq x) #xffffffff) 16)))
+  (let loop ((n (bitwise-and (jolt-identity-hasheq x) #xffffffff)) (acc '()))
+    (let ((acc (cons (string-ref "0123456789abcdef" (fxremainder n 16)) acc))
+          (m (fxquotient n 16)))
+      (if (fx=? m 0) (list->string acc) (loop m acc)))))
 ;; (str f) of a fn renders JVM-style — "ns$name@hexhash" — so code that parses
 ;; fn identity out of the string (expound's pprint-fn) finds the $-separated
 ;; class name instead of a raw Chez #<procedure> form.

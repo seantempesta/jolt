@@ -162,6 +162,16 @@
 ;; regression measures far above the ceiling on every attempt, so re-measuring
 ;; costs no power.
 
+;;   hashmap-get        get on a java.util.HashMap walks the get arms to the
+;;                      HashMap family's; a shim registering its arm AHEAD of it
+;;                      adds a predicate to every such get (measured against
+;;                      get on a persistent map, 2026-10: 4.6 on x86_64 Linux,
+;;                      5.0 on macOS arm64, 6.1 on bionic arm64).
+;;
+;;   host-object-pr     pr-str of a java.io.File is the #object fallback: the
+;;                      print arms, the class name, the str registry. Against a
+;;                      small vector's print (measured 1.24-1.40, 2026-10).
+;;
 (ns fastpath-ratio-test
   (:require [clojure.string :as str]))
 
@@ -533,6 +543,22 @@
           #(dotimes [_ dispatch-n] (fn-via-def kw-map))
           #(dotimes [_ dispatch-n] (fn-via-top kw-map))
           1.5 2.0)
+
+  ;; get on a java.util.HashMap goes through the get arms; every shim that
+  ;; registers one ahead of the HashMap family's adds its predicate to this walk.
+  (let [pm {1 2 3 4} hm (java.util.HashMap. {1 2 3 4})]
+    (judge! "hashmap-get"
+            #(dotimes [_ 200000] (get pm 3))
+            #(dotimes [_ 200000] (get hm 3))
+            7.0 9.0))
+
+  ;; pr-str of a host record (java.io.File) is the #object fallback: the print
+  ;; arms, the class name and the str registry, against a vector that prints
+  ;; straight off the fast path.
+  (judge! "host-object-pr"
+          #(dotimes [_ 20000] (pr-str [1 "a"]))
+          #(dotimes [_ 20000] (pr-str (java.io.File. "/tmp")))
+          1.6 2.0)
 
   (.delete (java.io.File. src-path))
   (.delete (java.io.File. data-path))

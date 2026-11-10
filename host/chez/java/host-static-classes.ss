@@ -182,7 +182,32 @@
     (cons "clear" (lambda (self) (vector-set! (jhost-state self) 0 (make-vector al-min-cap jolt-nil)) (al-cnt! self 0) (al-head! self 0) jolt-nil))
     (cons "contains" (lambda (self x) (and (memp (lambda (e) (jolt=2 e x)) (al->list self)) #t)))
     (cons "toArray" (lambda (self . args) (jcoll-to-array (al->list self) args)))
-    (cons "iterator" (lambda (self) (make-jiterator (list->cseq (al->list self)))))))
+    (cons "iterator" (lambda (self) (al-iterator self)))))
+;; iterator(): a walk over the elements as they are now, whose remove takes the
+;; last one handed out from the list (the JDK's Itr: the next index shifts back
+;; by one). An unmodifiable list's refuses, as Arrays$ArrayItr and the
+;; ImmutableCollections iterator do. One iterator class per list class.
+(define al-iterator-tags
+  '(("arraylist" . "arraylist-iterator") ("linkedlist" . "linkedlist-iterator")
+    ("arraydeque" . "arraydeque-iterator") ("arrays-aslist" . "arrays-aslist-iterator")
+    ("immutable-list" . "immutable-list-iterator")))
+(define (al-iterator self)
+  (let* ((xs (al->list self)) (n (length xs)) (removed 0)
+         (tag (cdr (or (assoc (jhost-tag self) al-iterator-tags) '(#f . "arraylist-iterator"))))
+         (fixed? (member (jhost-tag self) '("arrays-aslist" "immutable-list"))))
+    (make-jutil-iterator tag (iota n)
+      (lambda (i)
+        (when fixed? (throw-jvm 'UnsupportedOperationException "remove"))
+        (al-remove-at! self (fx- i removed))
+        (set! removed (fx+ removed 1)))
+      (let ((v (list->vector xs))) (lambda (i) (vector-ref v i))))))
+(for-each (lambda (p fqn)
+            (hashtable-set! jhost-tag->fqn (cdr p) fqn)
+            (register-jutil-iterator! (cdr p)))
+          al-iterator-tags
+          '("java.util.ArrayList$Itr" "java.util.LinkedList$ListItr" "java.util.ArrayDeque$DeqIterator"
+            "java.util.Arrays$ArrayItr" "java.util.ImmutableCollections$ListItr"))
+
 ;; java.util.SequencedCollection (JDK 21): List and Deque both have it, so the
 ;; first/last accessors and mutators sit on the shared ArrayList table and
 ;; LinkedList / ArrayDeque inherit them. On an empty list the accessors raise
@@ -405,7 +430,7 @@
                              (let ((p (port-writer-port self)))
                                (flush-output-port p)
                                (jolt-process-stream-failed? p))))
-        (cons "toString" (lambda (self) ""))))
+        (cons "toString" host-object-tostring)))
 (def-dynvar! "clojure.core" "*out*" (make-jhost "port-writer" (vector 'out)))
 (def-dynvar! "clojure.core" "*err*" (make-jhost "port-writer" (vector 'err)))
 
@@ -581,7 +606,7 @@
                                  (let ((t (pw-target self)))
                                    (and (jhost? t) (host-method-ref (jhost-tag t) "checkError")
                                         (jolt-truthy? (record-method-dispatch t "checkError" jolt-nil)))))))
-        (cons "toString" (lambda (self) ""))))
+        (cons "toString" host-object-tostring)))
 
 ;; PrintWriter-on — a writer that accumulates writes and, on flush, hands the
 ;; accumulated string to flush-fn and clears it; close calls close-fn if given.
@@ -633,8 +658,14 @@
 ;; be map-like through one of them and opaque through another.
 (define (hm-hashmap? x)
   (and (jhost? x)
+       ;; by the tag's first character first: this answers every count, seq and
+       ;; get arm walk that passes over the family, so a miss costs one compare
        (let ((t (jhost-tag x)))
-         (or (string=? t "hashmap") (string=? t "properties")))))
+         (and (fx>? (string-length t) 0)
+              (case (string-ref t 0)
+                ((#\h) (string=? t "hashmap"))
+                ((#\p) (string=? t "properties"))
+                (else #f))))))
 (define (hm-copy-into-ordered! self src)  ; copy a jolt map or hashmap, keeping insertion order
   (if (hm-hashmap? src)
       (for-each (lambda (k)
@@ -649,7 +680,7 @@
   (lambda args
     (let* ((ht (make-hashtable hm-hash jolt=2))
            (self (make-jhost "hashmap" (vector ht '()))))
-      (when (and (pair? args) (or (pmap? (car args)) (hm-hashmap? (car args))))
+      (when (and (pair? args) (not (number? (car args))))
         (hm-copy-into-ordered! self (car args)))
       self)))
 (define (hm->pmap self)
@@ -731,9 +762,19 @@
                              (hashtable-keys (hm-tbl self))) found)))
         (cons "size" (lambda (self) (hashtable-size (hm-tbl self))))
         (cons "isEmpty" (lambda (self) (= 0 (hashtable-size (hm-tbl self)))))
-        (cons "remove" (lambda (self k) (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
-                                           (hashtable-delete! (hm-tbl self) k)
-                                           (hm-drop-key! self k) old)))
+        (cons "remove" (case-lambda
+                         ((self k) (let ((old (hashtable-ref (hm-tbl self) k jolt-nil)))
+                                     (hashtable-delete! (hm-tbl self) k)
+                                     (hm-drop-key! self k) old))
+                         ;; remove(key, value): only when mapped to exactly that
+                         ((self k v) (if (and (hashtable-contains? (hm-tbl self) k)
+                                              (jolt=2 v (hashtable-ref (hm-tbl self) k jolt-nil)))
+                                         (begin (hashtable-delete! (hm-tbl self) k) (hm-drop-key! self k) #t)
+                                         #f))))
+        (cons "clone" (lambda (self)
+                        (let ((m (make-jhost (jhost-tag self) (vector (make-hashtable hm-hash jolt=2) '()))))
+                          (hm-copy-into-ordered! m self)
+                          m)))
         (cons "clear" (lambda (self) (hashtable-clear! (hm-tbl self)) (hm-ord! self '()) jolt-nil))
         (cons "putAll" (lambda (self m) (hm-copy-into-ordered! self m) jolt-nil))
         (cons "keySet" (lambda (self) (apply jolt-hash-set (hm-keys-ordered self))))
@@ -854,7 +895,7 @@
 (define (make-hashmap-jhost . args)
   (let* ((ht (make-hashtable hm-hash jolt=2))
          (self (make-jhost "hashmap" (vector ht '()))))
-    (when (and (pair? args) (or (pmap? (car args)) (hm-hashmap? (car args))))
+    (when (and (pair? args) (not (number? (car args))))
       (hm-copy-into-ordered! self (car args)))
     self))
 (register-class-ctor! "ConcurrentHashMap" make-hashmap-jhost)
@@ -1046,19 +1087,44 @@
 
 ;; A mutable set over the same value-keyed hashtable (element -> #t).
 ;; Constructors: () | (capacity) [ignored] | (coll) [copy].
-(define (hs-hashset? x) (and (jhost? x) (string=? (jhost-tag x) "hashset")))
+(define (hs-hashset? x)
+  (and (jhost? x)
+       (let ((t (jhost-tag x)))
+         (and (fx>? (string-length t) 0)
+              (case (string-ref t 0)
+                ((#\h) (string=? t "hashset"))
+                (else #f))))))
 (define (hs->list self) (hm-keys-ordered self))
-(let ((ctor (lambda args
-              (let* ((ht (make-hashtable hm-hash jolt=2))
-                     (self (make-jhost "hashset" (vector ht '()))))
-                (when (and (pair? args) (not (number? (car args))))
-                  (for-each (lambda (e)
-                              (hm-note-key! self e)
-                              (hashtable-set! ht e #t))
-                            (seq->list (jolt-seq (car args)))))
-                self))))
-  (register-class-ctor! "HashSet" ctor)
-  (register-class-ctor! "java.util.HashSet" ctor))
+(define (hs-ctor tag)
+  (lambda args
+    (let* ((ht (make-hashtable hm-hash jolt=2))
+           (self (make-jhost tag (vector ht '()))))
+      (when (and (pair? args) (not (number? (car args))))
+        (for-each (lambda (e)
+                    (hm-note-key! self e)
+                    (hashtable-set! ht e #t))
+                  (seq->list (jolt-seq (car args)))))
+      self)))
+(register-class-ctor! "HashSet" (hs-ctor "hashset"))
+(register-class-ctor! "java.util.HashSet" (hs-ctor "hashset"))
+;; HashMap.newHashMap / HashSet.newHashSet (JDK 19): sized for N mappings, which
+;; this table needs no hint for
+(define (hm-sized-new what make)
+  (lambda (n)
+    (when (< (jnum->exact n) 0)
+      (throw-jvm 'IllegalArgumentException
+                 (string-append "Negative number of " what ": " (jolt-str-render-one n))))
+    (make)))
+(register-class-statics! "java.util.HashMap"
+  (list (cons "newHashMap" (hm-sized-new "mappings" (lambda () (make-jhost "hashmap" (vector (make-hashtable hm-hash jolt=2) '())))))))
+(register-class-statics! "java.util.HashSet"
+  (list (cons "newHashSet" (hm-sized-new "elements" (lambda () ((hs-ctor "hashset")))))))
+;; the linked subclasses inherit them
+(register-class-statics! "java.util.LinkedHashMap"
+  (list (cons "newHashMap" (host-static-ref "java.util.HashMap" "newHashMap"))))
+(register-class-statics! "java.util.LinkedHashSet"
+  (list (cons "newHashSet" (host-static-ref "java.util.HashSet" "newHashSet"))))
+
 (register-host-methods! "hashset"
   (list (cons "add" (lambda (self x) (let ((had (hashtable-contains? (hm-tbl self) x)))
                                         (hm-note-key! self x)
@@ -1067,39 +1133,32 @@
                                            (hashtable-delete! (hm-tbl self) x)
                                            (hm-drop-key! self x) (if had #t #f))))
         (cons "contains" (lambda (self x) (if (hashtable-contains? (hm-tbl self) x) #t #f)))
-        ;; The bulk Collection methods, as java.util.Set states them: each answers whether
-        ;; the set changed (containsAll: whether every element of c is here).
         (cons "addAll" (lambda (self c)
-                         (let loop ((xs (seq->list (jolt-seq c))) (changed #f))
-                           (if (null? xs) changed
-                               (let ((had (hashtable-contains? (hm-tbl self) (car xs))))
-                                 (unless had
-                                   (hm-note-key! self (car xs))
-                                   (hashtable-set! (hm-tbl self) (car xs) #t))
-                                 (loop (cdr xs) (or changed (not had))))))))
-        (cons "removeAll" (lambda (self c)
-                            (let loop ((xs (seq->list (jolt-seq c))) (changed #f))
-                              (if (null? xs) changed
-                                  (let ((had (hashtable-contains? (hm-tbl self) (car xs))))
-                                    (when had
-                                      (hashtable-delete! (hm-tbl self) (car xs))
-                                      (hm-drop-key! self (car xs)))
-                                    (loop (cdr xs) (or changed had)))))))
-        (cons "retainAll" (lambda (self c)
-                            (let ((keep (make-hashtable hm-hash jolt=2)))
-                              (for-each (lambda (x) (hashtable-set! keep x #t)) (seq->list (jolt-seq c)))
-                              (let loop ((xs (hs->list self)) (changed #f))
-                                (if (null? xs) changed
-                                    (if (hashtable-contains? keep (car xs))
-                                        (loop (cdr xs) changed)
-                                        (begin (hashtable-delete! (hm-tbl self) (car xs))
-                                               (hm-drop-key! self (car xs))
-                                               (loop (cdr xs) #t))))))))
+                         (fold-left (lambda (ch x)
+                                      (if (hashtable-contains? (hm-tbl self) x)
+                                          ch
+                                          (begin (hm-note-key! self x) (hashtable-set! (hm-tbl self) x #t) #t)))
+                                    #f (seq->list (jolt-seq c)))))
         (cons "containsAll" (lambda (self c)
-                              (let loop ((xs (seq->list (jolt-seq c))))
-                                (cond ((null? xs) #t)
-                                      ((hashtable-contains? (hm-tbl self) (car xs)) (loop (cdr xs)))
-                                      (else #f)))))
+                              (for-all (lambda (x) (hashtable-contains? (hm-tbl self) x)) (seq->list (jolt-seq c)))))
+        (cons "removeAll" (lambda (self c)
+                            (fold-left (lambda (ch x)
+                                         (if (hashtable-contains? (hm-tbl self) x)
+                                             (begin (hashtable-delete! (hm-tbl self) x) (hm-drop-key! self x) #t)
+                                             ch))
+                                       #f (seq->list (jolt-seq c)))))
+        (cons "retainAll" (lambda (self c)
+                            (let ((keep (seq->list (jolt-seq c))))
+                              (fold-left (lambda (ch x)
+                                           (if (exists (lambda (k) (jolt=2 k x)) keep)
+                                               ch
+                                               (begin (hashtable-delete! (hm-tbl self) x) (hm-drop-key! self x) #t)))
+                                         #f (hs->list self)))))
+        (cons "clone" (lambda (self) ((hs-ctor (jhost-tag self)) (list->cseq (hs->list self)))))
+        (cons "iterator" (lambda (self)
+                           (make-jutil-iterator "hashset-iterator" (hs->list self)
+                                                (lambda (x) (hashtable-delete! (hm-tbl self) x)
+                                                            (hm-drop-key! self x)))))
         (cons "size" (lambda (self) (hashtable-size (hm-tbl self))))
         (cons "isEmpty" (lambda (self) (= 0 (hashtable-size (hm-tbl self)))))
         (cons "clear" (lambda (self) (hashtable-clear! (hm-tbl self)) (hm-ord! self '()) jolt-nil))
@@ -1108,9 +1167,7 @@
         ;; found: toArray for class java.util.HashSet". Same jcoll-to-array the
         ;; ArrayList family uses, over the set's own iteration order.
         (cons "toArray" (lambda (self . args) (jcoll-to-array (hs->list self) args)))
-        ;; The Collection method, over the set's iteration order as of the call (a snapshot, as
-        ;; ArrayList's here): Datahike's recursive rules walk a HashSet with it.
-        (cons "iterator" (lambda (self) (make-jiterator (list->cseq (hs->list self)))))
+        ;; merge: ours c66fa88c's snapshot iterator dropped, upstream's "iterator" above (with remove) replaces it
         (cons "forEach" (lambda (self f) (jcoll-for-each (hs->list self) f)))
         (cons "removeIf" (lambda (self pred)
                            (let* ((xs (hs->list self)) (keep (jcoll-keep xs pred)))
@@ -1120,6 +1177,7 @@
                                            (hm-drop-key! self x)))
                                        xs)
                              (not (fx=? (length keep) (length xs))))))))
+(register-jutil-iterator! "hashset-iterator")
 (register-seq-arm! hs-hashset? (lambda (x) (list->cseq (hs->list x))))
 
 ;; the HashMap family and HashSet are a java.util.Map / Set to =, hash, pr, str
@@ -1608,18 +1666,35 @@
       (else (java-decode-all bv cs name)))))
 ;; (String. bytes offset length [charset]) — decode a SLICE. Returns (bv . rest')
 ;; where rest' is the charset args; a plain (String. bytes [charset]) is unsliced.
-(define (bytes-slice-for-string bv rest)
+;; N is the source's length, COPY! copies a span of it into a fresh bytevector,
+;; WHOLE gives the unsliced bytes. Only the slice is copied: a jolt byte array
+;; used to become a bytevector in full before the slice was cut, so taking 30
+;; bytes out of a 1.5 MB array cost the 1.5 MB. The range is String's own check
+;; (checkBoundsOffCount), with its exception and message.
+(define (bytes-slice-for-string n copy! whole rest)
   (if (and (pair? rest) (number? (car rest)) (pair? (cdr rest)) (number? (cadr rest)))
-      (let* ((off (jnum->exact (car rest))) (len (jnum->exact (cadr rest)))
-             (out (make-bytevector len)))
-        (bytevector-copy! bv off out 0 len)
-        (cons out (cddr rest)))
-      (cons bv rest)))
+      (let ((off (jnum->exact (car rest))) (len (jnum->exact (cadr rest))))
+        (unless (and (>= off 0) (>= len 0) (<= off (- n len)))
+          (throw-jvm 'StringIndexOutOfBoundsException
+                     (string-append "Range [" (number->string off) ", " (number->string off)
+                                    " + " (number->string len) ") out of bounds for length "
+                                    (number->string n))))
+        (let ((out (make-bytevector len)))
+          (copy! off out len)
+          (cons out (cddr rest))))
+      (cons (whole) rest)))
 (register-class-ctor! "String"
   (lambda (x . rest)
-    (cond ((bytevector? x) (let ((p (bytes-slice-for-string x rest))) (decode-bytevector (car p) (cdr p))))
+    (cond ((bytevector? x)
+           (let ((p (bytes-slice-for-string (bytevector-length x)
+                                            (lambda (off out len) (bytevector-copy! x off out 0 len))
+                                            (lambda () x) rest)))
+             (decode-bytevector (car p) (cdr p))))
           ((and (jolt-array? x) (eq? (jolt-array-kind x) 'byte))
-           (let ((p (bytes-slice-for-string (na-bytearray->bv x) rest))) (decode-bytevector (car p) (cdr p))))
+           (let ((p (bytes-slice-for-string (ja-len x)
+                                            (lambda (off out len) (ja-bytes->bv! x off out 0 len))
+                                            (lambda () (na-bytearray->bv x)) rest)))
+             (decode-bytevector (car p) (cdr p))))
           ;; (String. char[] [offset count]) — the whole array or a slice. Buffered
           ;; readers (data.json) build a string from a fill buffer this way.
           ;; The whole array went through (list->string (ja->list x)) — a cons per
@@ -2165,7 +2240,7 @@
 ;; answers a method before deciding how to resolve (java/io.ss's io/resource
 ;; 2-arity: a loader object with getResource resolves in its own context).
 (define (tagged-method-lookup obj name)
-  (let* ((tag (and (htable? obj) (hashtable-ref (htable-h obj) "jolt/type" #f)))
+  (let* ((tag (and (htable? obj) (htable-str-ref obj "jolt/type" #f)))
          (mh (and tag (hashtable-ref tagged-methods-tbl (tag->method-key tag) #f))))
     (and mh (hashtable-ref mh name #f))))
 
@@ -2173,7 +2248,7 @@
 ;; an unregistered method falls through (sorted colls are htables too).
 (register-method-arm! arm-priority-htable
   (lambda (obj method-name rest-args)
-    (let ((tag (and (htable? obj) (hashtable-ref (htable-h obj) "jolt/type" #f))))
+    (let ((tag (and (htable? obj) (htable-str-ref obj "jolt/type" #f))))
       (let* ((mh (and tag (hashtable-ref tagged-methods-tbl (tag->method-key tag) #f)))
              (f  (and mh (hashtable-ref mh method-name #f))))
         (cond
@@ -3284,8 +3359,8 @@
 ;; which lowers to (instance? C e). Non-match returns 'pass so other arms still run.
 (register-instance-check-arm!
   (lambda (type-sym val)
-    (if (and (htable? val) (string? (hashtable-ref (htable-h val) "class" #f)))
-        (let* ((cls (hashtable-ref (htable-h val) "class" #f))
+    (if (and (htable? val) (string? (htable-str-ref val "class" #f)))
+        (let* ((cls (htable-str-ref val "class" #f))
                (want (symbol-t-name type-sym))
                (want-seg (hsc-last-segment want)))
           (let loop ((names (cons cls (jch-closure cls))))
@@ -3349,6 +3424,8 @@
 ;; jolt-count that duplicated the hashmap arm.
 (register-count-arm! al-family? (lambda (c) (al-cnt c)))
 (register-count-arm! hs-hashset? (lambda (c) (hashtable-size (hm-tbl c))))
+;; contains? on a java.util.Set is Set.contains (RT.contains)
+(register-contains-arm! hs-hashset? (lambda (c k) (if (hashtable-contains? (hm-tbl c) k) #t #f)))
 ;; IEditableCollection / ITransient* answer from the representation: the
 ;; transient-able persistent collections are editable; a transient reports its
 ;; kind's interfaces. Widening only — anything else passes to the other arms.

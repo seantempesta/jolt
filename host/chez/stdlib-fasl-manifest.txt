@@ -83,6 +83,7 @@ jolt.parser.combinators
 jolt.parser.monad
 jolt.parser.position
 jolt.process
+jolt.profile
 jolt.reader
 jolt.scheme
 jolt.socket

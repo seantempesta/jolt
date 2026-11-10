@@ -229,6 +229,7 @@
   (let ((r (jolt-get mc jbd-kw-rounding)))
     (cond ((symbol-t? r) (symbol-t-name r))
           ((string? r) r)
+          ((jbd-rounding-mode-constant? r) (jhost-state r))
           (else "HALF_UP"))))
 
 ;; should |value| = q + r/div (0 <= r < div) round up in magnitude? neg is the
@@ -520,16 +521,22 @@
 ;; rules being the whole reason a caller reaches for .movePointLeft or .setScale
 ;; instead of ordinary arithmetic.
 
-;; RoundingMode as jolt models it: the enum's NAME, the same string
-;; *math-context*'s :rounding carries and jbd-round-inc? already dispatches on.
-;; The constants are registered as statics so (.setScale b 2
-;; RoundingMode/HALF_UP) — how JVM code spells it — resolves; BigDecimal's
-;; pre-Java-5 ROUND_* ints are registered beside them because plenty of ported
-;; code still passes those.
+;; RoundingMode is an enum (java/enums.ss) whose constant carries its NAME, the
+;; same string *math-context*'s :rounding carries and jbd-round-inc? dispatches
+;; on. BigDecimal's pre-Java-5 ROUND_* ints are registered beside them because
+;; plenty of ported code still passes those.
 (define jbd-rounding-mode-names
   '("UP" "DOWN" "CEILING" "FLOOR" "HALF_UP" "HALF_DOWN" "HALF_EVEN" "UNNECESSARY"))
-(register-class-statics! "java.math.RoundingMode"
-  (map (lambda (n) (cons n n)) jbd-rounding-mode-names))
+(define (jbd-rounding-mode-constant? x) (and (jhost? x) (string=? (jhost-tag x) "rounding-mode")))
+(define jbd-rounding-mode-constants
+  (map (lambda (n) (cons n (make-jhost "rounding-mode" n))) jbd-rounding-mode-names))
+;; RoundingMode.valueOf(int): the legacy BigDecimal.ROUND_* number
+(register-enum-class! "java.math.RoundingMode" jbd-rounding-mode-constants
+  (lambda (n)
+    (let ((i (and (number? n) (exact? n) (integer? n) n)))
+      (if (and i (<= 0 i 7))
+          (cdr (list-ref jbd-rounding-mode-constants i))
+          (throw-jvm 'IllegalArgumentException "argument out of range")))))
 (class-statics-merge! "java.math.BigDecimal"
   (let loop ((ns jbd-rounding-mode-names) (i 0) (acc '()))
     (if (null? ns) (reverse acc)
@@ -541,7 +548,8 @@
 (define (jbd-mode-normalize s)
   (list->string (map (lambda (c) (if (char=? c #\-) #\_ (char-upcase c))) (string->list s))))
 (define (jbd-rounding-mode x)
-  (let ((name (cond ((string? x) (jbd-mode-normalize x))
+  (let ((name (cond ((jbd-rounding-mode-constant? x) (jhost-state x))
+                    ((string? x) (jbd-mode-normalize x))
                     ((symbol-t? x) (jbd-mode-normalize (symbol-t-name x)))
                     ((keyword? x) (jbd-mode-normalize (keyword-t-name x)))
                     ((and (number? x) (exact? x) (integer? x) (<= 0 x 7))

@@ -122,6 +122,15 @@
 ;; through to a miss instead of being refused.
 (define (rd-java-list? obj)
   (or (pvec? obj) (cseq? obj) (empty-list-t? obj) (jolt-lazyseq? obj)))
+;; The seq classes that implement IReduce on the JVM (class-hierarchy.ss): a
+;; PersistentList, Iterate, Cycle, Repeat, the ranges, and a vector's ChunkedSeq.
+;; A Cons or a LazySeq doesn't.
+(define (rd-ireduce-seq? obj)
+  (and (cseq? obj)
+       (or (cseqv? obj)
+           (let ((k (cseq-kind obj)))
+             (or (fx=? k sk-iterate) (fx=? k sk-cycle) (fx=? k sk-repeat)
+                 (fx=? k sk-long-range) (fx=? k sk-range) (fx=? k sk-list))))))
 (define (rd-java-set? obj)
   (or (pset? obj) (htable-sorted-set? obj)))
 (define (rd-persistent-coll? obj)
@@ -676,41 +685,6 @@
             (throw-jvm 'NoSuchElementException ""))
            ((or (string=? method-name "replaceAll") (string=? method-name "sort")) jolt-nil)
            (else (throw-jvm 'UnsupportedOperationException "")))))
-      ;; Iterable.forEach over a list / seq / range — every one is a
-      ;; java.util.List on the JVM (vectors, maps and sets answer it in
-      ;; dot-coll-method).
-      ((and (string=? method-name "forEach") (pair? rest) (null? (cdr rest)) (rd-java-list? obj))
-       (car (dot-coll-method obj method-name rest)))
-;; IReduce.reduce(f) / IReduceInit.reduce(f, init) on the seq classes that
-      ;; implement it — Iterate, Cycle, Repeat, the ranges and a PersistentList —
-      ;; as the class model claims (class-hierarchy.ss): reduce itself, reduced
-      ;; honored.
-      ((and (string=? method-name "reduce") (pair? rest) (fx<=? (length rest) 2)
-            (or (empty-list-t? obj)
-                (and (cseq? obj)
-                     (let ((k (cseq-kind obj)))
-                       (or (fx=? k sk-iterate) (fx=? k sk-cycle) (fx=? k sk-repeat)
-                           (fx=? k sk-long-range) (fx=? k sk-range) (fx=? k sk-list))))))
-       (if (null? (cdr rest))
-           (jolt-reduce (car rest) obj)
-           (jolt-reduce (car rest) (cadr rest) obj)))
-      ;; java.util.List .indexOf / .lastIndexOf over any seqable (vector / list /
-      ;; seq) — -1 when absent, like the JVM (medley/index-of reads this).
-      ((or (string=? method-name "indexOf") (string=? method-name "lastIndexOf"))
-       (let ((target (car rest)) (last? (string=? method-name "lastIndexOf")))
-         (let loop ((s (jolt-seq obj)) (i 0) (found -1))
-           (cond ((jolt-nil? s) found)
-                 ((jolt=2 (seq-first s) target)
-                  (if last? (loop (jolt-seq (seq-more s)) (fx+ i 1) i) i))
-                 (else (loop (jolt-seq (seq-more s)) (fx+ i 1) found))))))
-      ;; java.util.Collection.contains over a list/seq (vectors/sets handle it in
-      ;; dot-coll-method): value membership, like the JVM.
-      ((string=? method-name "contains")
-       (let ((target (car rest)))
-         (let loop ((s (jolt-seq obj)))
-           (cond ((jolt-nil? s) #f)
-                 ((jolt=2 (seq-first s) target) #t)
-                 (else (loop (jolt-seq (seq-more s))))))))
       ;; universal Object methods on any remaining value (boolean, etc.).
       ((string=? method-name "toString") (jolt-str-render-one obj))
       ;; a seq or list is a java.util.List: List.hashCode (31*h + e.hashCode),
@@ -768,8 +742,13 @@
 ;; it answers a procedure of (self arg ...) or #f.
 (define iface-default-hook #f)
 (define (set-iface-default-hook! f) (set! iface-default-hook f))
+;; java.lang.Enum's instance methods for an enum constant whose own dispatch has
+;; no such method (java/enums.ss installs it): (obj method-name argc) -> proc | #f.
+(define enum-method-hook #f)
+(define (set-enum-method-hook! f) (set! enum-method-hook f))
 (define (dispatch-miss obj method-name args)
-  (let ((d (and iface-default-hook (iface-default-hook obj method-name (length args)))))
+  (let ((d (or (and enum-method-hook (enum-method-hook obj method-name (length args)))
+               (and iface-default-hook (iface-default-hook obj method-name (length args))))))
     (if d
         (apply d obj args)
         (let ((f (and class-ext-fallback-hook (class-ext-fallback-hook obj method-name))))
@@ -870,29 +849,89 @@
 ;; rather than in java/dot-forms.ss because record-method-dispatch below reaches
 ;; it for a deftype built on the clojure.lang interfaces, and this file is
 ;; shared with the Gambit boot while the java/ tree is not.
+;;
+;; Which JVM class a builtin collection is decides which of these methods it
+;; has at all: a seq is an ISeq and a java.util.List but not Associative, a set
+;; has no valAt, a map is no Collection. dot-coll-kind names the class family,
+;; and a method only some families have checks it (dot-coll-has!), raising the
+;; JVM's own "No matching method" for the rest -- where answering anyway was
+;; jolt saying yes to a call the JVM rejects. #f is a value whose methods are
+;; its own business (a deftype built on these interfaces), so nothing is gated.
+;; A host collection outside this file (the queue) registers its family.
+(define dot-coll-kind-arms '())
+(define (register-dot-coll-kind! pred kind)
+  (set! dot-coll-kind-arms (cons (cons pred kind) dot-coll-kind-arms)))
+(define (dot-coll-kind obj)
+  (cond ((jrec? obj) #f)
+        ((jolt-vector? obj) 'vec)
+        ((pmap? obj) 'map)
+        ((pset? obj) 'set)
+        ((empty-list-t? obj) 'empty-list)
+        ((cseq? obj) (if (cseq-list? obj) 'list 'seq))
+        ((jolt-lazyseq? obj) 'lazy)
+        ((htable-sorted-map? obj) 'smap)
+        ((htable-sorted-set? obj) 'sset)
+        (else (let loop ((as dot-coll-kind-arms))
+                (cond ((null? as) #f)
+                      (((caar as) obj) (cdar as))
+                      (else (loop (cdr as))))))))
+;; the families, by the interface that brings the methods
+(define dck-seq '(list empty-list seq lazy))                     ; ISeq
+(define dck-list '(vec list empty-list seq lazy))                ; java.util.List
+(define dck-stack '(vec list empty-list queue))                  ; IPersistentStack
+(define dck-assoc '(vec map smap))                               ; Associative
+(define dck-coll '(vec set sset list empty-list seq lazy queue)) ; java.util.Collection
+(define dck-all (cons* 'map 'smap dck-coll))
+;; Inline, with the three common records tested first: this runs on every gated
+;; interop call, and a call out to the full classifier was a measured 15-40 ns
+;; on (.peek v).
+(define-syntax dot-coll-kind-fast
+  (syntax-rules ()
+    ((_ obj) (cond ((pvec? obj) 'vec) ((pmap? obj) 'map) ((pset? obj) 'set) (else (dot-coll-kind obj))))))
+(define-syntax dot-coll-has!
+  (syntax-rules ()
+    ((_ obj name args kinds)
+     (let ((k (dot-coll-kind-fast obj)))
+       (when (and k (not (memq k kinds))) (no-method-throw name obj (length args)))))))
+;; the same check for a method only builtins answer here: #f for anything else (a
+;; deftype that doesn't declare it gets the dispatcher's own miss, as on the JVM)
+(define-syntax dot-coll-builtin!
+  (syntax-rules ()
+    ((_ obj name args kinds)
+     (let ((k (dot-coll-kind-fast obj)))
+       (cond ((not k) #f)
+             ((memq k kinds) #t)
+             (else (no-method-throw name obj (length args))))))))
+(define (dot-coll-core name . args) (apply jolt-invoke (var-deref "clojure.core" name) args))
+
 ;; Mirror coll-interop: return a one-element list boxing the result (so a jolt-nil
 ;; result is still distinguishable from "not a collection method"), or #f.
 (define (dot-coll-method obj name args)
   (cond
     ((string=? name "count") (list (jolt-count obj)))
-    ;; Seqable.seq() only: (.seq sc ascending?) is Sorted's, answered by the
-    ;; sorted arm past this one (it walks a sorted map in reverse on false)
+    ;; Seqable.seq takes no argument; (.seq sorted ascending?) is clojure.lang.Sorted's,
+    ;; answered past this table (dot-forms.ss sorted-iface-dispatch)
     ((and (string=? name "seq") (null? args)) (list (jolt-seq obj)))
-    ((string=? name "nth")   (list (apply jolt-nth obj args)))
-    ((or (string=? name "get") (string=? name "valAt"))
-     (list (apply jolt-get obj args)))
-    ((string=? name "containsKey") (list (jolt-contains? obj (car args))))
+    ((string=? name "nth")   (dot-coll-has! obj name args '(vec)) (list (apply jolt-nth obj args)))
+    ;; List.get(int) indexes; a set's or map's get looks up
+    ((string=? name "get")
+     (let ((k (dot-coll-kind-fast obj)))
+       (cond ((eq? k 'queue) (no-method-throw name obj (length args)))
+             ((memq k dck-seq) (list (jolt-nth obj (car args))))
+             (else (list (apply jolt-get obj args))))))
+    ((string=? name "valAt") (dot-coll-has! obj name args dck-assoc) (list (apply jolt-get obj args)))
+    ((string=? name "containsKey") (dot-coll-has! obj name args dck-assoc) (list (jolt-contains? obj (car args))))
     ;; java.util.Collection.contains(o): VALUE membership (a set is O(1) via
     ;; contains?; a list/vector/seq is a linear scan — contains? on a vector tests
     ;; an index, so it is wrong here).
-    ((string=? name "contains")
-     (list (if (pset? obj)
+    ;; A deftype answers it here only when it is a java.util.Collection (a record
+    ;; is a Map, so it gets the miss, as on the JVM).
+    ((and (string=? name "contains")
+          (or (dot-coll-kind-fast obj) (rd-instance-of? "java.util.Collection" obj)))
+     (dot-coll-has! obj name args dck-coll)
+     (list (if (or (pset? obj) (htable-sorted-set? obj))
                (jolt-contains? obj (car args))
-               (let ((x (car args)))
-                 (let loop ((s (jolt-seq obj)))
-                   (cond ((jolt-nil? s) #f)
-                         ((jolt=2 (seq-first s) x) #t)
-                         (else (loop (jolt-seq (seq-more s))))))))))
+               (if (dot-coll-index-of obj (car args) #f) #t #f))))
     ((string=? name "size")    (list (jolt-count obj)))
     ((string=? name "isEmpty") (list (jolt-empty? obj)))
     ;; Iterable.forEach(Consumer): every element in seq order. A map is both an
@@ -932,11 +971,12 @@
     ;; map/vector/set. Each maps to the persistent op of the same meaning.
     ((string=? name "cons")    (list (jolt-conj obj (car args))))
     ((or (string=? name "assoc") (string=? name "assocN"))
+     (dot-coll-has! obj name args (if (string=? name "assoc") dck-assoc '(vec)))
      (list (jolt-assoc obj (car args) (cadr args))))
-    ((string=? name "without") (list (jolt-dissoc obj (car args))))
-    ((string=? name "disjoin") (list (jolt-disj obj (car args))))
-    ((string=? name "pop")     (list (jolt-pop obj)))
-    ((string=? name "peek")    (list (jolt-peek obj)))
+    ((string=? name "without") (dot-coll-has! obj name args '(map smap)) (list (jolt-dissoc obj (car args))))
+    ((string=? name "disjoin") (dot-coll-has! obj name args '(set sset)) (list (jolt-disj obj (car args))))
+    ((string=? name "pop")     (dot-coll-has! obj name args dck-stack) (list (jolt-pop obj)))
+    ((string=? name "peek")    (dot-coll-has! obj name args dck-stack) (list (jolt-peek obj)))
     ((string=? name "equiv")   (list (if (jolt= obj (car args)) #t #f)))
     ;; IEditableCollection.asTransient — hand back a transient over this coll.
     ((string=? name "asTransient") (list (jolt-transient-new obj)))
@@ -962,10 +1002,36 @@
     ;; (.reduce coll f) / (.reduce coll f init): clojure.lang.IReduce — every
     ;; persistent collection reduces itself on the JVM.
     ((string=? name "reduce")
+     (let ((k (dot-coll-kind-fast obj)))
+       (when (and k (not (eq? k 'vec)) (not (rd-ireduce-seq? obj)))
+         (no-method-throw name obj (length args))))
      (list (if (pair? (cdr args))
                (jolt-reduce (car args) (cadr args) obj)
                (jolt-reduce (car args) obj))))
+    ;; methods jolt had no interop for, after every older clause so this
+    ;; string=? chain costs the earlier methods what it always did
+    ((string=? name "entryAt") (dot-coll-has! obj name args dck-assoc) (list (dot-coll-core "find" obj (car args))))
+    ((or (string=? name "indexOf") (string=? name "lastIndexOf"))
+     (and (dot-coll-builtin! obj name args dck-list)
+          (list (or (dot-coll-index-of obj (car args) (string=? name "lastIndexOf")) -1))))
+    ((string=? name "toArray") (and (dot-coll-builtin! obj name args dck-coll) (list (dot-coll-core "to-array" obj))))
+    ((string=? name "empty")   (and (dot-coll-builtin! obj name args dck-all) (list (dot-coll-core "empty" obj))))
+    ((string=? name "hasheq")  (list (jolt-hasheq obj)))
+    ;; IKVReduce: maps and vectors, (.kvreduce coll f init)
+    ((string=? name "kvreduce")
+     (and (dot-coll-builtin! obj name args dck-assoc) (list (jolt-reduce-kv (car args) (cadr args) obj))))
+    ((string=? name "first")   (and (dot-coll-builtin! obj name args dck-seq) (list (jolt-first obj))))
+    ((string=? name "next")    (and (dot-coll-builtin! obj name args dck-seq) (list (jolt-next obj))))
+    ((string=? name "more")    (and (dot-coll-builtin! obj name args dck-seq) (list (jolt-rest obj))))
+    ((string=? name "rseq")    (and (dot-coll-builtin! obj name args '(vec sset smap)) (list (jolt-rseq obj))))
     (else #f)))
+;; index of the first (or, last?, the last) element = x in coll's seq order, or #f
+(define (dot-coll-index-of coll x last?)
+  (let loop ((s (jolt-seq coll)) (i 0) (found #f))
+    (cond ((jolt-nil? s) found)
+          ((jolt=2 (seq-first s) x)
+           (if last? (loop (jolt-seq (seq-more s)) (fx+ i 1) i) i))
+          (else (loop (jolt-seq (seq-more s)) (fx+ i 1) found)))))
 
 ;; ---- method-dispatch arm registry ------------------------------------------
 ;; A .method call (record-method-dispatch) is resolved by an ordered list of arms

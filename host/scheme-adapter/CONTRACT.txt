@@ -86,10 +86,11 @@
 # MUTEXES ARE NON-RECURSIVE (PSL R4, pinned): same-thread re-acquire blocks,
 # per SRFI-18 mutex-acquire!. No host site re-acquires: re-entrant entry is
 # handled structurally — nested dosync joins the outer transaction through
-# the *txn* thread parameter (jolt-sync, refs.ss:159-161) and atom/ref/user
-# callbacks are never invoked under a held lock (atoms.ss swap! runs f and
-# watches outside the CAS lock; refs.ss fires watches after commit, outside
-# stm-lock). A target whose mutexes are recursive must still satisfy every
+# the *txn* thread parameter (jolt-sync, refs.ss) and atom/ref/user
+# callbacks are never invoked under a held mutex (atoms.ss swap! runs f and
+# watches outside the CAS lock; refs.ss runs a transaction's body, commute fns
+# and validators with no lock held and fires watches after commit). A target
+# whose mutexes are recursive must still satisfy every
 # contract name with the non-recursive discipline, since host code relies on
 # re-entrance NOT being recursion.
 fork-thread
@@ -323,6 +324,51 @@ sa-make-boot-file
 # the write/read and convert a raise into a jolt-level message).
 sa-fasl-write
 sa-fasl-read
+#
+# tier: capability-profile
+# OUR OWN definitions in host/chez/scheme-adapter-runtime.ss — Chez's
+# compile-profile counters behind one entry surface for jolt.profile.
+# (sa-profile-instrument! on?) switches instrumentation of code compiled from
+# then on, process-wide; sa-profile-compile wraps each runtime compile so the
+# switch reaches every thread; (sa-profile-counts) answers every counter as
+# #(source-name start end count), the counted expression's byte span in the
+# text it was read from; (sa-profile-release!) gives back the counters of code
+# the collector reclaimed and answers them, in the same shape, with their final
+# counts; sa-profile-clear! zeroes them. Permitted
+# degradation: sa-profile-instrument! answers #f when asked to turn on, and the
+# rest answer nothing (counts and release '(), compile just calls its thunk) — jolt.profile
+# then reports profiling as unsupported on the target.
+# Block profiles for `jolt build --profile-gen/--profile-use`: sa-compile-file's
+# (block-profile . #t) compiles with block counters; (sa-block-profile-dump!
+# path tag) writes them and answers how many (0 writes nothing);
+# (sa-block-profile-tag path) answers the tag a dump was written under; and
+# (sa-block-profile-load-unit! paths src) loads the dumps' data for one source
+# file before it compiles, #f when none covers its current text. Permitted
+# degradation: dump answers 0 and load-unit #f, which the build reports as a
+# profile that does not fit.
+sa-block-profile-dump!
+sa-block-profile-tag
+sa-block-profile-load-unit!
+sa-profile-instrument!
+sa-profile-instrumenting?
+sa-profile-compile
+sa-profile-counts
+sa-profile-release!
+sa-profile-clear!
+#
+# tier: capability-sample
+# OUR OWN definitions in host/chez/scheme-adapter-runtime.ss — what the sampling
+# profiler (host/chez/sampler.ss) reads from a timer handler. (sa-stack-walk k
+# cap proc) calls (proc code offset frame) on each of k's frames innermost first,
+# at most cap, and answers how many it walked; (sa-frame-source-pair frame) is the
+# frame's (source-name . byte-offset); (sa-code-name code) the code object's name;
+# (sa-thread-cpu-nanos) the calling thread's CPU time. Permitted degradation:
+# sa-stack-walk answers #f — jolt.profile then reports sampling as unsupported —
+# sa-frame-source-pair and sa-code-name #f, sa-thread-cpu-nanos 0.
+sa-stack-walk
+sa-frame-source-pair
+sa-code-name
+sa-thread-cpu-nanos
 #
 # tier: capability-unchecked
 # OUR OWN definitions in the adapter runtime file, SYNTAX. The unchecked

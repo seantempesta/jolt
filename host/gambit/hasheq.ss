@@ -389,7 +389,12 @@
 (define proc-hasheq-tbl (make-weak-eq-hashtable))
 (define proc-hasheq-mu (make-mutex))
 (define proc-hasheq-counter 0)
+;; An id already handed out is read without the lock, as on Chez (hasheq.ss
+;; there); the locked path re-checks before it mints.
 (define (jolt-identity-hasheq p)
+  (or (hashtable-ref proc-hasheq-tbl p #f)
+      (jolt-identity-hasheq/locked p)))
+(define (jolt-identity-hasheq/locked p)
   (jolt-with-mutex proc-hasheq-mu
     (or (hashtable-ref proc-hasheq-tbl p #f)
         (begin

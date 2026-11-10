@@ -268,6 +268,11 @@
     ;; else the structural record hash.
     ((jrec? x) (let ((m (find-method-any-protocol (jrec-tag x) "hashCode")))
                  (if m (call-declared-hash m x) (jrec-hash x))))
+    ;; any other sequential coll (a PersistentQueue) is a java.util.List
+    ((jolt-sequential? x)
+     (let loop ((s (jolt-seq x)) (h 1))
+       (if (jolt-nil? s) h
+           (loop (jolt-seq (seq-more s)) (i32 (+ (* 31 h) (jolt-java-hashcode (seq-first s))))))))
     (else (record-method-dispatch x "hashCode" jolt-nil))))
 (def-var! "jolt.host" "java-hashcode" jolt-java-hashcode)
 

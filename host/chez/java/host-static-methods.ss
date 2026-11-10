@@ -152,7 +152,7 @@
 (register-class-statics! "Thread" thread-statics)
 (register-class-statics! "java.lang.Thread" thread-statics)
 
-;; clojure.lang.LockingTransaction: jolt refs with serialized transactions.
+;; clojure.lang.LockingTransaction: jolt refs and their transactions (refs.ss).
 ;; isRunning -> true when a transaction is active on this thread.
 (register-class-statics! "clojure.lang.LockingTransaction" (list (cons "isRunning" (lambda () (and (*txn*) #t)))))
 
@@ -960,21 +960,15 @@
 ;; between that and the call, so text that needs no normalizing does not get
 ;; rebuilt character by character to prove it.
 ;;
-;; Form is an enum, and jolt models an enum constant the way TimeUnit does: a
-;; jhost carrying its name, so (str Normalizer$Form/NFC) is "NFC" as on the JVM
-;; and (= f Normalizer$Form/NFC) compares the one interned constant. The
-;; constants are registered under the binary name (Normalizer$Form), which is
-;; how the analyzer spells a nested class; registering the FQN registers the
-;; short name with it.
+;; Form is an enum (java/enums.ss): each constant a jhost carrying its name,
+;; declared under the binary name (Normalizer$Form), which is how the analyzer
+;; spells a nested class.
 (define (normalizer-form? x) (and (jhost? x) (string=? (jhost-tag x) "normalizer-form")))
 (define (normalizer-form-name f) (vector-ref (jhost-state f) 0))
 (define normalizer-form-constants
   (map (lambda (nm) (cons nm (make-jhost "normalizer-form" (vector nm))))
-       '("NFC" "NFD" "NFKC" "NFKD")))
-(register-str-render! normalizer-form? normalizer-form-name)
-(register-host-methods! "normalizer-form"
-  (list (cons "name" normalizer-form-name)
-        (cons "toString" normalizer-form-name)))
+       '("NFD" "NFC" "NFKD" "NFKC")))
+(register-enum-class! "java.text.Normalizer$Form" normalizer-form-constants)
 ;; The JVM's normalize(CharSequence, Form) rejects a null form with an NPE and
 ;; has no other failure mode. A form that is not one of the four constants can
 ;; only come from jolt code that built one by hand, so it names itself in the
@@ -999,7 +993,6 @@
         (cons "isNormalized"
               (lambda (s form)
                 (jtn-normalized? (jolt-str-render-one s) (normalizer-form-index form))))))
-(register-class-statics! "java.text.Normalizer$Form" normalizer-form-constants)
 
 ;; Class.forName: an array descriptor ("[C") is its own class token; a class Jolt
 ;; can back (registered statics/ctor, or a java.*/clojure.* core class) yields a

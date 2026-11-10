@@ -178,6 +178,22 @@
 (let ((e (emitf "u" (string-append "(fn* ([y] " (vec-of-calls "add1" 300) "))"))))
   (ok "a tiny callee is inlined at every one of 300 sites" (= 0 (count-occ (code-part e) "add1"))))
 
+;; --- scalar-replace moves field values only where they mean the same ----------
+;; Dropping (let [m {:x a ..}] ..) moves `a` to each (:x m). Under a binder that
+;; rebinds `a` it read the inner one (12, not 3); into a fn literal it left the
+;; literal's captures naming m, which no longer exists, so a build's image maker
+;; read an unbound variable. Both keep the map; the plain case still folds.
+(ok "scalar-replace does not move a value under a binder that shadows its local"
+    (= 3 (jnum->exact (ev "((fn* ([a] (let [m {:x a :y 2}] (let [a 10] (+ (:x m) (:y m)))))) 1)"))))
+(ok "scalar-replace does not move a value under a loop binding that shadows it"
+    (= 6 (jnum->exact (ev "((fn* ([a] (let [m {:x a :y 2}] (loop [a 0 acc 0] (if (< a 2) (recur (inc a) (+ acc (:x m) (:y m))) acc))))) 1)"))))
+(ok "scalar-replace does not move a value under a fn param that shadows it"
+    (= 3 (jnum->exact (ev "(((fn* ([a] (let [m {:x a :y 2}] (fn* ([a] (+ (:x m) (:y m))))))) 1) 100)"))))
+(let ((e (code-part (emitf "u" "(fn* ([a] (let [m {:x a :y 2}] (fn* ([] (+ (:x m) (:y m)))))))"))))
+  (ok "a map a fn literal captures is not scalar-replaced into it" (has? e "amap-slots->pmap")))
+(let ((e (code-part (emitf "u" "(fn* ([a] (let [m {:x a :y 2}] (+ (:x m) (:y m)))))"))))
+  (ok "a map read only in its own scope is still scalar-replaced" (not (has? e "amap-slots->pmap"))))
+
 (set-optimize! #f)
 (set-direct-link-flag! #f)
 (printf "~a/~a passed~n" (- total fails) total)

@@ -320,6 +320,24 @@
 (def-var! "jolt.host" "agent-threads-daemon!" (lambda () jolt-nil))
 (def-var! "jolt.host" "callable-host?"
   (lambda (x) (if (jolt-multifn? x) #t jolt-nil)))
+;; jolt.profile's host surface. Chez defines it in source-registry.ss, which
+;; this boot leaves out; here it is the profile tier's degradation, so
+;; instrument! throws {:host :unsupported} rather than naming an unbound var.
+(def-var! "jolt.host" "profile-instrument!"
+  (lambda (on?) (sa-profile-instrument! (jolt-truthy? on?))))
+(def-var! "jolt.host" "profile-instrumenting?" (lambda () (sa-profile-instrumenting?)))
+(def-var! "jolt.host" "profile-clear!" (lambda () (sa-profile-clear!) jolt-nil))
+(def-var! "jolt.host" "profile-sites" (lambda () (jolt-vector)))
+(def-var! "jolt.host" "profile-retired" (lambda () (jolt-vector)))
+(def-var! "jolt.host" "profile-defs" (lambda (files) (jolt-vector)))
+(def-var! "jolt.host" "profile-stats"
+  (lambda () (apply jolt-vector (vector->list (sa-stats)))))
+;; The sampler's half (sampler.ss on Chez, also left out): no timer to drive
+;; it, so sample! throws {:host :unsupported} and there is nothing to read.
+(def-var! "jolt.host" "sample-start!" (lambda (interval depth) #f))
+(def-var! "jolt.host" "sample-stop!" (lambda () jolt-nil))
+(def-var! "jolt.host" "sampling?" (lambda () #f))
+(def-var! "jolt.host" "sample-read" (lambda () (jolt-vector 0 (jolt-vector))))
 ;; Per-object identity for the back end's constant pool (rt.ss on Chez).
 (def-var! "jolt.host" "identity-hash" (lambda (x) (jolt-identity-hasheq x)))
 

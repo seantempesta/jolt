@@ -37,7 +37,7 @@
 ;; --- value machinery ---------------------------------------------------------
 
 ;; type-kw -> {:eq (fn [a b]) :hash (fn [v]) :str (fn [v]) :cmp (fn [a b]|nil)
-;;             :classes #{class-name-strings}}
+;;             :classes #{class-name-strings} :enum? true-for-an-enum-type}
 (defonce ^:private registry (atom {}))
 
 (def ^:private type-key :jolt.time/type)
@@ -128,7 +128,11 @@
     ;; java.time values have no reader literal, so pr renders the same as str
     ;; (time-literals layers #time/… readable printing on top separately).
     (__register-str! jt? (fn [v] ((:str (spec-of v)) v)) claim)
-    (__register-pr!  jt? (fn [v] ((:str (spec-of v)) v)) claim)
+    ;; an enum constant (:enum? in its spec) prints as the JVM's #object form,
+    ;; which the enum model renders over its str
+    (__register-pr!  (fn [v] (and (jt? v) (not (:enum? (spec-of v)))))
+                     (fn [v] ((:str (spec-of v)) v))
+                     claim)
     (__register-compare!
      (fn [a b] (or (jt? a) (jt? b)))
      (fn [a b]

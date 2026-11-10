@@ -14,8 +14,9 @@
 # (host/chez/bionic-provision-chez.sh), so nothing Chez-shaped is installed here.
 # Results (the binary, the report) are copied back to /src/target/release.
 #
-# GATES are extra make targets to run after the build (tests.yml passes a gate
-# subset; the release passes none). Every check here runs in the container,
+# GATES are extra make targets to run after the build (tests.yml passes one
+# shard of the CI gate, `ci-shard SHARD-SET=ci SHARD=i SHARDS=n`; the release
+# passes none). Every check here runs in the container,
 # since the host cannot execute a bionic binary.
 set -eu
 
@@ -55,6 +56,15 @@ cd "$work"
 rm -rf target
 
 make jolt-release
+
+# The Chez that make provisioned, handed back for tests.yml to cache: only the
+# installed prefix, not the tarball and build tree beside it. Skipped when the
+# host didn't open target/ to this user (release.yml doesn't cache it).
+if [ -w /src/target ]; then
+  rm -rf /src/target/bionic-chez
+  mkdir -p /src/target/bionic-chez
+  cp -R .cache/local/chezscheme-* /src/target/bionic-chez/
+fi
 
 b=target/release/jolt
 {

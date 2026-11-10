@@ -121,20 +121,20 @@ export JOLT_CC := $(GCC)
 endif
 
 JOLT-TARGETS-NEEDING-DEPS := \
-  aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke \
+  aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke reprobuildsmoke profilebuildsmoke \
   aotcachepathsmoke aotcachesourcepathsmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling zipmemory lazyscaling \
   devbootsmoke devirt directlink mintgate ffi fibers fiberspoll fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inferscaling inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance libperf mandelbrot-num mathfl mvnhttp defmetacells staticsite gcpolicy stacklimit lazyretain \
   deadhost recordshadow emittedheads mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa regexanchor regexanchorprims regexanchorcheck regexsyntax regexbacktrack \
-  hostarity narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
+  hostarity enummodel enumregistrymodel imagecoverage narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit vfaslceiling \
   shakesmoke smoke sortedcoll staticnativesmoke stateimage test testbin transient unit unitcontext zlibregistersmoke zlibnativesmoke noexecsmoke \
   threadsafety maskedacquire ioerrno values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
-.PHONY: build install test ci bionic-ci gate-run-test gate-run-ci gate-run-bionic-ci gate-status hooks attributioncheck noticecheck monitormodel \
+.PHONY: build install test ci bionic-ci ci-shard ci-shard-list gate-run-test gate-run-ci gate-run-bionic-ci gate-run-ci-shard gate-status hooks attributioncheck noticecheck monitormodel \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
         gambitgen gambitgencheck gambitseedcheck gambitunbound gambitunbound-regen \
         gambitvars gambitvars-regen gambitstatics gambitstatics-regen gambittwins grenadinecheck \
@@ -186,15 +186,15 @@ install: build
 # answers "is this working tree gated?" — which is not something to remember.
 
 CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling gcpolicy stacklimit footprint lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
-  smoke tracesmoke errorreport errorkinds buildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym ffiloadfail continuations stdlibfasl zlibunit depsnounzip systemexitsmoke ziparchiveerrors zipreadscopepark zipindexpreempt zlibnativesmoke zipmemory noexecsmoke \
+  smoke tracesmoke errorreport errorkinds buildsmoke reprobuildsmoke profilebuildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym ffiloadfail continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke systemexitsmoke ziparchiveerrors zipreadscopepark zipindexpreempt \
   transient sortedcoll rrbprop rrbscaling stateimage infer inferscaling wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
   protoret accfix pic narrow directlink mintgate directcall defmetacells staticsite arraymap arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flonumdisp flarr \
   fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost recordshadow emittedheads adaptercheck hostprops normalizecheck hostregistry hostarity foreignhandles dispatchalloc numequivalloc analyzealloc emitalloc treeseqcost imagefnforms hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke \
-  gatebootsmoke aotcachesmoke aotcachepathsmoke aotcachesourcepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments buildunitwrite threadeddeadlock forkheldlocks oomafterrendezvous heaphistogram siginfodump compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost recordshadow emittedheads adaptercheck hostprops normalizecheck hostregistry hostarity enummodel imagecoverage foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke numequivalloc analyzealloc emitalloc treeseqcost imagefnforms \
+  gatebootsmoke aotcachesmoke aotcachepathsmoke aotcachesourcepathsmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck buildunitwrite threadeddeadlock forkheldlocks oomafterrendezvous heaphistogram siginfodump \
   systemstreams closedstdout stderrsplit userdirpaths utf8decode \
-  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer interruptnest tickbudget monitorescape windescape threadsafety maskedacquire ioerrno cas flow remotechan
+  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer ticks interruptnest monitorescape windescape threadsafety maskedacquire ioerrno cas flow tickbudget remotechan
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -221,7 +221,7 @@ GATE-SHA = $$(command -v sha256sum >/dev/null 2>&1 && echo sha256sum || echo "sh
 # ("ik"); long options stay separate words. Read the first word only when it is
 # that group, or --no-print-directory matches a search for "i".
 MAKE-SHORT-FLAGS := $(filter-out -%,$(firstword $(MAKEFLAGS)))
-ifneq (,$(filter test ci gate-run-test gate-run-ci,$(MAKECMDGOALS)))
+ifneq (,$(filter test ci ci-shard gate-run-test gate-run-ci gate-run-ci-shard,$(MAKECMDGOALS)))
 ifneq (,$(findstring i,$(MAKE-SHORT-FLAGS)))
 $(error make -i ignores failures, so the gate cannot fail — drop -i)
 endif
@@ -276,6 +276,35 @@ bionic-ci:
 gate-run-test: $(TEST-GATES)
 gate-run-ci: $(CI-GATES)
 gate-run-bionic-ci: $(CI-GATES)
+
+# One shard of a gate, so CI can run a gate as parallel jobs. SHARD-SET is test
+# (selfhost plus CI-GATES) or ci (CI-GATES alone, what bionic-ci runs), and
+# SHARD of SHARDS takes every SHARDS-th gate of that set's sorted list, so the
+# shards between them run every gate exactly once and a gate added to CI-GATES
+# lands in some shard without anyone listing it. `make ci-shard-list` prints a
+# shard's gates. A shard is not the gate: it leaves no receipt, and gate-status
+# keeps saying NOT GATED.
+SHARD ?= 1
+SHARDS ?= 1
+SHARD-SET ?= test
+SHARD-POOL = $(sort $(filter-out ci,$(if $(filter ci,$(SHARD-SET)),$(CI-GATES),$(TEST-GATES) $(CI-GATES))))
+SHARD-GATES = $(shell printf '%s\n' $(SHARD-POOL) | awk -v i='$(SHARD)' -v n='$(SHARDS)' '(NR - 1) % n == i - 1')
+ci-shard:
+	@case '$(SHARD-SET)' in test|ci) ;; *) echo "ci-shard: SHARD-SET must be test or ci, not '$(SHARD-SET)'"; exit 2;; esac
+	@if ! [ '$(SHARDS)' -ge 1 ] 2>/dev/null || ! [ '$(SHARD)' -ge 1 ] 2>/dev/null || [ '$(SHARD)' -gt '$(SHARDS)' ]; then \
+	  echo "ci-shard: need 1 <= SHARD <= SHARDS, got SHARD=$(SHARD) SHARDS=$(SHARDS)"; exit 2; fi
+	@echo "ci-shard: $(SHARD-SET) shard $(SHARD)/$(SHARDS), $(words $(SHARD-GATES)) of $(words $(SHARD-POOL)) gates"
+	+@if $(MAKE) --no-print-directory gate-run-ci-shard; then \
+	  echo "OK: $(SHARD-SET) shard $(SHARD)/$(SHARDS) passed ($(words $(SHARD-GATES)) targets)"; \
+	else \
+	  st=$$?; \
+	  echo "FAILED: $(SHARD-SET) shard $(SHARD)/$(SHARDS) did not complete — targets after the failure never ran,"; \
+	  echo "        so nothing here is evidence the rest of the shard passes."; \
+	  exit $$st; \
+	fi
+gate-run-ci-shard: $(SHARD-GATES)
+ci-shard-list:
+	@printf '%s\n' $(SHARD-GATES)
 
 # Is THIS working tree covered by a complete gate run? A subset run leaves the
 # receipt absent (the wrapper clears it) and any edit since changes the tree hash.
@@ -402,6 +431,12 @@ fibers:
 # cleared before an idle wait forked a second immortal timer per call.
 asynctimer:
 	@$(CHEZ) --script test/chez/async-timer-test.ss
+
+# The per-thread tick scheduler (host/chez/ticks.ss): clients keep their own
+# cadence on one engine timer, a lone preemption stays a bare set-timer, and the
+# state is per thread.
+ticks:
+	@$(CHEZ) --script test/chez/ticks-test.ss
 
 # A nested run-interruptible extent restores the enclosing polling timer after
 # normal return, exception, or interruption, without sharing ownership between
@@ -537,6 +572,17 @@ seeddefs:
 # `jolt build` produces a working standalone binary.
 buildsmoke: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/build-smoke.sh
+
+# Building the same sources twice gives every compiled unit identical text, the
+# ground profile-guided builds stand on (RFC 0015 P1).
+reprobuildsmoke: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/repro-build-smoke.sh
+
+# `jolt build --profile-gen` / `--profile-use`: Chez block profiles round trip,
+# never share a cache entry with plain units, and a profile that does not fit
+# fails naming the unit (RFC 0015 P2).
+profilebuildsmoke: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/profile-build-smoke.sh
 
 # `jolt build --library` produces a shared object callable from C/C++/Rust.
 buildlibsmoke: testbin
@@ -688,9 +734,11 @@ gcpolicy: testbin
 	 [ -n "$$after" ] && [ $$((after * 1048576 * 10)) -le $$((mx * 11)) ] || { echo "FAIL gcpolicy: a collection left the total heap at $${after}MB, more than 10% over JOLT_MAX_HEAP=256m: the ceiling bounds the TOTAL heap, as -Xmx does, within the collector's working room"; exit 1; }; \
 	 [ -n "$$pk" ] && [ $$((pk * 10)) -le $$((mx * 11)) ] || { echo "FAIL gcpolicy: the total heap peaked at $$pk during collections, more than 10% over JOLT_MAX_HEAP=256m (v0.8.12 peaked 23% over)"; exit 1; }; \
 	 fdir=$$(mktemp -d); \
-	 set -- $$(cd "$$fdir" && JOLT_NO_USER_DEPS=1 JOLT_MAX_HEAP=256m "$(CURDIR)/$$j" run "$(CURDIR)/test/gc_ceiling_forced_test.clj" 2>&1 | sed -n 's/^peak //p'); pk=$$1; mx=$$3; rmdir "$$fdir"; \
-	 echo "gcpolicy: a ceiling-forced full collection with ~140MB spread over the older generations -> peak $$(($${pk:-0} / 1048576))MB"; \
-	 [ -n "$$pk" ] && [ $$((pk * 10)) -le $$((mx * 11)) ] || { echo "FAIL gcpolicy: the heap peaked at $${pk:-?} in a ceiling-forced full collection, more than 10% over JOLT_MAX_HEAP=256m: one collection of every generation holds its copies beside their sources (collect it a generation at a time; jolt-exoj)"; exit 1; }; \
+	 for pad in 0 1024 4096 8192; do \
+	   set -- $$(cd "$$fdir" && JOLT_NO_USER_DEPS=1 JOLT_MAX_HEAP=256m "$(CURDIR)/$$j" run "$(CURDIR)/test/gc_ceiling_forced_test.clj" $$pad 2>&1 | sed -n 's/^peak //p'); pk=$$1; mx=$$3; \
+	   echo "gcpolicy: a ceiling-forced full collection with ~140MB spread over the older generations, $${pad}KB more at boot -> peak $$(($${pk:-0} / 1048576))MB"; \
+	   [ -n "$$pk" ] && [ $$((pk * 10)) -le $$((mx * 11)) ] || { rmdir "$$fdir"; echo "FAIL gcpolicy: the heap peaked at $${pk:-?} near the ceiling with $${pad}KB more at boot, more than 10% over JOLT_MAX_HEAP=256m: a collection under the ceiling copied more than the room left (a whole generation beside its sources; sa-collect-young!, sa-collect-tight; jolt-exoj)"; exit 1; }; \
+	 done; rmdir "$$fdir"; \
 	 set -- $$(JOLT_NO_USER_DEPS=1 $$j run $$t refresh 2>&1 | sed -n 's/^growth //p'); \
 	 echo "gcpolicy: older generations' allowance with ~100MB held $$(($${1:-0} / 1048576))MB, after dropping it and System/gc $$(($${2:-0} / 1048576))MB"; \
 	 [ -n "$${2:-}" ] && [ "$$1" -gt 67108864 ] && [ "$$2" -ge 67108864 ] && [ "$$2" -lt "$$1" ] || { echo "FAIL gcpolicy: System/gc did not re-measure the live set the older generations' allowance is sized from"; exit 1; }; \
@@ -1446,6 +1494,17 @@ hostregistry:
 hostarity:
 	@$(CHEZ) --script test/chez/host-arity-test.ss
 
+# Every enum the runtime models is declared through the enum model
+# (java/enums.ss): no class reaches java.lang.Enum, or carries the ENUM modifier,
+# without values/valueOf, Class.isEnum, Enum/valueOf and Enum's methods.
+enummodel:
+	@$(CHEZ) --script test/chez/enum-model-test.ss
+
+# Every java.util collection shim round-trips through a state image (its
+# contents, order, comparator and class), or is refused naming its class.
+imagecoverage:
+	@$(CHEZ) --script test/chez/image-coverage-test.ss
+
 # The process's own symbol handle is loaded once per process: Chez walks every
 # loaded handle with dlsym before its static "(cs)" table, so the 57 boot-time
 # loads made each foreign miss (and inspect/object) a 2 ms walk.
@@ -1716,6 +1775,13 @@ noticecheck:
 monitormodel:
 	@command -v swipl >/dev/null || { echo "monitormodel: needs swipl (SWI-Prolog)" >&2; exit 1; }
 	@swipl -q -g main -t halt tools/monitor-model.pl
+
+# The enum model's lock-free tables (host/chez/java/enums.ss), model-checked over
+# every interleaving of two declaring writers and two readers: no torn read, no
+# lost declaration, both mutants caught. Manual, like monitormodel: needs swipl.
+enumregistrymodel:
+	@command -v swipl >/dev/null || { echo "enumregistrymodel: needs swipl (SWI-Prolog)" >&2; exit 1; }
+	@swipl -q -g main -t halt tools/enum-registry-model.pl
 
 # Install the repository's git hooks into .git/hooks (copies, so a clone that
 # never runs this is unaffected; re-run after a hook changes).

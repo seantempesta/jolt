@@ -14,6 +14,22 @@
   ([s1 s2] (if (< (count s1) (count s2)) (reduce conj s2 s1) (reduce conj s1 s2)))
   ([s1 s2 & sets] (reduce union (union s1 s2) sets)))
 
+;; s without the members keep? rejects, dropped by disj-ing each one out of s
+;; itself (the reference's idiom: it keeps s's type, comparator and meta, and
+;; costs only the drops). disj answers by value, so a member not equal to
+;; itself (##NaN, or a collection holding one) can't be found that way -- the
+;; JVM's disj gets it by reference identity. A disj that misses answers the set
+;; itself, and the first such miss rebuilds from (empty s) instead, which keeps
+;; the same type, comparator and meta.
+(defn- keep-members [keep? s]
+  (let [r (reduce (fn [acc item]
+                    (if (keep? item)
+                      acc
+                      (let [acc' (disj acc item)]
+                        (if (identical? acc' acc) (reduced ::rebuild) acc'))))
+                  s s)]
+    (if (identical? r ::rebuild) (into (empty s) (filter keep?) s) r)))
+
 (defn intersection
   ([s1] s1)
   ([s1 s2]
@@ -23,7 +39,7 @@
    ;; not a million.
    (if (< (count s2) (count s1))
      (recur s2 s1)
-     (reduce (fn [acc item] (if (contains? s2 item) acc (disj acc item))) s1 s1)))
+     (keep-members #(contains? s2 %) s1)))
   ([s1 s2 & sets] (reduce intersection (intersection s1 s2) sets)))
 
 (defn difference
@@ -38,7 +54,7 @@
 
 (defn select
   [pred s]
-  (reduce (fn [acc item] (if (pred item) acc (disj acc item))) s s))
+  (keep-members pred s))
 
 (defn project
   [xrel ks]

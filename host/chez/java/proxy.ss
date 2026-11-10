@@ -13,8 +13,9 @@
 ;; Delegation is not inheritance in one respect, and it is the respect worth
 ;; stating: the base instance holds no reference back to the proxy, so a base
 ;; method that calls an overridden method reaches the BASE's version, where the
-;; JVM's virtual dispatch would re-enter the override. Overriding a method the
-;; base calls internally is the case this does not model.
+;; JVM's virtual dispatch would re-enter the override — unless the base's shim
+;; asks to be told its proxy (proxy-attach-hook!, below), as LinkedHashMap does
+;; for removeEldestEntry.
 
 ;; A class is constructible when something registered a constructor for it. Probe
 ;; rather than calling host-new, so a genuine error raised INSIDE a real
@@ -51,8 +52,12 @@
                    (seq->list (jolt-seq ctor-args))))
          (base (and (pair? names)
                     (proxy-class-constructible? (car names))
-                    (apply host-new (car names) args))))
-    (make-reified-delegating methods-map base names)))
+                    (apply host-new (car names) args)))
+         (p (make-reified-delegating methods-map base names)))
+    (proxy-attach! base p)
+    p))
+
+
 (def-var! "clojure.core" "make-proxy" jolt-make-proxy)
 
 ;; (proxy-super meth args...) inside a proxy body: the base's own implementation,

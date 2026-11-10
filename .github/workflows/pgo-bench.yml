@@ -1,0 +1,93 @@
+name: pgo-bench
+
+# What a profile-guided build buys (RFC 0015 P3): ci/pgo-bench.sh times each
+# benchmark built plain and built with --profile-use from its own
+# --profile-gen run, in both build modes. It is a measurement, not part of the
+# gate, so it runs on demand and when the harness itself changes.
+on:
+  workflow_dispatch:
+    inputs:
+      workloads:
+        description: space-separated workload names (empty for all)
+        default: ""
+      rounds:
+        description: timed runs per side
+        default: "3"
+  pull_request:
+    paths:
+      - ci/pgo-bench.sh
+      - ci/pgo-workloads/**
+      - .github/workflows/pgo-bench.yml
+
+concurrency:
+  group: pgo-bench-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Each workload pays three builds, and a --profile-use build compiles the
+  # runtime again with its profile, so the suite is dealt out four ways. Every
+  # ratio is two binaries timed on one runner, so rows from different shards
+  # are comparable even though their runners are not.
+  measure:
+    name: measure (${{ matrix.shard }}/4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - uses: actions/checkout@v5
+        with:
+          repository: jolt-lang/examples
+          path: examples
+      - name: Set up Chez
+        uses: ./.github/actions/setup-chez
+      - name: Build jolt
+        run: make CHEZ=/opt/chez/bin/chez testbin
+      - name: Measure (shard ${{ matrix.shard }}/4)
+        env:
+          PGO_SHARD: ${{ matrix.shard }}/4
+          PGO_EXAMPLES: ${{ github.workspace }}/examples
+          PGO_REQUIRE_ALL: "1"
+          PGO_OUT: ${{ runner.temp }}/rows-${{ matrix.shard }}.txt
+          PGO_ROUNDS: ${{ inputs.rounds || '3' }}
+          WORKLOADS: ${{ inputs.workloads }}
+        # $WORKLOADS is deliberately unquoted: it is a list of names
+        run: TMPDIR="$RUNNER_TEMP" ci/pgo-bench.sh target/release/jolt 1.10 $WORKLOADS
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: pgo-rows-${{ matrix.shard }}
+          path: ${{ runner.temp }}/rows-${{ matrix.shard }}.txt
+          if-no-files-found: ignore
+
+  # The four shards' rows as one table, with a geomean per mode.
+  summary:
+    name: summary
+    needs: measure
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: pgo-rows-*
+          merge-multiple: true
+          path: rows
+      - name: Table
+        run: |
+          set -eu
+          {
+            echo '```'
+            head -1 "$(ls rows/*.txt | head -1)"
+            cat rows/*.txt | grep -v '^workload ' | sort
+            for m in release opt; do
+              cat rows/*.txt | awk -v m="$m" '$2 == m { r = $5; sub(/x$/, "", r); s += log(r); n++ }
+                END { if (n) printf "%s geomean ratio %.3f over %d workloads\n", m, exp(s / n), n }'
+            done
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"

@@ -180,6 +180,29 @@
 ;;   sa-fasl-read           UNIMPLEMENTED  ?? same, must verify externals resolution shape.
 
 ;; ---------------------------------------------------------------------------
+;; tier: capability-profile
+;; ---------------------------------------------------------------------------
+;;   sa-profile-instrument! UNIMPLEMENTED  ?? Guile has statprof (sampling), no
+;;                                        per-expression counters; degrade (#f for on).
+;;   sa-profile-instrumenting? UNIMPLEMENTED  #f.
+;;   sa-profile-compile     UNIMPLEMENTED  call the thunk.
+;;   sa-profile-counts      UNIMPLEMENTED  '().
+;;   sa-profile-release!    UNIMPLEMENTED  '().
+;;   sa-block-profile-dump! UNIMPLEMENTED  0 (no block counters).
+;;   sa-block-profile-tag   UNIMPLEMENTED  raise.
+;;   sa-block-profile-load-unit! UNIMPLEMENTED  #f.
+;;   sa-profile-clear!      UNIMPLEMENTED  no-op.
+
+;; ---------------------------------------------------------------------------
+;; tier: capability-sample
+;; ---------------------------------------------------------------------------
+;;   sa-stack-walk          UNIMPLEMENTED  ?? Guile's stack API (make-stack) walks
+;;                                        frames, and setitimer could drive it; degrade (#f).
+;;   sa-frame-source-pair   UNIMPLEMENTED  #f.
+;;   sa-code-name           UNIMPLEMENTED  #f.
+;;   sa-thread-cpu-nanos    UNIMPLEMENTED  0.
+
+;; ---------------------------------------------------------------------------
 ;; tier: capability-unchecked
 ;; ---------------------------------------------------------------------------
 ;;   sa-ufx+ sa-ufx- sa-ufx<? sa-ufx>=? sa-ufx=?  UNIMPLEMENTED  Guile: the

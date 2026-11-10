@@ -619,7 +619,12 @@
 (set! jolt-pop (lambda (coll)
   (cond ((jrec-cl coll "pop") => (lambda (m) (jolt-invoke m coll)))
         (else (%r-jolt-pop coll)))))
-(register-pr-arm! jrec? jrec-pr)
+;; A record that is an enum constant (java/enums.ss register-enum!) prints as
+;; the JVM prints an enum constant, through the #object fallback; the enum model
+;; installs the test, which answers #f until a record constant is declared.
+(define jrec-enum-constant? (lambda (x) #f))
+(define (set-jrec-enum-constant-test! f) (set! jrec-enum-constant? f))
+(register-pr-arm! (lambda (x) (and (jrec? x) (not (jrec-enum-constant? x)))) jrec-pr)
 
 ;; records are map? and coll? (Clojure: a record IS an associative map). The
 ;; predicates.ss vars hold a snapshot, so re-def-var! after extending. record? is

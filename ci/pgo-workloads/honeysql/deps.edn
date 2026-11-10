@@ -1,0 +1,8 @@
+{:paths ["src"]
+ ;; jolt-lang/time provides java.util.Locale, which honey.sql's upper-case uses
+ :deps {com.github.seancorfield/honeysql
+        {:git/url "https://github.com/seancorfield/honeysql"
+         :git/sha "308d5a741825cb13ded6d4766041306a61181acb"}
+        jolt-lang/time
+        {:git/url "https://github.com/jolt-lang/time"
+         :git/sha "a28ab100111050356957eb42b7ec89a4065de754"}}}

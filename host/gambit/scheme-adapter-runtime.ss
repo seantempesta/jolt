@@ -206,10 +206,10 @@
         (inexact->exact (floor (* t 1000)))
         (inexact->exact (floor (* (time->seconds t) 1000))))))
 
-;; (sa-gc-tight! on?) -> void
+;; (sa-gc-tight! limit) -> void
 ;; Permitted degradation: Gambit has no in-place collection mode, so this is
 ;; ignored.
-(define (sa-gc-tight! on?) (if #f #f))
+(define (sa-gc-tight! limit) (if #f #f))
 
 ;; (sa-make-large-bytevector n) -> bytevector
 ;; Permitted degradation: an ordinary bytevector; Gambit has no immobile
@@ -286,13 +286,14 @@
   'little)
 
 ;; (sa-stats) -> #(cpu-nanos real-nanos gc-count gc-cpu-nanos gc-real-nanos
-;;                gc-bytes)
-;; One statistics snapshot as the six exact-integer fields rt.ss reads into
-;; the jolt.host telemetry vars (time fields pre-converted to nanos). Contract:
-;; the six fields in this order. Degradation: a zero vector — the OTel layer
-;; maps zeros to absent metrics.
+;;                gc-bytes allocated-bytes)
+;; One statistics snapshot as the seven exact-integer fields rt.ss reads into
+;; the jolt.host telemetry vars (time fields pre-converted to nanos).
+;; allocated-bytes is every byte allocated since the process started, freed or
+;; not. Contract: the seven fields in this order. Degradation: a zero vector —
+;; the OTel layer maps zeros to absent metrics.
 (define (sa-stats)
-  (vector 0 0 0 0 0 0))
+  (vector 0 0 0 0 0 0 0))
 
 ;; (sa-continuation-frames k) -> list of frame inspectors | '()
 ;; The continuation's frames, innermost first. Contract: stepping a throw
@@ -511,6 +512,34 @@
 ;; sa-fasl-write wrote. Degradation: raise — same story as sa-fasl-write.
 (define (sa-fasl-read port . rest)
   (error 'sa-fasl-read "fasl serialization is unsupported on the gambit target"))
+
+;; ---- execution-count profiling (capability: profile) -----------------------
+;; Gambit's compiler has no per-expression counters to read back, so this tier
+;; takes the contract's degradation throughout: jolt.profile reports profiling
+;; as unsupported and every reading is empty.
+(define (sa-profile-instrument! on?) (not on?))
+(define (sa-profile-instrumenting?) #f)
+(define (sa-profile-compile thunk) (thunk))
+(define (sa-profile-counts) '())
+(define (sa-profile-release!) '())
+;; no block counters, so no build here can be profile-guided
+(define (sa-block-profile-dump! path tag) 0)
+(define (sa-block-profile-tag path) (error 'sa-block-profile-tag "no block profiles on this target" path))
+(define (sa-block-profile-load-unit! paths src) #f)
+(define (sa-profile-clear!) (if #f #f))
+
+;; ---- stack sampling (capability: sample) ------------------------------------
+;; No engine timer per thread to drive a sampler from, so this tier degrades:
+;; jolt.profile reports sampling as unsupported.
+(define (sa-stack-walk k cap proc) #f)
+(define (sa-frame-source-pair frame) #f)
+(define (sa-code-name code) #f)
+(define (sa-thread-cpu-nanos) 0)
+;; The shared lazy-bridge.ss fork wrapper asks the Chez tick scheduler whether a
+;; new thread should join the sampler (host/chez/ticks.ss). Never, here.
+(define jolt-tick-sampling? #f)
+(define (jolt-tick-join-sampling!) (if #f #f))
+
 
 ;; ---- continuations tier (capability: continuations) -------------------------
 

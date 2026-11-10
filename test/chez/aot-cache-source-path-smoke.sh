@@ -57,7 +57,8 @@ run_in() {
 hit_in() {
   dir="$1"; shift
   (cd "$dir" && JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache" JOLT_QUIET=1 JOLT_DEBUG=1 \
-     "$jolt" "$@" -M -e "$probe" 2>&1 >/dev/null) | grep -c '\[jolt.aot\] hit mylib.where' || true
+     "$jolt" "$@" -M -e "$probe" 2>&1 >/dev/null) > "$tmp/hit.log"
+  grep -c '\[jolt.aot\] hit mylib.where' "$tmp/hit.log" || true
 }
 
 want='mylib/where.clj
@@ -81,6 +82,8 @@ check_hit() {
     echo "PASS: ($label) a cache hit"; pass=$((pass+1))
   else
     echo "FAIL: ($label) recompiled instead of hitting the cache"; fails=$((fails+1))
+    echo "  the cache's report:"; grep '\[jolt.aot\]' "$tmp/hit.log" | sed 's/^/    /'
+    echo "  the cache dir:"; find "$cache" -name '*mylib*' | sed 's/^/    /'
   fi
 }
 

@@ -599,6 +599,52 @@ for c in run repl nrepl-server path tasks completions build; do
   fi
 done
 rm -rf "$help_dir"
+# nrepl-server --no-port-file writes no .nrepl-port, and --port-file PATH writes
+# the bound port there (relative to the caller's directory) and deletes it on
+# the way out. The PATH is not read as the port: `--port-file p.txt 0` binds 0.
+nr_dir="$(mktemp -d)"
+mkdir -p "$nr_dir/sub"
+nr_jolt="$(cd "$(dirname "$jolt_bin")" && pwd)/$(basename "$jolt_bin")"
+nr_start() {
+  (cd "$nr_dir" && JOLT_PWD="$nr_dir" exec "$nr_jolt" nrepl-server "$@" </dev/null >"$nr_dir/out" 2>&1) &
+  nr_pid=$!
+  nr_i=0
+  while [ $nr_i -lt 120 ] && ! grep -q 'started on port' "$nr_dir/out" 2>/dev/null; do
+    sleep 0.5; nr_i=$((nr_i + 1))
+  done
+}
+nr_stop() { kill "$nr_pid" 2>/dev/null; wait "$nr_pid" 2>/dev/null; }
+nr_start 0 --no-port-file
+if grep -q 'started on port' "$nr_dir/out" && [ ! -e "$nr_dir/.nrepl-port" ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: nrepl-server --no-port-file should start and write no .nrepl-port: $(head -2 "$nr_dir/out")"
+  fails=$((fails + 1))
+fi
+nr_stop
+nr_start --port-file sub/p.txt 0
+nr_port="$(sed -n 's/.*started on port \([0-9]*\).*/\1/p' "$nr_dir/out")"
+if [ -n "$nr_port" ] && [ "$nr_port" != 0 ] && [ "$(cat "$nr_dir/sub/p.txt" 2>/dev/null)" = "$nr_port" ] \
+   && [ ! -e "$nr_dir/.nrepl-port" ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: nrepl-server --port-file sub/p.txt 0 should write the bound port there: $(head -2 "$nr_dir/out")"
+  fails=$((fails + 1))
+fi
+nr_stop
+if [ ! -e "$nr_dir/sub/p.txt" ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: nrepl-server should delete its --port-file on the way out"
+  fails=$((fails + 1))
+fi
+if (cd "$nr_dir" && JOLT_PWD="$nr_dir" $jolt_timeout "$nr_jolt" nrepl-server --port-file </dev/null 2>&1) | grep -q -- '--port-file needs a path'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: nrepl-server --port-file with no PATH should say so"
+  fails=$((fails + 1))
+fi
+rm -rf "$nr_dir"
 # version / --version are synonyms and name the version.
 if $jolt version 2>/dev/null | grep -q '^jolt ' \
    && [ "$($jolt version 2>/dev/null)" = "$($jolt --version 2>/dev/null)" ]; then
@@ -1295,6 +1341,81 @@ else
   fails=$((fails + 1))
 fi
 rm -rf "$bbshadow"
+
+# jolt.profile — execution counts from the compile-profile counters, mapped back
+# to the fixture's lines and fns. The file self-checks and prints one marker.
+profile_out="$($jolt run test/chez/profile-test.clj 2>/dev/null)"
+if printf '%s' "$profile_out" | grep -q 'PROFILE-TEST OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: jolt.profile"
+  printf '%s\n' "$profile_out" | grep FAIL | head -5 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
+# JOLT_PROFILE instruments the whole run and prints the report on stderr at exit:
+# fib(10) is 177 calls, so the fixture's fn row carries that count. The fixture
+# is required, and a first run without the profiler leaves its fasl in the AOT
+# cache (synchronously, so it is there): the profiled run has to compile it
+# again with counters instead of loading that.
+profile_cache="$(mktemp -d)"
+profile_roots='{:paths ["test/chez/fixtures"]}'
+JOLT_CACHE_DIR="$profile_cache" JOLT_AOT_ASYNC=0 \
+  $jolt -Sdeps "$profile_roots" run test/chez/fixtures/profile_env_main.clj >/dev/null 2>&1
+profile_env_err="$(JOLT_CACHE_DIR="$profile_cache" JOLT_PROFILE=1 \
+  $jolt -Sdeps "$profile_roots" run test/chez/fixtures/profile_env_main.clj 2>&1 >/dev/null)"
+rm -rf "$profile_cache"
+if printf '%s' "$profile_env_err" | grep 'profile-fixture/fib' | grep -q '177'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: JOLT_PROFILE report at exit"
+  printf '%s\n' "$profile_env_err" | head -8 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
+# jolt.profile's sampler — the sample client of the tick scheduler. hot spins three
+# times as long as cold, and the gate compares their shares with each other.
+sample_out="$($jolt run test/chez/sample-test.clj 2>/dev/null)"
+if printf '%s' "$sample_out" | grep -q 'SAMPLE-TEST OK'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: jolt.profile sampling"
+  printf '%s\n' "$sample_out" | grep FAIL | head -5 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
+# JOLT_PROFILE=sample samples the whole run and prints the report on stderr at
+# exit. Nothing is recompiled, so the AOT cache is left alone.
+sample_env_err="$(JOLT_PROFILE=sample $jolt -Sdeps '{:paths ["test/chez/fixtures"]}' \
+  run test/chez/fixtures/sample_env_main.clj 2>&1 >/dev/null)"
+if printf '%s' "$sample_env_err" | grep -q 'sample-fixture/spin'; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: JOLT_PROFILE=sample report at exit"
+  printf '%s\n' "$sample_env_err" | head -8 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
+# Code from -e has no file to find its defs by; its fns are named from the
+# def forms themselves.
+profile_e_err="$(JOLT_PROFILE=1 $jolt -e '(defn f [n] (if (< n 2) n (+ (f (- n 1)) (f (- n 2))))) (f 10)' 2>&1 >/dev/null)"
+if printf '%s' "$profile_e_err" | grep -q 'user/f  '; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: JOLT_PROFILE names fns from -e"
+  printf '%s\n' "$profile_e_err" | head -8 | sed 's/^/    /'
+  fails=$((fails + 1))
+fi
+
+# Instrumenting turns trace frames on, which its counters resolve against;
+# turning it off puts JOLT_TRACE=0's setting back.
+profile_tf="$(JOLT_TRACE=0 $jolt -e "(require 'jolt.profile) (jolt.profile/instrument!) (jolt.profile/instrument! false) (prn (#'jolt.backend-scheme/trace-frames?))" 2>&1)"
+if [ "$profile_tf" = "false" ]; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: instrument! false restores trace frames (got $profile_tf)"
+  fails=$((fails + 1))
+fi
 
 # jolt.fs — the stdlib file-system API against a scratch temp dir (glob, copy-tree,
 # move, mtime round-trip, which). The file self-checks and prints one marker.
@@ -1995,6 +2116,15 @@ if ( cd "$bare/app" && "$abs_jolt" build -m app.core -o app >/dev/null 2>&1 )   
   pass=$((pass + 1))
 else
   echo "  FAIL: bare-directory standalone build (embedded runtime sources)"
+  fails=$((fails + 1))
+fi
+# JOLT_PROFILE=sample in a built binary: the launcher starts the sampler, and the
+# report prints at exit without jolt.profile, which this app does not require.
+if [ -x "$bare/app/app" ] \
+   && JOLT_PROFILE=sample "$bare/app/app" 2>&1 >/dev/null | grep -q '^jolt.profile: '; then
+  pass=$((pass + 1))
+else
+  echo "  FAIL: JOLT_PROFILE=sample in a built binary"
   fails=$((fails + 1))
 fi
 rm -rf "$bare"

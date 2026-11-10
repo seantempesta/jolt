@@ -873,8 +873,10 @@
 ;;     the OS, with the same back-off as below;
 ;;   - under pressure -- the total plus the data in use, roughly what the next
 ;;     collection may copy, over the limit -- collections mark the older
-;;     generations in place instead of copying them (sa-gc-tight!), and go back
-;;     to copying once that is under three quarters of the limit.
+;;     generations in place instead of copying them (sa-gc-tight!), and a young
+;;     collection whose copies would not fit under the limit leaves generation 1
+;;     for the full one; both go back to copying once that is under three
+;;     quarters of the limit.
 ;; The out-of-memory error is unchanged: only live data that cannot fit raises.
 ;;
 ;; Above SOFT after a collection, force the FULL one a generational collector
@@ -935,7 +937,7 @@
   (gc-fit-reserve! hard)
   (let ((pressure (+ (sa-total-memory-bytes) (sa-bytes-allocated))))
     (cond ((and (not gc-tight?) (> pressure hard))
-           (set! gc-tight? #t) (sa-gc-tight! #t))
+           (set! gc-tight? #t) (sa-gc-tight! hard))
           ((and gc-tight? (< pressure (quotient (* 3 hard) 4)))
            (set! gc-tight? #f) (sa-gc-tight! #f)))))
 ;; --- a policy's error is raised after the collection ----------------------------
@@ -1653,6 +1655,9 @@
 ;; slot 11: java/async.ss jolt-vreg-chan-wait — (box . cell): the cell a thread
 ;;   blocked in <!! / >!! / alts!! points at the channel it waits on, so the one
 ;;   interrupt wake registered for its box can find it
+;; slot 13: ticks.ss jolt-vreg-ticks
+;; slot 14: printing.ss jolt-vreg-deref-printing — the cycle check's state for
+;;   the IDeref values this thread is printing
 ;; Effective *print-readably* for the readable renderer's string/char cases. The
 ;; print family stashes its override in the slot above — a virtual-register write
 ;; is ~1ns vs a pmap alloc + fold + two thread-parameter writes per dynamic
@@ -2835,7 +2840,7 @@
 ;; jolt-invoke (seq.ss) / jolt= (values.ss) / jolt-vector (collections.ss).
 (load "host/chez/atoms.ss")
 
-;; refs: Clojure refs and serialized transactions (STM).  Loaded after atoms
+;; refs: Clojure refs and transactions (STM).  Loaded after atoms
 ;; (shares the IRef seam and jolt-deref); must load before loader.ss (wires
 ;; *loaded-libs*) and before concurrency.ss (which chains jolt-deref further).
 (load "host/chez/refs.ss")
@@ -2993,21 +2998,32 @@
 ;; Content is the value's str rendering, taken STRAIGHT from the str registry
 ;; rather than through jolt-str-render-one, whose own fallback is this function —
 ;; going through it would recurse. Types with no str arm print bare, like the
-;; JVM's default Object.toString. readable? quotes the content, which is the
-;; (pr x) vs (print x) difference on the JVM. The identity hash is omitted, as
-;; jolt omits it in the print arms it already has.
+;; JVM's default Object.toString. readable? quotes the content unless
+;; *print-readably* is off, which is the (pr x) vs (print x) difference on the JVM. The class is
+;; followed by the identity hash where jolt-object-repr-hash? (below) says so.
 (define (jolt-object-content x)
-  (let loop ((rs str-render-registry))
-    (cond ((null? rs) #f)
-          (((caar rs) x) ((cdar rs) x))
-          (else (loop (cdr rs))))))
+  (or (str-render-by-identity x)
+      (let loop ((rs str-render-registry))
+        (cond ((null? rs) #f)
+              (((caar rs) x) ((cdar rs) x))
+              (else (loop (cdr rs)))))))
+;; Which values print their identity hash, as the JVM's #object form does:
+;; a host shim object and, once the enum model has said so, an enum constant.
+;; Naming one costs an insert into the identity-hash table, which a record
+;; printed in bulk (a java.io.File) would pay per object; those print without it.
+(define jolt-object-repr-hash? (lambda (x) (jhost? x)))
 (define (jolt-object-repr x readable?)
-  (let ((cls (guard (e (#t #f)) (jolt-class-name x)))
-        (content (guard (e (#t #f)) (jolt-object-content x))))
-    (cond ((not (string? cls)) (format "~a" x))
-          ((not (string? content)) (string-append "#object[" cls "]"))
-          (readable? (string-append "#object[" cls " \"" (jolt-str-escape content) "\"]"))
-          (else (string-append "#object[" cls " " content "]")))))
+  (let* ((cls (guard (e (#t #f)) (jolt-class-name x)))
+         (content (guard (e (#t #f)) (jolt-object-content x)))
+         (head (and (string? cls)
+                    (if (jolt-object-repr-hash? x)
+                        (string-append "#object[" cls " 0x" (jolt-identity-hex x))
+                        (string-append "#object[" cls)))))
+    (cond ((not head) (format "~a" x))
+          ((not (string? content)) (string-append head "]"))
+          ((and readable? (jolt-pr-readable?))
+           (string-append head " \"" (jolt-str-escape content) "\"]"))
+          (else (string-append head " " content "]")))))
 
 (define (jolt-pr-str-base/readable x readable?)
   (cond
@@ -3311,12 +3327,15 @@
 ;; ascii-string-down, re-split, str-split-drop-trailing) + the regex-t accessors.
 (load "host/chez/java/java-parse.ss")           ; Long/parseLong & co: the NumberFormatException family (shared)
 (load "host/chez/java/host-static.ss")          ; registries + jhost + the emit entry points
+(load "host/chez/java/enums.ss")                ; the enum model every enum shim declares through
 (load "host/chez/java/string-builder.ss")       ; StringBuilder/StringBuffer over jhost (shared)
 (load "host/chez/java/text-normalize.ss")       ; java.text.Normalizer's quick-check fast paths
 (load "host/chez/java/host-static-methods.ss")  ; Class/member static methods + fields
 (load "host/chez/java/class-model.ss")          ; java.lang.Class values + the class model core reads (shared)
 (load "host/chez/java/jutil-colls.ss")         ; java.util Map/Set/List shims to =, hash, pr, str (shared)
 (load "host/chez/java/tree-map.ss")            ; TreeMap / TreeSet + Comparator objects (shared)
+(load "host/chez/java/enum-colls.ss")           ; EnumSet / EnumMap over the enum model
+(load "host/chez/java/linked-hash.ss")          ; LinkedHashMap / LinkedHashSet
 (load "host/chez/java/host-static-classes.ss")  ; instantiable host object classes
 ;; clojure.math and the IEEE 754 bit patterns (dbl->bits, flt->bits, ...).
 ;; Self-contained; ahead of byte-buffer.ss, which encodes floats with them.
@@ -3494,6 +3513,10 @@
 ;; uncaught-throwable renderer. After the printers/equality it relies on.
 (load "host/chez/source-registry.ss")
 
+;; The sampling profiler (jolt.profile/sample!): the sample client of the tick
+;; scheduler (ticks.ss). After source-registry.ss, which resolves its frames.
+(load "host/chez/sampler.ss")
+
 ;; Unique anon-fn names -> {source form, ns, free locals} for the image write
 ;; side. Plain defines (no def-var! / manifest lines): only emitted code and the
 ;; image writer call them, never Clojure.
@@ -3502,6 +3525,7 @@
 ;; State images: dump the value graph to a file and read it back. Loads LAST —
 ;; walks jolt collections, var cells and atoms, prints paths through the printers,
 ;; and reads proc-name-tbl to write a fn as its var's name.
+(load "host/chez/java/image-codecs.ss")         ; how the host's values travel in an image
 (load "host/chez/state-image.ss")
 
 ;; The stall watch (see "a stalled collection says so" above): after every

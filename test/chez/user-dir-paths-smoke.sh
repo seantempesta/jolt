@@ -97,6 +97,20 @@ check "nREPL stop removes the caller's .nrepl-port" \
   "$(run '(do (require (quote jolt.nrepl)) (let [stop (binding [*out* (java.io.StringWriter.)] ((resolve (quote jolt.nrepl/start)) 0)) written (.exists (java.io.File. ".nrepl-port"))] (stop) (prn [written (.exists (java.io.File. ".nrepl-port"))])))')" \
   "[true false]"
 
+# jolt's own install roots ("stdlib", "jolt-core") stay relative to the
+# checkout, where the resource was found; its URL used to be absolutized
+# against the caller's directory instead, naming a file that isn't there.
+# Source mode by name: once `make devboot` has written target/dev/flat.so,
+# bin/jolt loads that image, whose resources are embedded rather than files,
+# so these checks failed or passed depending on whether devboot ran first.
+runsrc() { JOLT_NO_DEVCACHE=1 run "$1"; }
+check "io/resource of a stdlib file names a file that exists" \
+  "$(runsrc '(do (require (quote [clojure.java.io :as io])) (let [u (io/resource "clojure/string.clj")] (prn [(.exists (io/file u)) (pos? (count (slurp u)))])))')" \
+  "[true true]"
+check "io/resource of a compiler file names a file that exists" \
+  "$(runsrc '(do (require (quote [clojure.java.io :as io])) (prn (.exists (io/file (io/resource "jolt/analyzer.clj")))))')" \
+  "true"
+
 # Nothing landed in the checkout.
 leaked=""
 for f in a.txt b.txt c.txt zz sub link here.clj .nrepl-port; do

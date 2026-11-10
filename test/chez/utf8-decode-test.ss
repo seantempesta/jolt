@@ -190,6 +190,14 @@
 (ok "utf-16be still decodes"
     (equal? (cps (decode-bytevector (bv 0 97 0 98) '("UTF-16BE"))) '(97 98)))
 
+;; (String. bytes offset length cs) over a bare bytevector, which host code
+;; hands the constructor (a jolt byte array is the other arm, in the corpus):
+;; the slice alone is decoded, and a span outside the bytes is refused.
+(ok "a bytevector slice decodes only its bytes"
+    (equal? (cps (host-new "String" (bv 104 195 169 108 108 111) 1 3 "UTF-8")) '(233 108)))
+(ok "a bytevector slice past the end is refused"
+    (guard (e (#t #t)) (host-new "String" (bv 104 195 169) 2 5 "UTF-8") #f))
+
 ;; --- the streaming decoder ---------------------------------------------------
 ;; io-streams.ss open-java-utf8-input-port is what every Reader decodes through.
 ;; It sees the same bytes in pieces, and the pieces fall wherever the source and

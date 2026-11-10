@@ -280,7 +280,7 @@
            (.redirectInput (java.io.File. "/dev/null"))
            (.redirectOutput (java.io.File. "/dev/null")))]
   (check-eq "a File setter reads back as a Redirect"
-            [(.type (.redirectInput pb)) (.type (.redirectOutput pb))] ["read" "write"]))
+            (mapv #(.name (.type %)) [(.redirectInput pb) (.redirectOutput pb)]) ["READ" "WRITE"]))
 ;; anything that is neither says so, instead of being stored and ignored
 (check-eq "a non-file, non-Redirect argument is named"
           (try (.redirectInput (java.lang.ProcessBuilder. ["true"]) 42) :no-throw

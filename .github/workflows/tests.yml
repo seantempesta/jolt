@@ -6,114 +6,39 @@ on:
   push:
   pull_request:
 
+# A newer push to the same branch or PR makes the run in flight moot, so it is
+# cancelled rather than left to hold runners for half an hour. main keeps
+# every run: each commit there is one someone may bisect to. A PR's runs are
+# grouped by its number, not its branch name: head_ref is the bare branch name,
+# so two PRs from different forks that both use, say, fix/typo would share a
+# group and cancel each other. A push groups by its ref.
+concurrency:
+  group: tests-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
-  test:
+  # The gate (make test) as parallel shards. The runner has 4 cores and the
+  # gate is ~180 independent targets, so one job spent ~27 minutes working
+  # through them; `make ci-shard` deals the sorted gate list out SHARD of
+  # SHARDS, so the shards between them still run every gate exactly once, a
+  # new gate needs no edit here, and each shard's log holds only its own
+  # targets. fail-fast is off so one red shard doesn't hide another's result.
+  gate:
+    name: test (${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v5
         with:
           submodules: recursive   # vendor/irregex, used by the Chez regex shim
 
-      # Build Chez from source rather than the distro package: the apt
-      # chezscheme ships petite+scheme only, with no kernel dev files
-      # (libkernel.a, scheme.h), so `jolt build` (the buildsmoke gate) can't link
-      # a binary and would skip. The source build provides them, plus the libs the
-      # kernel links against.
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential git liblz4-dev zlib1g-dev libncurses-dev uuid-dev
+      - name: Set up Chez, Gambit and the certify oracle
+        uses: ./.github/actions/setup-chez
 
-      - name: Cache Chez Scheme
-        id: cache-chez
-        uses: actions/cache@v5
-        with:
-          path: /opt/chez
-          key: chez-${{ runner.os }}-${{ env.ImageOS }}-v10.4.1-x11off-pic-${{ hashFiles('host/chez/chez-patches/*.patch') }}
-
-      - name: Build Chez Scheme from source
-        if: steps.cache-chez.outputs.cache-hit != 'true'
-        run: |
-          git clone --depth 1 --branch v10.4.1 https://github.com/cisco/ChezScheme.git /tmp/chez-src
-          sh "$GITHUB_WORKSPACE/ci/apply-chez-patches.sh" /tmp/chez-src
-          cd /tmp/chez-src
-          # --disable-x11: the expression editor's X11 clipboard isn't needed and
-          # would pull an X11 build/link dep.
-          #
-          # CFLAGS+=-fPIC: `jolt build --library` links Chez's libkernel.a into a
-          # shared object, which a kernel built without -fPIC cannot do — the
-          # -shared link fails with a relocation error. build-lib-smoke.sh treats
-          # that as an environment limitation and SKIPS, so without this flag the
-          # buildlibsmoke gate passes without testing anything.
-          ./configure --installprefix=/opt/chez --threads --disable-x11 CFLAGS+=-fPIC
-          make -j"$(nproc)"
-          sudo make install
-          sudo chown -R "$USER" /opt/chez
-
-      - name: Put chez on PATH
-        run: |
-          # Installed as `scheme`; the gate invokes `chez`. A wrapper that execs
-          # scheme keeps argv0 so Chez finds its boot files. Placed next to scheme
-          # so build.ss derives the csv dir (libkernel.a/scheme.h) from it.
-          printf '#!/bin/sh\nexec /opt/chez/bin/scheme "$@"\n' > /opt/chez/bin/chez
-          chmod +x /opt/chez/bin/chez
-          echo '/opt/chez/bin' >> "$GITHUB_PATH"
-          /opt/chez/bin/chez --version
-
-      # Gambit, for the host/gambit gates (gambitcheck/kernel/eval/boot/unbound/
-      # vars/profile). apt's gambc is 4.9.3; the gates run on 4.9.8, the brew
-      # pin, so build the tag from source and cache it like Chez. The git tag
-      # ships the generated C files, so no bootstrap compiler is involved.
-      # Flags are the brew formula's minus openssl, which nothing here uses:
-      # --enable-single-host is the one-C-file-per-module build, the runtime
-      # options make UTF-8 the default encoding on files, stdio and terminals.
-      - name: Cache Gambit
-        id: cache-gambit
-        uses: actions/cache@v5
-        with:
-          path: /opt/gambit
-          key: gambit-${{ runner.os }}-${{ env.ImageOS }}-v4.9.8-single-host-f8
-
-      - name: Build Gambit from source
-        if: steps.cache-gambit.outputs.cache-hit != 'true'
-        run: |
-          git clone --depth 1 --branch v4.9.8 https://github.com/gambit/gambit.git /tmp/gambit-src
-          cd /tmp/gambit-src
-          ./configure --prefix=/opt/gambit --enable-single-host --enable-default-runtime-options=f8,-8,t8
-          make -j"$(nproc)"
-          sudo make install
-          sudo chown -R "$USER" /opt/gambit
-
-      - name: Show Gambit version
-        # Not on PATH: `gsc` is Ghostscript's name too, and the Makefile only
-        # ever runs $(GAMBIT_PREFIX)/bin/gsi and gsc.
-        run: /opt/gambit/bin/gsi -v
-
-      - name: Install JDK + Clojure (certify oracle)
-        run: |
-          # openjdk-21 by name, not default-jdk: the corpus is measured on JDK 21
-          # (test/conformance/profile.edn :oracle-jdk), and default-jdk follows
-          # the image, so it is 25 on ubuntu-26.04 and certify refuses the oracle.
-          sudo apt-get install -y openjdk-21-jdk-headless rlwrap
-          jdk=/usr/lib/jvm/java-21-openjdk-$(dpkg --print-architecture)
-          # --retry + --fail so a transient CDN error retries instead of handing
-          # bash an HTML error page (a 2min timeout page flaked a run)
-          curl --fail --retry 5 --retry-delay 10 --retry-all-errors -L -O \
-            https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
-          head -1 linux-install.sh | grep -q '^#!' || { echo "installer download corrupt"; cat linux-install.sh | head -5; exit 1; }
-          sudo bash linux-install.sh
-          # The runner image puts an older Temurin's java first on PATH, and the
-          # clojure launcher runs that (JAVA_HOME is only its fallback when no
-          # java is on PATH). JAVA_CMD is the launcher's first choice: point it
-          # at the JDK just installed (the corpus is measured on the JDK
-          # test/conformance/profile.edn pins as :oracle-jdk, and certify.clj
-          # refuses any other).
-          echo "JAVA_CMD=$jdk/bin/java" >> "$GITHUB_ENV"
-          echo "JAVA_HOME=$jdk" >> "$GITHUB_ENV"
-          clojure --version
-          JAVA_CMD=$jdk/bin/java clojure -M -e '(println "oracle JDK" (System/getProperty "java.runtime.version"))'
-
-      - name: Gate
+      - name: Gate (shard ${{ matrix.shard }}/4)
         # `make test` = the self-host byte-fixpoint (the rebuilt seed must equal
         # the checked-in seed byte-for-byte — holds cross-platform on the pinned
         # source-built Chez) + the behavior gates (`make ci`: corpus/unit/smoke/
@@ -136,7 +61,19 @@ jobs:
         # TMPDIR on the runner's disk: from ubuntu-26.04, /tmp is a tmpfs with a
         # size limit, and the build gates' mktemp dirs (shakelocal keeps two
         # binaries per app until it exits) ran it out with EDQUOT.
-        run: TMPDIR="$RUNNER_TEMP" make CHEZ=/opt/chez/bin/chez GAMBIT_PREFIX=/opt/gambit -j"$(nproc)" -Oline test
+        run: TMPDIR="$RUNNER_TEMP" make CHEZ=/opt/chez/bin/chez GAMBIT_PREFIX=/opt/gambit -j"$(nproc)" -Oline ci-shard SHARD-SET=test SHARD=${{ matrix.shard }} SHARDS=4
+
+  # The check that says the whole gate passed, under the name the single job
+  # had, so anything that waits on "test" (a required status check, a person)
+  # still waits on all of it.
+  test:
+    name: test
+    needs: gate
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: test "${{ needs.gate.result }}" = success
 
   # The gate on bionic (Android/Termux, #943): jolt and its pinned Chez build in
   # termux/termux-docker on an arm64 runner, the release smokes run there
@@ -146,10 +83,21 @@ jobs:
   # /tmp and many gates' fixtures write there by name, so the entrypoint makes one
   # as root before dropping to the Termux user: the gates are there to exercise
   # jolt, and jolt itself uses $TMPDIR.
-  android:
-    name: Android (bionic)
+  #
+  # bionic-ci's gates run as shards, like the gate job's, three ways: each shard repeats the container
+  # setup and the jolt build (~2 minutes), so more shards stop paying. The
+  # bionic Chez the Makefile provisions (bionic-provision-chez.sh, ~2 minutes
+  # of the build) is cached between runs: termux-build.sh copies the
+  # workspace in, so a restored prefix is there for make to find, and copies a
+  # fresh one back out to target/bionic-chez for the save step.
+  android-gate:
+    name: Android (bionic ${{ matrix.shard }}/3)
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v5
         with:
@@ -173,13 +121,45 @@ jobs:
         with:
           path: ~/termux-image.tar
           key: termux-docker-aarch64-${{ steps.month.outputs.month }}
-      - name: Build and gate jolt in Termux
+      # Keyed on what decides the build: the makes pin (which names the Chez
+      # version), the provisioning script and jolt's kernel patches.
+      - name: Bionic Chez cache key
+        id: bionic-chez
+        run: echo "key=bionic-chez-$(sed -n 's/^V := //p' Makefile)-${{ hashFiles('host/chez/bionic-provision-chez.sh', 'host/chez/chez-patches/*.patch') }}" >> "$GITHUB_OUTPUT"
+      - name: Restore bionic Chez
+        id: bionic-chez-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: .cache/local
+          key: ${{ steps.bionic-chez.outputs.key }}
+      - name: Build and gate jolt in Termux (shard ${{ matrix.shard }}/3)
         run: |
           mkdir -p target/release
           chmod 777 target target/release
           docker run --rm --entrypoint /system/bin/sh -v "$PWD":/src \
             termux/termux-docker:aarch64 \
-            -c 'mkdir -p /tmp && chmod 1777 /tmp && exec /entrypoint.sh sh /src/ci/termux-build.sh bionic-ci'
+            -c 'mkdir -p /tmp && chmod 1777 /tmp && exec /entrypoint.sh sh /src/ci/termux-build.sh ci-shard SHARD-SET=ci SHARD=${{ matrix.shard }} SHARDS=3'
+      - name: Stage bionic Chez for the cache
+        if: steps.bionic-chez-cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf .cache/local
+          mkdir -p .cache
+          cp -R target/bionic-chez .cache/local
+      - name: Save bionic Chez
+        if: steps.bionic-chez-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: .cache/local
+          key: ${{ steps.bionic-chez.outputs.key }}
+
+  android:
+    name: Android (bionic)
+    needs: android-gate
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: test "${{ needs.android-gate.result }}" = success
 
   # No AI-assistant attribution in what a push or PR adds: tools/attributioncheck.sh
   # over the pushed range (push) or the PR's commits and its description (PR).

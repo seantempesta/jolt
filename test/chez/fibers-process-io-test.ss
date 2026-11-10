@@ -252,7 +252,11 @@
   ;; --- 3. jolt.host/gc-full! succeeds while the poller is blocked -----------
   (at! "3. gc-full! mid poller-blocked wait")
   (printf "\n== 3. jolt.host/gc-full! succeeds while the poller is blocked servicing a pipe registration ==\n")
-  (ev "(def p3 (jolt.process/process [\"sh\" \"-c\" \"sleep 0.3; printf z\"]))")
+  ;; The child writes when we tell it to, after the collection, not after a
+  ;; fixed delay: on a slow runner the waits and the collection below outlasted
+  ;; a 300 ms sleep, the data arrived first, and the fiber had already resumed
+  ;; when the row asked whether it was still parked.
+  (ev "(def p3 (jolt.process/process [\"sh\" \"-c\" \"read go; printf z\"]))")
   (ev "(def p3-out (:out p3))")
   (set! read-thunk-3
     (ev "(fn [] (let [b (byte-array 64) n (.read p3-out b 0 64)] (String. b 0 n \"UTF-8\")))"))
@@ -281,6 +285,7 @@
   (ok "3. jolt.host/gc-full! succeeded while the poller was blocked (a pipe registration mid-flight)"
       gc-ok)
   (ok "3. the parked fiber survived the collection" (eq? (jolt-fiber-state fc) 'parked))
+  (ev "(doto (:in p3) (.write (.getBytes \"go\\n\")) (.flush) (.close))")
   (set! fc-done
     (wait-until (lambda () (eq? (jolt-fiber-state fc) 'done)) 15.0 "3. the read resumed after gc-full!"))
   (ok "3. the fiber completed after gc-full! with the correct payload"

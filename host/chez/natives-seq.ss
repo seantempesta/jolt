@@ -102,8 +102,10 @@
          (xrf (jolt-invoke xform conj-rf))
          ;; into-fold, not reduce-seq: an IReduce(Init) source drives its own
          ;; reduce here too (seq.ss).
-         (res (into-fold xrf to from)))
-    (jolt-invoke xrf res)))
+         (res (jolt-invoke xrf (into-fold xrf to from))))
+    ;; jolt-conj1 carries no meta; the JVM's into keeps to's (with-meta on the
+    ;; transient path, conj's own carry otherwise), as jolt-into does
+    (if (jolt-nil? to) res (meta-carry-conj to res))))
 
 ;; mapcat: (mapcat f) -> transducer; (mapcat f coll & colls) -> map f across the
 ;; colls (stops at shortest), then concat the results.

@@ -14,12 +14,22 @@
 ;; The gate runs this from an empty directory. From the repo root the project's
 ;; deps.edn is read, which shifts the baseline heap enough that the first forced
 ;; collection comes at a kinder moment (269MB before the fix).
+;;
+;; An optional argument retains that many KB of small objects first, standing in
+;; for a larger boot live set. The gate runs several: which collection lands at
+;; the ceiling moves with the baseline, and a peak that holds for one baseline
+;; only is luck. 0.44MB more at boot took the peak from 279MB to 282MB, over the
+;; gate on macOS: under the ceiling the young collection still copied generation
+;; 1 on Chez's schedule (every fourth), 24MB beside a 251MB total
+;; (sa-collect-young!).
 (ns gc-ceiling-forced-test)
 
+(def pad-kb (if-let [a (first *command-line-args*)] (parse-long a) 0))
+(def pad (vec (map (fn [i] (str "pad-" i)) (range (* pad-kb 16)))))
 (def held (atom nil))
 (reset! held (vec (map (fn [i] {:i i :s (str "held-" i)}) (range 600000))))
 (jolt.host/reset-maximum-memory-bytes!)
 (loop [i 0 window []]
   (when (< i 40)
     (recur (inc i) (mapv (fn [j] {:i j :s (str j "-" i)}) (range 200000)))))
-(println "peak" (jolt.host/maximum-memory-bytes) "max" (.maxMemory (Runtime/getRuntime)))
+(println "peak" (jolt.host/maximum-memory-bytes) "max" (.maxMemory (Runtime/getRuntime)) (count pad))

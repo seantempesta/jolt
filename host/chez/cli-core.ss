@@ -388,6 +388,26 @@
      (jolt-cli-build-cmd? (cdr args)))
     (else #f)))
 
+;; JOLT_PROFILE (any value but an off one): instrument the whole run for
+;; jolt.profile and print its report on stderr as the process exits. Before the
+;; dispatch, so the app's namespaces are compiled with counters. jolt.profile
+;; itself is loaded first, uninstrumented, so its own code never shows up in the
+;; report. The internal worker modes are copies of this process the environment
+;; reaches too; they compile nothing of the user's and must not print a report.
+;; JOLT_PROFILE=sample runs the sampler instead (sampler.ss), which needs no
+;; compilation, so a built binary's launcher starts it the same way.
+(define (jolt-profile-init-from-env! cli-args)
+  (let ((e (getenv "JOLT_PROFILE")))
+    (when (and (string? e) (not (string=? e "")) (not (jolt-trace-env-off? e))
+               (not (and (pair? cli-args)
+                         (member (car cli-args) '("--aot-worker" "--build-worker")))))
+      (load-namespace "jolt.profile")
+      (if (string=? e "sample")
+          (jolt-sample-init-from-env!)
+          (let ((at-exit (var-deref "jolt.profile" "report-at-exit")))
+            (when (jolt-profile-instrument! #t)
+              (jolt-add-shutdown-hook (lambda () (jolt-invoke at-exit)))))))))
+
 (define (jolt-cli-run cli-args prepare-build!)
   ;; Every entry starts in user, as clojure.main's does. The image bakes jolt.main
   ;; and jolt.deps at heap build, and loading a namespace leaves it current, so
@@ -421,7 +441,9 @@
       (lambda (c)
         (when (serious-condition? c) (jolt-capture-fault! c))
         (raise-continuable c))
-      (lambda () (jolt-cli-dispatch cli-args prepare-build!)))
+      (lambda ()
+        (jolt-profile-init-from-env! cli-args)
+        (jolt-cli-dispatch cli-args prepare-build!)))
     ;; The JVM does not end while a non-daemon thread the program started is
     ;; still running; the shutdown hooks run after the last one finishes.
     (guard (_ (#t #f)) (jolt-await-user-threads!))

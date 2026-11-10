@@ -250,6 +250,8 @@
 ;; table stands in for a library value: it orders through the compare arm,
 ;; answers (class x) through the class arm, and dispatches a protocol extended
 ;; to a class its tags-fn reports.
+(check "[(jolt.host/profile-instrument! true) (jolt.host/profile-instrument! false) (jolt.host/profile-instrumenting?) (jolt.host/profile-sites) (count (jolt.host/profile-stats))]" "[false true false [] 7]")
+(check "[(jolt.host/sample-start! 1000000 8) (jolt.host/sampling?) (jolt.host/sample-stop!) (jolt.host/sample-read)]" "[false false nil [0 []]]")
 (check "(do (defn spt? [x] (= :spt (jolt.host/ref-get x :tag))) (defn spt [n] (doto (jolt.host/tagged-table :spt) (jolt.host/ref-put! :tag :spt) (jolt.host/ref-put! :n n))) :ok)" ":ok")
 (check "(clojure.core/__register-compare! (fn [a b] (or (spt? a) (spt? b))) (fn [a b] (compare (jolt.host/ref-get a :n) (jolt.host/ref-get b :n))))" "nil")
 (check "[(compare (spt 1) (spt 2)) (compare (spt 2) (spt 2)) (mapv #(jolt.host/ref-get % :n) (sort [(spt 3) (spt 1) (spt 2)]))]"

@@ -242,7 +242,7 @@
 ;; a worker manifest compiles its jobs
 (define wm (at "jobs.edn"))
 (let ((op (open-output-file wm 'replace)))
-  (write (vector u1-ss (at "w1.so") (at "w1.so.vfasl") "release" 'default) op)
+  (write (vector u1-ss (at "w1.so") (at "w1.so.vfasl") "release" 'default #f) op)
   (close-port op))
 (bld-compile-worker wm)
 (ok "a worker compiles and converts each job in its manifest"
@@ -257,7 +257,7 @@
   (lambda (mode src so) (write-text! so "half a fasl") (error 'gate "compile died part way")))
 (ok "a job whose compile dies part way raises"
     (guard (e (#t #t))
-      (bld-run-job! (vector u1-ss (at "w2.so") (at "w2.so.vfasl") "release" 'default))
+      (bld-run-job! (vector u1-ss (at "w2.so") (at "w2.so.vfasl") "release" 'default #f))
       #f))
 (set! bld-chez-compile-file real-compile)
 (ok "…and leaves no output for the parent to take as finished"

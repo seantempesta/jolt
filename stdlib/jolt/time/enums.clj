@@ -9,9 +9,27 @@
 (defn- statics! [names members]
   (doseq [n names] (__register-class-statics! n members)))
 
+;; The four enums are declared through jolt.host/register-enum!, which gives them
+;; values/valueOf, Class.isEnum, Enum/valueOf and the JVM's print form. A
+;; constant is ONE value, so every constructor below hands back the declared
+;; constant rather than building an equal one.
+(defn- enum! [fqn names consts]
+  (jolt.host/register-enum! fqn (mapv vector names consts)))
+
+;; A ChronoUnit's toString: its name in camel case (HALF_DAYS is HalfDays), as
+;; the JDK declares it.
+(defn- display-name [nm]
+  (apply str (map (fn [part]
+                    (str (subs part 0 1) (.toLowerCase (subs part 1))))
+                  (.split nm "_"))))
+
 ;; ---- Month ------------------------------------------------------------------
 
-(defn month [n] (impl/value :jolt.time/month {:value n}))
+(def ^:private months (mapv #(impl/value :jolt.time/month {:value %}) (range 1 13)))
+(defn month [n]
+  (or (get months (dec n))
+      (throw (jolt.host/throwable "java.time.DateTimeException"
+                                  (str "Invalid value for MonthOfYear: " n)))))
 (defn month-val [e] (impl/field e :value))
 (defn- month-name [e] (nth u/month-names (dec (month-val e))))
 ;; A month argument: the JDK overloads every `of` that takes a month number with
@@ -25,6 +43,7 @@
   {:eq   (fn [a b] (= (month-val a) (month-val b)))
    :hash (fn [e] (month-val e))
    :str  month-name
+   :enum? true
    :cmp  (fn [a b] (- (month-val a) (month-val b)))
    :classes #{"java.time.Month" "Month"
               "java.time.temporal.TemporalAccessor" "TemporalAccessor"
@@ -48,19 +67,16 @@
                                         (= (month-val e) (month-val o)))))
    "hashCode"  (fn [e] (month-val e))})
 
-(defn- month-valueOf [s]
-  (or (some (fn [i] (when (= (nth u/month-names i) s) (month (inc i)))) (range 12))
-      (throw (ex-info (str "No enum constant Month." s) {}))))
-
-(statics! ["Month" "java.time.Month"]
-  (merge {"of"      (fn [n] (month (u/->long n)))
-          "valueOf" month-valueOf
-          "values"  (fn [] (mapv month (range 1 13)))}
-         (zipmap u/month-names (map month (range 1 13)))))
+(enum! "java.time.Month" u/month-names months)
+(statics! ["Month" "java.time.Month"] {"of" (fn [n] (month (u/->long n)))})
 
 ;; ---- DayOfWeek --------------------------------------------------------------
 
-(defn dow [n] (impl/value :jolt.time/day-of-week {:value n}))
+(def ^:private days (mapv #(impl/value :jolt.time/day-of-week {:value %}) (range 1 8)))
+(defn dow [n]
+  (or (get days (dec n))
+      (throw (jolt.host/throwable "java.time.DateTimeException"
+                                  (str "Invalid value for DayOfWeek: " n)))))
 (defn dow-val [e] (impl/field e :value))
 (defn- dow-name [e] (nth u/day-names (dec (dow-val e))))
 
@@ -68,6 +84,7 @@
   {:eq   (fn [a b] (= (dow-val a) (dow-val b)))
    :hash (fn [e] (dow-val e))
    :str  dow-name
+   :enum? true
    :cmp  (fn [a b] (- (dow-val a) (dow-val b)))
    :classes #{"java.time.DayOfWeek" "DayOfWeek"
               "java.time.temporal.TemporalAccessor" "TemporalAccessor"
@@ -87,25 +104,24 @@
                                         (= (dow-val e) (dow-val o)))))
    "hashCode"  (fn [e] (dow-val e))})
 
-(defn- dow-valueOf [s]
-  (or (some (fn [i] (when (= (nth u/day-names i) s) (dow (inc i)))) (range 7))
-      (throw (ex-info (str "No enum constant DayOfWeek." s) {}))))
-
-(statics! ["DayOfWeek" "java.time.DayOfWeek"]
-  (merge {"of"      (fn [n] (dow (u/->long n)))
-          "valueOf" dow-valueOf
-          "values"  (fn [] (mapv dow (range 1 8)))}
-         (zipmap u/day-names (map dow (range 1 8)))))
+(enum! "java.time.DayOfWeek" u/day-names days)
+(statics! ["DayOfWeek" "java.time.DayOfWeek"] {"of" (fn [n] (dow (u/->long n)))})
 
 ;; ---- ChronoUnit -------------------------------------------------------------
 
-(defn chrono-unit [name] (impl/value :jolt.time/chrono-unit {:name name}))
+(def ^:private units
+  (into {} (map (fn [nm] [nm (impl/value :jolt.time/chrono-unit {:name nm})]) u/chrono-units)))
+(defn chrono-unit [name]
+  (or (get units name)
+      (throw (jolt.host/throwable "java.lang.IllegalArgumentException"
+                                  (str "No enum constant java.time.temporal.ChronoUnit." name)))))
 (defn cu-name [u] (impl/field u :name))
 
 (impl/register-type! :jolt.time/chrono-unit
   {:eq   (fn [a b] (= (cu-name a) (cu-name b)))
    :hash (fn [u] (hash (cu-name u)))
-   :str  cu-name
+   :str  (fn [u] (display-name (cu-name u)))
+   :enum? true
    :cmp  (fn [a b] (- (u/chrono-unit-index (cu-name a))
                       (u/chrono-unit-index (cu-name b))))
    :classes #{"java.time.temporal.ChronoUnit" "ChronoUnit"
@@ -117,7 +133,7 @@
 
 (__register-class-methods! :jolt.time/chrono-unit
   {"name"       cu-name
-   "toString"   cu-name
+   "toString"   (fn [u] (display-name (cu-name u)))
    "ordinal"    (fn [u] (u/chrono-unit-index (cu-name u)))
    "compareTo"  compare
    "isTimeBased" (fn [u] (contains? time-based-units (cu-name u)))
@@ -128,20 +144,26 @@
                                          (= (cu-name u) (cu-name o)))))
    "hashCode"   (fn [u] (hash (cu-name u)))})
 
-(statics! ["ChronoUnit" "java.time.temporal.ChronoUnit"]
-  (merge {"valueOf" (fn [s] (chrono-unit s))
-          "values"  (fn [] (mapv chrono-unit u/chrono-units))}
-         (zipmap u/chrono-units (map chrono-unit u/chrono-units))))
+(enum! "java.time.temporal.ChronoUnit" u/chrono-units (map units u/chrono-units))
 
 ;; ---- ChronoField ------------------------------------------------------------
 
-(defn chrono-field [name] (impl/value :jolt.time/chrono-field {:name name}))
+(def ^:private fields
+  (into {} (map (fn [nm] [nm (impl/value :jolt.time/chrono-field {:name nm})]) u/chrono-fields)))
+(defn chrono-field [name]
+  (or (get fields name)
+      (throw (jolt.host/throwable "java.lang.IllegalArgumentException"
+                                  (str "No enum constant java.time.temporal.ChronoField." name)))))
 (defn cf-name [f] (impl/field f :name))
 
 (impl/register-type! :jolt.time/chrono-field
   {:eq   (fn [a b] (= (cf-name a) (cf-name b)))
    :hash (fn [f] (hash (cf-name f)))
+   ;; the JDK's toString is the camel-case name (AmPmOfDay); jolt-lang/time's
+   ;; DateTimeFormatterBuilder reads a field's name through str, so it stays the
+   ;; constant name until that reads .name
    :str  cf-name
+   :enum? true
    :cmp  (fn [a b] (- (u/chrono-field-index (cf-name a))
                       (u/chrono-field-index (cf-name b))))
    :classes #{"java.time.temporal.ChronoField" "ChronoField"
@@ -161,10 +183,7 @@
                                         (= (cf-name f) (cf-name o)))))
    "hashCode"  (fn [f] (hash (cf-name f)))})
 
-(statics! ["ChronoField" "java.time.temporal.ChronoField"]
-  (merge {"valueOf" (fn [s] (chrono-field s))
-          "values"  (fn [] (mapv chrono-field u/chrono-fields))}
-         (zipmap u/chrono-fields (map chrono-field u/chrono-fields))))
+(enum! "java.time.temporal.ChronoField" u/chrono-fields (map fields u/chrono-fields))
 
 ;; ---- ValueRange -------------------------------------------------------------
 

@@ -506,14 +506,17 @@
 ;; family. A map is not a Collection (it has no stream method on the JVM), and a
 ;; string is not either. Lazy: a seq source is streamed without realizing it.
 (define (stream-source? x)
-  (or (pvec? x) (pset? x) (jolt-seq? x) (jolt-lazyseq? x) (al-family? x) (hs-hashset? x)))
+  (or (pvec? x) (pset? x) (jolt-seq? x) (jolt-lazyseq? x) (al-family? x) (hs-hashset? x)
+      (jutil-collection? x)))
+;; any other java.util shim that is a Collection (not a Map)
+(define (jutil-collection? x) (and (memq (jutil-coll-kind x) '(set ralist list coll entries)) #t))
 (define arm-priority-stream 29)
 (register-method-arm! arm-priority-stream
   (lambda (obj name rest)
     (if (and (or (string=? name "stream") (string=? name "parallelStream"))
              (stream-source? obj))
         (if (null? (method-rest-args->list rest))
-            (make-stream 'ref (if (or (al-family? obj) (hs-hashset? obj))
+            (make-stream 'ref (if (or (al-family? obj) (hs-hashset? obj) (jutil-collection? obj))
                                   ;; a mutable source is snapshotted, as the JDK's
                                   ;; late-binding spliterator is by the time it runs
                                   (list->cseq (seq->list (jolt-seq obj)))

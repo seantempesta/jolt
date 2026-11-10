@@ -260,18 +260,21 @@
 (define (jolt-math-decrement-exact a) (jolt-math-long-exact (- (exact-long a) 1)))
 (define (jolt-math-negate-exact a) (jolt-math-long-exact (- (exact-long a))))
 
-;; clojure.math fns always return a DOUBLE; Chez's sqrt/expt/sin/floor/... return
-;; EXACT for exact args ((sqrt 9) -> 3, (sin 0) -> 0), so coerce.
-(define (m1 f) (lambda (x) (exact->inexact (f (jolt-need-num x)))))
-(define (m2 f) (lambda (a b) (exact->inexact (f (jolt-need-num a) (jolt-need-num b)))))
+;; clojure.math fns take ^double parameters, so an argument is a DOUBLE before the
+;; op sees it. Coercing only the result was wrong at the poles: Chez raises on
+;; exact (atan 0 0), (log 0) and (expt 0 -1) where the doubles answer 0.0, ##-Inf
+;; and ##Inf. The result coerce stays for the fns that keep a flonum exact-free.
+(define (->dbl x) (exact->inexact (jolt-need-num x)))
+(define (m1 f) (lambda (x) (exact->inexact (f (->dbl x)))))
+(define (m2 f) (lambda (a b) (exact->inexact (f (->dbl a) (->dbl b)))))
 ;; a real result stays a flonum; a complex result becomes +nan.0. Chez extends
 ;; several real-domain ops (sqrt/expt/log/asin/acos, and log's kin log10/log1p)
 ;; onto the complex plane for out-of-domain real inputs, but Java/clojure.math
 ;; returns NaN there. real? is #t for a flonum and #f for a Chez complex, so this
 ;; guards exactly the complex leak; NaN/Inf are real and pass through unchanged.
 (define (real-or-nan x) (if (and (number? x) (real? x)) (exact->inexact x) +nan.0))
-(define (m1c f) (lambda (x) (real-or-nan (f (jolt-need-num x)))))
-(define (m2c f) (lambda (a b) (real-or-nan (f (jolt-need-num a) (jolt-need-num b)))))
+(define (m1c f) (lambda (x) (real-or-nan (f (->dbl x)))))
+(define (m2c f) (lambda (a b) (real-or-nan (f (->dbl a) (->dbl b)))))
 ;; the clojure.math fns implemented above take their numbers as given; these
 ;; take any jolt number first, as the m1/m2 wrappers do (a Float is the double
 ;; it widens to, which is what clojure.math's ^double parameters receive)
@@ -331,18 +334,23 @@
 ;; java.lang.Math: sqrt/pow/floor/ceil/trig/log/exp always return a DOUBLE on the
 ;; JVM (Chez's sqrt/expt return EXACT for exact args, e.g. (sqrt 9) -> 3), so coerce
 ;; to flonum. round -> long (exact); abs/max/min preserve the argument's type.
-(define (->dbl x) (exact->inexact (jolt-need-num x)))
 ;; Every Math method takes numbers (PI/E are values, not methods), and each one
 ;; hands its argument to a host numeric primitive. Check at the boundary: the
 ;; condition Chez raises for a wrong-typed operand carries no class, so it would
 ;; escape as #object[:object] with no catch clause able to select it. The hot path
 ;; does not come through here — a Math call over proven flonums lowers to a native
 ;; Chez flonum op (jolt.passes.numeric).
+;; Every method but the long ones takes doubles, so its arguments become doubles
+;; here, as clojure.math's do above (exact (Math/atan2 0 0) raised in Chez).
+(define math-long-methods
+  '("floorDiv" "floorMod" "addExact" "subtractExact" "multiplyExact"
+    "incrementExact" "decrementExact" "negateExact"))
 (define (math-checked entry)
   (let ((f (cdr entry)))
     (if (procedure? f)
-        (cons (car entry)
-              (host-arity-like f (lambda args (apply f (map jolt-need-num args)))))
+        (let ((coerce (if (member (car entry) math-long-methods) jolt-need-num ->dbl)))
+          (cons (car entry)
+                (host-arity-like f (lambda args (apply f (map coerce args))))))
         entry)))
 ;; --- java.lang.Math's float overloads ------------------------------------------
 ;; A Float argument picks Math's float overload where there is one, so the answer

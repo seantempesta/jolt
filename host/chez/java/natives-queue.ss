@@ -62,8 +62,10 @@
 (register-empty-arm! jolt-queue? (lambda (x) (fx=? 0 (jolt-queue-cnt x))))
 (define %q-peek jolt-peek)
 (set! jolt-peek (lambda (x) (if (jolt-queue? x) (queue-peek x) (%q-peek x))))
+;; pop threads the receiver's meta, as the JVM's PersistentQueue.pop does
+;; (popping an empty queue answers the queue itself, meta and all)
 (define %q-pop jolt-pop)
-(set! jolt-pop (lambda (x) (if (jolt-queue? x) (queue-pop x) (%q-pop x))))
+(set! jolt-pop (lambda (x) (if (jolt-queue? x) (meta-carry x (queue-pop x)) (%q-pop x))))
 (register-conj-arm! jolt-queue? queue-conj)
 ;; sequential => seq=?/seq-hash handle queue equality + hashing. The hash is
 ;; cached in the queue (PersistentQueue._hasheq): a queue is immutable, and
@@ -94,6 +96,26 @@
                        '("PersistentQueue" "IPersistentCollection" "Sequential" "Collection" "Object"))
                #t))
         'pass)))
+
+;; A queue is an IObj: its meta lives in the identity side table (natives-meta.ss),
+;; like a sorted collection's, so with-meta answers a fresh-identity copy (the
+;; fields are immutable pvecs; the hash cache restarts empty). conj carries it
+;; through meta-carry-conj's side-table arm, pop above, empty below.
+(define %q-with-meta jolt-with-meta)
+(set! jolt-with-meta
+  (lambda (x m)
+    (if (jolt-queue? x)
+        (if (eq? (jolt-meta x) m)
+            x
+            (let ((c (make-jolt-queue (jolt-queue-front x) (jolt-queue-fi x)
+                                      (jolt-queue-rear x) (jolt-queue-cnt x))))
+              (unless (jolt-nil? m) (meta-table-set! c m))
+              c))
+        (%q-with-meta x m))))
+(def-var! "clojure.core" "with-meta" jolt-with-meta)
+(register-dot-coll-kind! jolt-queue? 'queue)
+;; with-meta, not meta-carry: carry would key the meta onto the shared EMPTY
+(register-empty-coll-arm! jolt-queue? (lambda (q) (jolt-with-meta jolt-queue-empty (jolt-meta q))))
 
 ;; clojure.lang.PersistentQueue/EMPTY + a queue? predicate.
 (register-class-statics! "PersistentQueue" (list (cons "EMPTY" jolt-queue-empty)))

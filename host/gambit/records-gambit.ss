@@ -1512,7 +1512,14 @@
       ((jrec-cl coll "pop") => (lambda (m) (jolt-invoke m coll)))
       (else (%r-jolt-pop coll)))))
 
-(register-pr-arm! jrec? jrec-pr)
+(define jrec-enum-constant? (lambda (x) #f))
+
+(define (set-jrec-enum-constant-test! f)
+  (set! jrec-enum-constant? f))
+
+(register-pr-arm!
+  (lambda (x) (and (jrec? x) (not (jrec-enum-constant? x))))
+  jrec-pr)
 
 (register-map-pred-arm! jrec-maplike?)
 
@@ -2546,6 +2553,17 @@
       (empty-list-t? obj)
       (jolt-lazyseq? obj)))
 
+(define (rd-ireduce-seq? obj)
+  (and (cseq? obj)
+       (or (cseqv? obj)
+           (let ((k (cseq-kind obj)))
+             (or (fx=? k sk-iterate)
+                 (fx=? k sk-cycle)
+                 (fx=? k sk-repeat)
+                 (fx=? k sk-long-range)
+                 (fx=? k sk-range)
+                 (fx=? k sk-list))))))
+
 (define (rd-java-set? obj)
   (or (pset? obj) (htable-sorted-set? obj)))
 
@@ -3067,43 +3085,6 @@
                 (string=? method-name "sort"))
             jolt-nil)
            (else (throw-jvm 'UnsupportedOperationException "")))))
-      ((and (string=? method-name "forEach")
-            (pair? rest)
-            (null? (cdr rest))
-            (rd-java-list? obj))
-       (car (dot-coll-method obj method-name rest)))
-      ((and (string=? method-name "reduce")
-            (pair? rest)
-            (fx<=? (length rest) 2)
-            (or (empty-list-t? obj)
-                (and (cseq? obj)
-                     (let ((k (cseq-kind obj)))
-                       (or (fx=? k sk-iterate)
-                           (fx=? k sk-cycle)
-                           (fx=? k sk-repeat)
-                           (fx=? k sk-long-range)
-                           (fx=? k sk-range)
-                           (fx=? k sk-list))))))
-       (if (null? (cdr rest))
-           (jolt-reduce (car rest) obj)
-           (jolt-reduce (car rest) (cadr rest) obj)))
-      ((or (string=? method-name "indexOf")
-           (string=? method-name "lastIndexOf"))
-       (let ((target (car rest))
-             (last? (string=? method-name "lastIndexOf")))
-         (let loop ((s (jolt-seq obj)) (i 0) (found -1))
-           (cond
-             ((jolt-nil? s) found)
-             ((jolt=2 (seq-first s) target)
-              (if last? (loop (jolt-seq (seq-more s)) (fx+ i 1) i) i))
-             (else (loop (jolt-seq (seq-more s)) (fx+ i 1) found))))))
-      ((string=? method-name "contains")
-       (let ((target (car rest)))
-         (let loop ((s (jolt-seq obj)))
-           (cond
-             ((jolt-nil? s) #f)
-             ((jolt=2 (seq-first s) target) #t)
-             (else (loop (jolt-seq (seq-more s))))))))
       ((string=? method-name "toString")
        (jolt-str-render-one obj))
       ((string=? method-name "hashCode")
@@ -3135,9 +3116,15 @@
 (define (set-iface-default-hook! f)
   (set! iface-default-hook f))
 
+(define enum-method-hook #f)
+
+(define (set-enum-method-hook! f) (set! enum-method-hook f))
+
 (define (dispatch-miss obj method-name args)
-  (let ((d (and iface-default-hook
-                (iface-default-hook obj method-name (length args)))))
+  (let ((d (or (and enum-method-hook
+                    (enum-method-hook obj method-name (length args)))
+               (and iface-default-hook
+                    (iface-default-hook obj method-name (length args))))))
     (if d
         (apply d obj args)
         (let ((f (and class-ext-fallback-hook
@@ -3226,26 +3213,99 @@
   (and (not (procedure? x))
        (jolt-truthy? (instance-check cname x))))
 
+(define dot-coll-kind-arms '())
+
+(define (register-dot-coll-kind! pred kind)
+  (set! dot-coll-kind-arms
+    (cons (cons pred kind) dot-coll-kind-arms)))
+
+(define (dot-coll-kind obj)
+  (cond
+    ((jrec? obj) #f)
+    ((jolt-vector? obj) 'vec)
+    ((pmap? obj) 'map)
+    ((pset? obj) 'set)
+    ((empty-list-t? obj) 'empty-list)
+    ((cseq? obj) (if (cseq-list? obj) 'list 'seq))
+    ((jolt-lazyseq? obj) 'lazy)
+    ((htable-sorted-map? obj) 'smap)
+    ((htable-sorted-set? obj) 'sset)
+    (else
+     (let loop ((as dot-coll-kind-arms))
+       (cond
+         ((null? as) #f)
+         (((caar as) obj) (cdar as))
+         (else (loop (cdr as))))))))
+
+(define dck-seq '(list empty-list seq lazy))
+
+(define dck-list '(vec list empty-list seq lazy))
+
+(define dck-stack '(vec list empty-list queue))
+
+(define dck-assoc '(vec map smap))
+
+(define dck-coll
+  '(vec set sset list empty-list seq lazy queue))
+
+(define dck-all (cons* 'map 'smap dck-coll))
+
+(define-syntax dot-coll-kind-fast
+  (syntax-rules ()
+    ((_ obj)
+     (cond
+       ((pvec? obj) 'vec)
+       ((pmap? obj) 'map)
+       ((pset? obj) 'set)
+       (else (dot-coll-kind obj))))))
+
+(define-syntax dot-coll-has!
+  (syntax-rules ()
+    ((_ obj name args kinds)
+     (let ((k (dot-coll-kind-fast obj)))
+       (when (and k (not (memq k kinds)))
+         (no-method-throw name obj (length args)))))))
+
+(define-syntax dot-coll-builtin!
+  (syntax-rules ()
+    ((_ obj name args kinds)
+     (let ((k (dot-coll-kind-fast obj)))
+       (cond
+         ((not k) #f)
+         ((memq k kinds) #t)
+         (else (no-method-throw name obj (length args))))))))
+
+(define (dot-coll-core name . args)
+  (apply jolt-invoke (var-deref "clojure.core" name) args))
+
 (define (dot-coll-method obj name args)
   (cond
     ((string=? name "count") (list (jolt-count obj)))
     ((and (string=? name "seq") (null? args))
      (list (jolt-seq obj)))
-    ((string=? name "nth") (list (apply jolt-nth obj args)))
-    ((or (string=? name "get") (string=? name "valAt"))
+    ((string=? name "nth")
+     (dot-coll-has! obj name args '(vec))
+     (list (apply jolt-nth obj args)))
+    ((string=? name "get")
+     (let ((k (dot-coll-kind-fast obj)))
+       (cond
+         ((eq? k 'queue) (no-method-throw name obj (length args)))
+         ((memq k dck-seq) (list (jolt-nth obj (car args))))
+         (else (list (apply jolt-get obj args))))))
+    ((string=? name "valAt")
+     (dot-coll-has! obj name args dck-assoc)
      (list (apply jolt-get obj args)))
     ((string=? name "containsKey")
+     (dot-coll-has! obj name args dck-assoc)
      (list (jolt-contains? obj (car args))))
-    ((string=? name "contains")
+    ((and (string=? name "contains")
+          (or (dot-coll-kind-fast obj)
+              (rd-instance-of? "java.util.Collection" obj)))
+     (dot-coll-has! obj name args dck-coll)
      (list
-       (if (pset? obj)
+       (if (or (pset? obj) (htable-sorted-set? obj))
            (jolt-contains? obj (car args))
-           (let ((x (car args)))
-             (let loop ((s (jolt-seq obj)))
-               (cond
-                 ((jolt-nil? s) #f)
-                 ((jolt=2 (seq-first s) x) #t)
-                 (else (loop (jolt-seq (seq-more s))))))))))
+           (if (dot-coll-index-of obj (car args) #f) #t #f))))
     ((string=? name "size") (list (jolt-count obj)))
     ((string=? name "isEmpty") (list (jolt-empty? obj)))
     ((string=? name "forEach")
@@ -3278,13 +3338,24 @@
     ((string=? name "hashCode") (list (jolt-java-hashcode obj)))
     ((string=? name "cons") (list (jolt-conj obj (car args))))
     ((or (string=? name "assoc") (string=? name "assocN"))
+     (dot-coll-has!
+       obj
+       name
+       args
+       (if (string=? name "assoc") dck-assoc '(vec)))
      (list (jolt-assoc obj (car args) (cadr args))))
     ((string=? name "without")
+     (dot-coll-has! obj name args '(map smap))
      (list (jolt-dissoc obj (car args))))
     ((string=? name "disjoin")
+     (dot-coll-has! obj name args '(set sset))
      (list (jolt-disj obj (car args))))
-    ((string=? name "pop") (list (jolt-pop obj)))
-    ((string=? name "peek") (list (jolt-peek obj)))
+    ((string=? name "pop")
+     (dot-coll-has! obj name args dck-stack)
+     (list (jolt-pop obj)))
+    ((string=? name "peek")
+     (dot-coll-has! obj name args dck-stack)
+     (list (jolt-peek obj)))
     ((string=? name "equiv")
      (list (if (jolt= obj (car args)) #t #f)))
     ((string=? name "asTransient")
@@ -3307,11 +3378,56 @@
     ((string=? name "iterator")
      (list (make-jiterator (jolt-seq obj))))
     ((string=? name "reduce")
+     (let ((k (dot-coll-kind-fast obj)))
+       (when (and k (not (eq? k 'vec)) (not (rd-ireduce-seq? obj)))
+         (no-method-throw name obj (length args))))
      (list
        (if (pair? (cdr args))
            (jolt-reduce (car args) (cadr args) obj)
            (jolt-reduce (car args) obj))))
+    ((string=? name "entryAt")
+     (dot-coll-has! obj name args dck-assoc)
+     (list (dot-coll-core "find" obj (car args))))
+    ((or (string=? name "indexOf")
+         (string=? name "lastIndexOf"))
+     (and (dot-coll-builtin! obj name args dck-list)
+          (list
+            (or (dot-coll-index-of
+                  obj
+                  (car args)
+                  (string=? name "lastIndexOf"))
+                -1))))
+    ((string=? name "toArray")
+     (and (dot-coll-builtin! obj name args dck-coll)
+          (list (dot-coll-core "to-array" obj))))
+    ((string=? name "empty")
+     (and (dot-coll-builtin! obj name args dck-all)
+          (list (dot-coll-core "empty" obj))))
+    ((string=? name "hasheq") (list (jolt-hasheq obj)))
+    ((string=? name "kvreduce")
+     (and (dot-coll-builtin! obj name args dck-assoc)
+          (list (jolt-reduce-kv (car args) (cadr args) obj))))
+    ((string=? name "first")
+     (and (dot-coll-builtin! obj name args dck-seq)
+          (list (jolt-first obj))))
+    ((string=? name "next")
+     (and (dot-coll-builtin! obj name args dck-seq)
+          (list (jolt-next obj))))
+    ((string=? name "more")
+     (and (dot-coll-builtin! obj name args dck-seq)
+          (list (jolt-rest obj))))
+    ((string=? name "rseq")
+     (and (dot-coll-builtin! obj name args '(vec sset smap))
+          (list (jolt-rseq obj))))
     (else #f)))
+
+(define (dot-coll-index-of coll x last?)
+  (let loop ((s (jolt-seq coll)) (i 0) (found #f))
+    (cond
+      ((jolt-nil? s) found)
+      ((jolt=2 (seq-first s) x)
+       (if last? (loop (jolt-seq (seq-more s)) (fx+ i 1) i) i))
+      (else (loop (jolt-seq (seq-more s)) (fx+ i 1) found)))))
 
 (define method-dispatch-arms '())
 

@@ -180,6 +180,74 @@
             (list (cons "equals" (lambda (self o) (jutil-equals? self o)))
                   (cons "hashCode" (lambda (self) (jutil-hash-code self)))))))
 
+;; ---- a proxy over a shim ---------------------------------------------------------
+;; A proxy over a java.util collection is that collection to count, seq, get and
+;; contains?, which reach it through the methods the JVM's RT does — size,
+;; containsKey / contains, get — so an override in the proxy body answers.
+(define (proxy-coll-kind x)
+  (let ((d (and (jreify? x) (jreify-delegate x))))
+    (and d (jutil-coll-kind d))))
+(define (proxy-call x m . args) (record-method-dispatch x m (if (null? args) jolt-nil (list->cseq args))))
+(register-count-arm! proxy-coll-kind (lambda (x) (jnum->exact (proxy-call x "size"))))
+(register-seq-arm! proxy-coll-kind (lambda (x) (jolt-seq (jreify-delegate x))))
+(register-get-arm! (lambda (x) (eq? (proxy-coll-kind x) 'map))
+  (lambda (x k d) (if (jolt-truthy? (proxy-call x "containsKey" k)) (proxy-call x "get" k) d)))
+(register-contains-arm! (lambda (x) (memq (proxy-coll-kind x) '(map set)))
+  (lambda (x k) (jolt-truthy? (proxy-call x (if (eq? (proxy-coll-kind x) 'map) "containsKey" "contains") k))))
+
+;; A base whose own methods call one a subclass overrides — LinkedHashMap's put
+;; asking removeEldestEntry — is told which proxy stands over it, so that call
+;; reaches the override as the JVM's virtual dispatch would. tag -> (base proxy)
+(define proxy-attach-hooks '())
+(define (proxy-attach-hook! tag f) (set! proxy-attach-hooks (cons (cons tag f) proxy-attach-hooks)))
+(define (proxy-attach! base p)
+  (when (jhost? base)
+    (let ((h (assoc (jhost-tag base) proxy-attach-hooks)))
+      (when h ((cdr h) base p)))))
+
+;; ---- an Iterator whose remove writes through ---------------------------------------
+;; (make-jutil-iterator tag items remove! [project]): walks ITEMS, a list taken
+;; when the iterator is made; next() answers (project item) and remove() hands
+;; the last item to REMOVE!, once — a second remove, or one before any next, is
+;; the JDK's IllegalStateException. An item is whatever identifies an element to
+;; its collection (an EnumMap's slot index, say). Each tag is one JDK iterator
+;; class (classes follow tags); register-jutil-iterator! declares one.
+;; State: #(remaining last remove! project)
+(define jutil-iterator-none (list 'none))
+(define (make-jutil-iterator tag items remove! . project)
+  (make-jhost tag (vector items jutil-iterator-none remove!
+                          (if (pair? project) (car project) (lambda (x) x)))))
+(define jutil-iterator-methods
+  (list (cons "hasNext" (lambda (self) (pair? (vector-ref (jhost-state self) 0))))
+        (cons "next" (lambda (self)
+                       (let* ((st (jhost-state self)) (xs (vector-ref st 0)))
+                         (when (null? xs) (throw-jvm 'NoSuchElementException jolt-nil))
+                         (vector-set! st 0 (cdr xs))
+                         (vector-set! st 1 (car xs))
+                         ((vector-ref st 3) (car xs)))))
+        (cons "remove" (lambda (self)
+                         (let* ((st (jhost-state self)) (x (vector-ref st 1)))
+                           (when (eq? x jutil-iterator-none) (throw-jvm 'IllegalStateException jolt-nil))
+                           (vector-set! st 1 jutil-iterator-none)
+                           ((vector-ref st 2) x)
+                           jolt-nil)))
+        (cons "forEachRemaining" (lambda (self f)
+                                   (let* ((st (jhost-state self)) (xs (vector-ref st 0)))
+                                     (vector-set! st 0 '())
+                                     (unless (null? xs) (vector-set! st 1 (list-ref xs (fx- (length xs) 1))))
+                                     (for-each (lambda (x) (jolt-fi-call f "accept" ((vector-ref st 3) x))) xs)
+                                     jolt-nil)))))
+(define jutil-iterator-tags '())
+(define (jutil-iterator? x) (and (jhost? x) (member (jhost-tag x) jutil-iterator-tags) #t))
+(define (register-jutil-iterator! tag)
+  (set! jutil-iterator-tags (cons tag jutil-iterator-tags))
+  (register-host-methods! tag jutil-iterator-methods))
+;; (iterator-seq it) / (seq it): what the iterator has not handed out yet
+(register-seq-arm! jutil-iterator?
+  (lambda (it)
+    (let ((st (jhost-state it)))
+      (if (null? (vector-ref st 0)) jolt-nil (list->cseq (map (vector-ref st 3) (vector-ref st 0)))))))
+
 ;; ---- java.util.Map$Entry host objects ----------------------------------------------
 ;; An entry a java.util shim hands out (TreeMap$Entry, SimpleImmutableEntry)
 ;; registers its tag with a procedure answering its (key . value). That is what

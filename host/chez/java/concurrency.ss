@@ -49,10 +49,6 @@
 (define (make-time-unit nm nanos) (make-jhost "time-unit" (vector nm nanos)))
 (define (time-unit? x) (and (jhost? x) (string=? (jhost-tag x) "time-unit")))
 (define (time-unit-scale u) (vector-ref (jhost-state u) 1))
-(define (time-unit-ordinal u)
-  (let loop ((us time-unit-nanos) (i 0))
-    (if (string=? (caar us) (vector-ref (jhost-state u) 0)) i (loop (cdr us) (+ i 1)))))
-
 ;; JVM conversions TRUNCATE toward zero (SECONDS.toMinutes(90) is 1).
 (define (tu-convert self n per)
   (quotient (* (jnum->exact n) (time-unit-scale self)) per))
@@ -79,8 +75,26 @@
 
 (define time-unit-constants
   (map (lambda (p) (cons (car p) (make-time-unit (car p) (cdr p)))) time-unit-nanos))
-(register-class-statics! "TimeUnit" time-unit-constants)
-(register-class-statics! "java.util.concurrent.TimeUnit" time-unit-constants)
+(register-enum-class! "java.util.concurrent.TimeUnit" time-unit-constants)
+;; TimeUnit <-> java.time.temporal.ChronoUnit (the java.time base, autoloaded)
+(define time-unit-chrono-names
+  '(("NANOSECONDS" . "NANOS") ("MICROSECONDS" . "MICROS") ("MILLISECONDS" . "MILLIS")
+    ("SECONDS" . "SECONDS") ("MINUTES" . "MINUTES") ("HOURS" . "HOURS") ("DAYS" . "DAYS")))
+(define (time-unit-of-chrono cu)
+  (when (jolt-nil? cu) (throw-jvm 'NullPointerException "chronoUnit"))
+  (let* ((nm (jolt-final-str (record-method-dispatch cu "name" jolt-nil)))
+         (hit (find (lambda (p) (string=? (cdr p) nm)) time-unit-chrono-names)))
+    (if hit
+        (cdr (assoc (car hit) time-unit-constants))
+        (throw-jvm 'IllegalArgumentException (string-append "No TimeUnit equivalent for " nm)))))
+;; convert(duration, unit) and convert(Duration): truncated toward zero and
+;; saturated at Long's range, as TimeUnit.convert is
+(define (tu-saturate n)
+  (cond ((> n 9223372036854775807) 9223372036854775807)
+        ((< n -9223372036854775808) -9223372036854775808)
+        (else n)))
+(define (tu-from-nanos self nanos) (tu-saturate (truncate (/ nanos (time-unit-scale self)))))
+(register-class-statics! "java.util.concurrent.TimeUnit" (list (cons "of" time-unit-of-chrono)))
 (register-host-methods! "time-unit"
   (list (cons "toNanos"   (lambda (self n) (tu-convert self n 1)))
         (cons "toMicros"  (lambda (self n) (tu-convert self n 1000)))
@@ -103,19 +117,30 @@
                                         n))
                                   jolt-nil))))
         (cons "name"      (lambda (self) (vector-ref (jhost-state self) 0)))
-        (cons "toString"  (lambda (self) (vector-ref (jhost-state self) 0)))
-        ;; TimeUnit is an enum: declared NANOSECONDS..DAYS, ordered by that
-        ;; ordinal, and Enum.compareTo is the ordinal difference
-        (cons "ordinal"   (lambda (self) (time-unit-ordinal self)))
-        (cons "compareTo" (lambda (self other)
-                            (unless (time-unit? other)
-                              (throw-jvm 'ClassCastException
-                                         (string-append "class " (jolt-class-name other)
-                                                        " cannot be cast to class java.util.concurrent.TimeUnit")))
-                            (- (time-unit-ordinal self) (time-unit-ordinal other))))))
-;; ...and the same for (str TimeUnit/SECONDS): an enum constant's toString is its
-;; name on the JVM, where the generic host-object fallback prints #object[…].
-(register-str-render! time-unit? (lambda (u) (vector-ref (jhost-state u) 0)))
+        (cons "convert"
+              (case-lambda
+                ((self d)
+                 (let ((secs (jnum->exact (record-method-dispatch d "getSeconds" jolt-nil)))
+                       (nano (jnum->exact (record-method-dispatch d "getNano" jolt-nil))))
+                   (tu-from-nanos self (+ (* secs 1000000000) nano))))
+                ((self n unit)
+                 (tu-from-nanos self (* (jnum->exact n) (time-unit-scale unit))))))
+        ;; timedJoin / timedWait: Thread.join / Object.wait for a timeout in
+        ;; this unit; one of zero or less does nothing, as the JDK's guard has it
+        (cons "timedJoin" (lambda (self th n)
+                            (let ((ms (tu-convert self n 1000000)))
+                              (when (positive? (jnum->exact n))
+                                (record-method-dispatch th "join" (jolt-list (max ms 1))))
+                              jolt-nil)))
+        (cons "timedWait" (lambda (self o n)
+                            (let ((ms (tu-convert self n 1000000)))
+                              (when (positive? (jnum->exact n))
+                                (record-method-dispatch o "wait" (jolt-list (max ms 1))))
+                              jolt-nil)))
+        (cons "toChronoUnit"
+              (lambda (self)
+                (host-static-ref "java.time.temporal.ChronoUnit"
+                                 (cdr (assoc (vector-ref (jhost-state self) 0) time-unit-chrono-names)))))))
 
 ;; --- futures ----------------------------------------------------------------
 ;; A future is a mutable cell guarded by `mu`; workers/derefs coordinate on `cv`.
@@ -137,39 +162,69 @@
   (fields (mutable done?) (mutable cancelled?) (mutable ok?) (mutable payload) mu cv ibox)
   (nongenerative jolt-future-v2))
 
-;; (future-call thunk): spawn a thread running (thunk). The dynamic bindings in
-;; effect now are conveyed into the worker (Chez inherits thread-parameters at
-;; fork; we also install an explicit snapshot for certainty). The result — value
-;; or thrown condition — is latched and broadcast; a cancel that already finalized
-;; the future makes the late result a no-op.
+;; (future-call thunk): run (thunk) on the solo pool (below). The dynamic
+;; bindings and current namespace in effect now are conveyed into the task as a
+;; snapshot, and the worker gets its own back afterwards, so an in-ns inside one
+;; future does not leak into the next task the pooled thread runs. The result —
+;; value or thrown condition — is latched and broadcast; a cancel that already
+;; finalized the future makes the late result a no-op, and a cancel that lands
+;; before a worker takes the task keeps the body from running at all, as a
+;; FutureTask cancelled before run() never runs.
 ;; A future runs on the agent system's cached pool on the JVM, so after
-;; shutdown-agents it is refused, and after it finishes its worker idles for the
-;; pool's keep-alive, holding the process up (exit-linger!, below).
+;; shutdown-agents it is refused.
 (define (jolt-future-call thunk)
   (when (jolt-agents-shutdown?)
     (jolt-throw (jolt-host-throwable "java.util.concurrent.RejectedExecutionException" jolt-nil)))
   (let* ((ibox (box #f))
          (f (make-jolt-future #f #f #f jolt-nil (make-mutex) (jolt-make-cv) ibox))
-         (snap (dyn-binding-stack)))
-    (fork-agent-thread
+         (snap (dyn-binding-stack))
+         (ns (chez-current-ns-param)))
+    (solo-pool-run!
      (lambda ()
-       (*txn* #f)                          ; child thread must not inherit parent's txn
-       (rdr-default-modes!)                ; and not the reader modes of a read it forked from
-       ;; The worker's flag is the future's flag: future-cancel sets it, and
-       ;; (Thread/currentThread) inside the body hands back a handle onto the same
-       ;; box, so .isInterrupted / Thread/interrupted inside the worker and the
-       ;; cancel from outside are ONE flag (the shape jolt#727 fixed for Thread.).
-       (adopt-interrupt-box! ibox)
-       (dyn-binding-stack snap)
-       (let ((r (guard (e (#t (cons #f e))) (cons #t (jolt-invoke thunk)))))
-         (jolt-with-mutex (jolt-future-mu f)
-           (unless (jolt-future-done? f)            ; not already cancelled
-             (jolt-future-ok?-set! f (car r))
-             (jolt-future-payload-set! f (cdr r))
-             (jolt-future-done?-set! f #t))
-           (jolt-cv-wake! (jolt-future-cv f)))
-         (exit-linger-after-task!))))
+       (unless (jolt-future-settled? f)              ; cancelled before it started
+         (*txn* #f)                          ; the task must not inherit a txn
+         (rdr-default-modes!)                ; and not the reader modes of a read it forked from
+         ;; The worker's flag is the future's flag while the body runs:
+         ;; future-cancel sets it, and (Thread/currentThread) inside the body
+         ;; hands back a handle onto the same box, so .isInterrupted /
+         ;; Thread/interrupted inside the worker and the cancel from outside are
+         ;; ONE flag (the shape jolt#727 fixed for Thread.). The worker takes its
+         ;; own flag back when the body is done.
+         (let ((own (current-os-thread-box))
+               (own-ns (chez-current-ns-param)))
+           (adopt-interrupt-box! ibox)
+           (dyn-binding-stack snap)
+           (chez-current-ns-param ns)
+           (let* ((slot (agent-pool-take! 'send-off))
+                  (_ (jolt-thread-name-set! (get-thread-id) (agent-pool-thread-name 'send-off slot)))
+                  (r (guard (e (#t (cons #f e))) (cons #t (jolt-invoke thunk)))))
+             (agent-pool-give! 'send-off slot)
+             (dyn-binding-stack '())
+             (chez-current-ns-param own-ns)
+             (adopt-interrupt-box! own)
+             (jolt-with-mutex (jolt-future-mu f)
+               (unless (jolt-future-done? f)            ; not already cancelled
+                 (jolt-future-ok?-set! f (car r))
+                 (jolt-future-payload-set! f (cdr r))
+                 (jolt-future-done?-set! f #t))
+               (jolt-cv-wake! (jolt-future-cv f))))))))
     f))
+
+;; The STM's waits (refs.ss): a transaction blocked by another one's claim waits
+;; on that one's latch, a mutex and a jolt-cv, for a bounded time; the owner
+;; releases it when it finishes or is killed. The clock times barging.
+(set! stm-now-ms (lambda () (quotient (mono-nanos) 1000000)))
+(set! stm-raise jolt-raise-thrown)
+(set! stm-make-latch (lambda () (vector (make-mutex) (jolt-make-cv) #f)))
+(set! stm-latch-wait
+  (lambda (l ms)
+    (jolt-cv-wait (vector-ref l 0) (vector-ref l 1) (mono-deadline ms)
+      (lambda (timed-out?) (if (or timed-out? (vector-ref l 2)) #t jolt-cv-again)))))
+(set! stm-latch-release!
+  (lambda (l)
+    (jolt-with-mutex (vector-ref l 0)
+      (vector-set! l 2 #t)
+      (jolt-cv-wake! (vector-ref l 1)))))
 
 ;; Wrap a task's captured throw in an ExecutionException, the original as the
 ;; cause so ex-cause and .getCause both reach it. One helper for every place a
@@ -204,6 +259,23 @@
 ;; parks now and the settle resumes it; a thread still blocks, which is what a
 ;; thread should do.
 ;;
+;; SPIN BRIEFLY FIRST. A deref of a future still running, or one a worker has
+;; not reached yet, is usually answered within a few microseconds, and parking
+;; costs more than that: the waker's broadcast, the kernel's wake and the
+;; reschedule. The JVM's FutureTask yields before it parks for the same reason,
+;; and its handoff queues spin. task-spin-until reads the flag WITHOUT the mutex,
+;; so it is only a hint of when to take it: a #t from it is followed by
+;; jolt-future-settled? under the mutex, which is what orders the payload's
+;; read after the worker's write. A fiber does not spin; it parks, so its carrier
+;; runs the other fibers instead.
+(define task-spin-rounds 64)
+(define (task-spin-until done?)
+  (and (not (jolt-current-fiber))
+       (let loop ((i 0))
+         (cond ((done?) #t)
+               ((fx=? i task-spin-rounds) #f)
+               (else (thread-yield!) (loop (fx+ i 1)))))))
+
 ;; A settled one answers without the wait. The wait begins by checking that the
 ;; caller may park (jolt-fiber-may-park!, which must precede the commit), and a
 ;; fiber holding a counted lock may not, so @ on a future or promise that had
@@ -214,7 +286,8 @@
   (jolt-with-mutex (jolt-future-mu f) (jolt-future-done? f)))
 
 (define (jolt-future-deref f)
-  (unless (jolt-future-settled? f)
+  (unless (begin (task-spin-until (lambda () (jolt-future-done? f)))
+                 (jolt-future-settled? f))
     (jolt-cv-wait-interruptibly "future deref" (jolt-future-mu f) (jolt-future-cv f) #f
       (lambda (_timed-out?)
         (if (jolt-future-done? f) #t jolt-cv-again))))
@@ -374,6 +447,7 @@
 (define (jolt-agents-shutdown?) (unbox agents-shutdown?))
 (define (jolt-shutdown-agents)
   (set-box! agents-shutdown? #t)
+  (solo-pool-shutdown!)
   (exit-release-pools!)
   jolt-nil)
 
@@ -384,15 +458,16 @@
 ;; every thread is forked (lazy-bridge.ss, exit-nondaemon-live), and a thread's
 ;; daemon flag is the one Thread.isDaemon answers, so the two cannot disagree.
 ;;
-;; Two more holds stand for the agent system's pools, which jolt does not run
-;; (futures and agent actions get threads of their own) but whose idle workers
-;; keep a JVM up all the same, certified with timing probes on JDK 21:
+;; The agent system's pools keep a JVM up after their last task as well,
+;; certified with timing probes on JDK 21:
 ;;
-;;   future / future-call / pmap / send-off  the cached "solo" pool: its worker
-;;       idles 60s after its last task, so the process ends 60s after the last one
-;;       finishes. exit-linger-after-task! is called as each task ends, on the
-;;       task's own thread, and only a non-daemon one counts (a pool thread made
-;;       on a daemon thread is a daemon).
+;;   future / future-call / pmap  the cached "solo" pool, which jolt runs (below):
+;;       its idle workers are live threads until their 60s keep-alive runs out,
+;;       so the process ends 60s after the last task finishes.
+;;   send-off  the same pool on the JVM; here an agent's actions get a thread of
+;;       their own, so exit-linger-after-task! stands in for the idle worker. It
+;;       is called as each run of actions ends, on that thread, and only a
+;;       non-daemon one counts (a pool thread made on a daemon thread is a daemon).
 ;;   send / await / await-for  the fixed pool: its workers never time out, so
 ;;       after one of these the process never ends by itself.
 ;;
@@ -413,6 +488,37 @@
   (fork-thread/daemon agent-threads-daemon?
     (lambda () (jolt-thread-name-set! (get-thread-id) "clojure-agent-pool") (thunk))))
 (define solo-pool-keep-alive-ms 60000)     ; Executors.newCachedThreadPool's 60L, SECONDS
+
+;; The solo pool: what a future runs on, as clojure.lang.Agent/soloExecutor is on
+;; the JVM — a cached pool (0, unbounded, 60s keep-alive), so a worker that has
+;; finished a task takes the next one instead of a thread being forked per future
+;; (~25us a fork, against ~1us for a handoff to a parked worker). Its idle workers
+;; are live threads, so they hold the process up until their keep-alive runs out,
+;; which is the exit the JVM has after a future; shutdown-agents shuts the pool
+;; down, which retires them at once and lets running tasks finish.
+;;
+;; Its workers are never daemons, whatever thread's submit starts one, as
+;; clojure.core's pools are not (exit-wait-smoke pins a future started from a
+;; daemon thread holding the exit); under bb's semantics (agent-threads-daemon!)
+;; every worker is one. Made on first use, after jolt.main has settled that.
+(define solo-pool #f)
+(define-process-local solo-pool-mu (make-mutex)) ; merge: upstream's new lock, made process-local as ours are (16d668c5)
+;; Built OUTSIDE the mutex and published under it, so nothing that may park runs
+;; with the lock held (park-lock-check.ss); a pool that loses the race to publish
+;; is dropped, and with no core workers it has forked nothing.
+(define (solo-pool-state)
+  (or solo-pool
+      (let ((p (make-executor* "executor-service" 0 executor-unbounded-workers
+                               solo-pool-keep-alive-ms #f
+                               agent-threads-daemon? #f)))
+        (jolt-with-mutex solo-pool-mu
+          (unless solo-pool (set! solo-pool p))
+          solo-pool))))
+(define (solo-pool-run! job)
+  (executor-enqueue! (solo-pool-state) job))
+(define (solo-pool-shutdown!)
+  (let ((p (jolt-with-mutex solo-pool-mu solo-pool)))
+    (when p (executor-shutdown! (jhost-state p)))))
 (define (exit-linger-after-task!)
   (unless (jolt-thread-daemon? (get-thread-id))
     (let ((until (mono-deadline solo-pool-keep-alive-ms)))
@@ -455,7 +561,31 @@
          (loop))
         (else (void))))))
 
-;; Thread-local list of (agent f . args) sent from within the action currently
+;; The agent system's pool threads carry the names the JVM's thread factories give
+;; them: send runs on clojure-agent-send-pool-N, send-off and future on
+;; clojure-agent-send-off-pool-N, each pool numbering its own threads from 0. A
+;; worker takes the lowest number no running worker of its pool holds and gives
+;; it back when it ends, as a pool hands work to an idle thread, so the numbers
+;; stay as low as the pool's concurrency.
+(define agent-pool-slots (vector (vector 0 '()) (vector 0 '())))   ; #(next free)
+(define-process-local agent-pool-mu (make-mutex)) ; merge: upstream's new lock, made process-local as ours are (16d668c5)
+(define (agent-pool-of pool) (vector-ref agent-pool-slots (if (eq? pool 'send) 0 1)))
+(define (agent-pool-take! pool)
+  (jolt-with-mutex agent-pool-mu
+    (let* ((slot (agent-pool-of pool)) (free (vector-ref slot 1)))
+      (if (pair? free)
+          (begin (vector-set! slot 1 (cdr free)) (car free))
+          (let ((n (vector-ref slot 0))) (vector-set! slot 0 (+ n 1)) n)))))
+(define (agent-pool-give! pool n)
+  (jolt-with-mutex agent-pool-mu
+    (let ((slot (agent-pool-of pool)))
+      (vector-set! slot 1 (let ins ((l (vector-ref slot 1)))
+                            (if (or (null? l) (< n (car l))) (cons n l) (cons (car l) (ins (cdr l)))))))))
+(define (agent-pool-thread-name pool n)
+  (string-append (if (eq? pool 'send) "clojure-agent-send-pool-" "clojure-agent-send-off-pool-")
+                 (number->string n)))
+
+;; Thread-local list of (agent pool f . args) sent from within the action currently
 ;; running on this thread (#f outside an action). Holds nested sends until the
 ;; action completes, like the JVM's ThreadLocal `nested`. Its box-ness is also
 ;; the signal that *agent* is bound (an action is in flight on this thread).
@@ -529,10 +659,14 @@
 
 ;; Enqueue an action and start the worker if the agent is idle. No precondition
 ;; checks — used by the direct send path (after checks), by nested-send release,
-;; and by restart resuming a held queue.
-(define (jolt-agent-enqueue! a f args)
+;; and by restart resuming a held queue. A queue entry is (pool f . args): pool is
+;; send, send-off, or #f for an executor of the caller's (send-via). An action
+;; that reaches send's fixed pool holds the process up for good, as that pool's
+;; worker does.
+(define (jolt-agent-enqueue! a pool f args)
+  (when (eq? pool 'send) (exit-hold-pooled!))
   (jolt-with-mutex (jolt-agent-mu a)
-    (jagent-q-push! a (cons f args))
+    (jagent-q-push! a (cons* pool f args))
     (unless (jolt-agent-running? a)
       (jolt-agent-running?-set! a #t)
       (fork-agent-thread (lambda () (*txn* #f) (rdr-default-modes!) (jolt-agent-worker a)))))
@@ -548,7 +682,7 @@
         0
         (let ((sends (unbox nested)))
           (set-box! nested '())
-          (for-each (lambda (e) (jolt-agent-enqueue! (car e) (cadr e) (cddr e)))
+          (for-each (lambda (e) (jolt-agent-enqueue! (car e) (cadr e) (caddr e) (cdddr e)))
                     (reverse sends))
           (length sends)))))
 
@@ -557,23 +691,34 @@
 ;; sends it accumulated; a thrown action invokes the error-handler (if any, its
 ;; throws swallowed) and then either continues (:continue, state left untouched)
 ;; or fails the agent (:fail, error stored, queue halted).
+;; The worker takes the name of the pool each action was sent to, one number per
+;; pool for the worker's life (names: pool -> number, cur: the pool it is named
+;; for), and gives the numbers back when it goes idle.
 (define (jolt-agent-worker a)
   (*txn* #f)                          ; agent worker must not inherit parent's txn
-  (let loop ()
+  (let loop ((names '()) (cur #f))
     (let ((act (jolt-with-mutex (jolt-agent-mu a)
                  (if (or (not (jolt-nil? (jolt-agent-err a))) (jagent-q-empty? a))
                      (begin (jolt-agent-running?-set! a #f)
                             (jolt-cv-wake! (jolt-agent-cv a)) #f)
                      (jagent-q-pop! a)))))
       ;; idle: the pool worker this stands for would linger (exit wait, below)
-      (unless act (exit-linger-after-task!))
+      (unless act
+        (for-each (lambda (pn) (agent-pool-give! (car pn) (cdr pn))) names)
+        (exit-linger-after-task!))
       (when act
+        (let* ((pool (car act))
+               (names (if (or (not pool) (eq? pool cur) (assq pool names))
+                          names
+                          (cons (cons pool (agent-pool-take! pool)) names))))
+          (when (and pool (not (eq? pool cur)))
+            (jolt-thread-name-set! (get-thread-id) (agent-pool-thread-name pool (cdr (assq pool names)))))
         (parameterize ((*agent-nested* (box '())))
           (let ((err #f))
             (guard (e (#t (set! err (jolt-unwrap-throw e))))
               (let* ((old (jolt-agent-state a))
                      (nv (with-agent-binding a
-                           (lambda () (apply jolt-invoke (car act) old (cdr act))))))
+                           (lambda () (apply jolt-invoke (cadr act) old (cddr act))))))
                 (let ((vf (jolt-agent-validator a)))
                   (when (and (not (jolt-nil? vf)) (jolt-not (jolt-invoke vf nv)))
                     (jolt-iref-state-throw)))
@@ -592,11 +737,11 @@
                       (jolt-agent-err-set! a err)
                       (jolt-cv-wake! (jolt-agent-cv a)))))
                 (jolt-release-pending-sends))))   ; success: flush nested sends
-        (loop)))))
+        (loop names (or pool cur)))))))
 
-;; send / send-off: enqueue the action, start the worker if idle. (jolt treats
-;; them identically — one serialized worker per agent — observably a superset of
-;; the JVM fixed/cached pool split.) A send after shutdown-agents, to a failed
+;; send / send-off: enqueue the action, start the worker if idle. (One serialized
+;; worker per agent runs both, observably a superset of the JVM fixed/cached pool
+;; split; the pool names the worker's thread.) A send after shutdown-agents, to a failed
 ;; agent, inside a transaction, or from within an action is handled specially.
 ;; A send after shutdown-agents is the pool REJECTING the action, which the JVM's
 ;; Agent catches and hands to the agent's error handler: the send itself returns
@@ -607,15 +752,14 @@
 ;; what keeps the process up after it: send's fixed pool for good, send-off's cached
 ;; pool for its keep-alive (the exit wait, below). send-via takes the caller's
 ;; executor and holds nothing of the agent system's.
-;; The fixed pool gains a worker only once an action reaches it: a send that
-;; throws (a failed agent) or is rejected holds nothing up.
+;; The fixed pool gains a worker only once an action reaches it (jolt-agent-enqueue!):
+;; a send that throws (a failed agent) or is rejected holds nothing up.
 (define (jolt-agent-send a f . args)
-  (apply jolt-agent-dispatch a f args)
-  (unless (jolt-agents-shutdown?) (exit-hold-pooled!))
-  a)
+  (apply jolt-agent-dispatch 'send a f args))
 (define (jolt-agent-send-off a f . args)
-  (apply jolt-agent-dispatch a f args))
-(define (jolt-agent-dispatch a f . args)
+  (apply jolt-agent-dispatch 'send-off a f args))
+;; A send inside a transaction is held as a thunk the commit runs (refs.ss).
+(define (jolt-agent-dispatch pool a f . args)
   (cond
     ((jolt-agents-shutdown?)
      (let ((handler (jolt-agent-err-handler a)))
@@ -629,11 +773,12 @@
     ((*txn*)
      (let ((txn (*txn*)))
        (jolt-txn-pending-sends-set! txn
-         (cons (apply list a f args) (jolt-txn-pending-sends txn)))))
+         (cons (lambda () (apply jolt-agent-dispatch pool a f args))
+               (jolt-txn-pending-sends txn)))))
     ((jolt-in-agent-action?)
      (let ((nested (*agent-nested*)))
-       (set-box! nested (cons (cons* a f args) (unbox nested)))))
-    (else (jolt-agent-enqueue! a f args)))
+       (set-box! nested (cons (cons* a pool f args) (unbox nested)))))
+    (else (jolt-agent-enqueue! a pool f args)))
   a)
 
 ;; (await & agents) / (await-for ms & agents): block until each agent's queue has
@@ -742,7 +887,7 @@
 ;; The action runs on jolt's agent worker whatever executor is named; it holds
 ;; the exit as that worker does (the 60s linger), not as the fixed send pool.
 (define (jagent-dispatch-3 a f args _exec)
-  (apply jolt-agent-dispatch a f (rd-args->list args)))
+  (apply jolt-agent-dispatch #f a f (rd-args->list args)))
 (define (jagent-method name argc)
   (cond ((string=? name "getError")        (and (fx=? argc 0) jolt-agent-error))
         ((string=? name "getErrorMode")    (and (fx=? argc 0) jolt-agent-get-error-mode))
@@ -947,6 +1092,26 @@
 (define-record-type jolt-delay (fields thunk (mutable realized?) (mutable value) (mutable exn))
   (nongenerative jolt-delay-v2))
 (define (jolt-make-delay thunk) (make-jolt-delay thunk #f jolt-nil #f))
+
+;; How futures, promises, delays and agents print (printing.ss register-deref-print!):
+;; pending until realized, failed with the throwable a deref would raise, else
+;; ready with the value. A failed agent prints its state.
+(register-deref-print! jolt-future?
+  (lambda (f)
+    (cond ((not (jolt-future-done? f)) (cons "pending" jolt-nil))
+          ((jolt-future-cancelled? f)
+           (cons "failed" (jolt-host-throwable "java.util.concurrent.CancellationException" jolt-nil)))
+          ((jolt-future-ok? f) (cons "ready" (jolt-future-payload f)))
+          (else (cons "failed" (task-execution-exception (jolt-future-payload f)))))))
+(register-deref-print! jolt-promise?
+  (lambda (p) (if (jolt-promise-delivered? p) (cons "ready" (jolt-promise-value p)) (cons "pending" jolt-nil))))
+(register-deref-print! jolt-delay?
+  (lambda (d)
+    (cond ((not (jolt-delay-realized? d)) (cons "pending" jolt-nil))
+          ((jolt-delay-exn d) (cons "failed" (jolt-unwrap-throw (jolt-delay-exn d))))
+          (else (cons "ready" (jolt-delay-value d))))))
+(register-deref-print! jolt-agent?
+  (lambda (a) (cons (if (jolt-nil? (jolt-agent-err a)) "ready" "failed") (jolt-agent-state a))))
 ;; run the thunk once, like Clojure's Delay: if it throws, cache the exception
 ;; (the delay IS realized) and re-throw it on every deref — do NOT re-run the
 ;; body (so value-fns memoize and there is no cache-stampede / retried side
@@ -1116,7 +1281,7 @@
 (def-var! "clojure.core" "send-off" jolt-agent-send-off)
 ;; send-via takes an executor jolt has no model for; behave as send and ignore it.
 (def-var! "clojure.core" "send-via"
-  (lambda (_exec a f . args) (apply jolt-agent-dispatch a f args)))
+  (lambda (_exec a f . args) (apply jolt-agent-dispatch #f a f args)))
 ;; Documented superset no-ops: jolt has no executor pool, so these accept and
 ;; ignore their argument, returning nil (as the JVM setters would).
 (def-var! "clojure.core" "set-agent-send-executor!" (lambda (_e) jolt-nil))
@@ -1935,52 +2100,28 @@
 ;; sleep) only sees the interrupt when it returns to Scheme — like the JVM not
 ;; killing native code.
 ;;
-;; This BORROWS the timer, and on a fiber the timer belongs to the scheduler: it
-;; is what preempts a compute-bound fiber so the ones queued behind it on the same
-;; carrier are not starved. So both halves have to go back, the handler and the
-;; tick. It used to end with a bare (set-timer 0), which returns the handler and
-;; keeps the tick, and only the fiber's NEXT dispatch arms again — so a fiber that
-;; borrowed the timer once and then never parked pinned its carrier (jolt-ly62).
-;; jolt-fiber-rearm-preempt! puts it back, and does nothing off a fiber, where
-;; there was never anything armed to restore.
+;; The timer is shared with fiber preemption and the sampler, so this does not
+;; own it: it is the POLL client of the tick scheduler (ticks.ss), which keeps
+;; one demand per client and charges them all the same ticks. The borrow
+;; registers a poll every interrupt-check-ticks and cancels it on the way out;
+;; the quantum of a fiber it runs on keeps falling due as it would without the
+;; borrow, and is taken by the preempt client. It used to install its own
+;; handler and count what it borrowed so the quantum still fell due, and three
+;; bugs were found in that hand-off (jolt-ly62, jolt-1rod, jolt-449m).
 ;;
-;; It lives in fibers.ss, which rt.ss loads AFTER this file; the reference resolves
-;; at call time, the same forward reference async.ss makes to jolt-fiber-go-spawn
-;; and for the same reason. No fiber can exist before the boot finishes loading.
+;; Borrows nest. The poll client runs the INNERMOST borrow's check, kept on
+;; interrupt-poll-stack, and an inner borrow's exit leaves the poll registered
+;; when an outer one is still live, so the outer token keeps being polled.
 ;;
-;; WHY THE BORROW IS A dynamic-wind AND NOT THREE HAND-WRITTEN EXITS (jolt-1rod).
-;;
-;; It was three: a normal return, a guard for a raise, and the call/cc for its own
-;; interrupt escape. A fiber PARK is a fourth way out and it was none of them — it
-;; escapes through the carrier's sched-k, and timer-interrupt-handler is a setter
-;; write on a per-thread parameter, so a continuation escape does not undo it.
-;; jolt-fiber-install-preempt-handler! runs once per DRAIN rather than per
-;; dispatch, so the borrower's handler then stayed live over every later fiber on
-;; that carrier, and it failed two ways at once:
-;;
-;;   - that handler answers a quantum by re-arming its own tick and returning, so
-;;     nothing on the carrier was preempted again. Measured at a 20,000 tick
-;;     quantum: 0 preemptions in 0.5s behind a fiber parked inside a borrow. That
-;;     is the unbounded starvation window the head of fibers.ss says no setting can
-;;     open, reachable from ordinary jolt code.
-;;   - the handler closes over the call/cc continuation captured in the PARKED
-;;     fiber's stack. A later interrupt! fired it under whichever fiber owned the
-;;     carrier and invoked that continuation: the parked fiber returned from a park
-;;     it never came back from, and the running fiber was abandoned mid-computation
-;;     — 'running for the life of the process, its go channel never closed, every
-;;     reader of it waiting, and no error naming any of it.
-;;
-;; A wind is the answer the rest of the runtime already gives for state that must
-;; survive a park: the after-thunk hands the timer back on the way out and the
-;; before-thunk re-takes it on the way in, so the borrow is SUSPENDED across a park
-;; rather than leaking past it. It is jolt-with-mutex's rule and the opposite of
-;; jolt-with-monitor's, and the difference is what each thing is: a monitor must
-;; still be held when the fiber comes back, the carrier's timer must not.
-;;
-;; The other three exits come out of the same after-thunk, so they are no longer
-;; written separately. And an interrupt raised while the borrower is parked is not
-;; lost — the resume re-arms the borrowed tick, so it lands on the fiber that asked
-;; for it, on its own carrier time.
+;; WHY THE BORROW IS STILL A dynamic-wind (jolt-1rod). A fiber PARK is a way
+;; out of the body too, through the carrier's sched-k, and the poll must not
+;; outlive the extent: a poll left registered over the next fiber on the carrier
+;; would run this borrow's check there, and its escape would invoke a
+;; continuation captured in the PARKED fiber's stack under whichever fiber owned
+;; the carrier. The after-thunk cancels the poll on every way out, the park
+;; included, and the before-thunk re-registers it on resume, so an interrupt
+;; raised while the borrower is parked still lands on the fiber that asked for
+;; it.
 ;;
 ;; WHAT THIS RESTS ON, the same thing jolt-with-monitor's after-thunk rests on: a
 ;; CHEAP park (java/sm.ss) never rewinds, so it would fire this after-thunk and
@@ -1994,7 +2135,7 @@
 (define (jolt-make-interrupt) (box #f))
 (define (jolt-interrupt! token) (when (box? token) (set-box! token #t)) jolt-nil)
 (define (jolt-interrupted? token) (and (box? token) (unbox token) #t))
-;; Active timer borrows form a dynamic stack per application thread. Chez child
+;; Active borrows form a dynamic stack per application thread. Chez child
 ;; threads inherit thread-parameter values, so owner-tag it: an inherited stack
 ;; is empty in the child and cannot make the child poll a parent's token.
 (define interrupt-poll-stack (make-thread-parameter (cons #f '())))
@@ -2080,59 +2221,43 @@
     ((token thunk ticks bytes)
      (let ((limit (lambda (n) (and (number? n) (exact? n) (positive? n) n))))
        (jolt-run-interruptible* token thunk (limit ticks) (limit bytes))))))
+;; MERGE-REVIEW(deep-fixes): upstream 8620bef7 made run-interruptible the POLL client
+;; of ticks.ss's per-thread scheduler (no handler of its own, no `borrowed` quantum
+;; accounting, the poll stack holding each borrow's check closure); ours (02f97367,
+;; ed1e37a1) had added tick and byte budgets to the old handler-borrowing version (the
+;; poll stack holding budget vectors, a check of every budget at each poll). Chosen: our
+;; budgets re-fitted onto upstream's poll client. A budget vector gains slot 6, the
+;; borrow's check; the poll client runs the innermost entry's check, which tests the
+;; token, then every budget (innermost spent first), else re-polls at the nearer of
+;; interrupt-check-ticks and the nearest budget's remainder. The quantum is the
+;; scheduler's (the preempt slot), so `borrowed`/`armed`/`arm!` and prev-handler are gone.
+;; Needs: tickbudget, interruptnest, nested-budget-test, ticks-test, fibers-preempt-test.
+(jolt-tick-client-set! jolt-tick-slot-poll
+  (lambda ()
+    (let ((st (current-interrupt-poll-stack)))
+      (when (pair? st) ((vector-ref (car st) 6))))))
+;; The poll interval for a stack of budgets: interrupt-check-ticks, no later than the
+;; nearest bounded budget's remainder (at least 1, so a spent one fires at once).
+(define (jolt-budget-poll-ticks budgets)
+  (let ((left (jolt-budget-left budgets)))
+    (if left (max 1 (min interrupt-check-ticks left)) interrupt-check-ticks)))
 (define (jolt-run-interruptible* token thunk budget bytes)
-  ;; Captured ONCE, outside the wind: a before-thunk that re-read it would, on a
-  ;; resume, save the handler the SCHEDULER had put back and restore that on the
-  ;; real exit — the borrow would hand the carrier its own handler a second time
-  ;; and lose whatever an enclosing borrow had installed.
-  (let* ((prev-handler (timer-interrupt-handler))
-         (outer-bindings (dyn-binding-stack))
-         ;; Captured once, like prev-handler. On a real off-fiber exit from a
-         ;; nested borrow the restored outer handler needs a fresh poll tick.
+  (let* ((outer-bindings (dyn-binding-stack))
+         ;; Captured once, outside the wind: the stack this borrow sits on, the
+         ;; same on the way in after a resume as on the first entry.
          (owner (get-thread-id))
          (outer-stack (current-interrupt-poll-stack))
-         ;; --- handing the quantum back DURING the borrow (jolt-449m) -----------
-         ;; jolt-ly62 stopped the borrow outliving itself. What was still open is
-         ;; the extent of the borrow: the handler below answered a quantum by
-         ;; re-arming its own tick and RETURNING, so nothing on the carrier was
-         ;; preempted for as long as the body ran. Measured, one carrier and a
-         ;; 20,000 tick quantum: a spinning fiber inside a borrow managed
-         ;; 36,983,637 iterations and 0 preemptions while a sibling queued behind
-         ;; it never ran; the same spin outside a borrow was preempted 46 times.
-         ;; That is the unbounded starvation window the head of fibers.ss says no
-         ;; setting can open, and the body reached through jolt.host/run-interruptible
-         ;; is arbitrary user code — a whole eval, in the interrupt use it exists for.
-         ;;
-         ;; The borrow polls far more often than the quantum, so the fix is to
-         ;; COUNT what it consumes and let the scheduler decide once it adds up.
-         ;; `borrowed` is ticks since the fiber last had the CPU handed to it; the
-         ;; before-thunk zeroes it, because a rewind means the fiber has just been
-         ;; dispatched and its quantum restarts.
-         (borrowed 0)
-         ;; This borrow's budget, its entry on the poll stack: #(start limit k fiber),
-         ;; start the tick count at the body's first entry, on fiber's count (#f: the
-         ;; thread's), k where its escape lands.
-         (self (vector #f budget #f #f #f bytes))
+         ;; This borrow's budget, its entry on the poll stack:
+         ;; #(start limit k fiber bytes-start bytes-limit check), start the tick count at
+         ;; the body's first entry, on fiber's count (#f: the thread's), k where its
+         ;; escape lands, check the poll client's call for this borrow.
+         (self (vector #f budget #f #f #f bytes #f))
          (budgets (cons self outer-stack))
-         ;; What the borrow last armed, for the quantum (borrowed). It arms
-         ;; the TIGHTER of the two demands, so a quantum shorter than the poll
-         ;; interval is still honoured instead of being rounded up to it.
-         (armed interrupt-check-ticks)
-         (arm!
-          (lambda ()
-            (let* ((n (if (jolt-current-fiber)
-                          (fxmin interrupt-check-ticks (jolt-fiber-preempt-ticks))
-                          interrupt-check-ticks))
-                   ;; the nearest budget's remainder, when it is nearer than the poll
-                   (left (jolt-budget-left budgets))
-                   (n (if left (max 1 (min n left)) n)))
-              (set! armed n)
-              (jolt-set-timer! n))))
          ;; This wind's own edges are masked (jolt-wind*, locks.ss). A deferred
          ;; interrupt re-arms a short retry, and when the body returned normally
          ;; that retry could land at this after-thunk's entry, the winder already
-         ;; popped: the escape then left this handler installed and armed, and the
-         ;; next tick jumped back into an extent that had already returned.
+         ;; popped: the escape then jumped back into an extent that had already
+         ;; returned.
          (lv (jolt-locks-held))
          (r (call/cc
               (lambda (k)
@@ -2140,31 +2265,29 @@
                 (jolt-locks-enter!)
                 (dynamic-wind
                   (lambda ()
-                    (set! borrowed 0)
                     ;; the body's first entry starts its budget; a resume continues it
                     (when (and (or budget bytes) (not (vector-ref self 0)))
                       (vector-set! self 3 (jolt-current-fiber))
                       (vector-set! self 4 (jolt-thread-bytes))
                       (vector-set! self 0 (jolt-ticks)))
-                    (let ((handler
-                           (lambda ()
+                    (vector-set! self 6
+                      (lambda ()
                         (cond
                           ((and (box? token) (unbox token))
                            ;; Not while this thread holds a counted lock. The
                            ;; escape skips any cleanup that has not started, and
                            ;; jolt-with-mutex's edges are the place that costs: an
                            ;; escape between the count and the wind left the count
-                           ;; up for good (no preemption on that carrier again, every
-                           ;; park refused), and one at the after-thunk's entry —
-                           ;; the winder already popped — left the mutex held. The
-                           ;; count goes up first and comes down last
-                           ;; (host/chez/locks.ss), so a zero count is outside both
-                           ;; edges. The preempt handler refuses on the same test
-                           ;; and retries the same way.
+                           ;; up for good (no preemption on that carrier again,
+                           ;; every park refused), and one at the after-thunk's
+                           ;; entry — the winder already popped — left the mutex
+                           ;; held. The count goes up first and comes down last
+                           ;; (host/chez/locks.ss), so a zero count is outside
+                           ;; both edges. The preempt handler refuses on the same
+                           ;; test and retries the same way.
                            (if (fx=? 0 (jolt-locks-held))
                                (k interrupt-sentinel)
-                               (begin (set! armed (jolt-fiber-preempt-retry-ticks))
-                                      (jolt-set-timer! armed))))
+                               (jolt-tick-set! jolt-tick-slot-poll (jolt-fiber-preempt-retry-ticks))))
                           ((jolt-budget-spent budgets)
                            => (lambda (b)
                                 ;; a budget is spent, this one's or an enclosing one's:
@@ -2176,64 +2299,23 @@
                                               (>= (- (jolt-ticks) (vector-ref b 0)) (vector-ref b 1)))
                                          ticks-sentinel
                                          bytes-sentinel))
-                                    (begin (set! armed (jolt-fiber-preempt-retry-ticks))
-                                           (jolt-set-timer! armed)))))
-                          (else
-                           (set! borrowed (fx+ borrowed armed))
-                           (cond
-                             ;; The quantum has fallen due. Hand it to the
-                             ;; scheduler's handler, which either escapes through
-                             ;; sched-k — and the after-thunk below gives the timer
-                             ;; back, the before-thunk re-takes it on resume — or
-                             ;; refuses (a lock held, a transition committed) and
-                             ;; re-arms short to retry. When it refuses, `armed`
-                             ;; still names the old tick, so the next count is high
-                             ;; and the retry lands early. That is the only safe
-                             ;; direction: the guarantee is an upper bound on the
-                             ;; window, and early only tightens it.
-                             ;;
-                             ;; The jolt-current-fiber test is load-bearing, not a
-                             ;; nicety: off a fiber the scheduler's handler does
-                             ;; nothing AND does not re-arm, so calling it there
-                             ;; would leave the borrow with no timer and stop the
-                             ;; interrupt from ever being noticed.
-                              ((and (jolt-current-fiber)
-                                    (fx>=? borrowed (jolt-fiber-preempt-ticks)))
-                               (set! borrowed 0)
-                               (jolt-fiber-preempt-handler))
-                              (else (arm!) (void))))))))
-                      ;; Push is the timer-frame ownership linearization point.
-                      (interrupt-poll-stack (cons owner budgets))
-                      (timer-interrupt-handler handler)
-                      (arm!)))
+                                    (jolt-tick-set! jolt-tick-slot-poll (jolt-fiber-preempt-retry-ticks)))))
+                          (else (jolt-tick-set! jolt-tick-slot-poll (jolt-budget-poll-ticks budgets))))))
+                    ;; Push is the poll-ownership linearization point.
+                    (interrupt-poll-stack (cons owner budgets))
+                    (jolt-tick-set! jolt-tick-slot-poll (jolt-budget-poll-ticks budgets)))
                   (jolt-masked-body thunk)
-                  ;; Runs on every way out of the body, the park included. Disarm
-                  ;; BEFORE restoring the handler: the other order leaves a window
-                  ;; where the borrowed tick can fall due on the scheduler's
-                  ;; handler, which answers it by preempting.
+                  ;; Runs on every way out of the body, the park included. Pop,
+                  ;; then poll for the enclosing borrow if there is one, no later
+                  ;; than the nearest enclosing budget's remainder (a budget its
+                  ;; inner runs spent fires at once): a poll that fires between the
+                  ;; two runs the enclosing check, which is the right one either
+                  ;; way. On a park the enclosing borrow's own after-thunk runs next
+                  ;; and cancels it.
                   (lambda ()
-                    (jolt-set-timer! 0)
-                    ;; Pop before restoring the enclosing handler. Every terminal
-                    ;; path (return, throw, interrupt, and park unwind) comes here.
                     (interrupt-poll-stack (cons owner outer-stack))
-                    (timer-interrupt-handler prev-handler)
-                    ;; Off a fiber, and on a park (the current-fiber vreg is
-                    ;; already cleared by then), this is a plain disarm — which is
-                    ;; what the scheduler wants for the carrier it is about to take
-                    ;; back. On a real exit from a fiber it re-arms the quantum.
-                    ;; On a park, enclosing winds immediately disarm this tick;
-                    ;; on a real off-fiber nested exit it keeps the outer token
-                    ;; polling. An enclosing borrow gets its tick (its quantum's, on a
-                    ;; fiber), no later than the nearest enclosing budget's remainder:
-                    ;; a budget its inner runs spent fires at once.
-                    (cond
-                      ((pair? outer-stack)
-                       (let ((n (if (jolt-current-fiber)
-                                    (fxmin interrupt-check-ticks (jolt-fiber-preempt-ticks))
-                                    interrupt-check-ticks))
-                             (left (jolt-budget-left outer-stack)))
-                         (jolt-set-timer! (if left (max 1 (min n left)) n))))
-                      (else (jolt-fiber-rearm-preempt!)))
+                    (jolt-tick-set! jolt-tick-slot-poll
+                                    (if (pair? outer-stack) (jolt-budget-poll-ticks outer-stack) 0))
                     (when (fx>? (jolt-locks-held) lv) (jolt-locks-exit!))))))))
     (cond
       ((eq? r ticks-sentinel)
@@ -2655,26 +2737,7 @@
 ;; the fiber layer answers its state name here ("WAITING" while it is parked, say),
 ;; or #f to fall through to the OS-thread answer.
 (define jolt-thread-state-hook (lambda (th) #f))
-(let ((statics (append thread-state-constants
-                       (list (cons "values" (lambda () (apply jolt-vector (map cdr thread-state-constants))))
-                             (cons "valueOf"
-                                   (lambda (nm)
-                                     (let ((hit (assoc (jolt-final-str nm) thread-state-constants)))
-                                       (if hit
-                                           (cdr hit)
-                                           (throw-jvm 'IllegalArgumentException
-                                                      (string-append "No enum constant java.lang.Thread.State."
-                                                                     (jolt-final-str nm)))))))))))
-  (register-class-statics! "java.lang.Thread$State" statics)
-  (register-class-statics! "Thread$State" statics))
-(register-host-methods! "thread-state"
-  (list (cons "name" (lambda (self) (jhost-state self)))
-        (cons "toString" (lambda (self) (jhost-state self)))
-        (cons "ordinal" (lambda (self)
-          (let loop ((ns thread-state-names) (i 0))
-            (if (string=? (car ns) (jhost-state self)) i (loop (cdr ns) (+ i 1))))))))
-(register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "thread-state")))
-                      (lambda (x) (jhost-state x)))
+(register-enum-class! "java.lang.Thread$State" thread-state-constants)
 
 ;; --- java.lang.management.ThreadMXBean (the current thread's CPU clock) -----
 ;; ManagementFactory/getThreadMXBean, for what callers time with it: the CPU time
@@ -2959,6 +3022,10 @@
 ;; each task's in turn.
 (define (j-future-get-until self deadline on-timeout)
   (let* ((st (jhost-state self))
+         ;; the deref's short spin (task-spin-until), for an untimed get: a hint
+         ;; only, the wait below reads the status again under the mutex. A timed
+         ;; one does not spin, so a zero-timeout poll still answers at once.
+         (_ (unless deadline (task-spin-until (lambda () (j-future-settled? (vector-ref st 0))))))
          (status (jolt-cv-wait-interruptibly "Future.get"
                              (vector-ref st 3) (vector-ref st 4) deadline
                    (lambda (timed-out?)
@@ -3241,11 +3308,48 @@
           ;; above core, or any worker once allowCoreThreadTimeOut is on
           ((and (vector-ref st 8) (or (vector-ref st 19) (fx>? (vector-ref st 4) (vector-ref st 6))))
            (let ((dl (or deadline (mono-deadline (vector-ref st 8)))))
-             (if (mono-due? dl)
-                 (executor-worker-exit! st)                ; idle past keep-alive
-                 (begin (executor-idle-wait! st dl)
-                        (poll dl)))))
+             (cond ((mono-due? dl) (executor-worker-exit! st))   ; idle past keep-alive
+                   ((executor-idle-spin! st) (poll dl))
+                   (else (executor-idle-wait! st dl) (poll dl)))))
+          ((executor-idle-spin! st) (poll deadline))
           (else (executor-idle-wait! st #f) (poll deadline)))))
+;; Before an untimed park, a short spin with the mutex RELEASED, watching the queue
+;; depth and the shutdown flag: a burst of tasks (a fan-out, a submit/get loop)
+;; refills the queue within microseconds, and a worker that is still spinning takes
+;; the next task without the condition's wake, which costs the waker a signal and
+;; this thread a kernel wake and a reschedule. The JVM's cached pool hands over
+;; through a SynchronousQueue, which spins before it parks for the same reason.
+;;
+;; The spinner counts as IDLE (st 9), so the growth rule in executor-enqueue! sees
+;; it as a taker and forks no worker for a task it is about to take. An enqueue's
+;; signal finds no thread parked in the condition on its account (the condition's
+;; own count is of parked threads), so a lone spinner costs the enqueue nothing; with
+;; others parked, one of them may also wake, find the task taken, and park again,
+;; which is the spurious wake every waiter here already re-checks for. The depth is
+;; read without the mutex, as a hint: whatever it says, the caller re-polls under
+;; the mutex. Called and returning with the mutex HELD.
+;;
+;; NOT while delayed tasks are pending (a scheduled pool's st 13), and a schedule
+;; landing during the spin ends it. An idle worker is what times the delayed head
+;; (executor-idle-wait!'s leader), and executor-lead-handoff! / a schedule signal
+;; the condition for one when the idle count says one is parked: a spinner in
+;; that count is not parked, so the signal reached nobody and the head went
+;; untimed — periodic tasks skipped runs and missed their cancellation at
+;; shutdown (the corpus's scheduleAtFixedRate rows).
+(define (executor-idle-spin! st)
+  (and (null? (vector-ref st 13))
+       (let ((mu (vector-ref st 2))
+             (ready? (lambda () (or (fx>? (vector-ref st 10) 0) (vector-ref st 0)
+                                    (pair? (vector-ref st 13))))))
+         (vector-set! st 9 (fx+ (vector-ref st 9) 1))
+         (jolt-unlock! mu)
+         (let ((found (task-spin-until ready?)))
+           (jolt-lock! mu)
+           (vector-set! st 9 (fx- (vector-ref st 9) 1))
+           ;; Asked again under the mutex: an enqueue between the spin's last look
+           ;; and the lock counted this worker idle, so it neither grew the pool
+           ;; nor reached a parked waiter, and parking now would strand its task.
+           (or found (ready?))))))
 ;; A worker that dies must not take the pool's accounting with it. Everything a
 ;; TASK can throw is already caught at the task (submit's future keeps it, execute
 ;; reports it), so reaching this handler means the queue mechanics threw — which
@@ -3822,10 +3926,13 @@
         (cons "toArray" (lambda (self . _) (na-to-array (list->cseq (abq-snapshot self)))))
         ;; the tag, not a literal: "lbq" shares this table and must not print as
         ;; an ArrayBlockingQueue.
-        (cons "toString" (lambda (self)
-          (string-append (if (string=? (jhost-tag self) "lbq") "LinkedBlockingQueue" "ArrayBlockingQueue")
-                         "(" (number->string (vector-ref (jhost-state self) 4)) ")")))))
+        ;; AbstractCollection.toString: the elements, head first
+        (cons "toString" (lambda (self) (host-elems-tostring self (abq-snapshot self))))))
 (alias-host-methods! "lbq" "abq")
+;; a blocking queue is a java.util Collection: str, seq and the image see its
+;; elements (jutil-colls.ss)
+(register-jutil-coll! "abq" 'coll abq-snapshot)
+(register-jutil-coll! "lbq" 'coll abq-snapshot)
 ;; (seq q), (vec q) over a queue: the same snapshot, head first; (count q) is
 ;; the size, without one.
 (register-seq-arm! abq? (lambda (q) (list->cseq (abq-snapshot q))))
@@ -3840,7 +3947,7 @@
               ;; a reified Callable or Runnable is called through its method, as
               ;; submit calls one (it was invoked as a fn and failed the task)
               (vector 'new override-flag override jolt-nil #f (make-mutex) (jolt-make-cv)
-                      (runnable->thunk thunk))))
+                      (runnable->thunk thunk) thunk)))
 (define (future-task? x) (and (jhost? x) (string=? (jhost-tag x) "future-task")))
 (define (future-task-run! self)
   (let ((st (jhost-state self)))
@@ -3908,8 +4015,19 @@
                           #f))))
             (when (box? r) (task-interrupt-runner! r))
             (and r #t))))
+        ;; FutureTask.toString: Object's, then the state
         (cons "toString" (lambda (self)
-          (string-append "FutureTask[" (symbol->string (vector-ref (jhost-state self) 0)) "]")))))
+          (let ((st (jhost-state self)))
+            (string-append (host-object-tostring self) "["
+                           (case (vector-ref st 0)
+                             ((done) (if (vector-ref st 4)
+                                         (string-append "Completed exceptionally: "
+                                                        (jolt-str-render-one (vector-ref st 4)))
+                                         "Completed normally"))
+                             ((cancelled) "Cancelled")
+                             (else (string-append "Not completed, task = "
+                                                  (jolt-str-render-one (vector-ref st 8)))))
+                           "]"))))))
 ;; submit/execute above route a FutureTask through its own run (a Runnable on
 ;; the JVM), and a reify or deftype implementing Callable or Runnable through its
 ;; call or run — invoking one directly was "cannot be cast to clojure.lang.IFn",
@@ -3962,7 +4080,13 @@
           (let* ((ex (vector-ref (jhost-state self) 0))
                  (cap (vector-ref (jhost-state ex) 5)))
             (if cap (max 0 (- cap (executor-queue-depth ex))) 2147483647))))
-        (cons "toString" (lambda (self) "ExecutorQueueView"))))
+        ;; the work queue's tasks, head first, as the queue's own toString lists them
+        (cons "toString" (lambda (self)
+                           (let* ((st (jhost-state (vector-ref (jhost-state self) 0)))
+                                  (q (jolt-with-mutex (vector-ref st 2)
+                                       (let ((p (unbox (vector-ref st 1))))
+                                         (append (car p) (reverse (cdr p)))))))
+                             (host-elems-tostring self q))))))
 (register-host-methods! "executor-service"
   (list (cons "getQueue" (lambda (self) (make-jhost "executor-queue-view" (vector self))))
         ;; ThreadPoolExecutor's size accessors, which are how a caller (and the
@@ -4558,7 +4682,7 @@
             (jolt-timer-at! (ms->deadline-millis (vector-ref st 0))
               (lambda () (cf-execute! (vector-ref st 1) (lambda () (cf-fn-call r "run"))))))
           jolt-nil))
-        (cons "toString" (lambda (self) "java.util.concurrent.CompletableFuture$DelayedExecutor"))))
+        (cons "toString" host-object-tostring)))
 
 ;; java.util.concurrent.Future.State, what state() answers: an enum, so each
 ;; constant is one object and = compares them by identity.
@@ -4566,13 +4690,7 @@
   (map (lambda (nm) (cons nm (make-jhost "future-state" nm)))
        '("RUNNING" "SUCCESS" "FAILED" "CANCELLED")))
 (define (future-state nm) (cdr (assoc nm future-state-constants)))
-(register-class-statics! "java.util.concurrent.Future$State" future-state-constants)
-(register-class-statics! "Future$State" future-state-constants)
-(register-host-methods! "future-state"
-  (list (cons "name" (lambda (self) (jhost-state self)))
-        (cons "toString" (lambda (self) (jhost-state self)))))
-(register-str-render! (lambda (x) (and (jhost? x) (string=? (jhost-tag x) "future-state")))
-                      (lambda (x) (jhost-state x)))
+(register-enum-class! "java.util.concurrent.Future$State" future-state-constants)
 
 (define (cf-to-string self)
   (let* ((st (jhost-state self))

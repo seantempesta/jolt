@@ -67,10 +67,13 @@
 ;; every one of those sat where a jolt-cv sits now (a promise, a future, an agent,
 ;; a channel, a host queue or latch), so they restore as jolt-cvs too.
 ;;
-;; This build still READS versions 2 to 10: everything they can contain
+;; This build still READS versions 2 to 11: everything they can contain
 ;; (including raw jolt-ref-v1 records) restores here via the legacy arms.
-(define jolt-image-format-version 11)
-(define jolt-image-read-versions '(2 3 4 5 6 7 8 9 10 11))
+;; Version 12: a host collection shim travels as an image-hosted record (its
+;; codec's kind and plain data, host-static.ss register-image-codec!) and an
+;; enum constant as its class and name; formats 11 and older carry neither.
+(define jolt-image-format-version 12)
+(define jolt-image-read-versions '(2 3 4 5 6 7 8 9 10 11 12))
 
 ;; --- classification -----------------------------------------------------------
 ;; An eq hashtable is the ONE hashtable kind Chez can fasl; eqv/equal/string-hash
@@ -108,7 +111,11 @@
       ;; is a two-predicate check and runs before the table lookup, so this costs
       ;; a walked value nothing it did not already pay (jolt-2cny).
       (jns? x)
-      (and (code-value? x) (proc-name-of x) #t)))
+      (and (code-value? x) (proc-name-of x) #t)
+      ;; An enum constant (java/enums.ss) is ONE object per name: a fasl copy is
+      ;; a value no table knows, equal to nothing. It travels as its class and
+      ;; name, like a keyword.
+      (enum-constant? x)))
 
 ;; A record's fields for image purposes: its own AND every parent's, root first —
 ;; the order record-constructor takes them in. record-type-field-names reports only
@@ -333,6 +340,7 @@
       ;; would be a SECOND `user` that merely = the live one, where find-ns is
       ;; identity-stable and a var round-trips to the identical var (jolt-ji1h)
       ((jns? x) (list 'ns (jns-name x)))
+      ((enum-constant? x) (list 'enum (enum-info-fqn (car (enum-of x))) (enum-name x)))
       ;; A named fn travels as its var's name. So does any other CODE value some
       ;; var roots -- a multimethod, a reify -- which is not a procedure but is
       ;; equally something the restoring build already has (rt.ss code-value?).
@@ -354,6 +362,13 @@
     ;; back through the intern table, so the restored keyword IS the live one
     ((kw) (keyword (cadr d) (caddr d)))
     ((ns) (intern-ns! (cadr d)))
+    ((enum)
+     (let ((info (enum-class-info (cadr d))))
+       (if info
+           (enum-value-of info (caddr d))
+           (jolt-throw (jolt-ex-info (string-append "image: no enum " (cadr d)
+                                                    " in this build to restore " (caddr d))
+                                     empty-pmap)))))
     ((fn-ref)
      (let ((c (var-cell-lookup (cadr d) (caddr d))))
        (if (and c (not (jolt-var-unbound? (var-cell-root c))))
@@ -382,6 +397,12 @@
 ;; data directly. Routing it through a descriptor instead would put it in the
 ;; one part of the file that cannot carry either.
 (define-record-type image-handled (fields payload) (nongenerative image-handled-v1))
+
+;; A host value written through its codec (host-static.ss register-image-codec!):
+;; the codec's KIND and the #(header items) it dumped, walked as plain data.
+;; data is set after the record is memoized, so a value inside its own items
+;; refers back to this record and restores as the one value.
+(define-record-type image-hosted (fields kind (mutable data)) (nongenerative image-hosted-v1))
 
 ;; An anonymous closure a state image can rebuild from source (write side here;
 ;; R3 reconstructs). name is the unique jfn$<ns>/<def>$<n> the backend bound
@@ -1113,6 +1134,10 @@
                    (lambda (m) (if rebuild? m #t)))
                   (else
                    (cond
+                     ;; an enum constant stays in place and is written by name
+                     ;; (image-encode-external); restored, it is the live one
+                     ((enum-constant? x)
+                      (if rebuild? (begin (hashtable-set! memo x x) x) #t))
                      ;; R3 read side: image-owned records rebuild first, before
                      ;; user handlers could claim them. A stored fn source record
                      ;; becomes a live closure; a stored handler payload is handed
@@ -1176,6 +1201,25 @@
                               (hashtable-set! memo x r)
                               r)
                             (begin (hashtable-set! memo x #t) #t))))
+                     ;; then a host value's codec, or its refusal by name
+                     ((and restore? (image-hosted? x))
+                      (walk-hosted-restore x path))
+                     ((and (not restore?) (image-codec-for x)) =>
+                      (lambda (c) (walk-hosted x c path)))
+                     ((and (not restore?) (image-refusal-for x)) =>
+                      (lambda (why)
+                        (cond
+                          (stubbing?
+                           (let ((st (make-stub x path why)))
+                             (hashtable-set! memo x st) st))
+                          (rebuild?
+                           (jolt-throw
+                             (jolt-ex-info
+                               (string-append "image: cannot write a " (jolt-class-name x) " at "
+                                              (image-path->string path) ": " why)
+                               empty-pmap)))
+                          (else (hashtable-set! memo x #t)
+                                (report! x path (image-report-disposition mode))))))
                      ;; a named fn stays in place: the fn-ref external restores
                      ;; it as the live fn (cheaper than source, no form needed).
                      ;; On the READ side a procedure IS an already-restored
@@ -2010,6 +2054,32 @@
                     (hashtable-set! memo x coll)
                     (image-meta-copy! x coll)
                     coll))))
+             ;; a host value through its codec: the record is memoized first,
+             ;; then the dumped data walks, so an item that is the value itself
+             ;; comes back as this record (write) or the new value (restore)
+             (walk-hosted
+              (lambda (x c path)
+                (let ((data ((image-codec-dump c) x))
+                      (p (cons (jolt-class-name x) path)))
+                  (if rebuild?
+                      (let ((r (make-image-hosted (image-codec-kind c) #f)))
+                        (hashtable-set! memo x r)
+                        (image-hosted-data-set! r (walk data p))
+                        r)
+                      (begin (hashtable-set! memo x #t) (walk data p) #t)))))
+             (walk-hosted-restore
+              (lambda (x path)
+                (let ((c (hashtable-ref image-codec-by-kind (image-hosted-kind x) #f))
+                      (data (image-hosted-data x)))
+                  (unless c
+                    (jolt-throw (jolt-ex-info (string-append "image: no codec for "
+                                                             (image-hosted-kind x)
+                                                             " in this build to restore it")
+                                              empty-pmap)))
+                  (let ((v ((image-codec-make c) (walk (vector-ref data 0) (cons "header" path)))))
+                    (hashtable-set! memo x v)
+                    ((image-codec-fill! c) v (walk (vector-ref data 1) (cons "items" path)))
+                    v))))
              (walk-handled-restore
               (lambda (x path)
                 (let ((tp (walk (image-handled-payload x) (cons "payload" path))))

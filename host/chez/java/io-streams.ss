@@ -348,7 +348,7 @@
                    (set-port-position! (in-stream-port self) (vector-ref (jhost-state self) 2))
                    jolt-nil))
    (cons "markSupported" (lambda (self) (if (in-stream-markable? self) #t #f)))
-   (cons "toString" (lambda (self) "#<InputStream>"))))
+   (cons "toString" host-object-tostring)))
 
 ;; --- byte output stream -----------------------------------------------------
 ;; state #(port extract acc): extract/acc are #f for a file/passthrough stream;
@@ -767,7 +767,7 @@
                   (char-reader-mark-set! self (if (pair? rest) (jnum->exact (car rest)) 0))
                   jolt-nil))
    (cons "reset" (lambda (self) (char-reader-reset! self) jolt-nil))
-   (cons "toString" (lambda (self) "#<Reader>"))))
+   (cons "toString" host-object-tostring)))
 
 ;; --- java.io.BufferedReader -------------------------------------------------
 ;; BufferedReader's constructor was the identity over jolt's own readers (each
@@ -1074,7 +1074,7 @@
                                       (record-method-dispatch inner "close" jolt-nil)))
                          (lambda () (vector-set! st 2 #f)))))
                    jolt-nil))
-   (cons "toString" (lambda (self) "#<BufferedReader>"))))
+   (cons "toString" host-object-tostring)))
 
 ;; --- the java.io classes a reify/proxy extends ------------------------------
 ;; (proxy [java.io.InputStream] [] (read …)) inherits, on the JVM, every method
@@ -1263,7 +1263,7 @@
                          (when d (record-method-dispatch d "close" jolt-nil)))
                        (unless (port-closed? port) (close-port port))))
                    jolt-nil))
-   (cons "toString" (lambda (self) "#<Writer>"))))
+   (cons "toString" host-object-tostring)))
 
 ;; --- constructors -----------------------------------------------------------
 (define utf8-tx (make-transcoder (utf-8-codec)))
@@ -1642,7 +1642,7 @@
                         (let ((t (ps-target self)))
                           (and (jhost? t) (host-method-ref (jhost-tag t) "checkError")
                                (jolt-truthy? (record-method-dispatch t "checkError" jolt-nil))))))
-   (cons "toString" (lambda (self) "#<PrintStream>"))))
+   (cons "toString" host-object-tostring)))
 ;; (PrintStream. out) / (PrintStream. out autoFlush). The charset arity is
 ;; accepted and ignored: jolt renders UTF-8.
 (reg-ctor! '("PrintStream" "java.io.PrintStream")

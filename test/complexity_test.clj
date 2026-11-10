@@ -478,6 +478,20 @@
              #(dispatch-all c4 ks4)
              "case is testing its constants one = at a time instead of looking the value up (00-syntax.clj case)"))
 
+    ;; (String. bytes offset length cs) copies only its slice. A byte array became a
+    ;; bytevector WHOLE before the slice was cut, so 30 bytes out of a 1.5 MB
+    ;; array took 47 us against 0.4 us out of a 40-byte one. Both arms take the
+    ;; same 30 bytes, so the copy reads ~1.0 and the whole-array copy ~4.0.
+    (let [b1 (byte-array n1 (byte 65)) b4 (byte-array n2 (byte 65))]
+      (when-not (and (= "AAA" (String. b1 (int 7) (int 3) "UTF-8"))
+                     (= "AAA" (String. b4 (int (- n2 3)) (int 3) "UTF-8")))
+        (println "FAIL complexity string-slice: wrong values before timing")
+        (System/exit 1))
+      (judge "String byte slice"
+             #(String. b1 (int 1000) (int 30) "UTF-8")
+             #(String. b4 (int 1000) (int 30) "UTF-8")
+             "(String. bytes off len) copies the whole array before cutting its slice (java/host-static-classes.ss bytes-slice-for-string)"))
+
     (if (pos? @failures)
       (do (println (str "complexity: " @failures " section(s) failed"))
           (System/exit 1))

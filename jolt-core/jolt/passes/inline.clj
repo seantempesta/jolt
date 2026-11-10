@@ -926,6 +926,52 @@
       ;; un-substituted would dangle.
       (map-ir-children (fn [c] (subst-lookup c nm src)) node))))
 
+;; --- where a struct's field args may move to ---------------------------------
+;; elim-let-structs MOVES each field arg from the let binding to every read of
+;; that field. local-escapes? proves the reads are the only uses; it does not
+;; prove the arg still means the same thing at the read. Two places it does not:
+;;   - under a binder that rebinds a local the arg reads. (let [p (->P a 2)]
+;;     (let [a 10] (:x p))) is 1, and moved it reads the inner a: 10. Inlined
+;;     bodies are alpha-renamed, user code is not.
+;;   - inside a fn literal. The closure captured p; moved, it captures whatever
+;;     the args read instead, while the literal's :free-names (what the back end
+;;     passes to the site's image maker, and what an image rebuilds the closure
+;;     from) still names p, which no longer exists: "variable p is not bound" at
+;;     the site. The args would also re-run on every call instead of once.
+;; Both are refused here, so the allocation stays.
+
+(defn- mentions-local? [node nm]
+  (if (and (= :local (get node :op)) (= nm (get node :name)))
+    true
+    (reduce-ir-children (fn [acc c] (or acc (mentions-local? c nm))) false node)))
+
+(defn- local-names
+  "Every local name node reads, free or not — an over-approximation of its free
+  locals, which only makes relocation-blocked? refuse more."
+  [node]
+  (let [acc (atom #{})]
+    (letfn [(walk [n]
+              (when (= :local (get n :op)) (swap! acc conj (get n :name)))
+              (reduce-ir-children (fn [_ c] (walk c) nil) nil n))]
+      (walk node))
+    @acc))
+
+(defn- relocation-blocked?
+  "Would moving an expression reading the locals in fv to the reads of nm in node
+  change what it computes? True when a read of nm sits inside a fn literal, or
+  under a let/loop/catch binder whose name is in fv."
+  [node nm fv]
+  (let [op (get node :op)]
+    (cond
+      (= op :fn) (mentions-local? node nm)
+      (and (or (= op :let) (= op :loop))
+           (some (fn [b] (contains? fv (nth b 0))) (get node :bindings)))
+      (mentions-local? node nm)
+      (and (= op :try) (get node :catch-body) (contains? fv (get node :catch-sym))
+           (mentions-local? (get node :catch-body) nm))
+      true
+      :else (reduce-ir-children (fn [acc c] (or acc (relocation-blocked? c nm fv))) false node))))
+
 (defn- fold-kw-literal
   "(a) (:k <source>) -> the value at k. <source> is a const-key pure map
   ((:k {:k a ..}) -> a) or a pure record ctor ((:k (->Rec a ..)) -> the arg for
@@ -967,6 +1013,11 @@
                             (if (local-escapes? (nth (nth binds j) 1) nm) true (recur (inc j)))
                             false)))
                    (not (local-escapes? body nm))
+                   (let [fv (local-names init)
+                         tail (subvec binds (inc i) n)]
+                     (and (not (some (fn [bb] (contains? fv (nth bb 0))) tail))
+                          (not (some (fn [bb] (relocation-blocked? (nth bb 1) nm fv)) tail))
+                          (not (relocation-blocked? body nm fv))))
                    (or ismap
                        (lookups-all-fields?
                          (conj (mapv (fn [bb] (nth bb 1)) (subvec binds (inc i) n)) body)

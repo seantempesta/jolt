@@ -613,6 +613,24 @@
 ;; rewrites to the restore or to nothing (*self-wrap*: {:tok base :unsafe atom},
 ;; site-restore).
 (def ^:dynamic *self-wrap* nil)
+;; Inside a fn, a non-tail call's restore is a call to jolt-site-call, which the
+;; outermost fn's clause binds once (site-restore, emit-fn). Bound to an atom per
+;; clause while that clause emits; set once a site uses the helper.
+(def ^:dynamic *site-call* nil)
+;; Inside a fn the restore is spelled ONCE per clause, as the procedure
+;; site-call-helper binds to jolt-site-call, and each site is
+;; (jolt-site-call (lambda () call)). cp0 inlines the helper and the thunk, so
+;; the code that runs is the inline restore. What it saves is inspector
+;; information: with it on (jolt build's release mode) Chez keeps each lambda's
+;; whole expanded body as data, the code-info sexpr, and the inline restore was
+;; ~30 pairs of that per site, repeated in every enclosing lambda's copy. A
+;; 4,000-fn app's binary grew 32% with it (#1423). Outside any fn there is no
+;; clause to bind the helper in, and the site keeps the inline form.
+(def ^:private site-call-helper
+  (str "(lambda (_th$) (let ((_ss$ (virtual-register 2)) (_so$ (virtual-register 12)))"
+       " (if (pair? _ss$) (set-virtual-register! 12 _ss$))"
+       " (set-virtual-register! 2 0)"
+       " (let ((_sr$ (_th$))) (set-virtual-register! 2 _ss$) (set-virtual-register! 12 _so$) _sr$)))"))
 ;; A tail call that may run a jolt fn disqualifies the enclosing fn.
 (defn- note-tail-call! [tail?]
   (when (and tail? *self-wrap*) (reset! (:unsafe *self-wrap*) true)))
@@ -1213,8 +1231,9 @@
                   ;; the trace site-restore around a non-tail call (site-restore,
                   ;; lookup-restore): it reads and writes the site slots and
                   ;; tests the slot's pair. honeysql's (let [pair? ...]) turned
-                  ;; that test into a call to its boolean.
-                  "pair?" "virtual-register" "set-virtual-register!"
+                  ;; that test into a call to its boolean. jolt-site-call is the
+                  ;; local a clause binds the restore to (site-call-helper).
+                  "pair?" "virtual-register" "set-virtual-register!" "jolt-site-call"
                   "fxand" "fxior" "fxxor" "fxnot"
                   "jolt-register-source!" "jolt-proto-epoch"
                   ;; --- bare heads emitted at sites the registry doesn't cover ---
@@ -2954,7 +2973,18 @@
                           ;; DURING the initialisation, which is this fn itself.
                           *letrec-binders* #{}
                           *fnsrc-def-init?* false]
-                  (mapv emit-arity-clause (or once-marked arities)))
+                  (mapv (fn [a]
+                          ;; the outermost fn binds the restore helper in each
+                          ;; clause that has a site; a nested fn's sites use the
+                          ;; binding of the clause they sit in (site-restore)
+                          (if (and (nil? *site-call*) (trace-frames?) (= :chez (target)))
+                            (let [used (atom false)
+                                  c (binding [*site-call* used] (emit-arity-clause a))]
+                              (if @used
+                                [(nth c 0) (str "(let ((jolt-site-call " site-call-helper ")) " (nth c 1) ")")]
+                                c))
+                            (emit-arity-clause a)))
+                        (or once-marked arities)))
         ;; the self-calls' placeholder head, now that the body is known (*self-wrap*)
         clauses (if self-wrap
                   (let [tok (:tok self-wrap)
@@ -3412,12 +3442,15 @@
 ;; further out, which the reporter reads from the outer slot as a gap bridge.
 (defn- site-restore
   ([call]
-   (let [sv (fresh-label "_ss$") so (fresh-label "_so$") rv (fresh-label "_sr$")]
-     (str "(let ((" sv " (virtual-register 2)) (" so " (virtual-register 12)))"
-          " (if (pair? " sv ") (set-virtual-register! 12 " sv "))"
-          " (set-virtual-register! 2 0)"
-          " (let ((" rv " " call ")) (set-virtual-register! 2 " sv ")"
-          " (set-virtual-register! 12 " so ") " rv "))")))
+   (if *site-call*
+     (do (reset! *site-call* true)
+         (str "(jolt-site-call (lambda () " call "))"))
+     (let [sv (fresh-label "_ss$") so (fresh-label "_so$") rv (fresh-label "_sr$")]
+       (str "(let ((" sv " (virtual-register 2)) (" so " (virtual-register 12)))"
+            " (if (pair? " sv ") (set-virtual-register! 12 " sv "))"
+            " (set-virtual-register! 2 0)"
+            " (let ((" rv " " call ")) (set-virtual-register! 2 " sv ")"
+            " (set-virtual-register! 12 " so ") " rv "))"))))
   ([call rd wr]
    (let [sv (fresh-label "_ss$") rv (fresh-label "_sr$")]
      (str "(let ((" sv " " rd ")) (let ((" rv " " call ")) (" wr " " sv ") " rv "))"))))

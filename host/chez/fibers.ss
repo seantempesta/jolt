@@ -1076,8 +1076,7 @@
       ;; may in principle sit in the gap for a while, and the promise at the head of
       ;; this section is that no setting opens an unbounded starvation window.
       ((not (eq? (jolt-fiber-state f) 'running))
-       (jolt-set-timer! (jolt-fiber-preempt-retry-ticks))
-       (void))
+       (jolt-tick-preempt! (jolt-fiber-preempt-retry-ticks)))
       ;; A LOCK IS HELD. Switching here loses mutual exclusion whichever way it
       ;; goes: unwinding releases the mutex mid-section, and not unwinding leaves
       ;; this fiber holding an OS mutex while another fiber on the SAME carrier
@@ -1086,14 +1085,20 @@
       ;; the request instead would quietly restore starvation for a fiber that is
       ;; inside a region whenever the timer fires.
       ((fx>? (jolt-locks-held) 0)
-       (jolt-set-timer! (jolt-fiber-preempt-retry-ticks))
-       (void))
+       (jolt-tick-preempt! (jolt-fiber-preempt-retry-ticks)))
+      ;; The same transition sa-fiber-yield makes, under the same rule: the
+      ;; state change, the enqueue and the switch are one step. The timer this
+      ;; handler answered has fired, but the tick scheduler may have armed it
+      ;; again for another client (a sample, a run-interruptible poll), and a
+      ;; fire between the enqueue and the switch would queue this fiber twice.
       (else
+       (disable-interrupts)
        (jolt-fiber-bump-preempts! f)
        (jolt-fiber-state-set! f 'ready)
        (jolt-fiber-enqueue! (jolt-fiber-carrier f) f)
        ;; re-armed by jolt-fiber-arm-preempt! when this fiber is next dispatched
        (jolt-fiber-to-scheduler! f)
+       (enable-interrupts)           ; balance, see sa-fiber-yield
        ;; Resumed. A compute-bound fiber that was interrupted meets it here, on
        ;; its next quantum, the only safe point it ever reaches.
        (jolt-fiber-check-interrupt! f)))))
@@ -1158,46 +1163,21 @@
     n))
 
 ;; Arm around a dispatch, disarm on the way back to the drain loop, so the
-;; scheduler itself is never preempted. Installing the handler per dispatch
-;; rather than once per carrier keeps this composable with
-;; jolt-run-interruptible, which saves and restores the handler around its own
-;; thunk; the cost is that a run-interruptible inside a fiber leaves the timer
-;; disarmed (it ends with set-timer 0), so that fiber runs cooperatively until
-;; its next dispatch.
+;; scheduler itself is never preempted. The timer belongs to the tick scheduler
+;; (ticks.ss), and the quantum is its preempt demand: on a carrier with nothing
+;; else registered that is a bare set-timer, and with a sampler or a
+;; run-interruptible borrow registered too it is one demand among them, charged
+;; the same ticks. So a borrow no longer hides the quantum and nothing has to
+;; hand the timer back afterwards.
 ;; Installing the HANDLER is per drain, not per dispatch: it is a parameter
 ;; write, and paying it on every fiber dispatch showed up as a third of the cost
-;; of a yield. Per drain still composes with jolt-run-interruptible, which saves
-;; and restores the handler around its own thunk.
+;; of a yield. It has to be installed here at all because a solo carrier arms
+;; the raw timer, which never passes through the place ticks.ss installs it.
 (define (jolt-fiber-install-preempt-handler!)
-  (timer-interrupt-handler jolt-fiber-preempt-handler))
+  (timer-interrupt-handler jolt-tick-fire))
 (define (jolt-fiber-arm-preempt!)
-  (jolt-set-timer! jolt-fiber-preempt-ticks-global))
-(define (jolt-fiber-disarm-preempt!) (jolt-set-timer! 0))
-
-;; Hand the timer back to the scheduler after something else borrowed it.
-;;
-;; The one borrower is jolt-run-interruptible (java/concurrency.ss), which saves
-;; the handler, installs one of its own, and arms its own tick. Restoring the
-;; HANDLER is only half of it: the timer is the other half, and a bare
-;; (set-timer 0) on the way out left the fiber running with nothing to preempt it
-;; until its next dispatch — a compute-bound fiber that borrowed the timer once
-;; then pinned its carrier for as long as it liked. That is the starvation window
-;; the head of this section says no setting can open, reachable from ordinary
-;; jolt code through jolt.host/run-interruptible (jolt-ly62).
-;;
-;; Off a fiber it stays disarmed, which is not a fallback but the same rule
-;; jolt-fiber-run follows: a timer over the scheduler would park the carrier's own
-;; loop, and a plain thread has nothing to preempt.
-;;
-;; The caller must restore the handler BEFORE calling this. Arming first would
-;; leave a window where a fiber's quantum can fall due while the borrower's
-;; handler is still installed, and that handler answers a quantum by re-arming
-;; its own tick — so the borrow would silently outlive itself.
-(define (jolt-fiber-rearm-preempt!)
-  (cond ((jolt-current-fiber) (jolt-fiber-arm-preempt!))
-        ;; a ticks-of measure open on this thread keeps its arm (fibers-async.ss)
-        ((fx>? (vector-ref (jolt-ticks-cell) 4) 0) (jolt-set-timer! (most-positive-fixnum)))
-        (else (jolt-set-timer! 0))))
+  (jolt-tick-preempt! jolt-fiber-preempt-ticks-global))
+(define (jolt-fiber-disarm-preempt!) (jolt-tick-preempt! 0))
 
 ;; --- interrupts (an Erlang exit signal: raise in a fiber from outside) -------
 ;; A fiber otherwise stops only when its body returns or raises. An interrupt

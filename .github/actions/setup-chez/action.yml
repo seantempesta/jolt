@@ -1,0 +1,124 @@
+name: Set up Chez, Gambit and the certify oracle
+description: >-
+  The toolchain the jolt gate runs on: the pinned Chez Scheme built from source
+  with jolt's kernel patches (on PATH as chez), Gambit for the host/gambit
+  gates, and JDK 21 plus the Clojure CLI as the conformance oracle. Chez and
+  Gambit come from the actions cache when the key matches, so a warm run spends
+  seconds here. Every shard of the gate job runs this, which is why it is one
+  action and not steps copied per job.
+runs:
+  using: composite
+  steps:
+    # The runner image's OS id (ubuntu24), for the cache keys. ImageOS is a
+    # process env var, not one the workflow set, so ${{ env.ImageOS }} was
+    # always empty and the keys read chez-Linux--v10.4.1-…: a cache built on
+    # ubuntu-24.04 would have been restored on 26.04. Read from the shell, it
+    # is there, so the first run on each image builds Chez and Gambit once.
+    - id: image
+      shell: bash
+      run: echo "os=$ImageOS" >> "$GITHUB_OUTPUT"
+
+    # Build Chez from source rather than the distro package: the apt
+    # chezscheme ships petite+scheme only, with no kernel dev files
+    # (libkernel.a, scheme.h), so `jolt build` (the buildsmoke gate) can't link
+    # a binary and would skip. The source build provides them, plus the libs the
+    # kernel links against.
+    - name: Install build dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential git liblz4-dev zlib1g-dev libncurses-dev uuid-dev
+
+    - name: Cache Chez Scheme
+      id: cache-chez
+      uses: actions/cache@v5
+      with:
+        path: /opt/chez
+        key: chez-${{ runner.os }}-${{ steps.image.outputs.os }}-v10.4.1-x11off-pic-${{ hashFiles('host/chez/chez-patches/*.patch') }}
+
+    - name: Build Chez Scheme from source
+      if: steps.cache-chez.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        git clone --depth 1 --branch v10.4.1 https://github.com/cisco/ChezScheme.git /tmp/chez-src
+        sh "$GITHUB_WORKSPACE/ci/apply-chez-patches.sh" /tmp/chez-src
+        cd /tmp/chez-src
+        # --disable-x11: the expression editor's X11 clipboard isn't needed and
+        # would pull an X11 build/link dep.
+        #
+        # CFLAGS+=-fPIC: `jolt build --library` links Chez's libkernel.a into a
+        # shared object, which a kernel built without -fPIC cannot do — the
+        # -shared link fails with a relocation error. build-lib-smoke.sh treats
+        # that as an environment limitation and SKIPS, so without this flag the
+        # buildlibsmoke gate passes without testing anything.
+        ./configure --installprefix=/opt/chez --threads --disable-x11 CFLAGS+=-fPIC
+        make -j"$(nproc)"
+        sudo make install
+        sudo chown -R "$USER" /opt/chez
+
+    - name: Put chez on PATH
+      shell: bash
+      run: |
+        # Installed as `scheme`; the gate invokes `chez`. A wrapper that execs
+        # scheme keeps argv0 so Chez finds its boot files. Placed next to scheme
+        # so build.ss derives the csv dir (libkernel.a/scheme.h) from it.
+        printf '#!/bin/sh\nexec /opt/chez/bin/scheme "$@"\n' > /opt/chez/bin/chez
+        chmod +x /opt/chez/bin/chez
+        echo '/opt/chez/bin' >> "$GITHUB_PATH"
+        /opt/chez/bin/chez --version
+
+    # Gambit, for the host/gambit gates (gambitcheck/kernel/eval/boot/unbound/
+    # vars/profile). apt's gambc is 4.9.3; the gates run on 4.9.8, the brew
+    # pin, so build the tag from source and cache it like Chez. The git tag
+    # ships the generated C files, so no bootstrap compiler is involved.
+    # Flags are the brew formula's minus openssl, which nothing here uses:
+    # --enable-single-host is the one-C-file-per-module build, the runtime
+    # options make UTF-8 the default encoding on files, stdio and terminals.
+    - name: Cache Gambit
+      id: cache-gambit
+      uses: actions/cache@v5
+      with:
+        path: /opt/gambit
+        key: gambit-${{ runner.os }}-${{ steps.image.outputs.os }}-v4.9.8-single-host-f8
+
+    - name: Build Gambit from source
+      if: steps.cache-gambit.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        git clone --depth 1 --branch v4.9.8 https://github.com/gambit/gambit.git /tmp/gambit-src
+        cd /tmp/gambit-src
+        ./configure --prefix=/opt/gambit --enable-single-host --enable-default-runtime-options=f8,-8,t8
+        make -j"$(nproc)"
+        sudo make install
+        sudo chown -R "$USER" /opt/gambit
+
+    - name: Show Gambit version
+      # Not on PATH: `gsc` is Ghostscript's name too, and the Makefile only
+      # ever runs $(GAMBIT_PREFIX)/bin/gsi and gsc.
+      shell: bash
+      run: /opt/gambit/bin/gsi -v
+
+    - name: Install JDK + Clojure (certify oracle)
+      shell: bash
+      run: |
+        # openjdk-21 by name, not default-jdk: the corpus is measured on JDK 21
+        # (test/conformance/profile.edn :oracle-jdk), and default-jdk follows
+        # the image, so it is 25 on ubuntu-26.04 and certify refuses the oracle.
+        sudo apt-get install -y openjdk-21-jdk-headless rlwrap
+        jdk=/usr/lib/jvm/java-21-openjdk-$(dpkg --print-architecture)
+        # --retry + --fail so a transient CDN error retries instead of handing
+        # bash an HTML error page (a 2min timeout page flaked a run)
+        curl --fail --retry 5 --retry-delay 10 --retry-all-errors -L -O \
+          https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
+        head -1 linux-install.sh | grep -q '^#!' || { echo "installer download corrupt"; cat linux-install.sh | head -5; exit 1; }
+        sudo bash linux-install.sh
+        # The runner image puts an older Temurin's java first on PATH, and the
+        # clojure launcher runs that (JAVA_HOME is only its fallback when no
+        # java is on PATH). JAVA_CMD is the launcher's first choice: point it
+        # at the JDK just installed (the corpus is measured on the JDK
+        # test/conformance/profile.edn pins as :oracle-jdk, and certify.clj
+        # refuses any other).
+        echo "JAVA_CMD=$jdk/bin/java" >> "$GITHUB_ENV"
+        echo "JAVA_HOME=$jdk" >> "$GITHUB_ENV"
+        clojure --version
+        JAVA_CMD=$jdk/bin/java clojure -M -e '(println "oracle JDK" (System/getProperty "java.runtime.version"))'

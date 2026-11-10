@@ -2335,6 +2335,31 @@
   ;; --signable needs the same cc link for an ordinary executable — but a jolt
   ;; carrying the kernel files (bld-embedded-kernel?) compiles in process and
   ;; links against those, so there it needs only a C compiler (jolt#1255).
+  ;; A profile-guided build compiles in this process: the spawned-Chez paths
+  ;; (a library, a cross build, a jolt without the embedded stub or kernel) have
+  ;; no profile to load. The dev mode compiles under the target's defaults,
+  ;; which is not a build anyone profiles.
+  (when (bld-block-profile)
+    (let ((flag (if (bld-profile-gen?) "--profile-gen" "--profile-use")))
+      (cond
+        ((or library? (bld-cross?) (not (jolt-embedded-bytes "stub/launcher"))
+             (and (bld-signable) (not (bld-embedded-kernel?))))
+         (error 'jolt-build (string-append flag " builds an executable for this machine with a self-contained jolt; it is not available with --library or --target")))
+        ((not (bld-mode-params mode))
+         (error 'jolt-build (string-append flag " needs a release or --opt build, not --dev")))
+        ;; the same code compiles differently in another mode, so a profile from
+        ;; one does not fit the other; said here, rather than as stale units
+        ((bld-profile-use)
+         => (lambda (use)
+              (for-each
+                (lambda (f)
+                  (let ((tag (guard (e (#t (error 'jolt-build (string-append "--profile-use: " f " is not a profile a --profile-gen binary wrote"))))
+                               (sa-block-profile-tag f))))
+                    (unless (equal? tag mode)
+                      (error 'jolt-build
+                        (string-append "--profile-use: " f " is from a " (format "~a" tag)
+                                       " build, and this is a " mode " build; build with --profile-gen in the same mode")))))
+                (car use)))))))
   (when (or library? (bld-cross?)
            (and (bld-signable) (not (bld-embedded-kernel?)))
            (not (jolt-embedded-bytes "stub/launcher")))
@@ -2803,6 +2828,16 @@
           ;; arm; its host process owns both of these.
           (unless library? (put-string out "    (jolt-install-exit-handler!)\n"))
           (unless library? (put-string out "    (jolt-arm-shutdown!)\n"))
+          ;; JOLT_PROFILE=sample: the sampler needs only the runtime, so a built
+          ;; app can be profiled as it ships (sampler.ss). After the exit handler,
+          ;; since the report is a shutdown hook.
+          (unless library? (put-string out "    (jolt-sample-init-from-env!)\n"))
+          ;; --profile-gen: the block counts go to a file as the binary exits.
+          ;; Every build emits the call, not just that one: the launcher is a
+          ;; unit, and --profile-use needs its text to be what --profile-gen
+          ;; compiled. A binary with no counters writes nothing.
+          (unless library?
+            (put-string out (string-append "    (jolt-block-profile-at-exit! " (ei-str-lit mode) ")\n")))
           ;; The prologue (optional native loads + source-root setup) and the -main
           ;; call (or library export publish) run under one guard so a throw in
           ;; either surfaces as jolt-report-throwable + a non-zero exit/return
@@ -3160,13 +3195,114 @@
   (bld-with-backend-gc (lambda () (bld-chez-compile-params!* params src so))))
 (define (bld-chez-compile-params!* params src so)
   (if params
-      (let ((pv (lambda (k) (cadr (assq k params)))))
-        (sa-compile-file src so
-          `((optimize . ,(pv 'optimize-level))
-            (inspector-info . ,(pv 'generate-inspector-information))
-            (source-info . ,(pv 'generate-procedure-source-information))
-            (compressed . ,(pv 'fasl-compressed)))))
+      (let ((pv (lambda (k) (cadr (assq k params))))
+            (use (bld-profile-use)))
+        (when use (bld-profile-check! use src))
+        (guard (e ((and use (not (bld-profile-error? e)))
+                   ;; Chez raises when the blocks do not line up, which the
+                   ;; checksum test cannot see: the same text compiled under
+                   ;; other parameters (a --profile-gen release build used by an
+                   ;; --opt one)
+                   (bld-profile-fail! use src
+                     (string-append "its blocks do not line up with the profile's ("
+                                    (if (message-condition? e) (condition-message e) "compile failed")
+                                    "); build with --profile-gen in the same mode as this build"))))
+          (sa-compile-file src so
+            `((optimize . ,(pv 'optimize-level))
+              (inspector-info . ,(pv 'generate-inspector-information))
+              (source-info . ,(pv 'generate-procedure-source-information))
+              (compressed . ,(pv 'fasl-compressed))
+              (block-profile . ,(bld-profile-gen?))))))
       (sa-compile-file src so #f)))
+
+;; --- profile-guided builds (RFC 0015 part 2, tier 1) ---------------------------
+;; --profile-gen compiles every unit, the runtime's included, with Chez's block
+;; counters, and the binary writes them out as it exits (sampler.ss
+;; jolt-block-profile-at-exit!). --profile-use FILE... loads those dumps before
+;; compiling the same units again, so Chez lays out each unit's hot blocks first
+;; and gives their variables the registers. Two things follow from how Chez
+;; matches the data to code, by the checksum of a unit's text and its file name:
+;;
+;;   - The unit text must be what the --profile-gen build compiled, which
+;;     reprobuildsmoke holds the build to. Text that changed matches nothing,
+;;     and Chez then compiles it without the data and says nothing. A build
+;;     whose speed depends on how stale its profile is would be hard to make
+;;     sense of, so a unit the profile does not cover fails the build, named.
+;;   - Neither kind of unit may come from the plain cache, nor a plain build
+;;     take one of theirs: the cache keys carry bld-profile-tag.
+;;
+;; bld-block-profile: #f, 'gen, or (paths . digest) for --profile-use, the
+;; digest of the files' bytes. A pair of strings, so it travels to the compile
+;; workers inside their job vectors.
+(define bld-block-profile (make-parameter #f))
+(define (bld-profile-gen?) (eq? (bld-block-profile) 'gen))
+(define (bld-profile-use) (let ((p (bld-block-profile))) (and (pair? p) p)))
+(define (bld-profile-tag)
+  (cond ((bld-profile-gen?) "profile-gen")
+        ((bld-profile-use) => (lambda (p) (string-append "profile-use " (cdr p))))
+        (else "")))
+
+;; FNV-1a over bytes, as hex: bld-text-key's first half, for a binary file.
+(define (bld-bytes-key bv)
+  (let ((n (bytevector-length bv)))
+    (let loop ((i 0) (h 2166136261))
+      (if (fx=? i n)
+          (string-append (number->string n 16) "-" (number->string h 16))
+          (loop (fx+ i 1)
+                (fxlogand (fx* (fxlogxor h (bytevector-u8-ref bv i)) 16777619) #xFFFFFFFF))))))
+(define (bld-profile-spec paths)
+  (cons paths
+        (fold-left (lambda (acc p) (string-append acc (if (string=? acc "") "" "+")
+                                                  (bld-bytes-key (read-file-bytes p))))
+                   "" paths)))
+
+(define-condition-type &bld-profile &error make-bld-profile-error bld-profile-error?)
+(define (bld-profile-fail! use src why)
+  (raise
+    (condition
+      (make-bld-profile-error)
+      (make-who-condition 'jolt-build)
+      (make-message-condition
+        (string-append "--profile-use: " (bld-unit-description src) " (" (path-last src) "): "
+                       why ". The profile was " (bld-join-strings (car use) ", ") ".")))))
+
+;; The index of NEEDLE in S at or after START, or #f.
+(define (bld-string-index s needle start)
+  (let ((n (string-length s)) (m (string-length needle)))
+    (let loop ((i start))
+      (cond ((fx>? (fx+ i m) n) #f)
+            ((string=? (substring s i (fx+ i m)) needle) i)
+            (else (loop (fx+ i 1)))))))
+(define (bld-join-strings ss sep)
+  (fold-left (lambda (acc x) (if (string=? acc "") x (string-append acc sep x))) "" ss))
+
+;; A unit as a person would name it: its namespaces, for an app unit.
+(define (bld-unit-description src)
+  (let ((f (path-last src)))
+    (cond
+      ((bld-prefix? f "runtime") "the runtime unit")
+      ((string=? f "flat.ss") "the prologue unit")
+      ((string=? f "app-post.ss") "the launcher unit")
+      (else
+       (let* ((text (read-file-string src))
+              (key "(set-chez-ns! \"")
+              (nses (let loop ((i 0) (acc '()))
+                      (let ((j (bld-string-index text key i)))
+                        (if (not j)
+                            (reverse acc)
+                            (let* ((b (fx+ j (string-length key)))
+                                   (e (or (bld-string-index text "\"" b) b))
+                                   (ns (substring text b e)))
+                              (loop e (if (member ns acc) acc (cons ns acc)))))))))
+         (if (pair? nses)
+             (string-append "the unit of " (bld-join-strings nses ", "))
+             "an app unit"))))))
+
+;; Load the profile's data for SRC, the unit about to compile, or fail naming it.
+(define (bld-profile-check! use src)
+  (unless (sa-block-profile-load-unit! (car use) src)
+    (bld-profile-fail! use src
+      "the profile has no data for its code, which changed since the --profile-gen build that wrote it; build with --profile-gen again and rerun the binary")))
 
 ;; Compile one app-half (or one-file) source under MODE's row.
 ;; A unit's line-marker table, appended to the unit as a registration it runs
@@ -3268,7 +3404,8 @@
 ;; under a newer kernel must miss.
 (define (bld-runtime-cache-path body)
   (let ((keyed (string-append (scheme-version) " " (sa-host-tag) "\n"
-                              (bld-params-bindings bld-runtime-chez-params "\n") body)))
+                              (bld-params-bindings bld-runtime-chez-params "\n")
+                              (bld-profile-tag) body)))
     (string-append (bld-runtime-cache-dir) "/runtime-"
                    (number->string (string-length body) 16) "-"
                    (number->string (aot-content-hash keyed) 16) ".so")))
@@ -3664,6 +3801,7 @@
     (string-append (scheme-version) " " (sa-host-tag) " " (or (aot-runtime-fingerprint) "") "\n"
                    (bld-params-bindings (or (bld-mode-params mode) '()) "\n") "\n"
                    (if (bld-app-drops-expressions? mode) "inspector-expressions inspector-variables\n" "")
+                   (bld-profile-tag) "\n"
                    text)))
 
 ;; so path -> cache key, for the vfasl step to find the unit's cached image
@@ -3744,7 +3882,8 @@
   (let ((src (vector-ref job 0)) (so (vector-ref job 1)) (vso (vector-ref job 2))
         (mode (vector-ref job 3)) (codec (vector-ref job 4)))
     (let ((so-part (string-append so ".part")))
-      (bld-chez-compile-app-file mode src so-part)
+      (parameterize ((bld-block-profile (vector-ref job 5)))
+        (bld-chez-compile-app-file mode src so-part))
       (rename-file so-part so))
     (when vso
       (let ((vso-part (string-append vso ".part")))
@@ -3819,7 +3958,7 @@
           (job (lambda (k) (let ((u (car k)))
                              (vector (car u) (cadr u)
                                      (and vfasl? (string-append (cadr u) ".vfasl"))
-                                     mode codec)))))
+                                     mode codec (bld-block-profile))))))
       (when exe
         (for-each (lambda (k) (let ((so (cadr (car k)))) (when (file-exists? so) (delete-file so))))
                   misses)
@@ -3937,9 +4076,11 @@
 ;; app's runtime heap. Answer UNITS with each runtime unit's fasl replaced by a
 ;; stripped copy beside it (the original stays, it is the cached one); a unit
 ;; that will not strip ships as it was.
+;; Not for --profile-gen: the strip takes the profile information with it, and
+;; the runtime's block counters with that.
 (define (bld-strip-runtime-units units)
   (map (lambda (u)
-         (if (memq (caddr u) '(runtime runtime-shaken))
+         (if (and (memq (caddr u) '(runtime runtime-shaken)) (not (bld-profile-gen?)))
              (let ((out (bld-stripped-so-path (cadr u))))
                (if (sa-strip-compile-time-info! (cadr u) out)
                    (list (car u) out (caddr u))
@@ -4439,17 +4580,30 @@
     (cond ((or (null? o) (< i 0)) #f)
           ((= i 0) (jolt-truthy? (car o)))
           (else (loop (cdr o) (- i 1))))))
+;; optional trailing profile, index 7: nil, "gen" (--profile-gen), or a vector
+;; of profile files (--profile-use)
+(define (bld-opt-profile opt i)
+  (let loop ((o opt) (i i))
+    (cond ((or (null? o) (< i 0)) #f)
+          ((= i 0) (let ((v (car o)))
+                     (cond ((jolt-nil? v) #f)
+                           ((equal? (jolt-str-render-one v) "gen") 'gen)
+                           (else (bld-profile-spec (bld-strs v))))))
+          (else (loop (cdr o) (- i 1))))))
 (def-var! "jolt.host" "build-binary"
   (lambda (entry out mode natives embed-dirs ext-roots direct-link? tree-shake? . opt)
     (parameterize ((bld-target (bld-opt-str opt 0)) (bld-target-pack (bld-opt-str opt 1))
-                   (bld-boot-mode (bld-opt-boot-mode opt 2))
+                   (bld-block-profile (bld-opt-profile opt 7)))
+    ;; A --profile-gen binary boots plain: the code a vfasl image holds is not
+    ;; registered with the profiler, so it would write no counts at all.
+    (parameterize ((bld-boot-mode (if (bld-profile-gen?) 'plain (bld-opt-boot-mode opt 2)))
                    (bld-signable (bld-opt-bool opt 4))
                    (bld-exclude-resources (bld-opt-strs opt 6)))
       (build-binary (jolt-str-render-one entry)
                     (jolt-str-render-one out)
                     (jolt-str-render-one mode)
                     natives embed-dirs ext-roots (jolt-truthy? direct-link?) (jolt-truthy? tree-shake?)
-                    (bld-opt-strs opt 3) #f (bld-opt-strs opt 5)))
+                    (bld-opt-strs opt 3) #f (bld-opt-strs opt 5))))
     jolt-nil))
 (def-var! "jolt.host" "build-compile-worker"
   (lambda (manifest) (bld-compile-worker (jolt-str-render-one manifest)) jolt-nil))
@@ -4457,7 +4611,8 @@
   (lambda (entry out mode natives embed-dirs ext-roots direct-link? tree-shake? . opt)
     (parameterize ((bld-target (bld-opt-str opt 0)) (bld-target-pack (bld-opt-str opt 1))
                    (bld-boot-mode (bld-opt-boot-mode opt 2))
-                   (bld-exclude-resources (bld-opt-strs opt 6)))
+                   (bld-exclude-resources (bld-opt-strs opt 6))
+                   (bld-block-profile (bld-opt-profile opt 7)))
       (build-binary (jolt-str-render-one entry)
                     (jolt-str-render-one out)
                     (jolt-str-render-one mode)

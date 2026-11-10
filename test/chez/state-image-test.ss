@@ -96,6 +96,12 @@
 (rt "double"      "[1.5 -0.0]"                     "[1.5 -0.0]")
 (rt "empty colls" "[[] {} #{} ()]"                 "[[] {} #{} ()]")
 (rt "record"      "(do (defrecord P [x y]) (->P 1 2))" "#user.P{:x 1, :y 2}")
+;; an enum constant travels by class and name and comes back as THE constant
+(cleanup!)
+(ev (string-append "(jolt.host/image-write! \"" tmp "\" [java.util.concurrent.TimeUnit/DAYS java.nio.file.StandardOpenOption/SYNC])"))
+(ok "a restored enum constant is the live one"
+    (equal? (ev (string-append "(let [[u o] (jolt.host/image-read \"" tmp "\")] (pr-str [(identical? u java.util.concurrent.TimeUnit/DAYS) (identical? o java.nio.file.StandardOpenOption/SYNC) (str u)]))"))
+            "[true true \"DAYS\"]"))
 
 (define (str-has? s sub)
   (let ((n (string-length s)) (m (string-length sub)))

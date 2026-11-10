@@ -276,5 +276,4 @@
    (cons "replacement" decoder-replacement)
    (cons "averageCharsPerByte" (lambda (self) (->num 1)))
    (cons "maxCharsPerByte" (lambda (self) (->num 1)))
-   (cons "toString" (lambda (self) (string-append "java.nio.charset.CharsetDecoder@"
-                                                  (charset-name (decoder-charset self)))))))
+   (cons "toString" host-object-tostring)))

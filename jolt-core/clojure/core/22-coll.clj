@@ -177,11 +177,14 @@
     ;; a defrecord without its own empty can't have one (RT: UnsupportedOperation)
     (record? coll) (throw (new UnsupportedOperationException
                                (str "Can't create empty: " (.getName (class coll)))))
-    (sorted? coll) ((get (jolt.host/ref-get coll :ops) :empty) coll)
+    (sorted? coll) (with-meta ((get (jolt.host/ref-get coll :ops) :empty) coll) (meta coll))
     (map? coll) (with-meta {} (meta coll))
     (set? coll) (with-meta #{} (meta coll))
     (vector? coll) (with-meta [] (meta coll))
-    (coll? coll) (with-meta () (meta coll))
+    ;; only a list's .empty() keeps meta; a seq, lazy seq or range answers a bare
+    ;; () (ASeq/LazySeq.empty is PersistentList.EMPTY)
+    (list? coll) (with-meta () (meta coll))
+    (coll? coll) (or (jolt.host/empty-coll-arm coll) ())
     :else nil))
 
 (defn assoc-in [m [k & ks] v]

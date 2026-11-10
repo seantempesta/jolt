@@ -28,7 +28,7 @@
 ;;      and popped their own.
 ;;   4. Two fibers on one carrier cannot join each other's transaction: a fiber
 ;;      inside a dosync parks, another fiber runs and sees no transaction — and
-;;      cannot COMMIT one either while the first is still inside its own.
+;;      cannot COMMIT one either while the first holds its claim.
 ;;   5. Spawn conveys the parent's bindings (and does NOT convey its *txn*).
 ;;   6. The current namespace follows the fiber, not the carrier.
 
@@ -112,19 +112,15 @@
 
 ;; --- 4. two fibers on one carrier cannot join each other's transaction ------
 ;; t1 parks INSIDE a dosync (ref-set r 1, park, ref-set r 2). On park the
-;; parameterize unwinds *txn* and the slice swap keeps the carrier's *txn* #f —
-;; t2 runs and sees NO transaction; if it had inherited t1's *txn*, t2's
-;; jolt-sync would have joined it (ref-set into t1's log) instead of starting
-;; its own. That is the slice property this section is for.
+;; slice swap keeps the carrier's *txn* #f — t2 runs and sees NO transaction; if
+;; it had inherited t1's *txn*, t2's jolt-sync would have joined it (ref-set into
+;; t1's log) instead of starting its own. That is the slice property this section
+;; is for.
 ;;
-;; What t2 CANNOT do is finish. The transaction lock is an object monitor whose
-;; ownership is a field, so t1 keeps it across the park (jolt-pb2s) and t2 parks
-;; contending for it. This section used to assert the opposite — t2's whole
-;; transaction committing r = 9 inside t1's extent, and t1 then committing r = 2
-;; over the top of it — which is the isolation violation itself: t1's write is
-;; derived from a read that predated t2's commit, and the only serializable
-;; outcomes are 2 (t1 then t2, had t2 not committed) and 9 (t1 then t2). So the
-;; two properties are separated here: t2 never joins, and t2 never interleaves.
+;; What t2 CANNOT do is commit. t1's write claimed r, and a claim is a field on
+;; the ref rather than a lock, so it survives the park: t2 finds it, waits for t1,
+;; and runs again once t1 is done. The only serializable outcome left is t1 then
+;; t2.
 (define r (jolt-ref-new 0))
 (define t1-in-txn #f)        ; what t1 reads through its OWN log after resuming
 (define t1-committed-r #f)   ; and what is COMMITTED at that moment
@@ -153,12 +149,16 @@
       (set! txn-log (cons (jolt-txn-running?) txn-log)))))     ; #f — over, not joined
 (sa-fiber-run-all)
 (ok "4. t2 sees no transaction while t1 is parked" (equal? txn-log '(#f)))
-(ok "4. and t2 waits for the transaction lock rather than joining"
+(ok "4. and t2 waits on t1's claim rather than joining"
     (eq? (jolt-fiber-state t2) 'parked))
 (ok "4. so nothing of t2's is committed inside t1's extent" (= (jolt-ref-val r) 0))
-;; t1 finishes; releasing the lock resumes t2, which commits after it.
+;; t1 finishes; letting go of its claim wakes t2, which commits after it.
 (sa-fiber-resume t1)
-(sa-fiber-run-all)
+(let loop ((i 0))
+  (sa-fiber-run-all)
+  (when (and (< i 200) (not (eq? (jolt-fiber-state t2) 'done)))
+    (sleep (make-time 'time-duration 1000000 0))
+    (loop (+ i 1))))
 (ok "4. t1 resumed inside ITS txn" (= t1-in-txn 1))
 (ok "4. with nothing committed underneath it" (= t1-committed-r 0))
 (ok "4. t1 completed" (eq? (jolt-fiber-state t1) 'done))

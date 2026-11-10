@@ -217,6 +217,19 @@
 
 (def-var! "clojure.core" "meta" jolt-meta)
 (def-var! "clojure.core" "with-meta" jolt-with-meta)
+;; (empty coll) for a host collection type clojure.core/empty doesn't know (a
+;; PersistentQueue): the type registers its own, which carries the receiver's
+;; meta as Clojure's .empty() does. nil when no arm claims coll -- every arm
+;; answers a collection, so nil is never a real answer.
+(define jolt-empty-coll-arms '())
+(define (register-empty-coll-arm! pred handler)
+  (set! jolt-empty-coll-arms (cons (cons pred handler) jolt-empty-coll-arms)))
+(def-var! "jolt.host" "empty-coll-arm"
+  (lambda (coll)
+    (let loop ((as jolt-empty-coll-arms))
+      (cond ((null? as) jolt-nil)
+            (((caar as) coll) ((cdar as) coll))
+            (else (loop (cdr as)))))))
 
 ;; Carry SRC's metadata onto DST (a freshly-built collection of the same kind),
 ;; as Clojure's ops do — each new collection threads its receiver's meta()

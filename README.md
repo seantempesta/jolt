@@ -460,6 +460,9 @@ source roots and native libraries are loaded — `(require '[my.ns])` works live
 `nrepl-server` writes a `.nrepl-port` file in the project dir, so CIDER / Calva /
 Cursive auto-detect the port; override it with the argument or `JOLT_NREPL_PORT`.
 Port `0` lets the OS pick a free port, and `.nrepl-port` names the one it bound.
+`--port-file PATH` writes it to PATH instead, and `--no-port-file` writes none,
+for a tool that picks the port itself and doesn't want another client finding
+the server through the project's `.nrepl-port`.
 From code, `(jolt.nrepl/start 0)` returns the stop fn with that port as its
 `:port` metadata.
 

@@ -439,7 +439,17 @@
                     (begin (vector-set! out (fx+ i j) (vector-ref chunk (fx+ off j))) (cloop (fx+ j 1)))
                     (loop (fx+ i run))))))
           out))))
-(define (jolt-vector . xs) (make-pvec (list->vector xs)))
+;; The small arities build the backing vector directly: a vector literal with a
+;; non-constant element ([k v], [x y z]) compiles to a call here, and the
+;; variadic form paid a rest list, its length and a copy out of it for each one.
+(define jolt-vector
+  (case-lambda
+    (() (make-pvec (vector)))
+    ((a) (make-pvec (vector a)))
+    ((a b) (make-pvec (vector a b)))
+    ((a b c) (make-pvec (vector a b c)))
+    ((a b c d) (make-pvec (vector a b c d)))
+    (xs (make-pvec (list->vector xs)))))
 (define (make-map-entry k v) (make-pvec (vector k v) #t))
 (define (jolt-map-entry? x) (and (pvec? x) (eq? (pvec-ent x) #t)))
 ;; A HOST java.util.Map$Entry (a TreeMap$Entry, an AbstractMap$SimpleImmutableEntry)
@@ -1445,7 +1455,10 @@
 ;; sets are ALWAYS hash-ordered (JVM PersistentHashSet), backed by pmap in hash mode.
 (define empty-pset (make-pset empty-pmap-hash))   ; sets are ALWAYS hash-ordered (JVM PersistentHashSet)
 (define (pset-conj s e) (if (pmap-contains? (pset-m s) e) s (make-pset (pmap-assoc (pset-m s) e e))))
-(define (pset-disj s e) (make-pset (pmap-dissoc (pset-m s) e)))
+;; a miss answers s itself, as PersistentHashSet.disjoin does (and pset-conj on a
+;; hit): no allocation, and (identical? s (disj s x)) is how a caller sees the miss
+(define (pset-disj s e)
+  (let* ((m (pset-m s)) (m2 (pmap-dissoc m e))) (if (eq? m2 m) s (make-pset m2))))
 (define (pset-contains? s e) (pmap-contains? (pset-m s) e))
 ;; A lookup answers with the element the set HOLDS, not with the equal probe key
 ;; it was handed — only the stored one carries the element's metadata, and callers

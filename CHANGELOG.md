@@ -36,6 +36,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Code that bounds its in-flight work with one (Datahike's background GC test) construction
   failed with `No matching ctor found`.
 
+### Added
+
+- **`jolt.profile`, an execution-count profiler (#1421).** It reads Chez's
+  `compile-profile` counters back by Clojure file, line and fn: turn on
+  `(prof/instrument!)`, load the code, run it, and `(prof/report)` lists the
+  fns that did the most work and the lines that ran most. Counts are exact
+  for code running on one thread; the counters are not atomic, and code
+  running on several threads at once loses many increments.
+  Record, type and protocol-extension methods are named `ns/Type.method` and
+  defmethod bodies `ns/mm[dispatch]`. `(prof/annotate file)` prints the source with each line's count in the
+  margin. `JOLT_PROFILE=1` instruments a whole run and prints the report on
+  stderr at exit. `(prof/measure body)` gives a body's real and cpu time, bytes
+  allocated and collector work.
+- **A sampling profiler in `jolt.profile`.** `(prof/sample!)` interrupts every
+  thread that runs jolt code at an interval of its own CPU time (1 ms by
+  default) and records its stack, so it needs no recompilation and sees the
+  runtime, `clojure.core`, AOT-cached code and built binaries. `sample-report`
+  lists fns by self and total time and lines by self time, `sample-counts` and
+  `sample-lines` return the rows, and `write-folded` writes collapsed stacks
+  for flame graph tools. `JOLT_PROFILE=sample` samples a whole run, in a built
+  binary too, and prints the report at exit. Overhead measured 1–3%. Fiber
+  preemption and `run-interruptible` now share each thread's engine timer
+  through one scheduler instead of borrowing it from each other.
+- **Profile-guided builds: `jolt build --profile-gen` and `--profile-use`.**
+  A `--profile-gen` binary counts every basic block of the app and the
+  runtime, and writes the counts to `NAME-PID.jpd` (or `$JOLT_PROFILE_DATA`)
+  as it exits. `jolt build --profile-use run1.jpd run2.jpd …` compiles the
+  same sources with them, so Chez lays each function's hot blocks out first
+  and gives their variables the registers. A profile that no longer fits a
+  unit's code, or comes from a build in another mode, fails the build naming
+  the unit, rather than being ignored. Profiled units never share a build
+  cache entry with plain ones.
+- **`java.util.EnumSet` and `java.util.EnumMap`.** `EnumSet/of`, `noneOf`,
+  `allOf`, `range`, `copyOf` and `complementOf` build a mutable set ordered by
+  ordinal (a `java.util.RegularEnumSet`, or `JumboEnumSet` past 64 constants),
+  and `(EnumMap. Class)` / `(EnumMap. map)` a mutable map ordered by its keys'
+  ordinals, with live `keySet`, `values` and `entrySet` views. Both refuse a
+  null or foreign element the way the JDK does, and print and compare as a set
+  and a map.
+- **`jolt.host/register-enum!` declares an enum class from a library.**
+  `(jolt.host/register-enum! "my.Color" [["RED" red] ["GREEN" green]])` gives
+  the class `values`, `valueOf`, `Class.isEnum`, `getEnumConstants`,
+  `Enum/valueOf`, `java.lang.Enum`'s instance methods for any method the values
+  do not answer themselves, and the JVM's print form (a `deftype` constant
+  prints as `#object[my.Color 0x… "RED"]` and stringifies to its name). The java.time enums
+  (`Month`, `DayOfWeek`, `ChronoUnit`, `ChronoField`) are declared this way.
+- **`java.util.LinkedHashMap` and `java.util.LinkedHashSet`.** Both keep
+  insertion order, with O(1) operations. An access-ordered `LinkedHashMap`
+  (`(LinkedHashMap. 16 0.75 true)`) moves what `get`, `put`, `compute`,
+  `merge` and the rest reach to the tail, and `removeEldestEntry` is asked
+  after each new mapping, so the LRU idiom `(proxy [LinkedHashMap] [16 0.75
+  true] (removeEldestEntry [e] …))` evicts. JDK 21's sequenced methods are
+  there (`putFirst`, `putLast`, `firstEntry`, `pollLastEntry`, `reversed`,
+  `sequencedKeySet`, `addFirst`, `removeLast`, …) and the key, value and entry
+  views are live.
+- **Every java.util collection shim travels in a `jolt.image`.** `HashMap`,
+  `HashSet`, `Properties`, `LinkedHashMap` (access order kept), `TreeMap` and
+  `TreeSet` (comparator kept), `EnumSet`, `EnumMap`, `StringBuilder`,
+  `StringBuffer` and the java.time values used to fail to write; they
+  round-trip with their contents in order and their class, and one that holds
+  itself restores as one. A view or entry of another collection, an iterator,
+  a thread, pool or task and an open stream are refused naming their class.
+  `make imagecoverage` fails on a collection shim that does neither.
+
 ### Changed
 
 - **A built app's namespace init holds data, not code.** `jolt build` emitted each
@@ -71,6 +135,134 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fn of a def nothing registered (eval'd code) is an element named `ns$def$fn__n`, as the
   JVM names it. `build-smoke` pins it on a built app.
 
+- **Enums have `values` and `valueOf` (#1433).** The JDK enums jolt provides
+  (`TimeUnit`, `Future$State`, `Thread$State`, `RoundingMode`,
+  `Normalizer$Form`, `StandardOpenOption`, `StandardCopyOption`, `LinkOption`,
+  `FileVisitOption`, `FileVisitResult`, `PosixFilePermission`) had their
+  constants and nothing else. Each now answers `values` (a fresh array of its
+  class), `valueOf` with the JVM's messages, `Class.isEnum` and
+  `getEnumConstants` (which every class answers now), `Enum/valueOf`, and
+  `name`, `ordinal`, `compareTo` (a `ClassCastException` for another enum's
+  constant), `getDeclaringClass`, `equals` and `hashCode`. Constants are
+  `Serializable`, carry the enum's modifiers, print as
+  `#object[java.util.concurrent.TimeUnit 0x1b2c3d4e "DAYS"]`, and survive a
+  `jolt.image` round trip as the same constant. The lists are the JDK's, in its
+  order: `StandardOpenOption` gains `DELETE_ON_CLOSE`, `SPARSE`, `SYNC` and
+  `DSYNC`, which the `Files` streams and `FileChannel/open` now honor, and
+  `newInputStream` refuses `WRITE` and `APPEND`. A `RoundingMode` constant was a
+  string, equal to `"HALF_UP"`; `RoundingMode/valueOf` takes the legacy int too,
+  every enum answers `(X/valueOf Class name)`, and `TimeUnit` gains `convert`,
+  `of`, `toChronoUnit`, `timedJoin` and `timedWait`. Iterators over an EnumSet
+  or an EnumMap's views remove through them, and EnumMap's entries are live.
+- **java.time's enums are enums.** `(DayOfWeek/values)` was a vector,
+  `(DayOfWeek/of 1)` a new object equal to `DayOfWeek/MONDAY` but not identical
+  to it, and a constant printed bare. Each constant is now one object, `values`
+  is an array, they print like the JVM's, `ChronoUnit` renders its JDK names
+  (`HalfDays`), and `Month/of` and `DayOfWeek/of`
+  refuse an out-of-range value with `DateTimeException`.
+- **Host objects print and stringify as the JVM's.** `pr` of a host shim
+  object or an enum constant carries the identity hash
+  (`#object[java.util.Random 0x1b2c3d4e "java.util.Random@1b2c3d4e"]`), and
+  `print` leaves the content unquoted. `str` is its `toString`: Object's
+  `class@hash` for one with no `toString` of its own, where several shims
+  answered placeholders (`#<BufferedReader>`, `""` for a PrintWriter,
+  `LinkedBlockingQueue(1)`), and the JDK's for a queue (`[1, a]`), a
+  FutureTask, a Process and a `ProcessBuilder$Redirect`, whose `.type` is the
+  `ProcessBuilder$Redirect$Type` enum where it was a string.
+- **The ArrayList, LinkedList and ArrayDeque iterators support `remove`**, taking
+  the last element handed out; an `Arrays/asList` list's refuses it, as on the JDK.
+- **A `java.util.HashSet` has `.iterator` (with `remove`), `contains?`,
+  `addAll`, `containsAll`, `removeAll`, `retainAll` and `clone`; a `HashMap`
+  `remove(key, value)` and `clone`, and copies any map it is built from.**
+- **`count`, `seq`, `get` and `contains?` work on a proxy over a java.util
+  collection**, through the proxy's `size`, `containsKey` and `get`.
+- **`Files/write` with only `SYNC`, `SPARSE` or `DELETE_ON_CLOSE` no longer
+  truncates an existing file or creates a missing one**: any option replaces
+  the CREATE + TRUNCATE_EXISTING default, as on the JDK.
+- **A heap at its `JOLT_MAX_HEAP` ceiling no longer peaks 10% over it in a
+  young collection.** Near the ceiling, Chez's own schedule still copied
+  generation 1 every fourth collection, and with the heap already at the
+  limit those copies sat beside their sources: a program holding ~100MB under
+  a 256MB ceiling peaked at 282MB, and whether that collection landed at the
+  worst moment moved with a few hundred KB of boot live set. A young collection
+  now leaves generation 1 to the ceiling's full collection, which marks it in
+  place, when copying it would not fit under the ceiling. The same program
+  peaks at 261-265MB.
+
+- **An atom or ref that holds itself raises `StackOverflowError` when printed,
+  at once.** Printing one recursed until the heap filled and ended in
+  `OutOfMemoryError` some 30 seconds later, where the JVM overflows its stack.
+  The printer now notices when it meets the same atom, ref, volatile or other
+  IDeref value again along the path it is printing, directly or through
+  collections. `(str a)` of one is `clojure.lang.Atom@hash`, its `toString` on
+  the JVM, instead of the printed form.
+- **A transaction no longer holds a lock while its code runs.** Every `dosync`
+  ran under one global lock, so a body that waited on another thread's
+  transaction hung: `(dosync @(future (dosync (ref 1))))` never returned. The
+  STM now works like the JVM's: a transaction reads the refs as of its start,
+  claims each ref it writes, and commits under a short lock that no user code
+  runs under, so a body, a commute fn or a validator can wait on another
+  transaction. A transaction blocked by another one's claim waits for it and
+  retries; an older one that has been held up barges past younger ones instead
+  of starving, and `ensure` holds writers off until the ensuring transaction
+  ends. `commute` reapplies at commit, `ref-set` after `commute` throws,
+  validators run on the committed value, refs keep history (`ref-history-count`,
+  `:min-history`, `:max-history`), and a body that keeps conflicting stops after
+  10000 tries with `Transaction failed after reaching retry limit`. A `(ref x
+  :validator f)` validator also runs now; it was skipped until something else
+  installed a watch or validator.
+- **Collections report the JVM's class ancestry.** Maps, sets and vectors are
+  `AFn`, `IFn` and `IHashEq`, maps are `MapEquivalence`, maps and vectors are
+  `IKVReduce` (subvecs too), and seqs and lists are `IHashEq`, in `ancestors`
+  and `instance?`. `(.kvreduce m f init)` works on maps and vectors, where a map
+  answered nil.
+- **`(.comparator sorted-coll)` is the comparator it was built with.** It was an
+  unclassed object that printed as `#object[:object]`; it is now the fn given to
+  `sorted-map-by` / `sorted-set-by`, or `clojure.lang.RT$DefaultComparator`.
+  `.compare` on a fn answers -1, 1 or 0 for a boolean result and the `intValue`
+  of a number, as `AFunction.compare` does.
+- **Refs, atoms, agents, volatiles, delays, futures and promises print like the
+  JVM's.** They printed as a bare `#object[clojure.lang.Atom]`; they now print
+  `#object[clojure.lang.Atom 0x1b2c3d4e {:status :ready, :val 1}]`, with the
+  identity hash, `:pending` for an unrealized delay, future or promise, and
+  `:failed` for a failed agent or future.
+- **Futures and agent actions run on threads named like the JVM's.** A future or
+  `send-off` action runs on `clojure-agent-send-off-pool-N` and a `send` action on
+  `clojure-agent-send-pool-N`, where they were `Thread-N`. A pool reuses the
+  numbers of its finished workers.
+- **`jolt build` binaries are back near their 0.8.21 size (#1423).** 0.8.22
+  made every non-tail call in a traced build restore the trace site slot
+  inline, and with inspector information on Chez keeps each fn's expanded body
+  as data, so the restore was stored again for every call site: a 4,000-fn app
+  grew from 40.3 MB to 53.2 MB. The restore is now spelled once per fn clause
+  and the compiler inlines it back at each site, so the code that runs is the
+  same; the same app builds to 45.7 MB.
+
+- **A built binary no longer moves a dropped record's fields out of scope.**
+  When `jolt build` dropped a `(let [p (->P a b)] …)` whose only uses were field
+  reads, it moved `a` and `b` to each `(:x p)`. Moved into a fn literal, the
+  closure's site still passed `p` to its image maker, so the binary died with
+  `variable p is not bound` (the ray tracer's typed variant crashed this way on
+  every build). Moved under a `let`, `loop`, fn param or `catch` that rebinds
+  `a`, the read picked up the inner `a` and returned a wrong value. Such a
+  binding now keeps its allocation; source mode was never affected.
+
+- **`Math` and `clojure.math` take exact arguments as doubles.** The argument
+  went to the Chez op as given and only the result became a double, so the poles
+  raised: `(Math/atan2 0 0)`, `(Math/log 0)` and `(Math/pow 0 -1)` (and their
+  `clojure.math` twins) threw `ArithmeticException` where the JVM answers `0.0`,
+  `##-Inf` and `##Inf`. The double-parameter methods now convert first, as a
+  `double` parameter does on the JVM.
+
+- **`(String. bytes offset length)` copies only the slice (#1413).** A byte
+  array was copied whole before the slice was cut, so decoding 30 bytes out of a
+  1.5 MB array cost the 1.5 MB. An out-of-range offset or length now throws
+  `StringIndexOutOfBoundsException` with the JVM's message, where it used to
+  surface a Chez error.
+- **`io/resource` of a stdlib file names a file that exists (#1411, #1412).**
+  Under `bin/jolt`, run from a project directory, jolt's own relative install
+  roots were absolutized against the caller's directory instead of the checkout,
+  so `(slurp (io/resource "clojure/string.clj"))` threw.
 - **A warm AOT cache replayed the first load's source path (#1404, #1405).** The
   same source reached through another root, or from another directory, reported
   the `:file` and `*file*` of the load that filled the cache, which could name a
