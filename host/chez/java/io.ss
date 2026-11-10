@@ -92,10 +92,13 @@
 ;; ": reason" after either, as FileSystemException.getMessage builds it. Only the
 ;; paths are rendered natively; the reason is strerror's text, and flipping the
 ;; whole string would turn "Input/output error" into "Input\output error".
+;; With neither path the message is the reason alone, or #f without one.
 (define (fs-exception-message-for windows? file other reason)
-  (string-append (path-native-for windows? file)
-                 (if other (string-append " -> " (path-native-for windows? other)) "")
-                 (if reason (string-append ": " reason) "")))
+  (if (or file other)
+      (string-append (if file (path-native-for windows? file) "")
+                     (if other (string-append " -> " (path-native-for windows? other)) "")
+                     (if reason (string-append ": " reason) ""))
+      reason))
 (define (fs-exception-message file other reason)
   (fs-exception-message-for (eq? (sa-os-family) 'windows) file other reason))
 
@@ -736,6 +739,17 @@
        ;; path — leave it alone rather than prefixing "./".
        (if (string=? base ".") p (path-under base p))))))
 
+;; The cwd a child process starts in: a JVM child inherits user.dir (the user's
+;; cwd), but jolt's OS cwd is the repo root its launcher cd'd to — the user's
+;; logical cwd is JOLT_PWD. So default the child to JOLT_PWD and resolve a
+;; relative :dir against it (project-relative), matching ProcessBuilder.directory
+;; semantics. Shared by java.lang.ProcessBuilder (process.ss) and jolt.host/sh
+;; (loader.ss).
+(define (proc-effective-dir dir)
+  (if dir
+      (project-relative dir)
+      (let ((pwd (getenv "JOLT_PWD"))) (and pwd (> (string-length pwd) 0) pwd))))
+
 ;; (io/file path) / (io/file parent child) — join children with "/". The File
 ;; keeps the path AS GIVEN (like the JVM: new File("rel").getPath() is "rel");
 ;; a relative path resolves against JOLT_PWD only when the filesystem is touched
@@ -1011,33 +1025,81 @@
 ;;
 ;;   ENOENT / ENOTDIR / EACCES    best-effort path, no error
 ;;   ELOOP / ENAMETOOLONG         java.io.IOException, in strerror's own wording
-;;
-;; Errno comes from the location accessor rather than Chez's native-error
-;; convention, which needs a literal foreign-procedure whose load-time relocation
-;; aborts the boot where the symbol is absent -- exactly the Windows build
-;; realpath is already missing from. Same three spellings process.ss uses:
-;; Darwin/BSD, glibc/musl, then bionic.
-(define io-errno-loc
-  (or (jolt-foreign-proc-safe "__error" '() 'void*)
-      (jolt-foreign-proc-safe "__errno_location" '() 'void*)
-      (jolt-foreign-proc-safe "__errno" '() 'void*)))
-(define (io-errno)
-  (if io-errno-loc (guard (e (#t 0)) (sa-foreign-ref 'int (io-errno-loc) 0)) 0))
-
 ;; macOS values from <sys/errno.h>; Linux from asm-generic/errno.h. The same
 ;; os-family split process.ss uses for EAGAIN and io_poller.clj for EINPROGRESS.
 ;; A wrong value here degrades to today's behavior (no raise) rather than
 ;; misfiring, and the gate exercises both platforms.
 (define io-ELOOP        (if (eq? (sa-os-family) 'macos) 62 40))
 (define io-ENAMETOOLONG (if (eq? (sa-os-family) 'macos) 63 36))
+(define io-EEXIST 17)                       ; the same on macOS and Linux
+
+;; mkdir(2) and an O_EXCL open(2) with their own errno, each answering 0 or the
+;; errno, and each taking the mode in the call so the entry never exists with a
+;; wider one. Chez's mkdir raises a bare &i/o-filename for every failure, so a
+;; caller that needed to tell EEXIST apart had to stat first, and a directory
+;; another process made between that stat and the mkdir came back untyped
+;; (jolt-lang/jolt#1529). Windows binds neither. There the failure is looked at
+;; through Chez: EEXIST when the name is taken, and its condition otherwise.
+(define c-mkdir
+  (and (not (eq? (sa-os-family) 'windows))
+       (jolt-foreign-proc-safe "mkdir" '(string int) 'int)))
+(define (io-mkdir p mode)
+  (if c-mkdir
+      (let-values (((r err) (io-call+errno (c-mkdir p mode))))
+        (if (= r 0) 0 err))
+      (guard (e ((file-exists? p) io-EEXIST))
+        (mkdir p mode)
+        0)))
+;; O_WRONLY|O_CREAT|O_EXCL. macOS from <sys/fcntl.h>; Linux from
+;; asm-generic/fcntl.h, which every Linux target Chez builds for uses.
+(define io-O-create-exclusive
+  (case (sa-os-family)
+    ((macos) (fxior 1 #x200 #x800))
+    ((linux) (fxior 1 #x40 #x80))
+    (else #f)))
+;; open is variadic: the convention is what puts mode where its va_list reads it
+(define c-open-exclusive
+  (and io-O-create-exclusive
+       (jolt-foreign-proc-safe (__varargs_after 2) "open" '(string int int) 'int)))
+(define c-close-fd (jolt-foreign-proc-safe "close" '(int) 'int))
+(define (io-create-exclusive p mode)
+  (if (and c-open-exclusive c-close-fd)
+      (let-values (((fd err) (io-call+errno (c-open-exclusive p io-O-create-exclusive mode))))
+        (if (< fd 0)
+            err
+            (begin (c-close-fd fd) 0)))
+      (guard (e ((i/o-file-already-exists-error? e) io-EEXIST))
+        (close-port (open-file-output-port p (file-options)))
+        0)))
+
+;; Temp entries are named and made the JDK's way (TempFileHelper, and
+;; File.createTempFile's TempDirectory): prefix + an unsigned random 64-bit
+;; number + suffix, created exclusively, and a name already taken is retried with
+;; a fresh one. Millis plus a per-process counter collided across processes that
+;; started in the same millisecond, and checking the name before creating it left
+;; a window for another process to take it (jolt-lang/jolt#1528).
+(define (io-temp-name prefix suffix)
+  (string-append prefix
+                 (number->string (bytevector-u64-ref (jolt-random-bytes 8) 0 (endianness little)))
+                 suffix))
+;; CREATE! makes the entry at its path exclusively, answering 0 or the errno.
+;; FAILED! raises for any errno but EEXIST. Answers the path it made.
+(define (io-create-temp dir prefix suffix create! failed!)
+  (let loop ()
+    (let* ((p (string-append dir (io-temp-name prefix suffix)))
+           (err (create! p)))
+      (cond ((eqv? err 0) p)
+            ((eqv? err io-EEXIST) (loop))
+            (else (failed! p err))))))
 
 (define (jfile-realpath* p)                 ; -> (values path-or-#f errno)
   (cond
     (c-realpath
      (let ((buf (make-bytevector 4096 0)))
-       (if (= 0 (c-realpath p buf))
-           (values #f (io-errno))
-           (values (jfile-cstr buf) 0))))
+       (let-values (((r err) (io-call+errno (c-realpath p buf))))
+         (if (= 0 r)
+             (values #f err)
+             (values (jfile-cstr buf) 0)))))
     ((win32?) (values (win32-long-path p) 0))
     (else (values #f 0))))
 
@@ -1342,6 +1404,42 @@
          (win32-with-wstr link
            (lambda (l) (win32-with-wstr existing
                          (lambda (e) (not (= 0 (f l e 0))))))))))
+
+;; Files.move with ATOMIC_MOVE on Windows: MoveFileExW replacing the target, in one
+;; step, as WindowsFileCopy.move does. Chez's rename-file is _wrename, which refuses
+;; an existing target. Answers 0, or the Win32 error, read with interrupts off so a
+;; collect rendezvous cannot overwrite it first (io-call+errno, rt.ss).
+(define win32-MOVEFILE-REPLACE-EXISTING 1)
+(define-win32-proc win32-move-file-ex-w
+  "kernel32.dll" "MoveFileExW" (void* void* unsigned-32) int)
+(define-win32-proc win32-get-last-error
+  "kernel32.dll" "GetLastError" () unsigned-32)
+(define (win32-move-replacing! from to)
+  (let ((move (win32-move-file-ex-w)) (last-error (win32-get-last-error)))
+    (win32-with-wstr from
+      (lambda (f)
+        (win32-with-wstr to
+          (lambda (t)
+            (disable-interrupts)
+            (let ((err (if (= 0 (move f t win32-MOVEFILE-REPLACE-EXISTING)) (last-error) 0)))
+              (enable-interrupts)
+              err)))))))
+;; FormatMessageW's text for a Win32 error, which is what the JDK reports it as.
+(define-win32-proc win32-format-message-w
+  "kernel32.dll" "FormatMessageW" (unsigned-32 void* unsigned-32 unsigned-32 u8* unsigned-32 void*) unsigned-32)
+(define (win32-error-message err)
+  (let* ((f (win32-format-message-w))
+         (buf (make-bytevector 1024 0))
+         ;; FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS
+         (n (if f (f #x1200 0 err 0 buf 512 0) 0)))
+    (if (> n 0)
+        (let ((s (utf16->string (let ((b (make-bytevector (* 2 n)))) (bytevector-copy! buf 0 b 0 (* 2 n)) b)
+                                (endianness little))))
+          (let loop ((k (string-length s)))
+            (if (and (> k 0) (char-whitespace? (string-ref s (- k 1))))
+                (loop (- k 1))
+                (substring s 0 k))))
+        (string-append "Windows error " (number->string err)))))
 
 ;; The three times of PATH as a vector #(creation access write) of epoch
 ;; NANOSECONDS (100ns resolution), or #f. WIN32_FILE_ATTRIBUTE_DATA is the
@@ -2233,9 +2331,12 @@
       ((string=? name "isHidden")       (list (let ((nm (path-last-segment p)))
                                                 (if (and (> (string-length nm) 0) (char=? (string-ref nm 0) #\.)) #t #f))))
       ((string=? name "mkdir")          (list (guard (e (#t #f)) (and (not (file-exists? fp)) (begin (mkdir fp) #t)))))
-      ((string=? name "mkdirs")         (list (if (mkdirs! fp) #t #f)))
+      ;; File.mkdirs is true only when it made the directory: one already there
+      ;; is false, as exists() short-circuits it on the JVM.
+      ((string=? name "mkdirs")         (list (if (and (not (file-exists? fp)) (mkdirs! fp)) #t #f)))
       ((string=? name "delete")         (list (if (delete-path! fp) #t #f)))
-      ((string=? name "deleteOnExit")   (list jolt-nil))
+      ((string=? name "deleteOnExit")   ; a NUL path is skipped, as isInvalid() does
+       (list (if (jfile-nul? fp) jolt-nil (jolt-delete-on-exit! (jfile-abs fp)))))
       ((string=? name "setReadable")    (list (jfile-set-permission! fp 4 args)))
       ((string=? name "setWritable")    (list (jfile-set-permission! fp 2 args)))
       ((string=? name "setExecutable")  (list (jfile-set-permission! fp 1 args)))
@@ -3836,7 +3937,6 @@
         (else (jolt-make-file a))))
 (register-class-ctor! "File" jolt-file-ctor)
 ;; File statics: the platform separators plus createTempFile / listRoots.
-(define temp-file-counter 0)
 (define (file-create-temp prefix suffix . dir)
   ;; the JVM rejects a prefix under three characters, so a caller that works here
   ;; works there too
@@ -3847,22 +3947,16 @@
   (let* ((d (cond ((pair? dir) (file-path-of (car dir)))
                   (else (host-temp-dir))))
          (sfx (if (or (null? (list suffix)) (jolt-nil? suffix)) ".tmp" (jolt-str-render-one suffix))))
-    ;; The name is the pid and this process's counter, unique among live processes; the
-    ;; file is created exclusively, so a path that exists (another process's, a dead one's
-    ;; with a reused pid, a file put there) fails the create and the next counter is tried.
-    ;; Before, the name was the millisecond and the counter, checked then created: two
-    ;; processes in one millisecond got one path (four test shards started at once).
-    (let loop ()
-      (let* ((n (jolt-with-mutex io-counter-mutex
-                  (set! temp-file-counter (+ temp-file-counter 1))
-                  temp-file-counter))
-             (p (string-append d "/" (jolt-str-render-one prefix)
-                               (number->string (proc-c-getpid)) "-" (number->string n) sfx)))
-        (if (guard (e ((i/o-file-already-exists-error? e) #f))
-              (close-port (open-file-output-port p (file-options)))
-              #t)
-            (make-jfile p)
-            (loop))))))
+    ;; an exclusive create: the truncating open this replaced handed two
+    ;; processes that drew the same name one shared file, and told neither. The
+    ;; mode is the JDK's here too, 0666 under the umask: only Files/createTemp*
+    ;; is owner-only. The prefix is only its last segment, as TempDirectory has it.
+    (make-jfile (io-create-temp (string-append d "/")
+                                (path-last-segment (jolt-str-render-one prefix)) sfx
+                                (lambda (p) (io-create-exclusive p #o666))
+                                (lambda (p err)
+                                  (throw-jvm 'IOException (or (and c-strerror (c-strerror err))
+                                                              "Unable to create temporary file")))))))
 ;; File.listRoots: the filesystem roots. POSIX has exactly one; Windows has one
 ;; per mounted drive, and answering "/" there named a directory on whichever
 ;; drive the process happened to be on rather than enumerating anything
@@ -4445,7 +4539,8 @@
 (define (uri-parse s . opt)
   (let ((r (apply uri-parse-either s opt)))
     (if (uri-error? r)
-        (jolt-throw (jolt-host-throwable "java.net.URISyntaxException" (uri-error-message s r)))
+        (jolt-throw (jolt-host-throwable/detail "java.net.URISyntaxException" (uri-error-message s r)
+                                                (vector s (cadr r) (caddr r))))
         r)))
 ;; Percent-encode what is illegal in a URI path. File.toURI is new URI(scheme,
 ;; host, path, fragment) on the JVM, which QUOTES rather than rejects, so a file
@@ -4534,8 +4629,9 @@
 ;; the parser turns the missing "/" into a nonsense authority.
 (define (uri-check-path! composed scheme path)
   (when (and scheme path (> (string-length path) 0) (not (char=? (string-ref path 0) #\/)))
-    (jolt-throw (jolt-host-throwable "java.net.URISyntaxException"
-                  (string-append "Relative path in absolute URI: " composed)))))
+    (jolt-throw (jolt-host-throwable/detail "java.net.URISyntaxException"
+                  (string-append "Relative path in absolute URI: " composed)
+                  (vector composed "Relative path in absolute URI" -1)))))
 ;; a nil component is absent, not the string "nil"
 (define (uri-arg x) (if (or (jolt-nil? x) (not x)) #f (jolt-str-render-one x)))
 (define (uri-port-arg x) (if (jolt-nil? x) -1 (jnum->exact x)))

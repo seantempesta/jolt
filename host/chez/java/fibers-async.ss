@@ -615,6 +615,14 @@
     (jolt-with-mutex jolt-shutdown-mutex
       (set-box! jolt-shutdown-hooks '())
       (set-box! jolt-shutdown-ran #f))
+    ;; MERGE-REVIEW(deep-fixes): upstream 27766677/2bb457aa (slice 4) runs File.deleteOnExit's
+    ;; paths on every exit that runs the shutdown hooks; a child holds the parent's list, and
+    ;; would delete the parent's files at its own exit. Added, by the same rule as the hooks
+    ;; above (the parent's are the parent's): the child starts with none. Check the names and
+    ;; whether the list's lock is one of the process locals. Gate: fork-child-test.
+    (set-box! jolt-delete-on-exit-paths '())
+    (set-box! jolt-delete-on-exit-taken #f)
+    (hashtable-clear! jolt-delete-on-exit-seen)
     ;; the poller's kqueue and thread are not inherited by fork: its table starts afresh, and
     ;; the child's first wait sets it up for the child (a thread, or a main carrier's rounds).
     ;; Without it, every child of a process whose poller had run waited on a dead kqueue

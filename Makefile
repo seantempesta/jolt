@@ -124,17 +124,17 @@ JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke reprobuildsmoke profilebuildsmoke embeddedresources \
   aotcachepathsmoke aotcachesourcepathsmoke aotcachestarfilesmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling zipmemory lazyscaling \
-  devbootsmoke devirt directlink mintgate ffi fibers fiberspoll fieldjoin fieldnum fieldread flarr fnform coreproc grenadine \
+  devbootsmoke devirt directlink mintgate ffi fibers fiberspoll fieldjoin fieldnum fieldread flarr fnform poolshape coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inferscaling inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance libperf mandelbrot-num mathfl mvnhttp defmetacells staticsite gcpolicy stacklimit lazyretain \
   deadhost recordshadow emittedheads mirrordrift mirrordrift-regen regexdfacheck regexdfacheck-regen regexdfa regexanchor regexanchorprims regexanchorcheck regexsyntax regexbacktrack \
-  hostarity enummodel enumregistrymodel cowpublishmodel doseqperf failfastmodel imagecoverage narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
+  hostarity enummodel enumregistrymodel cowpublishmodel doseqperf failfastmodel imagecoverage lazyshims narrow narrowhash numeric numwp oparity pic protoret printperf remint sbperf sci selfhost shakelocal \
   traceemit vfaslceiling \
   shakesmoke smoke sortedcoll staticnativesmoke stateimage test testbin transient unit unitcontext zlibregistersmoke zlibnativesmoke noexecsmoke \
   threadsafety maskedacquire ioerrno values wp ci
 
 # Only mark PHONY targets for names that have file system conflicts:
-.PHONY: build install test ci bionic-ci ci-shard ci-shard-list gate-run-test gate-run-ci gate-run-bionic-ci gate-run-ci-shard gate-status hooks attributioncheck noticecheck monitormodel \
+.PHONY: nsaudit kondocheck build install test ci bionic-ci ci-shard ci-shard-list gate-run-test gate-run-ci gate-run-bionic-ci gate-run-ci-shard gate-status hooks attributioncheck noticecheck monitormodel \
         gambitcheck gambitkernel gambiteval gambitseed gambitweb gambitprofile \
         gambitgen gambitgencheck gambitseedcheck gambitunbound gambitunbound-regen \
         gambitvars gambitvars-regen gambitstatics gambitstatics-regen gambittwins grenadinecheck \
@@ -185,15 +185,15 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-  CI-GATES := submodules values recordinline corpus unit documented grenadine clishim mvnhttp readscaling gcpolicy stacklimit footprint lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio stdlibratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
+CI-GATES := submodules values recordinline corpus nsaudit unit documented grenadine clishim mvnhttp readscaling gcpolicy stacklimit footprint lazyretain compilescaling applyscaling lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio stdlibratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
   smoke tracesmoke errorreport errorkinds buildsmoke embeddedresources reprobuildsmoke profilebuildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym ffiloadfail continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke systemexitsmoke ziparchiveerrors zipreadscopepark zipindexpreempt \
   transient sortedcoll rrbprop rrbscaling stateimage infer inferscaling wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
   protoret accfix pic narrow directlink mintgate directcall defmetacells staticsite arraymap recfast recfold arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flonumdisp flarr \
-  fnform coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost recordshadow emittedheads adaptercheck hostprops normalizecheck hostregistry hostarity enummodel imagecoverage foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke numequivalloc analyzealloc emitalloc treeseqcost imagefnforms \
+  fnform poolshape coreproc traceemit traceeval degradedbacktrace \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost recordshadow emittedheads adaptercheck hostprops normalizecheck hostregistry hostarity enummodel imagecoverage lazyshims foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke numequivalloc analyzealloc emitalloc treeseqcost imagefnforms \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotcachesourcepathsmoke aotcachestarfilesmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck buildunitwrite threadeddeadlock forkheldlocks oomafterrendezvous heaphistogram siginfodump \
-  systemstreams closedstdout stderrsplit userdirpaths utf8decode \
+  systemstreams closedstdout stderrsplit userdirpaths mimetypes utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer ticks interruptnest monitorescape windescape threadsafety maskedacquire ioerrno cas flow tickbudget remotechan
 TEST-GATES := submodules selfhost ci
 
@@ -277,9 +277,11 @@ bionic-ci:
 # moved a ratio by 1.5-3x: over 134 CI jobs (2026-11-03..04) fastpathratio put
 # a row over its ceiling in 9, 7 of them x86, with no step change in any row and
 # the same commit's other run passing where there was one. A quiet machine reads
-# well inside every ceiling. A scaling gate (n vs 4n of the same work) is not
+# well inside every ceiling. stdlibratio is the same kind of gate and failed
+# the same way beside its shard (clojure.string/blank? 1.74 against 1.3, the same
+# commit's rerun 0.95; jolt-h1d). A scaling gate (n vs 4n of the same work) is not
 # listed: interference moves both of its arms alike.
-QUIET-GATES := fastpathratio
+QUIET-GATES := fastpathratio stdlibratio
 # Runs the QUIET-GATES of $(1) one at a time. -j1 takes the sub-make off the
 # jobserver, so nothing else this make started is running beside them.
 define run-quiet
@@ -639,6 +641,18 @@ zlibnativesmoke: testbin
 noexecsmoke: testbin
 	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/no-external-programs-smoke.sh
 
+# tools/ns_audit.clj reports the (ns ...) forms ns refuses, without loading them.
+nsaudit: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh host/chez/ns-audit-check.sh
+
+# clj-kondo over what jolt ships, with tools/clj-kondo-ci.edn. Its own CI job, since
+# the gate list runs where clj-kondo is not installed. jolt-core/clojure is left out:
+# it defines clojure.core, which clj-kondo reads against its own model of the same
+# names, so a deftype method named count reads as a call to core's.
+kondocheck:
+	@clj-kondo --cache false --config tools/clj-kondo-ci.edn --fail-level error \
+	  --lint stdlib jolt-core/jolt tools
+
 # Duplicate native symbol detection (issue #731): a declared :jolt/native that
 # carries its own static copy of another's code — raygui linked against
 # libraylib.a — used to go inert with no error. Pins that the footgun build is
@@ -874,7 +888,8 @@ fastpathratio: testbin
 # A stdlib fn against the same source compiled from a user file, as a ratio in
 # one process. The embedded stdlib fasls and the seed-embedded namespaces are
 # compiled by paths a user file never takes; build-jolt once captured the fasls
-# with var-cache off (every var ref looked up by name, 2-7x slower).
+# with var-cache off (every var ref looked up by name, 2-7x slower). A
+# QUIET-GATE: CI runs it after the rest of its shard, not beside it.
 stdlibratio: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/stdlib_compile_ratio_test.clj
 
@@ -1045,6 +1060,7 @@ ffi:
 	@bin/jolt run test/chez/jolt-ffi-scoped-test.clj
 	@bin/jolt run test/chez/jolt-ffi-arena-test.clj
 	@bin/jolt run test/chez/jolt-ffi-typed-array-test.clj
+	@bin/jolt run test/chez/jolt-ffi-callback-preempt-test.clj
 	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-foreign-thread-test.sh
 	@sh test/chez/ffi-gc-stall-test.sh
@@ -1344,6 +1360,11 @@ mintgate:
 fnform:
 	@$(CHEZ) --script test/chez/fnform-test.ss
 
+# A constant pool's scope nesting does not grow with the pool (a let* pool is
+# quadratic in Chez's compile; see pool-layers in backend_scheme.clj).
+poolshape:
+	@$(CHEZ) --script test/chez/pool-shape-test.ss
+
 # Every clojure.core fn must be nameable in value position: the state image
 # writes a procedure as its var NAME, and a native that is set!-extended after
 # its def-var! leaves a procedure nothing named — so values built from it stop
@@ -1551,6 +1572,14 @@ hostarity:
 # without values/valueOf, Class.isEnum, Enum/valueOf and Enum's methods.
 enummodel:
 	@$(CHEZ) --script test/chez/enum-model-test.ss
+
+# Host shims that load on first reference (host/chez/lazy-shims.ss, #1517): the
+# index is current, every lazy file keeps the rules a late load needs (no
+# override, no outside reference, no reordered arm, and a lazy boot whose
+# registries match an eager one's), and each kind of reference loads its file.
+lazyshims:
+	@CHEZ='$(CHEZ)' $(CHEZ) --script tools/lazy-shims-gen.ss --check
+	@CHEZ='$(CHEZ)' $(CHEZ) --script test/chez/lazy-shims-test.ss
 
 # Every java.util collection shim round-trips through a state image (its
 # contents, order, comparator and class), or is refused naming its class.
@@ -2202,6 +2231,12 @@ stderrsplit:
 # directory, so it is a script rather than a unit row.
 userdirpaths:
 	@sh test/chez/user-dir-paths-smoke.sh
+
+# Files/probeContentType reads ~/.mime.types before the JDK's own table, the
+# way the JDK's default detector does (#1554). HOME is read once per process,
+# so it drives bin/jolt with a scratch HOME rather than being a unit row.
+mimetypes:
+	@sh test/chez/mime-types-smoke.sh
 
 # Smoke test: clojure.core/compile writes artifacts under *compile-path* and a
 # later PROCESS loads them — including with the source removed, which is the point

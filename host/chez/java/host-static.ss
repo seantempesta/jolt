@@ -32,7 +32,9 @@
 ;; class; exposing it keeps the registry tables private to the java layer.
 (define (host-class-registered? nm)
   (or (and (hashtable-ref class-statics-tbl nm #f) #t)
-      (and (hashtable-ref class-ctors-tbl nm #f) #t)))
+      (and (hashtable-ref class-ctors-tbl nm #f) #t)
+      ;; a class a host shim registers when it loads (lazy-shims.ss)
+      (lazy-shims-provides? nm)))
 ;; narrower: registered with STATICS (not just a constructor) — an imported class
 ;; short name used as a static-call target, distinct from a deftype's bare name.
 (define (host-class-has-statics? nm) (and (hashtable-ref class-statics-tbl nm #f) #t))
@@ -77,12 +79,16 @@
 ;; registered is still free to be declared — nothing has claimed it — and a
 ;; registration that just landed must not make itself the reason.
 (define (runtime-provides-class? name)
-  (let ((short (short-class-name name)))
-    (and (or (hashtable-ref host-class-statics-tbl name #f)
-             (hashtable-ref host-class-statics-tbl short #f)
-             (hashtable-ref host-class-ctors-tbl name #f)
-             (hashtable-ref host-class-ctors-tbl short #f))
-         #t)))
+  (or (runtime-provides-spelling? name)
+      (runtime-provides-spelling? (short-class-name name))))
+;; The same for one spelling exactly — what register-class-provider! asks of each
+;; spelling of a claim.
+(define (runtime-provides-spelling? c)
+  (and (or (hashtable-ref host-class-statics-tbl c #f)
+           (hashtable-ref host-class-ctors-tbl c #f)
+           ;; one a host shim registers when it loads, which may not have happened
+           (lazy-shims-provides? c))
+       #t))
 
 ;; ---- arity, before the member runs ------------------------------------------
 ;; The JVM resolves a call by its ARITY before it runs anything: an extra trailing
@@ -866,6 +872,12 @@
 
 (define (lookup-class h-tbl name)
   (or (hashtable-ref h-tbl name #f)
+      ;; the exact name of a class a host shim registers when it loads
+      ;; (lazy-shims.ss) comes before the short-name fallback, as it did when the
+      ;; shim was part of the boot: java.lang.ProcessBuilder must not answer
+      ;; babashka.process's ProcessBuilder record, registered by its short name
+      (and (lazy-shims-provides? name) (lazy-shims-class! name)
+           (hashtable-ref h-tbl name #f))
       (hashtable-ref h-tbl (short-class-name name) #f)))
 
 ;; ---- the concrete methods of an abstract host class -------------------------
@@ -958,8 +970,12 @@
   (for-each (lambda (t) (hashtable-set! image-read-check-by-tag t check)) tags))
 (define (image-read-refusal x)
   (and (jhost? x)
-       (let ((c (hashtable-ref image-read-check-by-tag (jhost-tag x) #f)))
-         (and c (c x)))))
+       (begin
+         ;; a value of a lazy host shim's class: its file (and so its read check)
+         ;; loads before the value is looked at (lazy-shims.ss)
+         (lazy-shims-tag! (jhost-tag x))
+         (let ((c (hashtable-ref image-read-check-by-tag (jhost-tag x) #f)))
+           (and c (c x))))))
 
 ;; ---- host object ------------------------------------------------------------
 (define-record-type jhost (fields tag (mutable state)) (nongenerative chez-jhost-v1))
@@ -1407,7 +1423,8 @@
             '("java.net.InetAddress" "java.net.Inet4Address"
               "java.net.Inet6Address" "java.net.InterfaceAddress"
               "java.net.NetworkInterface" "java.net.Socket"
-              "java.net.ServerSocket" "java.net.InetSocketAddress"))
+              "java.net.ServerSocket" "java.net.InetSocketAddress"
+              "java.net.StandardSocketOptions"))
            (box #f))))
 (define lib-class-providers core-class-providers)
 
@@ -1542,8 +1559,12 @@
 ;; exists to provide.
 (define (register-class-provider! install-ns coordinate classes)
   (let* ((cs (class-spellings classes))
+         ;; the live tables, and runtime-provides-spelling? for a class a host shim
+         ;; registers when it loads (lazy-shims.ss), which may not have happened
+         ;; yet: whether the claim stands must not depend on that
          (taken? (lambda (c) (or (hashtable-ref class-statics-tbl c #f)
-                                 (hashtable-ref class-ctors-tbl c #f))))
+                                 (hashtable-ref class-ctors-tbl c #f)
+                                 (runtime-provides-spelling? c))))
          ;; the fully-qualified spellings the runtime provides, as declared
          (stale (filter (lambda (c) (taken? c)) classes))
          (kept (filter (lambda (c) (not (taken? c))) cs)))
@@ -1626,9 +1647,12 @@
 ;; jolt.time.base / jolt.socket leave a claim pending in almost every program, so
 ;; there is no steady state in which that lookup goes away.
 (define (lib-try-autoload! class)
-  (and lib-any-pending-claims?
-       (let ((p (hashtable-ref lib-pending-claims-tbl class #f)))
-         (and p (lib-load-provider! p)))))
+  ;; a host shim that loads on first reference (lazy-shims.ss) answers first: the
+  ;; runtime provides the class, so no library claim on it stands
+  (or (lazy-shims-class! class)
+      (and lib-any-pending-claims?
+           (let ((p (hashtable-ref lib-pending-claims-tbl class #f)))
+             (and p (lib-load-provider! p))))))
 
 ;; The provider that DECLARES this class and has not had its chance yet — meaning
 ;; the registration about to happen is somebody else's, and must wait. #f when
@@ -1843,9 +1867,11 @@
         (let ((h (lookup-class class-statics-tbl class)))
           (if h
               (let ((v (hashtable-ref h member host-static-miss)))
-                (if (eq? v host-static-miss)
-                    (throw-jvm (quote IllegalArgumentException) (string-append "No matching field or method: " class "/" member))
-                    v))
+                (cond
+                  ((not (eq? v host-static-miss)) v)
+                  ;; a member a lazy host shim adds to this class (Runtime/getRuntime)
+                  ((lazy-shims-static! class member) (host-static-ref class member))
+                  (else (throw-jvm (quote IllegalArgumentException) (string-append "No matching field or method: " class "/" member)))))
               ;; class miss — autoload the provider that declares the class (the
               ;; java.time base, jolt.socket, or a library that installs it) and
               ;; retry once. A claimed class cannot be a hit before its claimer

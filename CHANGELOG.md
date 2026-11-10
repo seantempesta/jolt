@@ -36,21 +36,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Code that bounds its in-flight work with one (Datahike's background GC test) construction
   failed with `No matching ctor found`.
 
-### Changed
-
-- **A fiber parking on a socket no longer wakes the poller**. It registers a
-  one-shot kevent or epoll_ctl itself, on kqueue and epoll, so there is no control
-  pipe, no delete to issue later and one poller round per park. A woken fiber's
-  next park also no longer spends a `recv` and a lock on a stale `:ready` flag. A
-  fiber socket round trip on macOS went from about 83 to 55 us. WSAPoll still wakes
-  its round, having no kernel-held set. `jolt.io-poller/debug-state` loses `:ready`,
-  `:ev-errors` and `:stale-consumes`.
-
 ### Fixed
 
-- **A fiber waiting on an fd the kernel refuses to watch now returns**. A closed fd
-  parked the fiber forever on kqueue and epoll; the caller's retry now reports what
-  is wrong with the fd, as `wait-thread` already did.
+- **The built-in nREPL server starts evals in `user`, and sessions keep their
+  namespace.** An eval that sent no `ns` ran in whatever namespace the server
+  thread was started under, which under `jolt nrepl-server` is `clojure.core`,
+  so a client's first `def` went into `clojure.core`. A cloned session also
+  forgot an `(ns foo)` by its next eval. New sessions and session-less evals
+  now start in `user`, as on JVM nREPL. A cloned session keeps the namespace
+  its last eval ended in, and a clone of it starts there too. Session-less evals
+  that the jolt-lang/nrepl session middleware passes through are fixed by the
+  same change. As on JVM nREPL, an eval that names its `ns` runs there without
+  moving the session, an `ns` that does not exist answers
+  `namespace-not-found` instead of running the code in `clojure.core`, and a
+  session whose namespace was removed starts its next eval in `user`.
+- **`File.deleteOnExit` deletes its paths at exit.** It answered nil and deleted
+  nothing, so a program that relied on it left its temp files behind, decrypted
+  PEM keys included. Paths now go on every exit that runs the shutdown hooks
+  (a normal end, `System/exit`, SIGTERM), right after those hooks, as on the
+  JVM. The order is the reverse of registration and each path goes once,
+  so a directory registered before the files in it is deleted after them.
+  Anything `File.delete` can't remove, such as a directory that still has files
+  in it, is skipped.
+
+## [0.8.25] - 2026-11-08
+
+A release that holds code to the JVM's rules where jolt used to accept it
+quietly: overlapping `fn` arities, a malformed `ns` form and a method declared
+twice in a type now fail to compile, and the old byte-index form of
+`ffi/read-into!` and `ffi/write-array` raises. To check a project's `ns` forms
+without loading it, run `jolt tools/ns_audit.clj <dir>` from a jolt checkout.
+jolt-lang/time before v0.0.13 has a malformed `ns` docstring and no longer loads.
+A foreign callback that parks on a fiber now raises instead of sometimes
+corrupting the stack. Sockets gain the JDK's options and exceptions, `java.nio.file` creation and
+moves handle races and failures as the JDK does, and the arm64 macOS binary
+runs on macOS 11 and later.
+
+### Changed
+
+- **BREAKING: `deftype`, `defrecord` and `reify` refuse a method declared twice.**
+  Two methods with the same name, argument count and parameter hints, in one
+  protocol or across two, now raise `analyze/duplicate-method` with the JVM's
+  ClassFormatError message. One of them used to be dropped without a word.
+  A protocol named twice in one form keeps only its last run of methods, as on
+  the JVM; it used to merge both runs. `extend-type` and `extend-protocol` still
+  take the last of two same-arity methods, as the JVM does. `proxy` refuses a
+  method name given in two specs with the JVM's "Method 'm' redefined", where it
+  used to merge them or fail with a `fn` arity error.
+- **BREAKING: a multi-arity `fn` whose arities overlap no longer compiles.** Two
+  variadic arities, two fixed arities of the same count, or a fixed arity with more
+  params than the variadic one now raise `analyze/invalid-fn-arities` with the JVM's
+  message. They used to compile, and the first matching clause ran every call, so
+  `([a & r] ...) ([a b c & r] ...)` never reached its second clause. A first clause
+  that delegated to the second looped at full CPU with no error.
+- **BREAKING: `ns` refuses a malformed form.** After the name it takes an optional
+  docstring, an optional attr-map and reference clauses, as on the JVM, and it used
+  to ignore anything else. An unescaped quote in a docstring splits it into strings
+  and bare symbols, and that loaded silently. So did a typo such as `(:requires ...)`.
+  Both now raise `analyze/invalid-ns-form`, in `jolt build` as well. To check code
+  without loading it, run `jolt tools/ns_audit.clj <dir>` from a jolt checkout.
 - **BREAKING: `ffi/read-into!` and `ffi/write-array` no longer take
   `(p arr off n)`.** In that form `off` was an index into a byte-array; in
   babashka.ffi's order, which every other form of both functions follows,
@@ -62,6 +106,134 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A pointer offset folded into `p`, as in `(read-into! (+ p k) arr off n)`, can
   move into the zero: `(read-into! p :byte arr k off n)`. `(write-array p arr)`
   and `(read-array p n)` are unchanged.
+- **`ffi/alloc` zeroes in place.** It built a zeroed bytevector the size of the
+  block and copied that over, so a 64 KB allocation took 6.4 us and left 64 KB of
+  garbage on the heap. It now calls `memset`: a 64 KB block takes 1.5 us and a 1 MB
+  block 10 us against 86. Arenas allocate the same way, so they gain it too.
+- **A fiber parking on a socket no longer wakes the poller**. It registers a
+  one-shot kevent or epoll_ctl itself, on kqueue and epoll, so there is no control
+  pipe, no delete to issue later and one poller round per park. A woken fiber's
+  next park also no longer spends a `recv` and a lock on a stale `:ready` flag. A
+  fiber socket round trip on macOS went from about 83 to 55 us. WSAPoll still wakes
+  its round, having no kernel-held set. `jolt.io-poller/debug-state` loses `:ready`,
+  `:ev-errors` and `:stale-consumes`.
+
+### Removed
+
+- `jolt.loader/url-search`, an unused alias of `jolt.loader/classpath`, and
+  `jolt.winsock/windows-host?`, which nothing called. Use `classpath`.
+
+### Performance
+
+- **Rarely used host classes load on first use (#1517).** 0.8.24 loaded about
+  1.3 MB more runtime at boot, which cost Linux roughly 10 ms per start. Seven host shims
+  most programs never touch now load on first use: `Vector`, `Stack`,
+  `Hashtable`, `BitSet`, `PriorityQueue` and the `java.util.concurrent`
+  collections, `ArrayDeque`, `EnumSet`/`EnumMap`, `Semaphore` and
+  `ReentrantReadWriteLock`, the atomic arrays, `java.util.zip`'s gzip streams
+  and `ProcessBuilder`. `instance?` and `isa?` answer without loading them, and
+  `jolt build` only includes the ones an app names. A computed class name that
+  reaches one left out raises `NoClassDefFoundError` suggesting an `:import`.
+
+  ```
+  x86_64 Linux     before   after
+  jolt -e nil      205 ms   200 ms   (RSS 116 -> 107 MB)
+  built hello app  130 ms   125 ms
+  ```
+
+### Fixed
+
+- **A fiber is no longer preempted inside a foreign callback.** While C was
+  calling back into jolt (a `qsort` comparator, a TLS library's callback), the
+  preempt timer could switch the fiber out with the C frames still on the
+  carrier thread's stack. Another fiber then called into C on the same thread
+  over them, and the first one's return failed with `attempt to return to stale
+  foreign context`: 40 of 50 fibers sorting through a Clojure comparator, at the
+  default quantum. A callback's body now counts as a lock region, so preemption
+  waits until it returns. **A callback that parks on a fiber now raises** (the
+  counted-lock error, which now names callbacks), where it used to work only
+  while no other fiber on that carrier entered C in the meantime.
+- **An uncaught report keeps the frames of a throw that passed through a catch.**
+  When no catch clause matched, the rethrow started the trace at the catching fn,
+  so a host fault or a runtime throw such as divide by zero lost the fns between
+  the catch and the fault. A handler's own `(throw e)` had the same problem. The
+  rethrow now keeps the first raise's frames.
+- An error in a `fn`, `let`, `loop` or `letfn` form no longer carries the note
+  "raised while expanding the `fn` macro". Those macros only rename the form to
+  its special form, so the error is in the code as written. When a user macro
+  generates the form, the note now names that macro instead of `fn`. An
+  overlapping-arity error points at the clause that breaks the rule rather than
+  the start of the `fn` or `defn`.
+- `BufferedInputStream` marks over any stream, as the JDK's does. Over a proxy,
+  pipe, socket or process stream it answered `markSupported` false and `reset`
+  threw, which failed every `Content-Encoding: deflate` response in
+  `babashka.http-client`. `reset` before any `mark` now throws
+  `Resetting to invalid mark`, and a mark read past its limit is dropped.
+- `Path.toRealPath` of a missing path throws `NoSuchFileException`, not `ex-info`.
+- **`Files/createDirectories` throws when it can't make the directory.** Under a
+  read-only parent it returned the path and made nothing. It now throws what the
+  JDK does, `AccessDeniedException` naming the first directory it couldn't create.
+  A regular file in the way is `FileSystemException: <path>: Not a directory`, where
+  it was `FileAlreadyExistsException`. Losing a race to another process making the
+  same directory is still not an error.
+- **`File.mkdirs` answers false for a directory that already exists**, as on the
+  JVM. It answered true.
+- **`clojure.java.io/copy` from a `char[]` copies its characters.** It wrote the
+  array's printed form, `#object["[C" ...]`. A byte destination gets them encoded
+  under `:encoding`, UTF-8 by default.
+- **`Files/probeContentType` types a file the way the JDK does (#1554).** It knew
+  22 extensions of its own, and typed `.md`, `.csv` and `.clj` as
+  `text/plain`. It now asks `~/.mime.types`, then `/etc/mime.types` (Linux and
+  the BSDs), then the JDK's own table of 132 extensions, matching OpenJDK 21 on
+  3,036 names: `.md` is `text/markdown`, `.csv` is `text/csv`, `.webp` is
+  `image/webp`, and a name nothing knows answers nil. macOS's system type lookup
+  and the Windows registry are not modelled, so there the JDK's table answers.
+  An embedded resource whose name the table doesn't know has the content type
+  `content/unknown`, as `JarURLConnection` reports it, rather than nil.
+
+- **A refused bind is a `java.net.BindException`.** The class didn't exist and a
+  bind failed with `IOException: bind failed on port N`, so a port probe catching
+  `BindException` got an error instead of an answer. It now carries the OS's reason
+  (`Address already in use`), and other socket failures take the class the JDK
+  gives them, such as `NoRouteToHostException`.
+- **A wildcard bind no longer calls a port held on `::1` free.** Any failure binding
+  `::` fell back to `0.0.0.0`, which succeeded beside the holder. The fallback is now
+  only for a host without IPv6.
+- **A connection reset raises.** A read of a reset connection answered end of stream.
+  It now throws `SocketException: Connection reset`, as on the JVM.
+- **`Socket` and `ServerSocket` options.** `Socket` gains `bind`, `sendUrgentData` and
+  the get and set pairs for `ReuseAddress`, `TcpNoDelay`, `KeepAlive`, `SoLinger`,
+  `OOBInline`, `TrafficClass` and the buffer sizes; both gain `setOption`, `getOption`
+  and `supportedOptions` with `java.net.StandardSocketOptions`. An option set before
+  a connect or a bind reaches the socket that ends up in use. A client socket no
+  longer gets `SO_REUSEADDR`, which only a listener has by default.
+- **`ServerSocket.setReuseAddress` and `getReuseAddress`.** Neither existed, so
+  a port probe that turns `SO_REUSEADDR` off before a wildcard bind, to count a
+  port another socket holds on one address as busy, threw
+  `IllegalArgumentException: No matching method setReuseAddress`. A listener
+  still gets the option by default on POSIX, as the JDK's does, and
+  `getReuseAddress` answers `true` for it; turned off before `bind`, the wildcard
+  bind refuses such a port, as on the JVM. Both throw `SocketException: Socket is
+  closed` on a closed socket.
+- **A namespace keeps its metadata.** `(meta (find-ns 'x))` was always nil, because
+  `ns` dropped the docstring, the attr-map and metadata on the name. It now answers
+  them as the JVM does, in built binaries too.
+- **`(:refer ...)` and `(:load ...)` in `ns` run.** They were ignored.
+- **A loaded file is part of a built binary.** `(load "x")` with a literal path, at
+  a file's top level or as `(:load "x")` in `ns`, compiled to a runtime load, so the
+  binary kept the compiler and failed once the source was gone. It now compiles into
+  the namespace. A file that switches to another namespace, a computed path and a
+  load that is not at top level stay runtime loads; a file that switches namespace
+  gets a build note saying so.
+- **Editing a loaded file reaches `jolt run`.** The AOT cache keyed a namespace on
+  its own source, so a macro in a file it `load`s kept its old expansion until the
+  namespace's own file changed.
+- **A failed `delay` can't answer nil to a racing thread.** Forcing read a flag and
+  then the exception, with no ordering between them, so on arm64 a thread could see
+  the flag and not the exception. Deref is one read now, no slower than it was.
+- **A fiber waiting on an fd the kernel refuses to watch now returns**. A closed fd
+  parked the fiber forever on kqueue and epoll; the caller's retry now reports what
+  is wrong with the fd, as `wait-thread` already did.
 - `jolt.profile/sample!` now reaches threads that were already running when it
   started. A plain thread or one parked in a wait had no timer event to join at, so
   a server's existing workers never appeared in the profile.
@@ -69,6 +241,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `(prof/instrument! :nope)` turned the execution counters on, so a misspelled
   `:debug` instrumented the code for the wrong thing without saying so. It now
   throws with the mode in `ex-data`. `nil` still turns instrumentation off.
+- **Temp files and directories no longer collide across processes.** A temp name
+  was the prefix, the current millis and a counter every process started at 1, so
+  two processes starting in the same millisecond picked the same name. The loser of
+  `Files/createTempDirectory` failed with `IOException: file exists`, and
+  `Files/createTempFile` and `java.io.File/createTempFile` opened it with a create
+  that also succeeds on an existing file, which handed both processes one file.
+  Names are now the prefix, a random 64-bit number and the suffix, as on the JVM,
+  and each entry is created exclusively, with a fresh name when one is taken.
+- **`Files/createDirectory` reports a lost race as `FileAlreadyExistsException`.**
+  It looked for the path before calling `mkdir`, so a directory another process made
+  in between came back as a plain `FileSystemException`, and code using the
+  directory as a lock read losing it as an I/O error. The class now comes from
+  `mkdir`'s own errno, as on the JVM, which also makes a permission failure
+  `AccessDeniedException`.
+- **`Files/move` with `ATOMIC_MOVE` replaces the target in one step.** It removed
+  the target and then renamed onto it, so a reader could find the file missing in
+  between, which defeats writing a temp file and renaming it over the real one. It
+  is now a single `rename(2)`, as on the JVM: an existing target is replaced with
+  or without `REPLACE_EXISTING`, a move across filesystems throws
+  `AtomicMoveNotSupportedException`, and a failure names both paths with the JDK's
+  class, such as `NoSuchFileException` for a missing parent. Windows does the same
+  with `MoveFileExW`. A move between filesystem providers refuses `ATOMIC_MOVE`
+  rather than copying and deleting.
+- **Exception accessors.** `FileSystemException` and its subclasses have `getFile`,
+  `getOtherFile` and `getReason`, `URISyntaxException` has `getInput`, `getReason` and
+  `getIndex`, and `PatternSyntaxException` has `getDescription`, `getIndex` and
+  `getPattern`. Their constructors take the JDK's arguments, where the second was
+  read as a cause and the message came out wrong.
+- **A temp file or a new entry is created with its final permissions.**
+  `Files/createTempFile` made the file with the default mode and then `chmod`ed it
+  to `0600`, so another user could open it in between and go on reading what was
+  written to it. `createFile`, `createDirectory` and `createTempDirectory` had the
+  same window for permissions passed as attributes. The mode now goes in the create
+  call. `createTemp*` also honor a permissions attribute, which they ignored.
+- **`createTemp*` argument and failure handling matches the JVM.** A prefix or suffix
+  that names a parent, such as `../x`, is `IllegalArgumentException` for
+  `Files/createTemp*` instead of creating outside the directory, and
+  `java.io.File/createTempFile` uses only the prefix's last segment. A `nil` suffix to
+  `Files/createTempFile` is `.tmp`. A missing or non-directory parent to
+  `Files/createTempFile` is `NoSuchFileException` or `FileSystemException` rather than
+  `FileNotFoundException` or `IOException` from the open.
+- **`errno` is read where nothing can overwrite it.** Between a libc call and the read,
+  an allocation or a collection could change `errno`, so `createDirectory` could call
+  an existing directory `Cannot allocate memory`. `Files/delete`, `createLink`,
+  `createSymbolicLink`, `getFileStore`, `setOwner`, `toRealPath` and the charset decoder
+  read it the same way and now share one safe read.
 - **`ffi/read-into!` and `ffi/write-array` refuse an array that is not a
   byte-array on the byte route.** `(write-array p :byte (int-array [1 2]) 0 0 2)`
   and `(write-array p (double-array 2))` truncated each element to a byte and
@@ -76,16 +294,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error. Both now throw `expected a byte-array` before copying anything, and a
   byte range error carries the same `:index`, `:length` and `:capacity` as the
   wider types.
-- **`ffi/alloc` zeroes in place.** It built a zeroed bytevector the size of the
-  block and copied that over, so a 64 KB allocation took 6.4 us and left 64 KB of
-  garbage on the heap. It now calls `memset`: a 64 KB block takes 1.5 us and a 1 MB
-  block 10 us against 86. Arenas allocate the same way, so they gain it too.
 - An uncaught report's trace and the frames `jolt.debug/with-break-handler` hands
   its handler no longer start with the wrong fn when a throw that is not in tail
   position runs under a host callback. The caller that tail-called the host fn was
   listed as the innermost frame, sometimes with a caller of its own that never ran.
 - A host fault after a caught throw no longer reports the fn that threw as its
   innermost frame. That fn had already left, but its site was still in the slot.
+
+- **`seq` on an array is lazy, as `ArraySeq` is (#1548).** It copied the whole
+  array into a list first, about 100 bytes per element, so `(first big-array)`
+  or `(take 4 bytes)` on a large array exhausted the heap or overflowed the
+  stack. Elements are now read on demand, including the first, so an `aset`
+  after `(seq a)` shows through, as on the JVM, and `reduce` or `into` over an
+  array's seq walks the array directly: over a million ints, `reduce` is about
+  3x faster than in 0.8.24 and `into` about 1.6x.
+- **`clojure.java.io/copy` honors `:encoding`.** A byte source copied to a
+  Writer always decoded as UTF-8, and a char source copied to a byte sink always
+  encoded as UTF-8. `clojure.java.shell/sh` passes `:out-enc` through `copy`, so
+  `(sh ... :out-enc "ISO-8859-1")` turned every non-UTF-8 byte into U+FFFD.
+- **Record literals refuse to run under `*read-eval*` false.** `#my.ns.Rec{...}`
+  and `#my.ns.Rec[...]` call the record's factory at read time, and jolt called
+  it even when `*read-eval*` was false. They now throw the JVM's `Record
+  construction syntax can only be used when *read-eval* == true`. EDN reading
+  is unchanged.
+
+- **The arm64 macOS binary starts on macOS 11.** The native link took the
+  build runner's OS as its minimum, so 0.8.24's binary needed macOS 14 and
+  refused to start on anything older. It is pinned to 11, as the Intel build
+  already was, and the release checks it.
+- **A Nix-built jolt gets the patched Chez.** The flake built on stock nixpkgs
+  Chez without jolt's kernel patches, so a struct argument passed on the stack
+  to a foreign function could land in the wrong slot, and `:blocking` calls paid
+  the stock collect-safe price.
 
 ## [0.8.24] - 2026-11-05
 

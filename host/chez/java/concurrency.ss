@@ -1099,6 +1099,19 @@
 (define-record-type jolt-delay (fields thunk (mutable realized?) (mutable value) (mutable exn))
   (nongenerative jolt-delay-v2))
 (define (jolt-make-delay thunk) (make-jolt-delay thunk #f jolt-nil #f))
+;; realized? is the one word a reader needs: #f, or the answer, (value) or #(exn). The
+;; loads of two fields can reorder on arm64, so a reader that went by a flag could see
+;; it set with exn still unset and answer nil for a failed delay. value and exn are
+;; still filled in for the record's layout, which an image holds; #t in this word is a
+;; delay realized by a build older than this one.
+(define (jolt-delay-publish! d word)
+  (when jolt-mt? (memory-order-release))
+  (jolt-delay-realized?-set! d word))
+(define (jolt-delay-answer d w)
+  (cond ((pair? w) (car w))
+        ((vector? w) (raise (vector-ref w 0)))
+        ((jolt-delay-exn d) => raise)
+        (else (jolt-delay-value d))))
 
 ;; How futures, promises, delays and agents print (printing.ss register-deref-print!):
 ;; pending until realized, failed with the throwable a deref would raise, else
@@ -1114,9 +1127,11 @@
   (lambda (p) (if (jolt-promise-delivered? p) (cons "ready" (jolt-promise-value p)) (cons "pending" jolt-nil))))
 (register-deref-print! jolt-delay?
   (lambda (d)
-    (cond ((not (jolt-delay-realized? d)) (cons "pending" jolt-nil))
-          ((jolt-delay-exn d) (cons "failed" (jolt-unwrap-throw (jolt-delay-exn d))))
-          (else (cons "ready" (jolt-delay-value d))))))
+    (let ((w (jolt-delay-realized? d)))
+      (cond ((not w) (cons "pending" jolt-nil))
+            ((if (vector? w) (vector-ref w 0) (and (not (pair? w)) (jolt-delay-exn d)))
+             => (lambda (e) (cons "failed" (jolt-unwrap-throw e))))
+            (else (cons "ready" (if (pair? w) (car w) (jolt-delay-value d))))))))
 (register-deref-print! jolt-agent?
   (lambda (a) (cons (if (jolt-nil? (jolt-agent-err a)) "ready" "failed") (jolt-agent-state a))))
 ;; run the thunk once, like Clojure's Delay: if it throws, cache the exception
@@ -1151,15 +1166,20 @@
 ;; Reentrancy is unchanged in observable terms: a delay whose body derefs itself
 ;; re-enters the monitor, finds realized? #f and recurses, which is what the JVM does
 ;; too (synchronized is reentrant and fn is still non-null).
-(define (jolt-delay-force d)
-  (unless (jolt-delay-realized? d)
+(define (jolt-delay-force-slow d w)
+  (unless w
     (jolt-with-monitor d
       (lambda ()
         (unless (jolt-delay-realized? d)
-          (guard (e (#t (jolt-delay-exn-set! d e) (jolt-delay-realized?-set! d #t)))
-            (jolt-delay-value-set! d (jolt-invoke (jolt-delay-thunk d)))
-            (jolt-delay-realized?-set! d #t))))))
-  (if (jolt-delay-exn d) (raise (jolt-delay-exn d)) (jolt-delay-value d)))
+          (guard (e (#t (jolt-delay-exn-set! d e)
+                        (jolt-delay-publish! d (vector e))))
+            (let ((v (jolt-invoke (jolt-delay-thunk d))))
+              (jolt-delay-value-set! d v)
+              (jolt-delay-publish! d (list v))))))))
+  (jolt-delay-answer d (jolt-delay-realized? d)))
+(define (jolt-delay-force d)
+  (let ((w (jolt-delay-realized? d)))
+    (if (pair? w) (car w) (jolt-delay-force-slow d w))))
 
 ;; --- deref extension --------------------------------------------------------
 ;; Chain the fully-built jolt-deref (atoms/vars/volatiles/reduced) with futures,
@@ -1261,7 +1281,7 @@
 (define (jolt-conc-realized? x)
   (cond ((jolt-future? x) (jolt-future-done? x))
         ((jolt-promise? x) (jolt-promise-delivered? x))
-        ((jolt-delay? x) (jolt-delay-realized? x))
+        ((jolt-delay? x) (and (jolt-delay-realized? x) #t))
         (else #f)))
 
 ;; --- bind into clojure.core -------------------------------------------------
@@ -3059,67 +3079,8 @@
                 (let* ((ts (timertask-state self)) (p (vector-ref ts 2)))
                   (if (< p 0) (+ (vector-ref ts 1) p) (- (vector-ref ts 1) p)))))))
 
-;; --- java.util.concurrent.Semaphore -----------------------------------------
-;; A counting semaphore: #(permits mutex cv). acquire takes n permits (1 by default), waiting
-;; interruptibly until that many are there; the permits are taken inside the wait's decision,
-;; under the mutex, so two acquirers never take the same ones. tryAcquire is the same without
-;; waiting (or waiting at most (timeout, unit)); release adds permits and wakes every waiter.
-;; Fairness is accepted and ignored: waiters are woken together and each re-asks, so a release
-;; goes to whichever runs first, as an unfair semaphore's does. A negative count of permits is
-;; refused as the JDK refuses it.
-(define (sem-check-count! n who)
-  (when (< n 0) (throw-jvm 'IllegalArgumentException (string-append who ": negative permits"))))
-(define (sem-take! st n)
-  ;; with the mutex held: take n permits if they are there
-  (and (>= (vector-ref st 0) n) (begin (vector-set! st 0 (- (vector-ref st 0) n)) #t)))
-(define (sem-acquire! self n who interruptible? . deadline)
-  (let* ((st (jhost-state self))
-         (decide (lambda (timed-out?)
-                   (cond ((sem-take! st n) #t)
-                         (timed-out? #f)
-                         (else jolt-cv-again)))))
-    (if interruptible?
-        (jolt-cv-wait-interruptibly who (vector-ref st 1) (vector-ref st 2)
-                                    (and (pair? deadline) (car deadline)) decide)
-        (jolt-cv-wait (vector-ref st 1) (vector-ref st 2) #f decide))))
-(for-each (lambda (nm) (register-class-ctor! nm (lambda (n . _)
-                                                  (make-jhost "semaphore" (vector (jnum->exact n) (make-mutex) (jolt-make-cv))))))
-          '("Semaphore" "java.util.concurrent.Semaphore"))
-(register-host-methods! "semaphore"
-  (list (cons "acquire" (lambda (self . n)
-          (let ((n (if (pair? n) (jnum->exact (car n)) 1)))
-            (sem-check-count! n "Semaphore.acquire")
-            (sem-acquire! self n "Semaphore.acquire" #t)
-            jolt-nil)))
-        (cons "acquireUninterruptibly" (lambda (self . n)
-          (let ((n (if (pair? n) (jnum->exact (car n)) 1)))
-            (sem-check-count! n "Semaphore.acquireUninterruptibly")
-            (sem-acquire! self n "Semaphore.acquireUninterruptibly" #f)
-            jolt-nil)))
-        ;; tryAcquire() | (n) | (timeout, unit) | (n, timeout, unit)
-        (cons "tryAcquire" (lambda (self . args)
-          (let* ((st (jhost-state self))
-                 (n (if (or (= 1 (length args)) (= 3 (length args))) (jnum->exact (car args)) 1))
-                 (timed (if (= 3 (length args)) (cdr args) (if (= 2 (length args)) args '()))))
-            (sem-check-count! n "Semaphore.tryAcquire")
-            (if (null? timed)
-                (jolt-with-mutex (vector-ref st 1) (sem-take! st n))
-                (let ((ms (tu-args->ms timed)))
-                  (and (sem-acquire! self n "Semaphore.tryAcquire" #t (ms->timeout ms)) #t))))))
-        (cons "release" (lambda (self . n)
-          (let ((st (jhost-state self)) (n (if (pair? n) (jnum->exact (car n)) 1)))
-            (sem-check-count! n "Semaphore.release")
-            (jolt-with-mutex (vector-ref st 1)
-              (vector-set! st 0 (+ (vector-ref st 0) n))
-              (jolt-cv-wake! (vector-ref st 2)))
-            jolt-nil)))
-        (cons "availablePermits" (lambda (self)
-          (let ((st (jhost-state self))) (jolt-with-mutex (vector-ref st 1) (vector-ref st 0)))))
-        (cons "drainPermits" (lambda (self)
-          (let ((st (jhost-state self)))
-            (jolt-with-mutex (vector-ref st 1)
-              (let ((n (vector-ref st 0))) (vector-set! st 0 0) n)))))
-        (cons "isFair" (lambda (self) #f))))
+;; java.util.concurrent.Semaphore: upstream's (concurrency-sync.ss, 3b10767c, loaded on first
+;; use); ours (448880cd) dropped in the merge, its sem-acquire! clashed with that file's.
 
 ;; --- java.util.concurrent.ExecutorService / Executors ----------------------
 ;; A real task QUEUE served by a fixed number of worker threads (FIFO). A single
@@ -5518,6 +5479,41 @@
       (set-box! jolt-shutdown-hooks after)
       (not (= (length before) (length after))))))
 
+;; java.io.File.deleteOnExit: the paths to delete once the hooks have run, most
+;; recently registered first. That is the JDK's DeleteOnExitHook, a
+;; LinkedHashSet walked in reverse: a path registered twice keeps its first
+;; place and is deleted once, and a directory registered before the files in it
+;; goes after them, by which time it is empty. Deletion is File.delete's, so a
+;; directory that is still not empty, or a path already gone, is skipped
+;; silently. It runs after the program's hooks, as the JDK's slot for it comes
+;; after theirs, so a hook can still read a file it registered, or register one.
+;;
+;; Paths are stored absolute, resolved at registration as the JVM resolves them
+;; against a user.dir that never changes. Registering arms the exit paths like
+;; a hook does, so ^C and `kill` delete them too, but it does not mark the
+;; process multi-threaded: deleting a path touches no jolt value.
+(define jolt-delete-on-exit-paths (box '()))
+;; the same paths as a set, so a program registering a temp file per iteration
+;; pays O(1) per call, not a walk of the list (the JDK's LinkedHashSet)
+(define jolt-delete-on-exit-seen (make-hashtable string-hash string=?))
+;; set as the deletions start, DeleteOnExitHook's `files = null`
+(define jolt-delete-on-exit-taken (box #f))
+
+(define (jolt-delete-on-exit! path)
+  (let ((late? (jolt-with-mutex jolt-shutdown-mutex
+                 (or (unbox jolt-delete-on-exit-taken)
+                     (begin
+                       (unless (hashtable-contains? jolt-delete-on-exit-seen path)
+                         (hashtable-set! jolt-delete-on-exit-seen path #t)
+                         (set-box! jolt-delete-on-exit-paths
+                                   (cons path (unbox jolt-delete-on-exit-paths))))
+                       #f)))))
+    ;; DeleteOnExitHook.add once its own hook has started. A program's hook
+    ;; still runs before that, so a path it registers is deleted with the rest.
+    (when late? (throw-jvm 'IllegalStateException "Shutdown in progress")))
+  (jolt-arm-shutdown!)
+  jolt-nil)
+
 ;; Runs the hooks exactly once per process, whichever exit path gets here first.
 ;; The once-flag is flipped under the mutex together with taking the list, so a
 ;; SIGTERM landing while the main thread is already exiting cannot run them twice.
@@ -5527,7 +5523,11 @@
                       (begin (set-box! jolt-shutdown-ran #t)
                              (reverse (unbox jolt-shutdown-hooks)))))))
     (when hooks
-      (for-each (lambda (e) (guard (_ (#t #f)) ((cdr e)))) hooks)))
+      (for-each (lambda (e) (guard (_ (#t #f)) ((cdr e)))) hooks)
+      (for-each (lambda (p) (guard (_ (#t #f)) (delete-path! p)))
+                (jolt-with-mutex jolt-shutdown-mutex
+                  (set-box! jolt-delete-on-exit-taken #t)
+                  (unbox jolt-delete-on-exit-paths)))))
   jolt-nil)
 
 ;; The Runnable a java.lang.Thread was constructed with, or #f (Thread() with no

@@ -1077,7 +1077,7 @@
           (id? (make-eq-hashtable))
           (else (make-hashtable hm-hash jolt=2)))))
 ;; A removal detaches what was handed out for the key (an entrySet node keeps
-;; the value it last saw, as the JDK's removed Node does); jutil-concurrent.ss
+;; the value it last saw, as the JDK's removed Node does); jutil-coll-views.ss
 ;; installs the hook once a map has handed one out.
 (define hm-detach-hook #f)
 (define (hm-drop-key! self k)
@@ -1307,7 +1307,7 @@
                           m)))
         (cons "clear" (lambda (self) (hm-clear! self) jolt-nil))
         (cons "putAll" (lambda (self m) (hm-copy-into-ordered! self m) jolt-nil))
-        ;; keySet / values / entrySet are live views (jutil-concurrent.ss), as
+        ;; keySet / values / entrySet are live views (jutil-coll-views.ss), as
         ;; the JDK's HashMap$KeySet / $Values / $EntrySet are
         (cons "keySet" (lambda (self) (jutil-view self 0 (lambda () (make-jhost "jx-hm-keyset" (vector self))))))
         (cons "values" (lambda (self) (jutil-view self 1 (lambda () (make-jhost "jx-hm-values" (vector self))))))
@@ -1457,7 +1457,7 @@
 
 ;; java.util.concurrent.ConcurrentHashMap — the HashMap shim's storage under a
 ;; tag of its own, so it is its own class: a ConcurrentMap, refusing null keys
-;; and values, whose views are weakly consistent (jutil-concurrent.ss).
+;; and values, whose views are weakly consistent (jutil-coll-views.ss).
 ;; (get a-chm k) reads the map (clojure.core/get).
 ;;
 ;; Every write, and every walk of the key order, holds the map's private monitor
@@ -2004,7 +2004,7 @@
 ;; A Map seqs through its entrySet's iterator on the JVM (RT.seq), so a seq
 ;; yields the map's own live entries (HashMap$Node, ConcurrentHashMap$MapEntry
 ;; ...), as a LinkedHashMap's already does, not detached MapEntry pairs
-;; (jolt-12zv0). The entrySet views (jutil-concurrent.ss) build them from the
+;; (jolt-12zv0). The entrySet views (jutil-coll-views.ss) build them from the
 ;; key order, never back through here.
 (define (hm-seq-entries self)
   (let ((t (jhost-tag self)))
@@ -2690,6 +2690,47 @@
 ;; java.text.ParseException(String s, int errorOffset): unlike the exceptions
 ;; above, its second ctor arg is an int offset (getErrorOffset), not a cause.
 ;; Store the offset in the record's error-offset field (invisible to ex-data).
+;; FileSystemException(file) and (file, other, reason), which every class under it
+;; takes as well. The strings are kept as given (no native path rendering: the
+;; caller wrote them) and the message is built from them as getMessage builds it.
+(define (make-fs-exc-ctor canonical)
+  (lambda args
+    (let* ((str-arg (lambda (x) (and (not (jolt-nil? x)) (jolt-str-render-one x))))
+           (nth-arg (lambda (n) (and (> (length args) n) (str-arg (list-ref args n)))))
+           (file (nth-arg 0)) (other (nth-arg 1)) (reason (nth-arg 2)))
+      (jolt-host-throwable/detail canonical
+        (or (fs-exception-message-for #f file other reason) jolt-nil)
+        (vector file other reason)))))
+(let-values (((keys vals) (hashtable-entries jvm-class-parents)))
+  (vector-for-each
+    (lambda (canonical supers)
+      (when (jch-isa? canonical "java.nio.file.FileSystemException")
+        (register-class-ctor! (jch-last-segment canonical) (make-fs-exc-ctor canonical))
+        (register-class-ctor! canonical (make-fs-exc-ctor canonical))))
+    keys vals))
+
+;; URISyntaxException(input, reason[, index]) and PatternSyntaxException(description,
+;; regex, index): the arguments are not a message and a cause.
+(let ((uri-exc-ctor
+       (lambda (input reason . more)
+         (when (or (jolt-nil? input) (jolt-nil? reason))
+           (jolt-throw (jolt-host-throwable "java.lang.NullPointerException" jolt-nil)))
+         (let ((idx (if (pair? more) (car more) -1)))
+           (when (< idx -1)
+             (jolt-throw (jolt-host-throwable "java.lang.IllegalArgumentException" jolt-nil)))
+           (jolt-host-throwable/detail "java.net.URISyntaxException"
+             (uri-error-message input (list 'uri-error reason idx))
+             (vector input reason idx)))))
+      (pattern-exc-ctor
+       (lambda (desc regex index)
+         (jolt-host-throwable/detail "java.util.regex.PatternSyntaxException"
+           (pattern-syntax-message desc index (if (jolt-nil? regex) "null" regex))
+           (vector desc index regex)))))
+  (register-class-ctor! "URISyntaxException" uri-exc-ctor)
+  (register-class-ctor! "java.net.URISyntaxException" uri-exc-ctor)
+  (register-class-ctor! "PatternSyntaxException" pattern-exc-ctor)
+  (register-class-ctor! "java.util.regex.PatternSyntaxException" pattern-exc-ctor))
+
 (let ((parse-exc-ctor
        (lambda args
          (let* ((a0 (if (pair? args) (car args) jolt-nil))
@@ -3500,6 +3541,7 @@
   (make-jolt-array (list->vector (seq->list (jolt-seq (class-constructor-list cls))))
                    "java.lang.reflect.Constructor"))
 (define (class-constructor-list cls)
+  (lazy-shims-class! (jclass-name cls))
   (let* ((nm (jclass-name cls))
          (dbl (hashtable-ref chez-record-dbl-tbl nm #f)))
     (cond

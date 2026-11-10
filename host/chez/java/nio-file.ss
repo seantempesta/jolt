@@ -435,7 +435,7 @@
                  (rp (nio-realpath fp)))
             (cond (rp (npath-like self rp))
                   ((file-exists? fp) (npath-like self (npath-normalize-for windows? abs)))
-                  (else (jolt-throw (jolt-ex-info abs empty-pmap)))))))   ; missing path throws
+                  (else (nio-no-such-file s))))))
   (cons "toFile" (lambda (self) (make-jfile (nio-path-str self))))
   ;; a java.net.URI in the default filesystem's own form, not File.toURI's
   ;; (io.ss nio-path->uri)
@@ -608,9 +608,10 @@
 ;;
 ;; So the entry points needing a class Chez does not type stat first and name the
 ;; error themselves. That is a race for the error's NAME only, never for
-;; correctness: no pre-check here gates a mutation. createFile -- the one place
-;; where losing the race would cost data -- takes the O_EXCL open instead, which
-;; does raise a typed condition, and stats nothing.
+;; correctness: no pre-check here gates a mutation. createFile, where losing the
+;; race would cost data, and createDirectory, where the name IS the answer (a
+;; directory made as a lock), stat nothing: they call libc and read its errno
+;; (io-create-exclusive, io-mkdir), on every platform but Windows.
 ;; A message names the path AS THE CALLER GAVE IT, as the JDK's does: Files ops
 ;; resolve a relative path against user.dir before touching disk (nfp), and the
 ;; message used that resolved string, so (Files/delete (Paths/get "nope/x"))
@@ -624,7 +625,8 @@
 (define (nio-fs-throw cls fp . other+reason)
   (let ((other  (and (pair? other+reason) (car other+reason)))
         (reason (and (pair? other+reason) (pair? (cdr other+reason)) (cadr other+reason))))
-    (jolt-throw (jolt-host-throwable cls (fs-exception-message fp other reason)))))
+    (jolt-throw (jolt-host-throwable/detail cls (or (fs-exception-message fp other reason) jolt-nil)
+                  (vector (and fp (path-native fp)) (and other (path-native other)) reason)))))
 (define (nio-no-such-file fp . other)
   (nio-fs-throw "java.nio.file.NoSuchFileException" fp (and (pair? other) (car other))))
 (define (nio-already-exists fp . other)
@@ -744,39 +746,24 @@
 
 ;; delete-file and delete-directory answer #f on failure rather than raising,
 ;; so the answer is checked here and the errno read straight after it.
+(define c-unlink (and (not (nio-windows?)) (jolt-foreign-proc-safe "unlink" '(string) 'int)))
+(define c-rmdir  (and (not (nio-windows?)) (jolt-foreign-proc-safe "rmdir" '(string) 'int)))
 (define (nio-delete1 fp missing-ok? . shown)
   (let ((m (if (pair? shown) (car shown) fp)))
-    (define (attempt del dir?)
-      (if (del fp) #t
-          (let ((err (io-errno)))   ; before anything else can set it
-            (nio-delete-failed fp m err dir?))))
-    (cond ((nio-is-symlink? fp) (attempt delete-file #f))   ; the link itself, even if dangling
+    ;; libc's own call where it is bound: Chez's answers #f having built its
+    ;; failure's message, and that is after errno was set
+    (define (attempt c-del del dir?)
+      (if c-del
+          (let-values (((r err) (io-call+errno (c-del fp))))
+            (or (= r 0) (nio-delete-failed fp m err dir?)))
+          (or (del fp) (nio-delete-failed fp m 0 dir?))))
+    (cond ((nio-is-symlink? fp) (attempt c-unlink delete-file #f))   ; the link itself, even if dangling
           ((not (file-exists? fp))
            (if missing-ok? #f (nio-no-such-file m)))
-          ((file-directory? fp) (attempt delete-directory #t))
-          (else (attempt delete-file #f)))))
+          ((file-directory? fp) (attempt c-rmdir delete-directory #t))
+          (else (attempt c-unlink delete-file #f)))))
 
-(define nio-temp-counter 0)
-(define-process-local nio-temp-mutex (make-mutex))
 (define (nio-tmp-dir) (host-temp-dir))
-;; A temp path in `dir` (default the system temp dir), unique across processes
-;; via now-millis + a retry counter, like java.nio.file's createTemp*.
-(define (nio-temp-path dir prefix suffix)
-  (let ((d (let ((d (or dir (nio-tmp-dir))))
-             (if (char=? (string-ref d (- (string-length d) 1)) #\/) d (string-append d "/")))))
-    (let loop ()
-      ;; the increment and the read are ONE step. Read after the release and two
-      ;; threads see the same value, so they build the same path — and the
-      ;; file-exists? retry below does not catch it, since neither has created
-      ;; the file yet and the caller that creates it second clobbers the first.
-      (let* ((n (jolt-with-mutex nio-temp-mutex
-                  (set! nio-temp-counter (+ nio-temp-counter 1))
-                  nio-temp-counter))
-             (full (string-append d (if (string? prefix) prefix "")
-                                  (number->string (now-millis)) "-" (number->string n)
-                                  (if (string? suffix) suffix ""))))
-        (if (file-exists? (project-relative full)) (loop) full)))))
-
 ;; ---- Files/isHidden ---------------------------------------------------------
 ;; Files.isHidden is implementation-specific, and the JDK answers it per
 ;; platform: UnixFileSystemProvider.isHidden tests the NAME's first character for
@@ -841,17 +828,33 @@
 ;; createTempFile(prefix, suffix, attrs*) | createTempFile(dir, prefix, suffix, attrs*)
 ;; createTempDirectory(prefix, attrs*)    | createTempDirectory(dir, prefix, attrs*)
 (define (nio-files-create-temp args dir?)
-  (let* ((args (filter (lambda (x) (not (jolt-array? x))) args))
+  (let* ((attrs (npath-spread-args args))
+         (args (filter (lambda (x) (not (jolt-array? x))) args))
          (has-dir (and (pair? args) (or (nio-path? (car args)) (jfile? (car args)))))
          (base (if has-dir (npath-string-of (car args)) #f))
          (rest (if has-dir (cdr args) args))
          (prefix (if (and (pair? rest) (string? (car rest))) (car rest) ""))
-         (suffix (if (and (not dir?) (pair? rest) (pair? (cdr rest)) (string? (cadr rest))) (cadr rest) ""))
-         (full (nio-temp-path base prefix suffix))
-         (fp (project-relative full)))
-    (if dir? (mkdir fp) (close-port (open-file-output-port fp (file-options no-fail))))
-    (when c-chmod (c-chmod fp (if dir? #o700 #o600)))
-    (make-nio-path full)))
+         (suffix (cond (dir? "")
+                       ((and (pair? rest) (pair? (cdr rest)) (string? (cadr rest))) (cadr rest))
+                       (else ".tmp")))
+         (d (let ((d (or base (nio-tmp-dir))))
+              (if (char=? (string-ref d (- (string-length d) 1)) #\/) d (string-append d "/")))))
+    (when (exists file-attr? attrs)
+      (nio-posix-view! "'posix:permissions' not supported as initial attribute"))
+    ;; the JDK asks the same of the generated name, so "../x" cannot put the entry
+    ;; outside the directory it was asked for
+    (unless (jolt-nil? (npath-parent-for (nio-windows?) (string-append prefix "0" suffix)))
+      (throw-jvm 'IllegalArgumentException "Invalid prefix or suffix"))
+    ;; owner-only unless told otherwise, in the create itself: a chmod after it
+    ;; leaves a window to open the entry through, and a descriptor opened in it
+    ;; goes on reading whatever the caller writes
+    (let ((mode (nio-attrs-mode attrs (if dir? #o700 #o600))))
+      (make-nio-path
+       (io-create-temp d prefix suffix
+                       (lambda (full)
+                         (let ((fp (project-relative full)))
+                           (if dir? (io-mkdir fp mode) (io-create-exclusive fp mode))))
+                       (lambda (full err) (nio-errno-throw full #f err)))))))
 
 ;; ---- walkFileTree + FileVisitor ---------------------------------------------
 ;; FileVisitResult values — distinct tokens; babashka.fs maps :continue etc. to
@@ -1255,19 +1258,22 @@
 (define nio-ENOENT 2)
 (define nio-EACCES 13)
 (define c-strerror (jolt-foreign-proc-safe "strerror" '(int) 'string))
+;; Throw for errno ERR the way UnixException.translateToIOException does. SHOWN
+;; and OTHER are the message's paths, OTHER #f for a one-path operation.
+(define (nio-errno-throw shown other err)
+  (cond ((= err nio-EEXIST) (nio-already-exists shown other))
+        ((= err nio-ENOENT) (nio-no-such-file shown other))
+        ((= err nio-EACCES)
+         (nio-fs-throw "java.nio.file.AccessDeniedException" shown other))
+        (else
+         (let ((reason (and (> err 0) c-strerror (c-strerror err))))
+           (nio-fs-throw "java.nio.file.FileSystemException" shown other
+                         (if (and reason (= err io-ELOOP))
+                             (string-append reason " or unable to access attributes of symbolic link")
+                             reason))))))
 (define (nio-link-failed link existing shown-link shown-existing err)
   (let ((other (and existing shown-existing)))
-    (cond ((and err (> err 0))
-           (cond ((= err nio-EEXIST) (nio-already-exists shown-link other))
-                 ((= err nio-ENOENT) (nio-no-such-file shown-link other))
-                 ((= err nio-EACCES)
-                  (nio-fs-throw "java.nio.file.AccessDeniedException" shown-link other))
-                 (else
-                  (let ((reason (and c-strerror (c-strerror err))))
-                    (nio-fs-throw "java.nio.file.FileSystemException" shown-link other
-                                  (if (and reason (= err io-ELOOP))
-                                      (string-append reason " or unable to access attributes of symbolic link")
-                                      reason))))))
+    (cond ((and err (> err 0)) (nio-errno-throw shown-link other err))
           ((or (file-exists? link) (nio-is-symlink? link)) (nio-already-exists shown-link other))
           ((or (and existing (not (file-exists? existing)))
                (let ((parent (npath-parent-for (nio-windows?) link)))
@@ -1280,17 +1286,18 @@
              (cons "isSymbolicLink" (lambda (p . _) (if (nio-is-symlink? (nfp p)) #t #f)))
              (cons "createSymbolicLink" (lambda (link target . _)
                                           (if c-symlink
-                                              (unless (= 0 (c-symlink (npath-string-of target) (nfp link)))
-                                                (let ((err (io-errno)))   ; before anything else can set it
-                                                  (nio-link-failed (nfp link) #f (nio-shown link) #f err)))
+                                              (let ((t (npath-string-of target)) (l (nfp link)))
+                                                (let-values (((r err) (io-call+errno (c-symlink t l))))
+                                                  (unless (= 0 r)
+                                                    (nio-link-failed l #f (nio-shown link) #f err))))
                                               (jolt-throw (jolt-ex-info "symlink unavailable" empty-pmap)))
                                           (->path link)))
              (cons "createLink" (lambda (link existing . _)
                                   (let* ((l (nfp link)) (e (nfp existing))
                                          (err (cond ((nio-windows?) (and (win32-create-hard-link! l e) 0))
                                                     ((not c-link) #f)
-                                                    ((= 0 (c-link e l)) 0)
-                                                    (else (io-errno)))))   ; before anything else can set it
+                                                    (else (let-values (((r err) (io-call+errno (c-link e l))))
+                                                            (if (= 0 r) 0 err))))))
                                     (unless (eqv? err 0)
                                       (nio-link-failed l e (nio-shown link) (nio-shown existing) err)))
                                   (->path link)))
@@ -1629,6 +1636,11 @@
 (define (nio-current-umask) (if c-umask (let ((old (c-umask 0))) (c-umask old) old) 0))
 ;; chmod a created entry to the requested permission file-attribute, masked by
 ;; the umask — exactly what java.nio.file's create* do.
+;; The mode a create's attributes ask for, the last one winning as in the JDK's
+;; UnixFileModeAttribute, for a call that takes the mode directly.
+(define (nio-attrs-mode args default)
+  (fold-left (lambda (mode a) (if (file-attr? a) (posix-set->mode (jhost-state a)) mode))
+             default (npath-spread-args args)))
 (define (nio-apply-attrs-umask! fp args)
   (let ((um (nio-current-umask)))
     (when (exists file-attr? (npath-spread-args args))
@@ -1639,53 +1651,142 @@
 (define (nio-parent-of fp)
   (let loop ((i (- (string-length fp) 1)))
     (cond ((< i 0) "") ((char=? (string-ref fp i) #\/) (substring fp 0 i)) (else (loop (- i 1))))))
-(define (nio-blocking-ancestor fp)   ; nearest existing ancestor that is not a directory
-  (let loop ((p (nio-parent-of fp)))
-    (cond ((or (string=? p "") (string=? p "/")) #f)
-          ((file-exists? p) (and (not (file-directory? p)) p))
-          (else (loop (nio-parent-of p))))))
-(define (nio-missing-ancestors fp)   ; the not-yet-existing path chain, shallowest first
-  (let loop ((p fp) (acc '()))
-    (cond ((or (string=? p "") (string=? p "/") (file-exists? p)) acc)
-          (else (loop (nio-parent-of p) (cons p acc))))))
+;; Files.createDirectories, as the JDK writes it. One mkdir of the target first:
+;; success, or EEXIST on what is now a directory, is the answer, and EEXIST on
+;; anything else is FileAlreadyExistsException naming the path as given. Any
+;; other failure climbs to the nearest ancestor that exists -- access(2), where
+;; ENOENT means keep climbing and any other errno is raised for that ancestor --
+;; and makes each name below it in turn, raising whatever the first one that
+;; fails raised. Those paths are absolute, as the JDK's are after toAbsolutePath.
+;; mkdirs! here swallowed every error, so a read-only parent answered success
+;; with nothing made, and a regular file in the way was FileAlreadyExists where
+;; the JDK reports mkdir's ENOTDIR. EEXIST on a directory is fine at every step,
+;; so losing a race to make one is not an error.
+(define (nio-try-mkdir fp attrs)     ; 0 or mkdir's errno; Windows' other failure is -1
+  (let ((mode (nio-attrs-mode attrs #o777)))
+    (if c-mkdir
+        (io-mkdir fp mode)
+        (guard (e (#t (if (file-exists? fp) io-EEXIST -1))) (mkdir fp mode) 0))))
+(define (nio-mkdir-checked! fp shown attrs)   ; the JDK's createAndCheckIsDirectory
+  (let ((err (nio-try-mkdir fp attrs)))
+    (cond ((eqv? err 0) (nio-apply-attrs-umask! fp attrs))
+          ((and (eqv? err io-EEXIST) (file-directory? fp)) (void))
+          ((eqv? err -1) (nio-fs-call fp (lambda () (mkdir fp)) shown))
+          (else (nio-errno-throw shown #f err)))))
+(define (nio-access-errno p)          ; checkAccess: 0, or the errno it failed with
+  (if (and c-access (not (nio-windows?)))
+      (let-values (((r err) (io-call+errno (c-access p 0))))
+        (if (= r 0) 0 err))
+      (if (file-exists? p) 0 nio-ENOENT)))
+(define (nio-up p)                    ; parent directory, "/" above "/x", "" above a root
+  (let ((q (nio-parent-of p)))
+    (if (and (string=? q "") (fx>? (string-length p) 1) (char=? (string-ref p 0) #\/)) "/" q)))
+(define (nio-create-directories! fp shown attrs)
+  (let ((err (nio-try-mkdir fp attrs)))
+    (cond
+      ((eqv? err 0) (nio-apply-attrs-umask! fp attrs))
+      ((eqv? err io-EEXIST) (unless (file-directory? fp) (nio-already-exists shown)))
+      (else
+       (let ((top (let loop ((q (nio-up fp)))
+                    (cond ((string=? q "")
+                           (nio-fs-throw "java.nio.file.FileSystemException" fp #f
+                                         "Unable to determine if root directory exists"))
+                          (else (let ((e (nio-access-errno q)))
+                                  (cond ((eqv? e 0) q)
+                                        ((eqv? e nio-ENOENT) (loop (nio-up q)))
+                                        (else (nio-errno-throw q #f e)))))))))
+         (for-each (lambda (d) (nio-mkdir-checked! d d attrs))
+                   (let loop ((q fp) (acc '()))
+                     (if (or (string=? q top) (string=? q "")) acc (loop (nio-up q) (cons q acc))))))))))
 ;; is the dest present as a link (even broken) or a real file?
 (define (nio-dest-present? d) (or (file-exists? d) (nio-is-symlink? d)))
+
+;; Files.move with ATOMIC_MOVE is one rename(2), as UnixCopyFile.move does: no
+;; existence checks first, REPLACE_EXISTING ignored, and an existing target
+;; replaced in the same step, so a reader of the target sees the old file or the
+;; new one and never neither. The plain move below removes the target and then
+;; renames, which left the path missing in between: a reader polling a file
+;; replaced 3,000 times this way found it gone 36,880 times in 114,525 reads
+;; (jolt-lang/jolt#1531). A failure is named from rename's errno through
+;; translateToIOException with both paths, except EXDEV, which is
+;; AtomicMoveNotSupportedException rather than a fallback to copy and delete.
+;; Windows is MoveFileExW replacing the target (win32-move-replacing!, io.ss), named
+;; from the Win32 error as WindowsException.translateToIOException names it. An
+;; antivirus scan of a freshly closed file holds it open for a moment and the move
+;; then answers ERROR_ACCESS_DENIED, so that alone is retried, as rename-replace!
+;; retries it and only while the move could still succeed (jolt-lang/jolt#1263).
+(define nio-EXDEV 18)                       ; the same on macOS and Linux
+(define c-rename
+  (and (not (eq? (sa-os-family) 'windows))
+       (jolt-foreign-proc-safe "rename" '(string string) 'int)))
+(define (nio-win-atomic-move! s d shown-s shown-d)
+  (let loop ((delays fs-retry-delays-ms))
+    (let ((err (win32-move-replacing! s d)))
+      (cond
+        ((= err 0) (void))
+        ((and (= err 5) (pair? delays) (file-exists? s) (not (file-directory? d)))
+         (sleep (make-time 'time-duration (* (car delays) 1000000) 0))
+         (loop (cdr delays)))
+        ((= err 17)                     ; ERROR_NOT_SAME_DEVICE
+         (nio-fs-throw "java.nio.file.AtomicMoveNotSupportedException" shown-s shown-d
+                       (win32-error-message err)))
+        ((memv err '(2 3)) (nio-no-such-file shown-s shown-d)) ; FILE or PATH_NOT_FOUND
+        ((memv err '(80 183)) (nio-already-exists shown-s shown-d)) ; FILE or ALREADY_EXISTS
+        ((= err 5) (nio-fs-throw "java.nio.file.AccessDeniedException" shown-s shown-d))
+        (else (nio-fs-throw "java.nio.file.FileSystemException" shown-s shown-d
+                            (win32-error-message err)))))))
+(define (nio-atomic-move! s d shown-s shown-d)
+  (if (nio-windows?)
+      (nio-win-atomic-move! s d shown-s shown-d)
+      (nio-posix-atomic-move! s d shown-s shown-d)))
+(define (nio-posix-atomic-move! s d shown-s shown-d)
+  (let-values (((r err) (io-call+errno (c-rename s d))))
+    (unless (= r 0)
+      (if (= err nio-EXDEV)
+          (nio-fs-throw "java.nio.file.AtomicMoveNotSupportedException" shown-s shown-d
+                        (and c-strerror (c-strerror err)))
+          (nio-errno-throw shown-s shown-d err)))))
 (let ((files-create+move
        (list
         (cons "createDirectory" (lambda (p . attrs)
                                   (let ((fp (nfp p)))
-                                    ;; mkdir's EEXIST and ENOENT come back untyped, so name them
-                                    ;; here. A non-directory in the way is neither: that is
-                                    ;; ENOTDIR, which nio-fs-call renders as a FileSystemException
-                                    ;; exactly as the JVM does.
-                                    (when (nio-dest-present? fp) (nio-already-exists (nio-shown p)))
-                                    (let ((parent (nio-parent-of fp)))
-                                      (when (and (not (string=? parent "")) (not (file-exists? parent)))
-                                        (nio-no-such-file (nio-shown p))))
-                                    (nio-fs-call fp (lambda () (mkdir fp)) (nio-shown p))
+                                    (if c-mkdir
+                                        ;; the class comes from mkdir's own errno, as the
+                                        ;; JDK's does. A stat before the mkdir named EEXIST
+                                        ;; only for a directory that was already there; one
+                                        ;; another process made between the stat and the
+                                        ;; mkdir came back a plain FileSystemException, so a
+                                        ;; createDirectory used as a lock misread losing it
+                                        ;; (jolt-lang/jolt#1529). ENOTDIR, a non-directory in
+                                        ;; the way above, is a FileSystemException on the JVM
+                                        ;; too.
+                                        (let ((err (io-mkdir fp (nio-attrs-mode attrs #o777))))
+                                          (unless (eqv? err 0) (nio-errno-throw (nio-shown p) #f err)))
+                                        ;; Windows: no errno, so EEXIST and ENOENT are named by
+                                        ;; looking first, and Chez's own failure translated.
+                                        (begin
+                                          (when (nio-dest-present? fp) (nio-already-exists (nio-shown p)))
+                                          (let ((parent (nio-parent-of fp)))
+                                            (when (and (not (string=? parent "")) (not (file-exists? parent)))
+                                              (nio-no-such-file (nio-shown p))))
+                                          (nio-fs-call fp (lambda () (mkdir fp)) (nio-shown p))))
                                     (nio-apply-attrs-umask! fp attrs) (->path p))))
         ;; CREATE_NEW's open, for the same reason Files/newOutputStream takes it:
         ;; `no-fail` here made createFile TRUNCATE an existing file and return it.
         (cons "createFile" (lambda (p . attrs)
                              (let ((fp (nfp p)))
-                               (close-port (nio-fs-call fp (lambda () (open-file-output-port fp (file-options))) (nio-shown p)))
+                               (let ((err (nio-fs-call fp (lambda () (io-create-exclusive fp (nio-attrs-mode attrs #o666))) (nio-shown p))))
+                                 (unless (eqv? err 0) (nio-errno-throw (nio-shown p) #f err)))
                                (nio-apply-attrs-umask! fp attrs) (->path p))))
         (cons "createDirectories" (lambda (p . attrs)
-                                    (let ((fp (nfp p)))
-                                      ;; an existing directory is a no-op; anything else in the
-                                      ;; way -- at the target or above it -- is the JVM's
-                                      ;; FileAlreadyExistsException, named for what blocks
-                                      (when (and (file-exists? fp) (not (file-directory? fp)))
-                                        (nio-already-exists (nio-shown p)))
-                                      (let ((blocked (nio-blocking-ancestor fp)))
-                                        (when blocked (nio-already-exists blocked)))
-                                      (let ((missing (nio-missing-ancestors fp)))
-                                        (nio-fs-call fp (lambda () (mkdirs! fp)))
-                                        (for-each (lambda (d) (nio-apply-attrs-umask! d attrs)) missing)))
+                                    (nio-create-directories! (nfp p) (nio-shown p) attrs)
                                     (->path p)))
         (cons "move" (lambda (src dst . opts)
                        (let ((s (nfp src)) (d (nfp dst)))
                          (cond
+                           ((nio-opts-have? opts copt-sym 'atomic-move)
+                            (nio-atomic-move! s d (nio-shown src) (nio-shown dst))
+                            (->path dst))
                            ((string=? s d) (->path dst))
                            ((not (nio-dest-present? s)) (nio-no-such-file (nio-shown src)))
                            ((and (nio-dest-present? d) (not (nio-opts-have? opts copt-sym 'replace-existing)))
@@ -2094,11 +2195,11 @@
     (throw-jvm 'UnsupportedOperationException
                (string-append "getFileStore is not supported on this host: " (sa-host-tag))))
   (let ((buf (make-bytevector 4096 0)))
-    (unless (= 0 (c-statfs fp buf))
-      (let ((err (io-errno)))
-        (if (and err (= err nio-ENOENT))
+    (let-values (((r err) (io-call+errno (c-statfs fp buf))))
+      (unless (= 0 r)
+        (if (= err nio-ENOENT)
             (nio-no-such-file shown)
-            (nio-fs-detail shown (and c-strerror err (c-strerror err))))))
+            (nio-fs-detail shown (and c-strerror (c-strerror err))))))
     buf))
 (define (nio-bv-cstr bv off)
   (let loop ((i off))
@@ -2199,12 +2300,13 @@
   (let ((pw (c-getpwnam (jhost-state owner))))
     (when (= 0 pw)
       (zip-throw "java.nio.file.attribute.UserPrincipalNotFoundException" (jhost-state owner)))
-    (unless (= 0 (c-chown (nfp p) (sa-foreign-ref 'unsigned-32 pw 16) #xFFFFFFFF))
-      (let ((err (io-errno)))
-        (cond ((and err (= err nio-ENOENT)) (nio-no-such-file (nio-shown p)))
-              ((and err (= err nio-EACCES))
-               (nio-fs-throw "java.nio.file.AccessDeniedException" (nio-shown p)))
-              (else (nio-fs-detail (nio-shown p) (and c-strerror err (c-strerror err)))))))
+    (let ((fp (nfp p)) (uid (sa-foreign-ref 'unsigned-32 pw 16)))
+      (let-values (((r err) (io-call+errno (c-chown fp uid #xFFFFFFFF))))
+        (unless (= 0 r)
+          (cond ((= err nio-ENOENT) (nio-no-such-file (nio-shown p)))
+                ((= err nio-EACCES)
+                 (nio-fs-throw "java.nio.file.AccessDeniedException" (nio-shown p)))
+                (else (nio-fs-detail (nio-shown p) (and c-strerror (c-strerror err))))))))
     (->path p)))
 
 ;; ---- attribute views, over any provider ---------------------------------------
@@ -2445,26 +2547,230 @@
                      (jolt-truthy? (jolt-fi-call predicate "test" path attrs))))
                  (nio-walk-seq p (jnum->exact depth) opts)))))
 
+;; ---- Files.probeContentType ----------------------------------------------------
+;; The JDK's default detector, measured against OpenJDK 21: on Linux (and the
+;; BSDs) it asks ~/.mime.types, then /etc/mime.types, then the JDK's own table
+;; (URLConnection.getFileNameMap, content-types.properties); on macOS
+;; ~/.mime.types, then the table (the JDK's Uniform Type Identifier lookup in
+;; between is not modelled, so a type only macOS knows answers nil); on Windows
+;; the table (the JDK's registry lookup is not modelled either).
+;; Nothing reads the file itself, so a path that does not exist is typed by its
+;; name too.
+
+;; content-types.properties from OpenJDK 21: extension (lower case, no dot) ->
+;; type. URLConnection.guessContentTypeFromName answers from this alone.
+(define nio-jdk-content-types
+  (let ((h (make-hashtable string-hash string=?)))
+    (for-each (lambda (p) (hashtable-set! h (car p) (cdr p)))
+      '(("7z" . "application/x-7z-compressed") ("a" . "application/octet-stream")
+       ("aac" . "audio/aac") ("adoc" . "text/plain")
+       ("ai" . "application/postscript") ("aif" . "audio/x-aiff")
+       ("aifc" . "audio/x-aiff") ("aiff" . "audio/x-aiff")
+       ("arc" . "application/octet-stream") ("au" . "audio/basic")
+       ("avi" . "application/x-troff-msvideo") ("bcpio" . "application/x-bcpio")
+       ("bin" . "application/octet-stream") ("bmp" . "image/bmp")
+       ("bz2" . "application/bz2") ("c" . "text/plain") ("c++" . "text/plain")
+       ("cc" . "text/plain") ("cdf" . "application/x-netcdf")
+       ("cpio" . "application/x-cpio") ("css" . "text/css") ("csv" . "text/csv")
+       ("doc" . "application/msword")
+       ("docx" . "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+       ("dump" . "application/octet-stream") ("dvi" . "application/x-dvi")
+       ("el" . "text/plain") ("eps" . "application/postscript")
+       ("etx" . "text/x-setext") ("exe" . "application/octet-stream")
+       ("flac" . "audio/flac") ("fpix" . "image/vnd.fpx") ("fpx" . "image/vnd.fpx")
+       ("gif" . "image/gif") ("gtar" . "application/x-gtar")
+       ("gz" . "application/gzip") ("h" . "text/plain")
+       ("hdf" . "application/x-hdf") ("hqx" . "application/octet-stream")
+       ("htm" . "text/html") ("html" . "text/html") ("ief" . "image/ief")
+       ("jar" . "application/java-archive") ("java" . "text/plain")
+       ("jfif" . "image/jpeg") ("jfif-tbnl" . "image/jpeg") ("jpe" . "image/jpeg")
+       ("jpeg" . "image/jpeg") ("jpg" . "image/jpeg") ("js" . "text/javascript")
+       ("json" . "application/json") ("latex" . "application/x-latex")
+       ("m4a" . "audio/mp4") ("m4v" . "video/mp4")
+       ("man" . "application/x-troff-man") ("markdown" . "text/markdown")
+       ("md" . "text/markdown") ("me" . "application/x-troff-me")
+       ("mime" . "message/rfc822") ("mov" . "video/quicktime")
+       ("movie" . "video/x-sgi-movie") ("mp2" . "audio/mpeg")
+       ("mp3" . "audio/mpeg") ("mp4" . "video/mp4") ("mpe" . "video/mpeg")
+       ("mpeg" . "video/mpeg") ("mpg" . "video/mpeg")
+       ("ms" . "application/x-troff-ms") ("mv" . "video/x-sgi-movie")
+       ("nc" . "application/x-netcdf") ("o" . "application/octet-stream")
+       ("oda" . "application/oda")
+       ("odp" . "application/vnd.oasis.opendocument.presentation")
+       ("ods" . "application/vnd.oasis.opendocument.spreadsheet")
+       ("odt" . "application/vnd.oasis.opendocument.text") ("oga" . "audio/ogg")
+       ("ogg" . "audio/ogg") ("ogv" . "video/ogg") ("opus" . "audio/ogg")
+       ("pbm" . "image/x-portable-bitmap") ("pdf" . "application/pdf")
+       ("pgm" . "image/x-portable-graymap") ("php" . "text/plain")
+       ("pl" . "text/plain") ("png" . "image/png")
+       ("pnm" . "image/x-portable-anymap") ("ppm" . "image/x-portable-pixmap")
+       ("ppt" . "application/vnd.ms-powerpoint")
+       ("pptx" . "application/vnd.openxmlformats-officedocument.presentationml.presentation")
+       ("ps" . "application/postscript") ("py" . "text/plain")
+       ("qt" . "video/quicktime") ("rar" . "application/vnd.rar")
+       ("ras" . "image/x-cmu-rast") ("rgb" . "image/x-rgb")
+       ("roff" . "application/x-troff") ("rtf" . "application/rtf")
+       ("saveme" . "application/octet-stream") ("sh" . "application/x-shar")
+       ("shar" . "application/x-shar") ("snd" . "audio/basic")
+       ("spx" . "audio/ogg") ("src" . "application/x-wais-source")
+       ("sv4cpio" . "application/x-sv4cpio") ("sv4crc" . "application/x-sv4crc")
+       ("svg" . "image/svg+xml") ("svgz" . "image/svg+xml")
+       ("t" . "application/x-troff") ("tar" . "application/x-tar")
+       ("tex" . "application/x-tex") ("texi" . "application/x-texinfo")
+       ("texinfo" . "application/x-texinfo") ("text" . "text/plain")
+       ("tif" . "image/tiff") ("tiff" . "image/tiff")
+       ("tr" . "application/x-troff") ("tsv" . "text/tab-separated-values")
+       ("txt" . "text/plain") ("ustar" . "application/x-ustar")
+       ("wasm" . "application/wasm") ("wav" . "audio/x-wav")
+       ("webm" . "video/webm") ("webp" . "image/webp")
+       ("wsrc" . "application/x-wais-source") ("xbm" . "image/x-xbitmap")
+       ("xls" . "application/vnd.ms-excel")
+       ("xlsx" . "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+       ("xml" . "application/xml") ("xpm" . "image/x-xbitmap")
+       ("xwd" . "image/x-xwindowdump") ("z" . "application/octet-stream")
+       ("zip" . "application/zip")))
+    h))
+
+;; FileNameMap.getContentTypeFor (sun.net.www.MimeTable.findByFileName): the
+;; extension is what follows the last dot, when no / or ? comes after it, once
+;; anything from a # past the first character is cut; matched in any case.
+(define (nio-index-of-last s ch)
+  (let loop ((i (- (string-length s) 1)))
+    (cond ((< i 0) #f) ((char=? (string-ref s i) ch) i) (else (loop (- i 1))))))
+(define (nio-file-name-map-type name)
+  (let* ((hash (nio-index-of-last name #\#))
+         (name (if (and hash (> hash 0)) (substring name 0 hash) name))
+         (at (fold-left (lambda (best ch)
+                          (let ((i (nio-index-of-last name ch)))
+                            (if (and i (or (not best) (> i best))) i best)))
+                        #f '(#\. #\/ #\?))))
+    (and at (char=? (string-ref name at) #\.)
+         (hashtable-ref nio-jdk-content-types
+                        (ascii-string-down (substring name (+ at 1) (string-length name)))
+                        #f))))
+
+;; One mime.types file (MimeTypesFileTypeDetector), read once, the first time
+;; a probe needs it: "type ext ext ..." per line, # to the end of a line a
+;; comment, and a line holding = in the Solaris form "type=t exts=a,b". The
+;; first entry for an extension wins; extensions match exactly, in their case.
+(define (nio-mime-split s pred)
+  (let loop ((i 0) (start #f) (acc '()))
+    (cond ((= i (string-length s))
+           (reverse (if start (cons (substring s start i) acc) acc)))
+          ((pred (string-ref s i))
+           (loop (+ i 1) #f (if start (cons (substring s start i) acc) acc)))
+          (else (loop (+ i 1) (or start i) acc)))))
+(define (nio-mime-solaris-field words key)
+  (let ((k (string-length key)))
+    (let loop ((ws words))
+      (cond ((null? ws) #f)
+            ((and (>= (string-length (car ws)) k) (string=? (substring (car ws) 0 k) key))
+             (substring (car ws) k (string-length (car ws))))
+            (else (loop (cdr ws)))))))
+(define (nio-mime-types-load path)
+  (let ((h (make-hashtable string-hash string=?))
+        (text (guard (_ (#t #f))
+                (and (file-regular? path)
+                     (call-with-port
+                       (open-file-input-port path (file-options) (buffer-mode block)
+                                             (make-transcoder (utf-8-codec) (eol-style lf)
+                                                              (error-handling-mode replace)))
+                       get-string-all)))))
+    (when (string? text)
+      (for-each
+        (lambda (line)
+          (let* ((line (let ((c (let loop ((i 0))
+                                  (cond ((= i (string-length line)) #f)
+                                        ((char=? (string-ref line i) #\#) i)
+                                        (else (loop (+ i 1)))))))
+                         (if c (substring line 0 c) line)))
+                 (words (nio-mime-split line char-whitespace?)))
+            (when (pair? words)
+              (let-values (((type exts)
+                            (if (exists (lambda (w) (memv #\= (string->list w))) words)
+                                (values (nio-mime-solaris-field words "type=")
+                                        (let ((e (nio-mime-solaris-field words "exts=")))
+                                          (if e (nio-mime-split e (lambda (c) (char=? c #\,))) '())))
+                                (values (car words) (cdr words)))))
+                (when type
+                  (for-each (lambda (ext)
+                              (unless (hashtable-contains? h ext) (hashtable-set! h ext type)))
+                            exts))))))
+        (nio-mime-split text (lambda (c) (char=? c #\newline)))))
+    h))
+(define nio-mime-types-cache (make-hashtable string-hash string=?))
+(define-process-local nio-mime-types-mutex (make-mutex)) ; merge: upstream's new lock, made process-local as ours are (16d668c5)
+(define (nio-mime-types path)
+  ;; The file is read outside the lock, so a slow read holds up no other prober
+  ;; and nothing blocks while preemption is refused. Two threads that both miss
+  ;; read it twice; the first table stored is the one every later probe uses.
+  (or (jolt-with-mutex nio-mime-types-mutex (hashtable-ref nio-mime-types-cache path #f))
+      (let ((h (nio-mime-types-load path)))
+        (jolt-with-mutex nio-mime-types-mutex
+          (or (hashtable-ref nio-mime-types-cache path #f)
+              (begin (hashtable-set! nio-mime-types-cache path h) h))))))
+;; The extension starts after the FIRST dot and, unmatched, gives way to the
+;; rest after the next: x.tar.gz tries "tar.gz", then "gz"; .bashrc is "bashrc".
+(define (nio-mime-types-type path name)
+  (let ((h (nio-mime-types path)))
+    (let loop ((s name))
+      (let ((dot (let find ((i 0))
+                   (cond ((= i (string-length s)) #f)
+                         ((char=? (string-ref s i) #\.) i)
+                         (else (find (+ i 1)))))))
+        (and dot (< dot (- (string-length s) 1))
+             (let ((ext (substring s (+ dot 1) (string-length s))))
+               (or (hashtable-ref h ext #f) (loop ext))))))))
+
+(define (nio-mime-files)
+  (let ((home (getenv "HOME")))
+    (append (if (and home (not (string=? home ""))) (list (string-append home "/.mime.types")) '())
+            (case (sa-os-family)
+              ((macos windows) '())
+              (else '("/etc/mime.types"))))))
+
+;; AbstractFileTypeDetector.parse: type/subtype, lower-cased, each an RFC 2045
+;; token; anything else is no answer at all (it does not fall through).
+(define (nio-mime-token? s)
+  (and (> (string-length s) 0)
+       (for-all (lambda (c)
+                  (and (char>? c #\space) (char<? c #\delete)
+                       (not (memv c '(#\( #\) #\< #\> #\@ #\, #\; #\: #\\ #\" #\/ #\[ #\] #\? #\=)))))
+                (string->list s))))
+(define (nio-mime-parse t)
+  (let ((slash (let loop ((i 0))
+                 (cond ((= i (string-length t)) #f)
+                       ((char=? (string-ref t i) #\/) i)
+                       (else (loop (+ i 1))))))
+        (semi (let loop ((i 0))
+                (cond ((= i (string-length t)) (string-length t))
+                      ((char=? (string-ref t i) #\;) i)
+                      (else (loop (+ i 1)))))))
+    (and slash (< slash semi)
+         (let ((type (ascii-string-down (nio-string-trim (substring t 0 slash))))
+               (sub (ascii-string-down (nio-string-trim (substring t (+ slash 1) semi)))))
+           (and (nio-mime-token? type) (nio-mime-token? sub)
+                (string-append type "/" sub))))))
+(define (nio-string-trim s)
+  (let* ((n (string-length s))
+         (a (let loop ((i 0)) (if (and (< i n) (char-whitespace? (string-ref s i))) (loop (+ i 1)) i)))
+         (b (let loop ((i n)) (if (and (> i a) (char-whitespace? (string-ref s (- i 1)))) (loop (- i 1)) i))))
+    (substring s a b)))
+
+(define (nio-probe-content-type-of-name name)
+  (let ((raw (or (exists (lambda (f) (nio-mime-types-type f name)) (nio-mime-files))
+                 (nio-file-name-map-type name))))
+    (if raw (or (nio-mime-parse raw) jolt-nil) jolt-nil)))
+
+(define (nio-files-probe-content-type p)
+  (let ((fname (npath-file-name (npath-string-of p))))
+    (if (jolt-nil? fname)
+        jolt-nil
+        (nio-probe-content-type-of-name (npath-string-of fname)))))
+
+;; URLConnection.guessContentTypeFromName: the JDK's table alone.
 (define (nio-content-type-of name)
-  (let* ((dot (let loop ((i (- (string-length name) 1)))
-                (cond ((< i 0) #f)
-                      ((char=? (string-ref name i) #\.) i)
-                      ((char=? (string-ref name i) #\/) #f)
-                      (else (loop (- i 1))))))
-         (ext (if dot (ascii-string-down (substring name dot (string-length name))) "")))
-    (cond ((member ext '(".txt" ".sql" ".clj" ".cljc" ".cljs" ".edn" ".md" ".csv" ".ss")) "text/plain")
-          ((member ext '(".html" ".htm")) "text/html")
-          ((string=? ext ".css") "text/css")
-          ((string=? ext ".json") "application/json")
-          ((string=? ext ".xml") "application/xml")
-          ((string=? ext ".png") "image/png")
-          ((member ext '(".jpg" ".jpeg")) "image/jpeg")
-          ((string=? ext ".gif") "image/gif")
-          ((string=? ext ".pdf") "application/pdf")
-          ((string=? ext ".zip") "application/zip")
-          ((string=? ext ".jar") "application/java-archive")
-          (else jolt-nil))))
-(define (nio-files-probe-content-type p) (nio-content-type-of (npath-string-of p)))
+  (or (nio-file-name-map-type name) jolt-nil))
 
 ;; Two paths on different providers: Files.copy and move go through the
 ;; source's bytes and the target's writes (CopyMoveHelper.copyToForeignTarget),
@@ -2486,6 +2792,10 @@
       (nio-copy-foreign src dst opts)
       (apply nio-files-provider-call "copy" src dst opts)))
 (define (nio-files-move src dst . opts)
+  (when (and (nio-foreign-pair? src dst) (nio-opts-have? opts copt-sym 'atomic-move))
+    ;; moving between providers is a copy and a delete, which is not atomic
+    (nio-fs-throw "java.nio.file.AtomicMoveNotSupportedException" #f #f
+                  "Atomic move between providers is not supported"))
   (if (nio-foreign-pair? src dst)
       (begin (nio-copy-foreign src dst opts)
              (nio-files-call "delete" src)

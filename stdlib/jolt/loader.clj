@@ -114,7 +114,7 @@
   of a name another context reloads while unrelated code compiles; a name one
   context reloaded is the name the global registry holds. `:class` requests
   have no backend on this host yet. A root may be a directory, a jar, or an
-  embedded root — "embed:<prefix>", a prefix into the runtime's
+  embedded root — \"embed:<prefix>\", a prefix into the runtime's
   embedded-resource table (what deps.edn `:jolt/build {:embed [dirs]}` bakes
   into a binary; see `embedded-root?`); a jar is read in place through its
   central directory, as the global roots read one, and never extracted.
@@ -1908,12 +1908,6 @@
    blank prefix — fails here, not at the first load."
   ([roots] (classpath roots nil))
   ([roots opts] (roots-loader roots opts)))
-
-(defn url-search
-  "The URLClassLoader analogue — `classpath` under the name the delegate table
-   uses."
-  ([roots] (classpath roots))
-  ([roots opts] (classpath roots opts)))
 
 ;; ─── Classloader facade ────────────────────────────────────────────────────
 ;; The host view of a loader (`as-classloader`): a jolt tagged table carrying

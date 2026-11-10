@@ -366,6 +366,33 @@
            (sa-foreign-procedure-native-error
             __errno (conv ...) name args res))))))
 
+;; Errno comes from the location accessor rather than Chez's native-error
+;; convention above, which needs a literal foreign-procedure whose load-time
+;; relocation aborts the boot where the symbol is absent, as on Windows.
+(define io-errno-loc
+  (or (jolt-foreign-proc-safe "__error" '() 'void*)
+      (jolt-foreign-proc-safe "__errno_location" '() 'void*)
+      (jolt-foreign-proc-safe "__errno" '() 'void*)))
+;; (io-call+errno (c-fn arg ...)) -> (values result errno), errno 0 where this
+;; host has no accessor. For a plain (not collect-safe) libc call whose failure
+;; is told apart by errno. A read after the call has returned is not enough: a
+;; guard allocates, and an allocation, or a collect rendezvous with another
+;; thread, can make libc calls on this thread. Two mkdir races in 2,900 lost
+;; EEXIST that way and reported ENOMEM (jolt-lang/jolt#1529). So the thread's
+;; errno address is taken first, and the call and the read sit inside
+;; disable-interrupts, which holds off the collect request. The arguments must
+;; not be able to raise: nothing here would re-enable interrupts. Same three
+;; accessor spellings process.ss uses: Darwin/BSD, glibc/musl, then bionic.
+(define-syntax io-call+errno
+  (syntax-rules ()
+    ((_ call)
+     (let ((loc (and io-errno-loc (io-errno-loc))))
+       (disable-interrupts)
+       (let* ((r call)
+              (err (if loc (sa-foreign-ref 'int loc 0) 0)))
+         (enable-interrupts)
+         (values r err))))))
+
 ;; --- how many processors can this process use ---------------------------------
 ;; Backs jolt.host/available-processors, which Runtime.availableProcessors and
 ;; pmap's look-ahead window read. Each host is asked the question the JVM asks
@@ -1561,7 +1588,9 @@
 ;; Equality: identity (records default to identity equality — (= e e2) false,
 ;; (= e e) true, matching the JVM where ExceptionInfo does NOT implement
 ;; equals). get / keyword lookup: MISS (record is NOT ILookup).
-;; error-offset stores ParseException.getErrorOffset (0 when not set).
+;; error-offset stores ParseException.getErrorOffset (0 when not set), or for the
+;; classes that keep several values apart from their message a vector of them
+;; (jolt-host-throwable/detail). Its name is image surface.
 ;; capture is (k . site): the continuation and site pair where the throwable was
 ;; constructed (jolt-capture-throwable!), which its stack trace is read from, or
 ;; #f. A field and not a side table: it costs a store, where a table shared across
@@ -1941,11 +1970,21 @@
   ;; which only the throw has. The throwable's OWN trace keeps the capture made
   ;; when it was constructed (jolt-remember-throw! does not overwrite it), which is
   ;; what the JVM's getStackTrace answers with.
-  (call/cc (lambda (k)
-             (jolt-throw-cont (cons v k))
-             (jolt-throw-sitep (jolt-site-snapshot))
-             (jolt-remember-throw! v k (jolt-throw-sitep))
-             (jolt-raise-thrown v))))
+  ;;
+  ;; A throw of the value this thread is still handling is a rethrow -- the catch
+  ;; whose clauses did not match it, or a handler's own (throw e) -- and keeps the
+  ;; first raise's capture and site. The rethrow's continuation starts in the
+  ;; catching fn: the frames between it and the raise are gone, and the report
+  ;; would begin at the catch. A handler that completes clears the slot
+  ;; (jolt-catch-complete!), so a later throw of the same value is a new throw.
+  (let ((tc (jolt-throw-cont)))
+    (if (and (pair? tc) (eq? (car tc) v))
+        (jolt-raise-thrown v)
+        (call/cc (lambda (k)
+                   (jolt-throw-cont (cons v k))
+                   (jolt-throw-sitep (jolt-site-snapshot))
+                   (jolt-remember-throw! v k (jolt-throw-sitep))
+                   (jolt-raise-thrown v))))))
 (define (jolt-raise-thrown v)
   (raise (condition (make-message-condition (jolt-throw-message v))
                     (make-jolt-throw-condition v))))
@@ -2059,6 +2098,14 @@
 ;; ex-message all reflect the real type.
 ;; java.text.ParseException carries an int error offset (getErrorOffset). Stored
 ;; in the record's error-offset field.
+;; A throwable with what its accessors answer: FileSystemException's #(file other
+;; reason), URISyntaxException's #(input reason index) and PatternSyntaxException's
+;; #(description index pattern), read by throwable-detail-method (records-interop.ss).
+(define (jolt-host-throwable/detail class-name msg detail)
+  (let ((t (jolt-host-throwable class-name msg)))
+    (jolt-ex-info-record-error-offset-set! t detail)
+    t))
+
 (define (jolt-host-throwable class-name msg . more)
   (jolt-capture-throwable!
     (make-jolt-ex-info-record class-name msg
@@ -2667,6 +2714,28 @@
 (define (load-frame-ns f) (vector-ref f 2))
 (define jolt-load-frames (make-parameter '()))
 (define jolt-form-ordinal (make-parameter #f))
+;; While a build walk visits a loaded file: #(file ordinal settled later) for each
+;; enclosing file's form that loaded it. A var the enclosing file defines after that
+;; form was not visible to the loaded file, whatever the loaded file's own counter
+;; says. A var that form itself defined has one ordinal however many files it named,
+;; so those are told apart by file: SETTLED ran by now, LATER had not.
+(define jolt-form-outer-frames (make-parameter '()))
+(define (var-def-visible-in-outer-frames? ns name)
+  (let ((frames (jolt-form-outer-frames)))
+    (or (null? frames)
+        (jolt-with-mutex var-table-mu
+          (let ((stamped? (lambda (file)
+                            (hashtable-contains? var-def-ordinals
+                              (var-def-ordinal-key file ns name)))))
+            (for-all (lambda (fr)
+                       (let ((s (hashtable-ref var-def-ordinals
+                                  (var-def-ordinal-key (vector-ref fr 0) ns name) #f))
+                             (ord (vector-ref fr 1)))
+                         (if (and s (not (fx=? s ord)))
+                             (fx<? s ord)
+                             (or (not (exists stamped? (vector-ref fr 3)))
+                                 (exists stamped? (vector-ref fr 2))))))
+                     frames))))))
 ;; Value-position comparison references compile to the seq.ss chain singletons
 ;; (jolt-lt/gt/le/ge), not to the clojure.core var roots — the roots were later
 ;; re-bound by the checked numeric layer, so def-var! never saw these procs.
@@ -3433,6 +3502,12 @@
 ;; record-method-dispatch (records.ss) and reuses natives-str helpers (str-trim,
 ;; ascii-string-down, re-split, str-split-drop-trailing) + the regex-t accessors.
 (load "host/chez/java/java-parse.ss")           ; Long/parseLong & co: the NumberFormatException family (shared)
+;; Host shims that load on first reference rather than with the boot: rt.ss names
+;; them (lazy-load "PATH") below, and the index says what each one registers so a
+;; miss on any of it loads the file (#1517). Ahead of host-static.ss, whose lookups
+;; ask it.
+(load "host/chez/lazy-shims.ss")
+(load "host/chez/lazy-shims-index.ss")
 (load "host/chez/java/host-static.ss")          ; registries + jhost + the emit entry points
 (load "host/chez/java/enums.ss")                ; the enum model every enum shim declares through
 (load "host/chez/java/string-builder.ss")       ; StringBuilder/StringBuffer over jhost (shared)
@@ -3441,7 +3516,13 @@
 (load "host/chez/java/class-model.ss")          ; java.lang.Class values + the class model core reads (shared)
 (load "host/chez/java/jutil-colls.ss")         ; java.util Map/Set/List shims to =, hash, pr, str (shared)
 (load "host/chez/java/tree-map.ss")            ; TreeMap / TreeSet + Comparator objects (shared)
-(load "host/chez/java/enum-colls.ss")           ; EnumSet / EnumMap over the enum model
+;; Comparators$NaturalOrderComparator is an enum on the JDK, and Comparator/naturalOrder
+;; answers its one constant. Declared here rather than in tree-map.ss, which Gambit
+;; includes without the enum model, or enum-colls.ss, which loads on first reference
+;; and would re-class a comparator the boot already hands out.
+(register-enum-class! "java.util.Comparators$NaturalOrderComparator"
+  (list (cons "INSTANCE" tm-natural-order)))
+(lazy-load "host/chez/java/enum-colls.ss")           ; EnumSet / EnumMap over the enum model
 (load "host/chez/java/linked-hash.ss")          ; LinkedHashMap / LinkedHashSet
 (load "host/chez/java/host-static-classes.ss")  ; instantiable host object classes
 ;; clojure.math and the IEEE 754 bit patterns (dbl->bits, flt->bits, ...).
@@ -3509,10 +3590,13 @@
 ;; Collections.unmodifiable* / synchronized* views and List/Set/Map.of — after
 ;; coll-defaults.ss, whose inherited members the views reach through.
 (load "host/chez/java/jutil-views.ss")
+;; The views and spliterators the boot's own collections answer through: HashMap's
+;; keySet / values / entrySet, List.reversed(), SequencedMap's views, Spliterator.
+(load "host/chez/java/jutil-coll-views.ss")
 ;; Vector, Stack, Hashtable, BitSet, PriorityQueue and the java.util.concurrent
 ;; collections, over the jx registry jutil-views.ss keeps.
-(load "host/chez/java/jutil-concurrent.ss")
-(load "host/chez/java/array-deque.ss")        ; java.util.ArrayDeque, a ring buffer
+(lazy-load "host/chez/java/jutil-concurrent.ss")
+(lazy-load "host/chez/java/array-deque.ss")        ; java.util.ArrayDeque, a ring buffer
 
 ;; java.io byte/char streams (FileInputStream/…/ByteArrayOutputStream/Buffered*)
 ;; over Chez ports. After io.ss (extends its slurp/__close/reader-jhost?) and
@@ -3543,7 +3627,7 @@
 (load "host/chez/java/zip-out-streams.ss")
 
 ;; GZIPInputStream and GZIPOutputStream on those frames.
-(load "host/chez/java/zip-gzip.ss")
+(lazy-load "host/chez/java/zip-gzip.ss")
 
 ;; ZipEntry, and ZipInputStream on the in-stream frame.
 (load "host/chez/java/zip-entries.ss")
@@ -3572,7 +3656,7 @@
 ;; (host-new + the ctor table it probes), records-interop.ss (instance-check) and
 ;; io-streams.ss, so a proxy over a stream class finds its constructor.
 (load "host/chez/java/proxy.ss")
-(load "host/chez/java/process.ss")
+(lazy-load "host/chez/java/process.ss")
 
 ;; clojure.lang.PersistentQueue: a functional queue + EMPTY static.
 ;; Chains seq/count/empty?/peek/pop/conj/sequential?/class/instance?/printer, so
@@ -3593,8 +3677,8 @@
 
 ;; Semaphore and ReentrantReadWriteLock on the same wait protocol (jolt-cv-wait),
 ;; and AtomicIntegerArray / AtomicLongArray beside the scalar atomics.
-(load "host/chez/java/concurrency-sync.ss")
-(load "host/chez/java/atomic-arrays.ss")
+(lazy-load "host/chez/java/concurrency-sync.ss")
+(lazy-load "host/chez/java/atomic-arrays.ss")
 
 ;; clojure.core.async: real-thread blocking channels + go/go-loop/
 ;; thread macros, def-var!'d into clojure.core.async. After concurrency.ss (reuses

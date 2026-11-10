@@ -26,7 +26,7 @@
   :upstream-quirk
   "reference Clojure's own inconsistency, not a substrate limit. LazySeq.reify() returns a MUTABLE (new ArrayList(this)) where ASeq.reify() wraps it in Collections.unmodifiableList, so java.util.List's DEFAULT sort and replaceAll — both of which go through listIterator() — mutate a throwaway copy and silently succeed on a lazy seq while refusing on every other seq. jolt refuses on all of them. Reproducing it would mean reproducing a missing wrapper whose only observable is that nothing happens.",
   :restrictive
-  "the JVM supports something jolt does not: mark/reset replay over a non-seekable stream, a Zip64 entry in a ZipInputStream. The narrow direction, so it is NOT a superset — code relying on the JVM capability has no counterpart here",
+  "the JVM supports something jolt does not: mark/reset on System.in, a Zip64 entry in a ZipInputStream. The narrow direction, so it is NOT a superset — code relying on the JVM capability has no counterpart here",
   :permissive
   "jolt succeeds where the JVM throws, on operations with one reasonable meaning: count works on eduction, keys on a vector of pairs. A superset: portable JVM code behaves identically.",
   :namespace-model
@@ -82,6 +82,21 @@
   ;; (protocols.ss protocol-resolve), so there is no name to report and no Class
   ;; to hand back. Reporting a name for a class that does not exist would just
   ;; move the failure from a nil key to a ClassNotFoundException.
+  ;; deftype/defrecord/reify methods overloaded by parameter TYPE at one arity:
+  ;; gvec's Vec has Collection's (remove [_ o]) and List's (remove [_ ^int i]).
+  ;; The JVM picks the overload from the call's static types; jolt dispatches a
+  ;; method by name and argument count only, so the first declared clause answers
+  ;; every call of that count and the macros drop the later one
+  ;; (merge-method-specs, 30-macros.clj). Picking by type would need parameter
+  ;; types jolt does not carry at the call.
+  {:category :host-model
+   :behavior "a deftype method overloaded by parameter type at one arity"
+   :jvm "picks the overload from the argument's static type"
+   :jolt "the first declared overload answers every call of that arity"
+   :check {:expr "(load-string \"(deftype KdOv [] java.util.List (^boolean remove [_ ^Object o] false) (^Object remove [_ ^int i] :index)) [(.remove ^java.util.List (KdOv.) \\\"x\\\") (.remove ^java.util.List (KdOv.) (int 0))]\")"
+           :jvm "[false :index]"
+           :jolt "[false false]"}
+   :note "Verified against Clojure 1.12.6 on JDK 27."}
   ;; Redefining a deftype replaces the TYPE, not just the name (jolt-nx2x). On the
   ;; JVM each deftype form is a fresh class: code compiled against the first keeps
   ;; constructing it, and its instances keep its methods. jolt keys a type's
@@ -499,23 +514,32 @@
   ;; is allowlisted in run-corpus.ss, so this is prose here rather than a keyed
   ;; entry: keyed entries are rows whose :expected departs from the JVM, and this
   ;; row's does not.
-  ;; The JVM's mark/reset provider is BufferedInputStream: wrapping ANY stream
-  ;; answers markSupported true, replaying from its buffer on reset. jolt marks
-  ;; via port positions, so the wrapper is markable only where the port can
-  ;; seek (file, bytevector) — over a socket/pipe/stdin it stays the wrapped
-  ;; stream and answers false, and reset throws IOException instead of
-  ;; silently rewinding wrong. System.in is such a BufferedInputStream on the
-  ;; JVM, so (.markSupported System/in) is true there and false here. jolt's
-  ;; markable reset with no prior mark seeks to 0 (the BAIS default) where a
-  ;; JVM BufferedInputStream would throw "Resetting to invalid mark" —
-  ;; lenient in the same direction the shim tier already goes.
+  ;; System.in is a BufferedInputStream on the JVM, so it marks. Here it is the
+  ;; one port on fd 0 that *in* and read-line share, and a replay buffer in front
+  ;; of it would take bytes they expect to see. Wrapping it in a
+  ;; BufferedInputStream of your own marks as usual.
   {:category :restrictive
-   :behavior "(.markSupported (BufferedInputStream. <non-seekable>)) / System/in"
-   :jvm "true — BufferedInputStream buffers and replays on reset"
-   :jolt "false — no replay layer; mark/reset honoured only where the port seeks"
+   :behavior "(.markSupported System/in)"
+   :jvm "true"
+   :jolt "false; reset throws IOException rather than rewinding wrong"
    :check :prose
    :why "needs a non-seekable stream (process stdin), which the gate does not control"
-   :note "Corpus rows cover the agreeing cases (file, ByteArrayInputStream, PipedInputStream, FileInputStream); unit rows pin System/in answering false without crashing."}
+   :note "Unit rows pin System/in answering false without crashing."}
+  ;; jolt.socket's options, against JDK 21's Net and jdk.net.ExtendedSocketOptions.
+  {:category :permissive
+   :behavior "(.setOption socket StandardSocketOptions/SO_RCVBUF 8192)"
+   :jvm "throws ClassCastException on a Long: the option's type is Integer, so it needs (int 8192)"
+   :jolt "accepts it: an int and a long are one integer here"
+   :check :prose
+   :why "the gate would need a live socket"
+   :note "A superset: code that passes (int n) behaves the same on both."}
+  {:category :restrictive
+   :behavior "(.supportedOptions socket)"
+   :jvm "also lists jdk.net's TCP_KEEPIDLE, TCP_KEEPINTERVAL and TCP_KEEPCOUNT"
+   :jolt "the java.net.StandardSocketOptions only"
+   :check :prose
+   :why "jdk.net.ExtendedSocketOptions is not modelled, so there is nothing to name the options by"
+   :note "SO_KEEPALIVE itself works."}
   ;; *in* reads its source a line at a time (__stdin-read-line), so a
   ;; BufferedReader over it, which fills with one read of up to 8192 chars,
   ;; takes one line where the JVM's takes everything the pipe already holds.
@@ -1029,16 +1053,6 @@
            :jvm ":present"
            :jolt ":absent"}
    :note "Runtime.totalMemory/freeMemory/maxMemory ARE present over Chez's collector accounting. What is missing is the rest of JMX. Affects criterium's benchmark reporting, not its timing."}
-  ;; A recv error reads as EOF: io-call classifies the captured errno itself and
-  ;; returns only the syscall result, so ECONNRESET reaches the read side as a
-  ;; bare -1 with no way to raise Java's SocketException for it.
-  {:category :host-model
-   :behavior "(.read (.getInputStream socket)) on a reset connection — requires (require 'jolt.socket)"
-   :jvm "throws java.net.SocketException (\"Connection reset\")"
-   :jolt "-1 (EOF)"
-   :check :prose
-   :why "needs a live TCP peer that resets the connection"
-   :note "errno IS captured atomically per syscall; io-call just consumes it for retry classification instead of returning it, so error and orderly shutdown collapse to EOF. Writes DO throw (send's return distinguishes); only the read side is permissive."}
   ;; java.net's address-family preferences are fixed at the JDK's defaults. The
   ;; JVM reads java.net.preferIPv6Addresses and java.net.preferIPv4Stack once, at
   ;; startup, from -D flags; jolt has no such flags to read them from, and answers

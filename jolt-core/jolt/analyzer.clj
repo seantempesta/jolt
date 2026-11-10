@@ -37,9 +37,9 @@
                                form-macro? form-expand-1 form-holds-set-form? resolve-global resolvable-names
                                form-sym-meta form-coll-meta host-intern! form-syntax-quote-lower
                                form-syntax-quote-expand
-                               record-type? record-ctor-key deftype-ctor-class form-position form-line late-bind?
+                               record-type? record-ctor-key deftype-ctor-class form-position form-line
                                resolve-class-hint host-class-name? ns-shaped-name? namespace-for
-                               jolt-class-for embed-plan ctx-for-ns]]))
+                               embed-plan ctx-for-ns]]))
 
 (declare analyze)
 ;; the quote arm reaches it well before its definition (it needs analyze itself)
@@ -1039,6 +1039,44 @@
          (= "fn*" (form-sym-name h))
          (let [m (form-sym-meta h)] (or (nil? m) (zero? (count m)))))))
 
+;; A multi-arity fn's clauses must be distinguishable by argument count, as the
+;; JVM's FnExpr.parse requires: one variadic clause at most, no two fixed clauses
+;; of the same count, and no fixed clause taking more than the variadic one's
+;; required count. Same checks and the same order as the JVM: per clause in
+;; declaration order, then the fixed-above-variadic rule. Accepting a second
+;; variadic clause was not harmless -- dispatch takes the first clause that
+;; accepts the count, so ([a & r] ...) ([a b c & r] ...) never reaches the second,
+;; and a first clause that delegates to the second loops forever.
+(defn- check-fn-arities [clauses arities]
+  ;; Each error points at the clause that broke the rule, as the recur check
+  ;; points at the recur: the clause is the code the user wrote, where the fn
+  ;; form may be a macro's (defn's, or fn's own fn*) and pointing there drew a
+  ;; note blaming the macro. The reference reports the fn's position instead.
+  (let [arity-error (fn [clause msg]
+                      (throw (ex-info msg (diagnostic-data :analyze/invalid-fn-arities
+                                                           (or (form-position clause)
+                                                               (current-form-position))
+                                                           nil))))
+        [variadic fixed]
+        (reduce (fn [[variadic fixed] [clause a]]
+                  (let [n (count (:params a))]
+                    (cond
+                      (:rest a)
+                      (if variadic
+                        (arity-error clause "Can't have more than 1 variadic overload")
+                        [n fixed])
+                      (contains? fixed n)
+                      (arity-error clause "Can't have 2 overloads with same arity")
+                      :else [variadic (conj fixed n)])))
+                [nil #{}] (map vector clauses arities))]
+    (when-let [clause (and variadic
+                           (some (fn [[clause a]]
+                                   (when (and (not (:rest a)) (> (count (:params a)) variadic))
+                                     clause))
+                                 (map vector clauses arities)))]
+      (arity-error clause "Can't have fixed arity function with more params than variadic function"))
+    arities))
+
 (defn- analyze-fn [ctx form items env]
   (let [named (form-sym? (nth items 1))
         fn-name (when named (form-sym-name (nth items 1)))
@@ -1050,10 +1088,16 @@
                                                          env fn-name)])
                (form-list? first*)
                (fn-node fn-name
-                        (mapv (fn [clause]
-                                (let [cl (vec (form-elements clause))]
-                                  (analyze-arity-with-ret ctx (first cl) (rest cl) env fn-name)))
-                              rest-items))
+                        (check-fn-arities
+                         rest-items
+                         (mapv (fn [clause]
+                                 (when-not (form-list? clause)
+                                   (analysis-error :analyze/invalid-fn-parameters
+                                                   (str "fn* clause " (pr-str clause)
+                                                        " should be a list of a parameter vector and a body")))
+                                 (let [cl (vec (form-elements clause))]
+                                   (analyze-arity-with-ret ctx (first cl) (rest cl) env fn-name)))
+                               rest-items)))
                :else (analysis-error :analyze/invalid-fn-parameters
                                      "Parameter declaration should be a vector"))
         ;; :src-form is the original post-expansion (fn* params body…) form —
@@ -2395,7 +2439,18 @@
                    _ (when mbox (reset! mbox mprev))
                    ebox *expansion-box*
                    prev (when ebox @ebox)
-                   _ (when ebox (reset! ebox [(form-sym-name head) form]))
+                   ;; fn, let, loop and letfn expand to their own special form
+                   ;; (fn → fn*) around the code the user wrote, and Clojure
+                   ;; documents them AS special forms. A diagnostic on that fn*
+                   ;; is about the user's form, so no expansion is recorded and
+                   ;; the report says nothing about "expanding the `fn` macro".
+                   ;; An enclosing user macro's record stays in force. Keyed on
+                   ;; the resolved core macro, not on the foo → foo* shape: a
+                   ;; user macro expanding to its own foo* keeps its note.
+                   own-sf? (contains? '#{clojure.core/fn clojure.core/let
+                                         clojure.core/loop clojure.core/letfn}
+                                      (macro-symbol ctx head))
+                   _ (when (and ebox (not own-sf?)) (reset! ebox [(form-sym-name head) form]))
                    node (analyze ctx expanded env)
                    _ (when ebox (reset! ebox prev))
                    p (form-position form)]
