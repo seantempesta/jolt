@@ -1640,13 +1640,16 @@
        (list (string-append (vector-ref r 0) "/" (vector-ref r 1)) (vector-ref r 2)
              (or line (vector-ref r 3)) locals))
       ;; an anonymous fn: a named literal by its own name, else as Clojure
-      ;; demunges the JVM's ns$def$fn__n, ns/def/fn--n
+      ;; demunges the JVM's ns$def$fn__n, ns/def/fn--n. Its def may be one nothing
+      ;; registered (eval'd code; srcreg-jfn-parts names it from the label alone),
+      ;; and then the frame has no file, and no line but its own.
       ((srcreg-jfn-parts (srcreg-frame-nm f))
        => (lambda (p)
             (let ((rec (srcreg-record-for-fqn (string-append (car p) "/" (cadr p)))))
               (list (or (srcreg-literal-display (srcreg-frame-nm f))
                         (string-append (car p) "/" (cadr p) "/fn--" (caddr p)))
-                    (vector-ref rec 2) (or line (vector-ref rec 3)) locals))))
+                    (and (vector? rec) (vector-ref rec 2))
+                    (or line (and (vector? rec) (vector-ref rec 3))) locals))))
       (else #f))))
 (define (jolt-debug-recs->rows recs sink)
   (let loop ((fs recs) (acc '()))
