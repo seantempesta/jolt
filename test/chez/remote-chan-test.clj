@@ -53,7 +53,7 @@
 
 (defn- write-bytes! [fd ^bytes b]
   (let [p (ffi/alloc (max 1 (alength b)))]
-    (try (ffi/write-array p b 0 (alength b)) (first (native/c-send fd p (alength b) native/msg-nosignal))
+    (try (ffi/write-array p :byte b 0 0 (alength b)) (first (native/c-send fd p (alength b) native/msg-nosignal))
          (finally (ffi/free p)))))
 (defn- read-bytes! [fd n]
   (let [p (ffi/alloc n)]

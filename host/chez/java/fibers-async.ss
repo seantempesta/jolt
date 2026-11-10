@@ -679,17 +679,20 @@
 (def-var! "jolt.host" "ticks-of"
   (lambda (thunk)
     (let* ((s (jolt-ticks-cell))
-           (idle? (and (not (jolt-current-fiber)) (fx=? 0 (vector-ref s 2))))
+           (off? (not (jolt-current-fiber)))
+           (idle? (and off? (fx=? 0 (vector-ref s 2))))
            (t0 #f))
       (dynamic-wind
         (lambda ()
-          (when idle?
-            (vector-set! s 4 (fx+ (vector-ref s 4) 1))
-            (jolt-tick-preempt! (most-positive-fixnum)))
+          ;; open on the thread whether or not it arms: the watch counts while a measure is open
+          ;; (ticks.ss jolt-tick-watch-arm!), so a body outlasting an older arm is counted whole
+          (when off? (vector-set! s 4 (fx+ (vector-ref s 4) 1)))
+          (when idle? (jolt-tick-preempt! (most-positive-fixnum)))
           (unless t0 (set! t0 (jolt-ticks))))
         thunk
         (lambda ()
-          (when idle?
+          (when off?
             (vector-set! s 4 (fx- (vector-ref s 4) 1))
-            (when (fx=? 0 (vector-ref s 4)) (jolt-tick-preempt! 0)))))
+            ;; the last measure out disarms the arm it made and puts the thread's watch back
+            (when (and idle? (fx=? 0 (vector-ref s 4))) (jolt-tick-preempt! 0) (jolt-tick-watch!)))))
       (- (jolt-ticks) t0))))

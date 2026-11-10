@@ -1240,7 +1240,8 @@
 (define (jolt-host-site-call1 site obj name a)
   (cond ((jhost? obj)
          (let ((f (host-site-hit site obj))) (if f (f obj a) (host-site-miss site obj name (list a)))))
-        ((and (native-coll-site? obj) (or (string=? name "valAt") (string=? name "get")))
+        ;; a set has get, and no valAt (clojure.lang.PersistentHashSet is no ILookup): that one walks on and raises
+        ((and (native-coll-site? obj) (or (string=? name "get") (and (string=? name "valAt") (not (pset? obj)))))
          (jolt-get obj a))
         ((and (native-coll-site? obj) (pvec? obj) (string=? name "nth"))
          (jolt-nth obj a))
@@ -1248,7 +1249,8 @@
 (define (jolt-host-site-call2 site obj name a b)
   (cond ((jhost? obj)
          (let ((f (host-site-hit site obj))) (if f (f obj a b) (host-site-miss site obj name (list a b)))))
-        ((and (native-coll-site? obj) (or (string=? name "valAt") (string=? name "get")))
+        ;; a set has get, and no valAt (clojure.lang.PersistentHashSet is no ILookup): that one walks on and raises
+        ((and (native-coll-site? obj) (or (string=? name "get") (and (string=? name "valAt") (not (pset? obj)))))
          (jolt-get obj a b))
         ((and (native-coll-site? obj) (pvec? obj) (string=? name "nth"))
          (jolt-nth obj a b))

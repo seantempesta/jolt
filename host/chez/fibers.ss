@@ -1130,6 +1130,20 @@
     (vector-set! s 1 (+ (vector-ref s 1) (fxmax 0 (fx- (vector-ref s 2) left))))
     (vector-set! s 2 n)
     left))
+;; The slow watch's arm (ticks.ss jolt-tick-watch!, jolt-tick-fire): the one arm that is not
+;; counted. The watch stands for no work: it keeps a timer event coming on a thread with nothing
+;; registered, so the thread can join sampling. Counted, an idle thread's count would move
+;; (jolt.host/ticks-of's "nothing armed" would never hold, and a measure a throw left open could
+;; not be told from the watch). It closes whatever counted arm it replaces and leaves the cell
+;; reading "nothing armed", so the count stands still under it.
+(define (jolt-watch-timer! n)
+  (let* ((s (jolt-ticks-cell)) (left (set-timer n)))
+    (vector-set! s 1 (+ (vector-ref s 1) (fxmax 0 (fx- (vector-ref s 2) left))))
+    (vector-set! s 2 0)
+    left))
+;; #t while the timer's running arm is a counted one (jolt-set-timer!'s), #f under the watch or
+;; with nothing armed.
+(define (jolt-timer-counted?) (not (fx=? 0 (vector-ref (jolt-ticks-cell) 2))))
 (define (jolt-thread-ticks)
   ;; read whole: the handler (which arms, so moves consumed and armed) never runs mid-read.
   ;; A plain pair, not with-interrupts-disabled (a dynamic-wind: a winder and a cons per

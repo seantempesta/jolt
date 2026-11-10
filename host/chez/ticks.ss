@@ -93,22 +93,26 @@
 (define-syntax jolt-tick-state
   (syntax-rules () ((_) (virtual-register 13))))
 
-;; MERGE-REVIEW(deep-fixes): upstream e35d0103 keeps a slow watch armed on every thread
-;; (fired every jolt-tick-watch-ticks), so the timer is never disarmed off a fiber. With every
-;; arm through jolt-set-timer!, our tick count (jolt.host/ticks) now always advances: ticks-of's
-;; "idle" arm is rarely taken, its close (jolt-tick-preempt! 0) disarms the watch until the
-;; next arm, and nested-budget-test's "a measure a throw left is closed: the idle count stands
-;; still" premise no longer holds (the count moves while idle). Undecided: drop that check, or
-;; keep the watch out of the count. Gate: nested-budget-test, ticks-test, sampler gates.
+;; Upstream's watch (e35d0103) keeps the timer armed on every thread off a fiber. Ours counts
+;; ticks at the timer's arm (jolt-set-timer!), so the watch arms through jolt-watch-timer!
+;; (fibers.ss), the one uncounted arm: an idle thread's count stands still under it, and a
+;; counted arm already running (a measure's, a budget's) is put back counted.
 (define jolt-tick-watch-ticks 1000000)
+;; The watch's arm: uncounted, unless a tick measure is open on this thread (jolt.host/ticks-of:
+;; the cell's measures count). A measure opened while an older counted arm still ran arms nothing
+;; of its own, so when that arm ends the watch that replaces it has to keep counting the body.
+(define (jolt-tick-watch-arm! n)
+  (if (fx>? (vector-ref (jolt-ticks-cell) 4) 0) (jolt-set-timer! n) (jolt-watch-timer! n)))
 ;; Arm the watch on this thread, leaving a timer that is already running alone.
 (define (jolt-tick-watch!)
   (disable-interrupts)
   (when (and (eq? (jolt-tick-state) 0) (not (jolt-current-fiber)))
-    (let ((rem (jolt-set-timer! 0)))
+    (let* ((counted? (jolt-timer-counted?)) (rem (jolt-set-timer! 0)))
       (unless (eq? (timer-interrupt-handler) jolt-tick-fire)
         (timer-interrupt-handler jolt-tick-fire))
-      (jolt-set-timer! (if (fx>? rem 0) rem jolt-tick-watch-ticks))))
+      (if (and counted? (fx>? rem 0))
+          (jolt-set-timer! rem)
+          (jolt-tick-watch-arm! (if (fx>? rem 0) rem jolt-tick-watch-ticks)))))
   (enable-interrupts)
   (void))
 
@@ -220,7 +224,7 @@
       ((jolt-current-fiber) ((vector-ref jolt-tick-clients jolt-tick-slot-preempt)))
       ;; Off a fiber it was the watch. On a carrier between dispatches it was a
       ;; quantum that fell due mid-park, and the next dispatch overwrites this.
-      (else (jolt-set-timer! jolt-tick-watch-ticks) (void)))))
+      (else (jolt-tick-watch-arm! jolt-tick-watch-ticks) (void)))))
 
 (define (jolt-tick-fire-multi s)
   (when (and jolt-tick-sampling? (not (vector-ref s jolt-tick-sampler)))

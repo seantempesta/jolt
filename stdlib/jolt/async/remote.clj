@@ -431,7 +431,7 @@
                 (recur (encode-error v r))     ; no descriptor travels with the answer
                 (let [^bytes b r len (alength b) p (room! (+ 4 len))]
                   (ffi/write p :uint32 (bit-or CARRIES len) 0)
-                  (ffi/write-array (+ p 4) b 0 len)
+                  (ffi/write-array (+ p 4) :byte b 0 0 len)
                   (if (true? (send-with-fd! fd (first @scratch) (+ 4 len) (::fd (meta v)) pump)) (recur nil) (dead! end)))))
             ;; this value, then whatever else is already queued, as one write, up to the next
             ;; value that carries a descriptor (held for its own)
@@ -441,7 +441,7 @@
                                    len (alength b)
                                    p (room! (+ off 4 len))]
                                (ffi/write p :uint32 len off)
-                               (ffi/write-array (+ p off 4) b 0 len)
+                               (ffi/write-array (+ p off 4) :byte b 0 0 len)
                                (let [off (+ off 4 len)]
                                  (if (< off batch-bytes)
                                    (let [nv (a/poll! out)]

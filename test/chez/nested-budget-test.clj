@@ -44,8 +44,10 @@
               [(str f) (inc i)])
       owner (fn [[f n]] (let [lines (clojure.string/split-lines (slurp f))]
                           (some #(second (re-find #"^\(define \(([^ )]+)" %)) (reverse (take n lines)))))]
-  (check "jolt-set-timer! is the one site that arms the engine timer"
-         (and (= 1 (count sites)) (.endsWith (ffirst sites) "fibers.ss") (= "jolt-set-timer!" (owner (first sites))))
+  ;; and one more, named: jolt-watch-timer!, the slow watch's arm, which is not work and is kept
+  ;; out of the count on purpose (fibers.ss). Any third site is red.
+  (check "jolt-set-timer! arms the engine timer, and jolt-watch-timer! the uncounted watch: no other site"
+         (and (every? #(.endsWith (first %) "fibers.ss") sites) (= ["jolt-set-timer!" "jolt-watch-timer!"] (sort (map owner sites))))
          (map (juxt identity owner) sites)))
 ;; a park inside nested budgets (a fiber's): its unwind runs on the carrier with no fiber
 ;; current, and a fiber's budget read against the carrier's count looked spent at once
@@ -53,6 +55,22 @@
 (run! a/<!! (doall (for [_ (range 64)] (a/go (work 5000000)))))
 (let [rs (frequencies (repeatedly 50 #(on-fiber (fn [] (outcome (fn [] (run 2000000 (fn [] (run 1000000 (fn [] (Thread/sleep 1) (work 1000)))))))))))]
   (check "a park inside nested budgets on a fiber resumes and finishes" (= {:finished 50} rs) rs))
+;; a budget still FIRES after its fiber parked and came back: the resume re-arms the poll
+;; client for the budgets on the fiber's stack. A budget that fell silent across a park would
+;; let these loops run for ever, so each is asked for the refusal itself, at its budget. Two
+;; parks: a sleep (the timer's wake) and a child's pipe (the io poller's wake).
+(require '[clojure.java.shell :as shell])
+(def parks {"a sleep" #(Thread/sleep 1) "a pipe read" #(shell/sh "sh" "-c" "sleep 0.02; echo x")})
+(def small 20000000)
+(doseq [[what park] parks]
+  (let [rs (frequencies (repeatedly 10 #(let [e (on-fiber (fn [] (outcome (fn [] (run small (fn [] (park) (loop [i 0] (recur (inc i)))))))))]
+                                          (if (and (map? e) (= small (:jolt/ticks-budget e)) (<= small (:jolt/ticks-spent e) (+ small (* 2 poll)))) :refused e))))]
+    (check (str "on a fiber, a tick budget that runs out after " what " is refused at the budget") (= {:refused 10} rs) rs))
+  (let [limit 1000000
+        rs (frequencies (repeatedly 10 #(let [e (on-fiber (fn [] (outcome (fn [] (jolt.host/run-interruptible (jolt.host/make-interrupt)
+                                                                                    (fn [] (park) (loop [] (vec (range 1000)) (recur))) nil limit)))))]
+                                          (if (and (map? e) (= limit (:jolt/bytes-budget e)) (<= limit (:jolt/bytes-spent e) (* 100 limit))) :refused e))))]
+    (check (str "on a fiber, a byte budget that runs out after " what " is refused") (= {:refused 10} rs) rs)))
 ;; a measure around a bounded run counts the work after it (the run's exit keeps the
 ;; measure's arm), and a throw out of a measure leaves the timer disarmed
 (let [t-run (jolt.host/ticks-of #(run 1000000000 (fn [] 1)))
