@@ -1597,7 +1597,7 @@ fi
 
 # File/createTempFile: a temp path no other process holds (eight processes in one
 # millisecond, every path distinct), named as the JDK names it.
-temp_out="$($jolt run test/chez/temp-file-test.clj "$jolt" 2>&1)"
+temp_out="$($jolt run test/chez/temp-file-test.clj "$jolt_bin" 2>&1)"
 if printf '%s' "$temp_out" | grep -q 'TEMP-FILE OK'; then
   pass=$((pass + 1))
 else
