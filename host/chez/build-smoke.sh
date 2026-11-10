@@ -178,7 +178,7 @@ if ! appsrc "$out.build" | grep -q 'define jv\$app.util/shout'; then
 fi
 # ...and nothing reads it through its var, which is the thing direct-linking is
 # for. This holds whether the call was spliced or left as a jv$ application.
-if appsrc "$out.build" | grep -q '(jolt-var "app.util" "shout")\|(var-deref "app.util" "shout")\|(v "app.util" "shout")'; then
+if appsrc "$out.build" | grep -q '(jolt-var "app.util" "shout")\|(var-deref "app.util" "shout")\|[ (]v "app.util" "shout"'; then
   echo "  FAIL: release build still var-routed the app->app call"; exit 1
 fi
 
@@ -291,10 +291,10 @@ fi
 check_fnid "$out.nodl" "the --no-direct-link build"
 # and it IS var-routed there -- without this the check above would pass on a
 # build that emitted no reference to shout at all.
-# A unit's var references are one constant table, each entry (v "ns" "name")
+# A unit's var references are one flat constant table, each entry v "ns" "name"
 # (the emitter's namespace-init cut), so that is the form a var route takes in a
 # built unit; the two older spellings stay for an emitter that writes them inline.
-if ! appsrc "$out.nodl.build" | grep -q '(jolt-var "app.util" "shout")\|(var-deref "app.util" "shout")\|(v "app.util" "shout")'; then
+if ! appsrc "$out.nodl.build" | grep -q '(jolt-var "app.util" "shout")\|(var-deref "app.util" "shout")\|[ (]v "app.util" "shout"'; then
   echo "  FAIL: --no-direct-link did not var-route the app->app call"; exit 1
 fi
 # An OPEN-WORLD build maps its frames too. emit-def-cached only emits a source
