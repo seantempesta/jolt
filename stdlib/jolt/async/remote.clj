@@ -357,6 +357,14 @@
   (when close-in? (a/close! in))
   (a/close! out))
 
+(defn- shut!
+  "This end is dead for a reason of its own (its writer threw): the socket is shut down both
+  ways while the descriptor is still this end's (see finish!), so this end's reader, still
+  waiting on it, ends, and the peer reads end of stream. Without it the descriptor stayed open
+  under the waiting reader and the peer's take never ended."
+  [{:keys [fd ::lock ::live]}]
+  (locking lock (when (pos? @live) (c-shutdown fd native/shut-rdwr))))
+
 (defn- reader [{:keys [fd in decode pump close-in?] :as end}]
   (let [st (rd-new)
         ;; msghdr @0 (48 bytes; 56 on Linux, whose controllen is a size_t and which has a flags word
@@ -379,7 +387,7 @@
             :else (if (= :eof (rd-fill! fd st pump m fds))
                     (dead! end)       ; a partial frame at EOF is discarded with the peer
                     (recur)))))
-      (catch Throwable t (dead! end) (throw t))
+      (catch Throwable t (dead! end) (shut! end) (throw t))
       (finally (ffi/free (aget st 0)) (ffi/free m)
                ;; descriptors no frame took are this process's to close
                (run! close-fd! @fds)
@@ -452,7 +460,7 @@
               (if (true? (write-all! fd (first @scratch) n pump))
                 (recur held)
                 (dead! end))))))
-      (catch Throwable t (dead! end) (throw t))
+      (catch Throwable t (dead! end) (shut! end) (throw t))
       (finally (ffi/free (first @scratch)) (finish! end)))))
 
 (defn- spawn [pump f]
