@@ -4159,8 +4159,15 @@
 ;; not: it scans the emission for a rewritten park site inside a wind's extent. See
 ;; the invariant note at jolt-sm-park!.
 ;; Both keys optional.
+;;
+;; With tracing on, a catch also puts the site slots back as they were when the
+;; try began. A non-tail call restores them when it returns, but a throw does not
+;; return: what the throw and the calls it left behind stored would stay there, and
+;; the next host fault would report the thrower as its innermost frame.
 (defn- emit-try [node]
-  (let [core (if-let [cs (:catch-sym node)]
+  (let [ts (when (and (:catch-sym node) (trace-frames?)) (fresh-label "_ts$"))
+        to (when ts (fresh-label "_to$"))
+        core (if-let [cs (:catch-sym node)]
                (let [raw (munge-name (:catch-raw-sym node))
                      ;; Snapshot the throwing line BEFORE the handler body runs:
                      ;; the body's own calls move the current line, so by the time
@@ -4180,6 +4187,7 @@
                  ;; Gate: degradedbacktrace, traceemit, errorreport, the debug-locals gates.
                      handler (str "(let ((" (munge-name cs) " (jolt-unwrap-throw " raw "))) "
                                   (if cl (str "(let ((" cl " (jolt-catch-enter!))) ") "")
+                                  (if ts (str "(set-virtual-register! 2 " ts ") (set-virtual-register! 12 " to ") ") "")
                                   "(let ((r " (binding [*array-vecs* (dissoc *array-vecs* (munge-name cs) raw)]
                                                ;; debug locals: the handler body is a tail region.
                                                ;; cs is the analyzer's; the user's name is a let
@@ -4189,7 +4197,8 @@
                                   (if cl (str "(jolt-catch-leave! " cl ") ") "")
                                   "(jolt-catch-complete!) r)"
                                   (if cl ")" "")
-                                  ")")]
+                                  ")")
+                     body
                  ;; Chez: jolt-try-body / jolt-try-handler (scheme-adapter-runtime.ss),
                  ;; a one-shot escape and a hand-pushed handler — 160 B and ~8 ns per
                  ;; entry against guard's 297 B and ~18 ns. Gambit keeps R7RS guard.
@@ -4209,7 +4218,12 @@
                    (with-site (if (and (map? (:body node)) (node-line (:body node))) (:body node) node)
                      (str "(call-with-values (lambda () (jolt-try-body "
                           (binding [*tail?* (or (some? *dbg-scope*) (and *tail?* (some? (:finally node))))] (emit (:body node))) ")) "
-                          "(jolt-try-handler " raw " " handler "))"))))
+                          "(jolt-try-handler " raw " " handler "))")))]
+                 ;; merge: upstream 6e84e482 puts the site slots back when a catch runs (ts/to,
+                 ;; under tracing), around our lowering as around its guard
+                 (if ts
+                   (str "(let ((" ts " (virtual-register 2)) (" to " (virtual-register 12))) " body ")")
+                   body))
                (emit-try-body node))]
     (if-let [fin (:finally node)]
       ;; The edges are masked against an interrupt's escape. run-interruptible
@@ -4540,7 +4554,17 @@
                  ch (let [c (or (get node :inline-chain) (get (:expr node) :inline-chain))]
                       (when (and (seq c) (every? (fn [x] (marker-safe-fqn? (nth x 0))) c)) c))
                  e (binding [*tail?* false] (emit (:expr node)))
-                 call (emit-call *tail?* "jolt-throw" [e] (or line 0) ch)]
+                 ;; A throw never returns, so its site goes in the slot in any
+                 ;; position, not only a tail one. What the slot holds otherwise is
+                 ;; the tail call that reached this fn, and the reporter would take
+                 ;; that caller for the innermost frame. Outside a named fn there
+                 ;; is no pair to store, so the slot is emptied instead.
+                 call (cond
+                        (not (trace-frames?)) (emit-call *tail?* "jolt-throw" [e] (or line 0) ch)
+                        *trace-site* (sited-tail-call *trace-site* (or line 0) "jolt-throw" [e] ch)
+                        :else (let [t (fresh-label "_tt$")]
+                                (str "(let* ((" t " " e ")) (set-virtual-register! 2 0) "
+                                     (plain-call "jolt-throw" [t]) ")")))]
              ;; A macro-built throw has no :pos — `assert` expands to one, and the
              ;; app.util fixture reaches it through a user macro besides — so a
              ;; site with a chain but no line still emits a marker, with line 0.

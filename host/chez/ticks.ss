@@ -76,6 +76,14 @@
 
 ;; Set by sampler.ss while sampling is on, so a thread that is already running
 ;; joins at its next timer event. Read on every fire, so a plain global.
+;;
+;; A thread with nothing registered would have no timer event, so it keeps a slow
+;; WATCH armed: the timer fires every jolt-tick-watch-ticks and does nothing unless
+;; sampling started since. It is not a client and has no slot, because it stands
+;; for no demand: it lives in the timer of a solo thread off a fiber, and anything
+;; that wants the timer simply overwrites it. A dispatch's quantum replaces it, and
+;; jolt-tick-go-multi! carries the rest of it as a preempt demand, whose fire off a
+;; fiber does nothing.
 (define jolt-tick-sampling? #f)
 (define (jolt-tick-join-sampling!) (void))   ; redefined by sampler.ss
 (define (jolt-tick-sampling-set! on? join)
@@ -84,6 +92,25 @@
 
 (define-syntax jolt-tick-state
   (syntax-rules () ((_) (virtual-register 13))))
+
+;; MERGE-REVIEW(deep-fixes): upstream e35d0103 keeps a slow watch armed on every thread
+;; (fired every jolt-tick-watch-ticks), so the timer is never disarmed off a fiber. With every
+;; arm through jolt-set-timer!, our tick count (jolt.host/ticks) now always advances: ticks-of's
+;; "idle" arm is rarely taken, its close (jolt-tick-preempt! 0) disarms the watch until the
+;; next arm, and nested-budget-test's "a measure a throw left is closed: the idle count stands
+;; still" premise no longer holds (the count moves while idle). Undecided: drop that check, or
+;; keep the watch out of the count. Gate: nested-budget-test, ticks-test, sampler gates.
+(define jolt-tick-watch-ticks 1000000)
+;; Arm the watch on this thread, leaving a timer that is already running alone.
+(define (jolt-tick-watch!)
+  (disable-interrupts)
+  (when (and (eq? (jolt-tick-state) 0) (not (jolt-current-fiber)))
+    (let ((rem (jolt-set-timer! 0)))
+      (unless (eq? (timer-interrupt-handler) jolt-tick-fire)
+        (timer-interrupt-handler jolt-tick-fire))
+      (jolt-set-timer! (if (fx>? rem 0) rem jolt-tick-watch-ticks))))
+  (enable-interrupts)
+  (void))
 
 ;; Arm (n > 0) or cancel (n = 0) the preempt demand. Syntax, so the solo case is
 ;; the register read and the set-timer the fiber scheduler always paid.
@@ -167,7 +194,7 @@
     (if (and may-go-solo? (not a) (not b) (not (vector-ref s jolt-tick-sampler)))
         (begin
           (set-virtual-register! 13 0)
-          (when c (jolt-set-timer! (fxmax 1 c))))
+          (jolt-set-timer! (if c (fxmax 1 c) jolt-tick-watch-ticks)))
         (let* ((m (if (and b (or (not a) (fx<? b a))) b a))
                (m (if (and c (or (not m) (fx<? c m))) c m)))
           (when m
@@ -190,7 +217,10 @@
       ;; sampling started since, join it instead; that leaves solo with the
       ;; preemption still due, and the next tick runs both.
       (jolt-tick-sampling? (jolt-tick-join-sampling!))
-      (else ((vector-ref jolt-tick-clients jolt-tick-slot-preempt))))))
+      ((jolt-current-fiber) ((vector-ref jolt-tick-clients jolt-tick-slot-preempt)))
+      ;; Off a fiber it was the watch. On a carrier between dispatches it was a
+      ;; quantum that fell due mid-park, and the next dispatch overwrites this.
+      (else (jolt-set-timer! jolt-tick-watch-ticks) (void)))))
 
 (define (jolt-tick-fire-multi s)
   (when (and jolt-tick-sampling? (not (vector-ref s jolt-tick-sampler)))
