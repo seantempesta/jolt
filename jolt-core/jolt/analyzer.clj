@@ -2449,7 +2449,7 @@
                    ;; user macro expanding to its own foo* keeps its note.
                    own-sf? (contains? '#{clojure.core/fn clojure.core/let
                                          clojure.core/loop clojure.core/letfn}
-                                      (macro-symbol ctx head))
+                                      (macro-symbol r head))
                    _ (when (and ebox (not own-sf?)) (reset! ebox [(form-sym-name head) form]))
                    node (analyze ctx expanded env)
                    _ (when ebox (reset! ebox prev))
