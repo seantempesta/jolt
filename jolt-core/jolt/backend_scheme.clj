@@ -1572,10 +1572,23 @@
 ;; char, so ours' bytes-a-char proof may move. Gate: emitalloc, imagefnforms, the corpus
 ;; string-literal cases (one past the BMP).
 (defn- chez-str-lit [^String s]
-  (let [sb (StringBuilder. (+ (count s) 2))]
+  ;; one indexed pass over the units .charAt answers, no seq step a char. A high
+  ;; surrogate followed by a low one is the one code point past the BMP they spell
+  ;; (what a UTF-16 index walks); where a unit is already a whole code point it
+  ;; stands as it is.
+  (let [n (.length s)
+        sb (StringBuilder. (+ n 2))]
     (.append sb "\"")
-    (doseq [c s]
-      (if-let [e (char-escape (int c))] (.append sb ^String e) (.append sb c)))
+    (loop [i 0]
+      (when (< i n)
+        (let [u (int (.charAt s i))
+              pair? (and (>= u 55296) (< u 56320) (< (inc i) n)
+                         (let [l (int (.charAt s (inc i)))] (and (>= l 56320) (< l 57344))))
+              cp (if pair?
+                   (+ 65536 (bit-shift-left (- u 55296) 10) (- (int (.charAt s (inc i))) 56320))
+                   u)]
+          (if-let [e (char-escape cp)] (.append sb ^String e) (.append sb (.charAt s i)))
+          (recur (if pair? (+ i 2) (inc i))))))
     (.append sb "\"")
     (.toString sb)))
 
