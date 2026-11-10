@@ -9,7 +9,7 @@
 ;; ones. This pins the emitted shape instead, which no runner can disturb: the
 ;; nesting depth of the emitted code is the same for a 50-statement body as for a
 ;; 200-statement one, with plain constants and with constants that reference
-;; other constants (a hoisted vector over its keywords, two layers).
+;; other constants (a hoisted vector over its keywords, two layers; see layered).
 ;;   chez --script test/chez/pool-shape-test.ss
 
 (import (chezscheme))
@@ -56,7 +56,11 @@
         (loop (+ i 1) (string-append acc (stmt i) " ")))))
 
 (define (plain i) (format "(clojure.core/println :k~a (quote s~a))" i i))
-(define (layered i) (format "(clojure.core/println [:a~a :b~a])" i i))
+;; The char keeps the vector a construction over its hoisted keywords, so the pool
+;; has two layers: a literal made only of keywords, numbers and strings is ONE
+;; entry, (jolt-datum '#(v ...)) over a quoted datum (backend_scheme.clj,
+;; datum-on?), which binds no keyword of its own and leaves nothing to layer.
+(define (layered i) (format "(clojure.core/println [:a~a :b~a \\c])" i i))
 
 (define (check label stmt)
   (let* ((small (emitf "user" (fn-src 50 stmt)))
