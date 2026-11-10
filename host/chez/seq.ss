@@ -2165,14 +2165,20 @@
 ;; record, a sorted map, a host map arm) folds over its keys, the reference's
 ;; IPersistentMap arm. nil folds to init.
 (define (kv-step f) (if (procedure? f) (lambda (acc k v) (jolt-site-kept (f acc k v))) (lambda (acc k v) (jolt-invoke3 f acc k v))))
+;; kv-step's call written at the site, as reduce-seq's direct? is: the per-entry
+;; loops below call a raw fn with no closure between, so a step is one call (a
+;; kv-step closure made it two: 1.31 -> 2.31 ticks a hash-map entry)
+(define-syntax kv-call
+  (syntax-rules ()
+    ((_ direct? f acc k v) (if direct? (jolt-site-kept (f acc k v)) (jolt-invoke3 f acc k v)))))
 (define (pmap-kv-reduce m f init)
-  (let ((step (kv-step f)) (root (pmap-root m)))
+  (let ((direct? (procedure? f)) (root (pmap-root m)))
     (if (not (hnode? root))
         (let ((n (vector-length root)))
           (let loop ((i 0) (acc init))
             (cond ((jolt-reduced? acc) acc)
                   ((fx>=? i n) acc)
-                  (else (loop (fx+ i 2) (step acc (vector-ref root i) (vector-ref root (fx+ i 1))))))))
+                  (else (loop (fx+ i 2) (kv-call direct? f acc (vector-ref root i) (vector-ref root (fx+ i 1))))))))
         ;; hash mode walks the trie in the seq view's order (ascending slots,
         ;; children in place), stopping at a reduced accumulator at any leaf
         (let walk ((node root) (acc init))
@@ -2188,10 +2194,10 @@
                                     (let cl ((al (hcoll-alist child)) (acc acc))
                                       (cond ((jolt-reduced? acc) acc)
                                             ((null? al) acc)
-                                            (else (cl (cdr al) (step acc (caar al) (cdar al)))))))
-                                   (else (step acc (car child) (cdr child))))))))))))))
+                                            (else (cl (cdr al) (kv-call direct? f acc (caar al) (cdar al)))))))
+                                   (else (kv-call direct? f acc (car child) (cdr child))))))))))))))
 (define (vec-kv-reduce v f init)
-  (let ((step (kv-step f)) (n (pvec-count v)))
+  (let ((direct? (procedure? f)) (n (pvec-count v)))
     (let outer ((i 0) (acc init))
       (cond ((jolt-reduced? acc) acc)
             ((fx>=? i n) acc)
@@ -2201,7 +2207,7 @@
                (let inner ((j offset) (k i) (acc acc))
                  (cond ((jolt-reduced? acc) acc)
                        ((fx>=? j clen) (outer k acc))
-                       (else (inner (fx+ j 1) (fx+ k 1) (step acc k (vector-ref chunk j))))))))))))
+                       (else (inner (fx+ j 1) (fx+ k 1) (kv-call direct? f acc k (vector-ref chunk j))))))))))))
 ;; IKVReduce over a java.util.Map shim: its entries in iteration order, or #f
 ;; for anything else. The java layer (java/jutil-colls.ss) set!s this; it is a
 ;; hook rather than a predicate list here because the shims are its to know.
