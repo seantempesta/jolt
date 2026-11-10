@@ -2,7 +2,9 @@
 ;; name was the millisecond and a per-process counter, checked and then created, so
 ;; processes making their first temp file in one millisecond were handed one path (four
 ;; test shards started at once, each making a git index there: "index.lock: File
-;; exists"). Now the name is the pid and the counter, and the create is exclusive.
+;; exists"). Now the name is the JDK's (prefix, an unsigned random 64-bit number,
+;; suffix), the create is exclusive and a taken name is retried (java/io.ss
+;; io-create-temp, upstream jolt-lang/jolt#1528).
 ;;
 ;; Run: bin/jolt run test/chez/temp-file-test.clj [JOLT] (prints "TEMP-FILE OK"); JOLT
 ;; is the runtime the child processes run (default bin/jolt).
@@ -17,15 +19,10 @@
 (def dir (str (System/getProperty "java.io.tmpdir") "/jolt-temp-test-" (System/currentTimeMillis)))
 (.mkdirs (File. dir))
 
-;; a pre-existing file at what would be the next name is skipped, not overwritten
-(let [probe (File/createTempFile "jtp" ".t" (File. dir))
-      [_ pid n] (re-find #"jtp(\d+)-(\d+)\.t$" (.getName probe))
-      squatter (File. dir (str "jtp" pid "-" (inc (parse-long n)) ".t"))]
-  (check "the name is the pid and the counter" (some? pid))
-  (spit squatter "kept")
-  (let [next (File/createTempFile "jtp" ".t" (File. dir))]
-    (check "a pre-existing file at the next name is skipped" (not= (.getPath next) (.getPath squatter)))
-    (check "and not overwritten" (= "kept" (slurp squatter)))))
+;; the name is the JDK's: prefix, an unsigned decimal number, suffix
+(let [probe (File/createTempFile "jtp" ".t" (File. dir))]
+  (check "the name is the prefix, a random number and the suffix"
+         (some? (re-find #"^jtp\d+\.t$" (.getName probe)))))
 
 ;; eight processes make their temp files in the same millisecond: every path is distinct
 (let [script (str dir "/child.clj")
