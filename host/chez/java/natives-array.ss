@@ -843,7 +843,7 @@
         (make-cseqn a (make-lazy-src lz-array-seq a i) (na-cells-kind a) jolt-nil (fx- n i)))))
 (define (na-cells-kind a) (fx+ (na-seq-kind a) (fx- sk-array-cells-seq sk-array-seq)))
 (define lz-array-seq
-  (register-lazy-src! 'array-seq (lambda (a i) (arr->seq a (fx+ i 1)))))
+  (register-pure-lazy-src! 'array-seq (lambda (a i) (arr->seq a (fx+ i 1)))))
 (define (array-cells-index a cnt) (fx- (ja-len a) cnt))
 ;; reduce over an array seq from the cell with CNT left: the elements straight off
 ;; the array, reduced honored and unwrapped, as reduce-seq's own loop does

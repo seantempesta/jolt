@@ -191,6 +191,25 @@
   (hashtable-set! lazy-src-name-tbl proc name)
   (hashtable-set! lazy-src-proc-tbl name proc)
   proc)
+;; The producers that call no user code: a descriptor of one run twice by two racing
+;; threads builds two equal cells and nothing observable differs (what they force is
+;; itself once-only), so a cell holding one needs no claim among threads -- the
+;; forcer runs it and compare-and-swaps the answer in, and a forcer that lost takes
+;; the winner's (cell-run-pure!). A claim costs a record, a dynamic-wind and its two
+;; closures per cell (~190 B, measured), which made a char seq 80 B a step single-
+;; threaded and 272 B once any thread had been forked. map, filter, iterate,
+;; take-while and the like call a user function, which must run once, and stay
+;; claimed. take is not here: it seqs an arbitrary coll (user code) on its first step.
+;; A producer says so where it is registered, in whichever file defines it: a list
+;; kept here missed the array seq natives-array.ss registers (an object array's seq
+;; walked at 224 B a cell once a thread existed, against 80 B).
+;; A table, not a list: a memq walks to its producer on every forced cell, and a
+;; list grown at each registration put str-seq eleventh (:str/seq-char 11 -> 16
+;; ticks a char).
+(define pure-lazy-src-tbl (make-eq-hashtable))
+(define (register-pure-lazy-src! name proc)
+  (hashtable-set! pure-lazy-src-tbl proc #t)
+  (register-lazy-src! name proc))
 (define (lazy-src-name-of proc) (hashtable-ref lazy-src-name-tbl proc #f))
 (define (lazy-src-proc-of name) (hashtable-ref lazy-src-proc-tbl name #f))
 (define (lazy-src-force t) ((lazy-src-fn t) (lazy-src-a t) (lazy-src-b t)))
@@ -203,7 +222,7 @@
 
 ;; forced tail of a seq whose own tail was not yet realized (jolt-rest)
 (define lz-rest
-  (register-lazy-src! 'rest (lambda (s _b) (jolt-seq (seq-more s)))))
+  (register-pure-lazy-src! 'rest (lambda (s _b) (jolt-seq (seq-more s)))))
 (define lz-map-more
   (register-lazy-src! 'map-more
     (lambda (f s) (map-seq f (jolt-seq (seq-more s))))))
@@ -218,11 +237,11 @@
   (register-lazy-src! 'remove-more
     (lambda (pred s) (filter-seq pred (jolt-seq (seq-more s)) #f))))
 (define lz-str-seq
-  (register-lazy-src! 'str-seq (lambda (s i) (str->seq s (fx+ i 1)))))
+  (register-pure-lazy-src! 'str-seq (lambda (s i) (str->seq s (fx+ i 1)))))
 (define lz-range-from
-  (register-lazy-src! 'range-from (lambda (n _b) (range-from (+ n 1)))))
+  (register-pure-lazy-src! 'range-from (lambda (n _b) (range-from (+ n 1)))))
 (define lz-repeat
-  (register-lazy-src! 'repeat
+  (register-pure-lazy-src! 'repeat
     (lambda (n end+step) (range-chunked n (car end+step) (cdr end+step) sk-repeat))))
 (define lz-iterate
   (register-lazy-src! 'iterate (lambda (f x) (jolt-iterate f (jolt-invoke1 f x)))))
@@ -230,7 +249,7 @@
 ;; coll's seq and starting over at its end. A cell holds the whole seq and its
 ;; place in it, so no element is realized ahead of the walk.
 (define lz-cycle
-  (register-lazy-src! 'cycle
+  (register-pure-lazy-src! 'cycle
     (lambda (all cur)
       (let ((n (jolt-next cur)))
         (cycle-cells all (if (jolt-nil? n) all n))))))
@@ -243,7 +262,7 @@
 ;; tail holds x and how many elements follow it (#f = unbounded), so a drop can
 ;; skip ahead instead of walking (repeat-skip), as Repeat's IDrop does.
 (define lz-repeat-val
-  (register-lazy-src! 'repeat-val (lambda (x left) (repeat-cells x left))))
+  (register-pure-lazy-src! 'repeat-val (lambda (x left) (repeat-cells x left))))
 (define (repeat-cells x n)            ; the first N elements (#f = all of them)
   (if (and n (<= n 0))
       jolt-empty-list
@@ -264,9 +283,9 @@
     (lambda (pred s) (jolt-seq (filter-seq pred (jolt-seq (na-chunk-rest s)) #f)))))
 ;; range carries four values through three slots: step and kind share the last.
 (define lz-range
-  (register-lazy-src! 'range
+  (register-pure-lazy-src! 'range
     (lambda (v rest) (jolt-seq (range-chunked v (car rest) (cadr rest) (caddr rest))))))
-(define lz-empty (register-lazy-src! 'empty (lambda (_a _b) jolt-empty-list)))
+(define lz-empty (register-pure-lazy-src! 'empty (lambda (_a _b) jolt-empty-list)))
 ;; take's walk is a top-level fn, not a named let, so a cell's tail can name it
 (define (take-walk n s)
   (cond
@@ -274,7 +293,7 @@
     ((fx=? n 1) (cseq-lazy (seq-first s) (make-lazy-src lz-empty #f #f)))
     (else (cseq-lazy (seq-first s) (make-lazy-src lz-take-walk (fx- n 1) s)))))
 (define lz-take-walk
-  (register-lazy-src! 'take-walk (lambda (n s) (take-walk n (jolt-seq (seq-more s))))))
+  (register-pure-lazy-src! 'take-walk (lambda (n s) (take-walk n (jolt-seq (seq-more s))))))
 ;; How many elements a take/drop count steps over. clojure.core counts down with
 ;; (dec n) while (pos? n), so a positive count is ceil(n) steps whatever its type:
 ;; (take 1.5 xs) is two elements, (take 1/2 xs) one. Answers a fixnum, or 'all for
@@ -295,18 +314,7 @@
          (cond ((eq? n 'all) (jolt-seq coll))
                ((fx<=? n 0) jolt-empty-list)    ; (take 0 coll) must not seq its source
                (else (take-walk n (jolt-seq coll)))))))))
-;; The producers that call no user code: a descriptor of one run twice by two racing
-;; threads builds two equal cells and nothing observable differs (what they force is
-;; itself once-only), so a cell holding one needs no claim among threads -- the
-;; forcer runs it and compare-and-swaps the answer in, and a forcer that lost takes
-;; the winner's (cell-run-pure!). A claim costs a record, a dynamic-wind and its two
-;; closures per cell (~190 B, measured), which made a char seq 80 B a step single-
-;; threaded and 272 B once any thread had been forked. map, filter, iterate,
-;; take-while and the like call a user function, which must run once, and stay
-;; claimed. take is not here: it seqs an arbitrary coll (user code) on its first step.
-(define pure-lazy-src-fns
-  (list lz-str-seq lz-range-from lz-range lz-repeat lz-repeat-val lz-empty lz-take-walk lz-cycle lz-rest))
-(define (lazy-src-pure? t) (and (memq (lazy-src-fn t) pure-lazy-src-fns) #t))
+(define (lazy-src-pure? t) (hashtable-contains? pure-lazy-src-tbl (lazy-src-fn t)))
 ;; clojure.core/list? — Clojure's (instance? IPersistentList x), which among the
 ;; seq flavors only PersistentList is.
 (define (cseq-list? s) (fx=? (cseq-kind s) sk-list))
@@ -778,7 +786,7 @@
 (define (hamt-mode-kind mode)
   (cond ((fx=? mode 0) sk-hashmap-seq) ((fx=? mode 1) sk-key-seq) (else sk-val-seq)))
 (define lz-hamt-chunk
-  (register-lazy-src! 'hamt-chunk
+  (register-pure-lazy-src! 'hamt-chunk
     (lambda (m mode+path) (hamt-chunk-seq m (car mode+path) (cdr mode+path)))))
 (define (hamt-chunk-seq m mode path)
   (let ((buf (make-vector seq-chunk-size)))

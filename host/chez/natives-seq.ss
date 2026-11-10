@@ -316,7 +316,7 @@
 ;; vec-reduce fast paths, so a descending seq wearing those fields would make all
 ;; three answer for the wrong direction.
 (define lz-vec-rseq
-  (register-lazy-src! 'vec-rseq (lambda (v i) (vec->rseq v (fx- i 1)))))
+  (register-pure-lazy-src! 'vec-rseq (lambda (v i) (vec->rseq v (fx- i 1)))))
 (define (vec->rseq v i)
   (if (fx<? i 0)
       jolt-nil
