@@ -650,9 +650,11 @@
     (lambda ()
       (unless fork (set! fork (foreign-procedure "fork" () int)))
       (disable-interrupts)
-      (mutex-acquire #%$tc-mutex)
+      ;; through the counting wrapper, as the collector's rendezvous takes this mutex
+      ;; (scheme-adapter-runtime.ss): every lock the runtime takes is one it can tell it holds
+      (jolt-lock! #%$tc-mutex)
       (let ((pid (if (= (jolt-active-threads) 1) (fork) -2)))
-        (mutex-release #%$tc-mutex)
+        (jolt-unlock! #%$tc-mutex)
         (when (= pid 0) (jolt-after-fork-child!))
         (enable-interrupts)
         pid))))
