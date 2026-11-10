@@ -550,7 +550,13 @@
 ;; Pools made with jolt-fiber-pool-make are not restarted: their carriers are gone
 ;; too, and a spawn onto one parks; a forking program makes them after the fork.
 (define jolt-after-fork-hooks '())   ; jolt.host/after-fork-add!: (thunk ...), newest first
+;; The reset runs with interrupts disabled, whatever its caller did: a timer or a signal taken
+;; partway would run the scheduler over bookkeeping that is half the parent's.
 (define (jolt-after-fork-child!)
+  (disable-interrupts)
+  (jolt-after-fork-child!*)
+  (enable-interrupts))
+(define (jolt-after-fork-child!*)
   ;; the process's locks are made afresh before anything here takes one (locks.ss,
   ;; define-process-local): a thread fork(2) did not copy may hold one at the fork instant without
   ;; counting as active, as the timer thread whose timed wait fired holds timeout-mu while it waits
@@ -631,6 +637,26 @@
     ;; closes the ends it inherited), oldest first
     (for-each (lambda (h) (h)) (reverse jolt-after-fork-hooks))))
 (def-var! "jolt.host" "after-fork-child!" (lambda () (jolt-after-fork-child!) jolt-nil))
+;; (jolt.host/fork-alone) -> the child's pid in the parent, 0 in the child, -2 when the fork is
+;; refused because another thread is running Scheme at that instant (a fork beside one breaks the
+;; child). The one way to fork a jolt process: the count and the fork are made under Chez's
+;; $tc-mutex with interrupts disabled, and the child resets itself (jolt-after-fork-child!)
+;; BEFORE interrupts return. A caller that enabled them first let a preemption switch the child
+;; to the scheduler over the parent's run queue, which ran the parent's ready fibers in the child
+;; (a Seon root's agents, 2026-11-10). The foreign entry is made at the first call, so loading
+;; this file asks nothing of a platform without fork(2).
+(define jolt-fork-alone
+  (let ((fork #f))
+    (lambda ()
+      (unless fork (set! fork (foreign-procedure "fork" () int)))
+      (disable-interrupts)
+      (mutex-acquire #%$tc-mutex)
+      (let ((pid (if (= (jolt-active-threads) 1) (fork) -2)))
+        (mutex-release #%$tc-mutex)
+        (when (= pid 0) (jolt-after-fork-child!))
+        (enable-interrupts)
+        pid))))
+(def-var! "jolt.host" "fork-alone" (lambda () (jolt-fork-alone)))
 ;; (jolt.host/after-fork-add! f): f, a fn of no arguments, runs in every forked child that calls
 ;; after-fork-child!, after the runtime has reset itself. For a library's own state across a fork
 (def-var! "jolt.host" "after-fork-add!"

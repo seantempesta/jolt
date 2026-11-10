@@ -376,6 +376,20 @@
       (check (str "a " pump " end: the end is still open both ways after it")
              (do (a/>!! (:out y) {:id 5}) (= {:id 5} (take-within 5000 (:in x)))) nil))
     (r/close! x) (r/close! y)))
+;; An end whose writer throws (a codec that cannot encode a value, nor the answer sent in its
+;; place) is dead for a reason of its own: its socket is shut down, so the peer's :in closes and
+;; a take answers nil. Before, the dead end's reader kept the descriptor open and the peer's take
+;; never ended (found when a removed jolt.ffi call form made every writer throw).
+(doseq [pump [:thread :fiber]]
+  (let [[fa fb] (r/socketpair)
+        bad (assoc r/edn-codec :encode (fn [_] (throw (ex-info "cannot encode" {}))))
+        x (r/open fa {:pump pump :codec bad}) y (r/open fb {:pump pump})]
+    (a/>!! (:out x) {:id 1})
+    (check (str "a " pump " end whose writer throws ends its peer's wait: the peer's :in closes")
+           (let [[v c] (a/alts!! [(:in y) (a/timeout 5000)])] (and (nil? v) (= c (:in y)))) nil)
+    (check (str "a " pump " end whose writer throws closes its own :in")
+           (let [[v c] (a/alts!! [(:in x) (a/timeout 5000)])] (and (nil? v) (= c (:in x)))) nil)
+    (r/close! x) (r/close! y)))
 (check "any other errno is a defect, thrown with it (EBADF, 9)"
        (= {:errno 9} (try (r/write-step 9) nil (catch clojure.lang.ExceptionInfo e (ex-data e)))))
 
