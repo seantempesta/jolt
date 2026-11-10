@@ -1826,6 +1826,83 @@
 (define jolt-stdin-poll-fd (box #f))          ; its descriptor, or #f
 (define jolt-stdin-waits (box 0))             ; times a wait went to sleep: the work count
 (def-var! "jolt.host" "stdin-waits" (lambda () (unbox jolt-stdin-waits)))
+;; The host calls the stdin wait makes, and the poller bridge process.ss's pipe
+;; reads share. They live here, not in process.ss, because process.ss is lazy
+;; (rt.ss lazy-load) and this file may not name a lazy file's definitions
+;; (tools/lazy-shims-gen.ss, rule eager-ref); process.ss, loaded after this file,
+;; uses them by name.
+;; errno, to tell a waitpid that was merely interrupted (EINTR — retry) from one
+;; that can never succeed (ECHILD — the child is gone, retrying is an infinite
+;; loop). All three spellings of the location accessor: Darwin/BSD, glibc/musl,
+;; then bionic (Android — __errno_location does not exist there, and leaving it
+;; out reads every error as 0, so an EINTR retry never fires).
+(define proc-errno-loc
+  (or (jolt-foreign-proc-safe "__error" '() 'void*)
+      (jolt-foreign-proc-safe "__errno_location" '() 'void*)
+      (jolt-foreign-proc-safe "__errno" '() 'void*)))
+(define (proc-errno)
+  (if proc-errno-loc (guard (e (#t 0)) (sa-foreign-ref 'int (proc-errno-loc) 0)) 0))
+
+;; jolt.socket is the only thing in the tree that requires jolt.io-poller, so a
+;; program that drives subprocesses from fibers without ever touching a socket
+;; — a build-tool wrapper, a shell pipeline — would find wait-ready unbound and
+;; take the blocking fallback below, pinning its carrier: exactly the starvation
+;; this whole file's R8 extension exists to remove. Autoload the poller instead,
+;; at the one moment it is known to be needed, and only when there IS a fiber to
+;; park: a plain thread keeps the cheaper blocking read rather than paying a
+;; private kqueue/epoll per wait.
+;;
+;; Safe from inside a port read even though a load can park and can race another
+;; thread's: loader.ss's claim protocol owns both cases (ldr-begin-load! steps
+;; 2-3), and leaning on it rather than on a latch of our own is what makes the
+;; CONCURRENT case come out right. Two fibers on two carriers reach their first
+;; EAGAIN at once routinely -- it is the ordinary shape of "read several
+;; subprocesses from go blocks", the thing this whole extension is for. A
+;; boolean "already tried" latch set before the load would let the second fiber
+;; skip straight past it, find the var still unbound because the first is only
+;; part way through, and take the blocking fallback -- clearing O_NONBLOCK on
+;; its own fd for good, so that one port never parks again for the life of the
+;; process. Calling load-namespace instead makes the second fiber WAIT on the
+;; first's claim (fiber-aware, via jolt-lock-parked, so it parks rather than
+;; pinning), then find a fully built namespace. Already-loaded is a hashtable
+;; lookup, and we only get here when the var is unbound anyway.
+;;
+;; The one thing the loader cannot decide for us is a load that FAILS
+;; (jolt.io-poller off the source roots in a trimmed install): the loader rolls
+;; its own mark back on a throw, deliberately, so a retry can work. Nothing
+;; about the next EAGAIN will have changed, though, so record the failure here
+;; and stop asking.
+(define proc-poller-load-failed #f)
+(define (proc-poller-autoload!)
+  (unless proc-poller-load-failed
+    (guard (e (#t (set! proc-poller-load-failed #t) #f))
+      (load-namespace "jolt.io-poller"))))
+
+;; Bridge to jolt.io-poller/wait-ready: var-deref never throws for a
+;; missing var -- jolt-var auto-vivifies a jolt-var-unbound placeholder
+;; instead (rt.ss:662-669), checkable via the record type's own
+;; predicate. Off a fiber an unbound var stays unbound (see
+;; proc-poller-autoload! above for why the load is fiber-only) and this
+;; returns #f, so the caller falls back to a real blocking wait it
+;; implements itself (the EAGAIN branches in
+;; proc-fd-input-port/proc-fd-output-port below -- a bare 0-byte return
+;; there would misread as EOF, since the pipe fd is genuinely
+;; non-blocking by then). On a fiber the same #f is only reachable when
+;; the autoload itself failed.
+(define (proc-poller-wait-ready fd filt-kw)
+  (let* ((f0 (var-deref "jolt.io-poller" "wait-ready"))
+         (f (if (and (jolt-var-unbound? f0) (jolt-current-fiber))
+                (begin (proc-poller-autoload!)
+                       (var-deref "jolt.io-poller" "wait-ready"))
+                f0)))
+    (if (jolt-var-unbound? f)
+        #f
+        (begin (jolt-invoke2 f fd filt-kw) #t))))
+
+(define proc-c-pipe  (jolt-foreign-proc-safe "pipe"  '(void*) 'int))
+(define proc-c-close (jolt-foreign-proc-safe "close" '(int)   'int))
+(define proc-c-write (jolt-foreign-proc-blocking "write" '(int void* size_t) 'ssize_t))
+
 (define jolt-poll-fn (jolt-foreign-proc-blocking "poll" '(void* unsigned-long int) 'int))
 (define jolt-poll-eintr 4)
 ;; Sleeps until fd has something to read, hangs up or errors, or the thread is
