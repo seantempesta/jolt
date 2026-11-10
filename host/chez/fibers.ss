@@ -855,6 +855,33 @@
                           (format "the procedure ~a" (or (and code (code 'name)) "?"))))
         (else "a value")))
 
+;; What a procedure is, for a fiber the dump cannot show frames of (a running one has no saved
+;; continuation; a go block's step is a bare procedure): the vars it and the closures it holds
+;; were defined as or call, by the same reading jolt-frame-vars makes of a frame's variables,
+;; three closures deep. A compiled fn's code is unnamed, so this is the only name it has.
+(define (jolt-procedure-holds p)
+  (let ((seen '()))
+    (let walk ((v p) (depth 0))
+      (when (and (procedure? v) (fx<? depth 4))
+        (cond ((proc-name-of v)
+               => (lambda (nm) (let ((s (format "~a/~a" (car nm) (cdr nm))))
+                                 (unless (member s seen) (set! seen (cons s seen)))))))
+        (guard (e (#t (void)))
+          (let ((o (inspect/object v)))
+            (when (eq? 'procedure (o 'type))
+              ;; its code's own label, where the emitter gave one (jfn$<ns>/<def>$<n>)
+              (let* ((code (o 'code)) (nm (and code (code 'name))))
+                (when (and nm (not (member nm seen))) (set! seen (cons nm seen))))
+              (let loop ((i 0))
+                (when (fx<? i (o 'length))
+                  (let* ((r (o 'ref i))
+                         (x (and (eq? 'variable (r 'type)) ((r 'ref) 'value))))
+                    (cond ((and x (var-cell? x))
+                           (let ((s (format "~a/~a" (var-cell-ns x) (var-cell-name x))))
+                             (unless (member s seen) (set! seen (cons s seen)))))
+                          ((procedure? x) (walk x (fx+ depth 1)))))
+                  (loop (fx+ i 1)))))))))
+    (reverse seen)))
 (define (jolt-fiber-dump port)
   (let* ((fs (jolt-fiber-registry-live))
          (carrier-index (lambda (c) (let ((cs jolt-fiber-carriers))
@@ -890,8 +917,12 @@
                                             ((fx>? (string-length t) 160) (format " (a form of ~a chars)" (string-length t)))
                                             (else (string-append " " t)))))
                            (loop (cdr fr) (fx+ i 1))))))))
-          ((jolt-fiber-sm f) => (lambda (sm) (fprintf port "  a CPS step: ~a~%" (jolt-fiber-describe-wait sm))))
-          (else (fprintf port "  no saved continuation (~a)~%" (jolt-fiber-state f)))))
+          ((jolt-fiber-sm f)
+           => (lambda (sm) (fprintf port "  a CPS step: ~a~a~%" (jolt-fiber-describe-wait sm)
+                                    (if (procedure? sm) (format " holding [~{~a~^ ~}]" (jolt-procedure-holds sm)) ""))))
+          ;; no frames to show, so the fiber is named by what its entry thunk holds
+          (else (fprintf port "  no saved continuation (~a); entered through [~{~a~^ ~}]~%"
+                         (jolt-fiber-state f) (jolt-procedure-holds (jolt-fiber-thunk f))))))
       live (iota (length live)))
     (flush-output-port port)))
 
