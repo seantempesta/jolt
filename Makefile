@@ -122,7 +122,7 @@ endif
 
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotfingerprint asynctimer buildlibsmoke buildsmoke reprobuildsmoke profilebuildsmoke embeddedresources \
-  aotcachebudget providerfirstuse fibersecondmutator fiberuncaught aotcachepathsmoke aotcachesourcepathsmoke aotcachestarfilesmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
+  aotcachebudget providerfirstuse fibersecondmutator fiberuncaught buildemptycacheentryaotcachepathsmoke aotcachesourcepathsmoke aotcachestarfilesmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
   readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling zipmemory lazyscaling \
   devbootsmoke devirt directlink mintgate ffi fibers fiberspoll fieldjoin fieldnum fieldread flarr fnform poolshape coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inferscaling inline inline-body irvalidate statlayout \
@@ -192,7 +192,7 @@ CI-GATES := submodules values recordinline corpus nsaudit unit documented grenad
   protoret accfix pic narrow directlink mintgate directcall defmetacells staticsite arraymap recfast recfold arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flonumdisp flarr \
   fnform poolshape coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost recordshadow emittedheads adaptercheck hostprops normalizecheck hostregistry hostarity enummodel imagecoverage lazyshims foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke numequivalloc analyzealloc emitalloc treeseqcost hashsetbulkcost imagefnforms imagelegacyclaim \
-  gatebootsmoke aotcachesmoke aotcachebudget providerfirstuse fibersecondmutator fiberuncaught aotcachepathsmoke aotcachesourcepathsmoke aotcachestarfilesmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck buildunitwrite threadeddeadlock forkheldlocks oomafterrendezvous heaphistogram siginfodump \
+  gatebootsmoke aotcachesmoke aotcachebudget providerfirstuse fibersecondmutator fiberuncaught buildemptycacheentryaotcachepathsmoke aotcachesourcepathsmoke aotcachestarfilesmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck buildunitwrite threadeddeadlock forkheldlocks oomafterrendezvous heaphistogram siginfodump \
   systemstreams closedstdout stderrsplit userdirpaths mimetypes utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer ticks interruptnest monitorescape windescape threadsafety maskedacquire ioerrno cas flow tickbudget remotechan
 TEST-GATES := submodules selfhost ci
@@ -2236,6 +2236,11 @@ fibersecondmutator:
 # uncaught-exception handler, as a thread's does.
 fiberuncaught:
 	@sh test/chez/fiber-uncaught.sh
+
+# An empty file under a build-cache key is no compiled unit: a build over one
+# compiles the unit again.
+buildemptycacheentry: testbin
+	@JOLT_BIN="$${JOLT_BIN:-target/release/jolt}" sh test/chez/build-empty-cache-entry.sh
 
 # System/in, System/out, System/err: the process streams and the classes the JVM
 # reports for them. Needs a real pipe on stdin, so it is a script rather than a
