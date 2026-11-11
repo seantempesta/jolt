@@ -30,6 +30,16 @@
 ;; pointer that publishes it, so a reader that sees the pointer sees the
 ;; object; a reader's own loads are dependent and need nothing (the lock
 ;; version never fenced a deref either).
+;;
+;; A store-load fence after each successful CAS, of the value or of the watches,
+;; orders that store ahead of the thread's next load of the other slot, as the
+;; JVM's volatiles do: a swap! then reads the watches, an add-watch then reads
+;; the value (a deref), and with the fence one of the two always sees the other's
+;; store. Without it AArch64 lets each load pass its own CAS's store (Chez's CAS
+;; is a bare ldxr/stxr), and a thread that adds a watch and then checks the value
+;; missed a change that the changer's notify missed too (gate atomwatchorder).
+;; The writer pays; deref stays one plain load. memory-order-release is the
+;; fence: CSUG gives it store-load, and on AArch64 it is dmb ish.
 (define-record-type jolt-atom
   (fields (mutable val) (mutable watches) (mutable validator) lock)
   (nongenerative jolt-atom-v3))
@@ -113,7 +123,9 @@
 ;; success. The compute step (f) runs outside this; a loser recomputes.
 (define (jolt-atom-cas! a old nv)
   (when jolt-mt? (memory-order-release))
-  (sa-record-cas! a jolt-atom-val-slot old nv))
+  (and (sa-record-cas! a jolt-atom-val-slot old nv)
+       ;; the store-load fence: the notify that follows reads the watches after it
+       (begin (when jolt-mt? (memory-order-release)) #t)))
 ;; Unconditional exchange (AtomicReference.getAndSet): the old value.
 (define (jolt-atom-exchange! a v)
   (let retry ()
@@ -258,6 +270,11 @@
       (jolt-with-mutex iref-tbl-mu (hashtable-ref iref-validator-tbl r jolt-nil))
       jolt-nil))
 (define (iref-notify r old new)
+  ;; the store-load fence: the caller has just stored the reference's value (an
+  ;; agent's state, a ref's commit, a var's root), and a thread adding the first
+  ;; watch of the process bumps iref-writes and then reads that value; one of the two
+  ;; must see the other's store, as for an atom (above)
+  (when jolt-mt? (memory-order-release))
   (for-each (lambda (kv) (jolt-invoke4 (cdr kv) (car kv) r old new))
             (reverse (iref-watches-of r))))
 (define (iref-validate r v)
@@ -291,7 +308,10 @@
     (let* ((ws (jolt-atom-watches a)) (nws (f ws)))
       ;; NWS is a fresh alist that a swap! on another thread walks
       (memory-order-release)
-      (unless (sa-record-cas! a jolt-atom-watches-slot ws nws) (retry)))))
+      (if (sa-record-cas! a jolt-atom-watches-slot ws nws)
+          ;; the store-load fence: a deref that follows reads the value after it
+          (when jolt-mt? (memory-order-release))
+          (retry)))))
 (define (jolt-add-watch a key f)
   (cond
     ((jolt-atom? a)
@@ -302,6 +322,8 @@
        (iref-tbl-bump!)
        (hashtable-set! iref-watch-tbl a
          (jolt-watch-add (hashtable-ref iref-watch-tbl a '()) key f)))
+     ;; the store-load fence: a deref that follows reads the value after the bump
+     (when jolt-mt? (memory-order-release))
      a)
     ((declared-method a "clojure.lang.IRef" "addWatch" 3)
      => (lambda (m) (jolt-invoke m a key f)))
