@@ -1307,9 +1307,16 @@
 ;; jolt.host/gc-full!) measures the live set as the policy's own do, so what the
 ;; heap may grow by afterwards is sized from it rather than from whatever was live
 ;; at the policy's last full one. Raises what sa-gc-collect raises.
-(define (jolt-collect-full!)
-  (sa-gc-collect)
+;; The measuring is the collector's work too (sa-collector-work): none of it is counted
+;; to the thread that asked.
+(define (jolt-collect-full!) (sa-collector-work jolt-collect-full-now!))
+(define (jolt-collect-full-now!)
+  (sa-gc-collect-now)
   (set! gc-live-after-full (sa-bytes-allocated)))
+;; System.gc and Runtime.gc: a hint, which never throws. The guard is inside the uncounted
+;; extent, so what it allocates is not the caller's either.
+(define (jolt-collect-full-hint!) (sa-collector-work jolt-collect-full-hint-now!))
+(define (jolt-collect-full-hint-now!) (guard (e (#t #f)) (jolt-collect-full-now!)))
 ;; How far the heap may grow past the live set before the older generations are
 ;; collected: garbage promoted before then stays, so work that holds nothing can
 ;; raise the footprint by up to this (jolt.host/gc-old-growth-bytes).

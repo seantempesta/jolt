@@ -58,7 +58,19 @@
 ;; System.gc must hint, never throw. Any other collector error still raises.
 (define sa-full-collect-requested? #f)
 (define sa-collect-handler-installed? #f)
-(define (sa-gc-collect)
+;; What the request allocates on its way (the guard's handler, the rendezvous: 608 B, or
+;; 704 B when another thread was active) is the collector's bookkeeping, like the
+;; collection's own, never the caller's: taken back from the calling thread's count where
+;; the Chez keeps one ((cs)thread_bytes_uncount), so a call reads the same bytes whether or
+;; not it asked for a collection.
+(define sa-collector-work
+  (if (and (foreign-entry? "(cs)thread_bytes_allocated") (foreign-entry? "(cs)thread_bytes_uncount"))
+      (let ((thread-bytes (foreign-procedure "(cs)thread_bytes_allocated" () uptr))
+            (thread-bytes-uncount (foreign-procedure "(cs)thread_bytes_uncount" (uptr) void)))
+        (lambda (f) (let ((since (thread-bytes))) (f) (thread-bytes-uncount since))))
+      (lambda (f) (f))))
+(define (sa-gc-collect) (sa-collector-work sa-gc-collect-now))
+(define (sa-gc-collect-now)
   (let loop ((tries (if sa-collect-handler-installed? 0 100)))
     (let ((r (guard (e (#t (if (and (message-condition? e)
                                     (string=? (condition-message e)

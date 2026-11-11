@@ -457,7 +457,7 @@
                      ;; System.gc is a HINT on the JVM and never throws; Chez's
                      ;; collect refuses when multiple threads are active, so a
                      ;; guarded no-op is the faithful behavior under live threads.
-                     (guard (e (#t #f)) (jolt-collect-full!))
+                     (jolt-collect-full-hint!)
                      jolt-nil))
         ;; No finalizers on this host, so running them is genuinely a no-op — which
         ;; is also all the JVM promises (a hint, deprecated for removal since 18).
