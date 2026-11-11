@@ -114,8 +114,13 @@
           ;; #t while nobody has read this fiber's outcome, for a fiber whose
           ;; error is reported if it is collected unread (jolt-fiber-unread-watch!);
           ;; #f for every other fiber, and once a monitor is registered on it
-          (mutable unread))
-  (nongenerative jolt-fiber-v11))
+          (mutable unread)
+          ;; where it was spawned, for the dump (jolt-fiber-dump-site): the string
+          ;; "ns:line" a go form's expansion passes, one constant every spawn from
+          ;; that form shares, else the procedure the spawner handed over (its body:
+          ;; a fn literal's code name says the fn it was written in). Set at the spawn.
+          site)
+  (nongenerative jolt-fiber-v12))
 
 ;; --- the per-fiber dynamic slice ---------------------------------------------
 ;; R2 (jolt-nvpr.3). jolt's `binding` macro pushes by calling the
@@ -354,8 +359,27 @@
           ;; default pool. live: how many fibers spawned onto it have not
           ;; finished, counted under mu for a pool carrier only, so a shut-down
           ;; pool's carrier knows when it may stop (see jolt-fiber-pool-make).
-          pool (mutable live))
-  (nongenerative jolt-carrier-v7))
+          pool (mutable live)
+          ;; (chez-thread-id . os-thread-id) of the thread running this carrier's
+          ;; loop, set when the loop starts, #f before: what the fiber dump's header
+          ;; prints, so a native sample's thread is matched to a carrier
+          (mutable os-thread))
+  (nongenerative jolt-carrier-v8))
+
+;; (jolt-thread-ids) -> (chez-thread-id . os-thread-id): the calling thread's id as Chez
+;; numbers it (get-thread-id, the dump's "on thread") and as the OS does, which a native
+;; sample prints (macOS pthread_threadid_np, `sample`'s Thread_N; Linux gettid, perf's and
+;; /proc's tid), or #f for the second where the platform has neither. The foreign
+;; procedure is made once, here, at load: a carrier asks once, as its loop starts.
+(define jolt-os-thread-id
+  (cond ((foreign-entry? "pthread_threadid_np")
+         (let ((tid (foreign-procedure "pthread_threadid_np" (uptr u8*) int)))
+           (lambda () (let ((b (make-bytevector 8 0)))
+                        (and (fx=? 0 (tid 0 b)) (bytevector-u64-native-ref b 0))))))
+        ((foreign-entry? "gettid")
+         (let ((tid (foreign-procedure "gettid" () int))) (lambda () (tid))))
+        (else (lambda () #f))))
+(define (jolt-thread-ids) (cons (get-thread-id) (jolt-os-thread-id)))
 
 ;; (jolt-fiber-bump-sm-parks! f) / (jolt-fiber-bump-chan-parks! f) — called by the
 ;; parking fiber, on its own carrier's field, so no two threads touch one field.
@@ -453,7 +477,7 @@
         (do ((i 0 (fx+ i 1))) ((fx=? i n))
           (vector-set! v i
             (make-jolt-carrier (make-mutex) (make-condition) #f #f #f
-                               (make-jolt-dslice #f #f #f) #f #f 0 0 0 0 #f 0)))
+                               (make-jolt-dslice #f #f #f) #f #f 0 0 0 0 #f 0 #f)))
         (set! jolt-fiber-carriers v)))
     (jolt-unlock! jolt-fiber-rr-mu)))
 
@@ -743,7 +767,10 @@
 ;; (dyn-binding-stack) for a thread today; *txn* is always #f so a child
 ;; spawned inside a dosync cannot join the parent's transaction (ref-sets into
 ;; the parent's log would be committed by the parent, not the child).
-(define (sa-fiber-spawn thunk) (jolt-fiber-spawn* thunk #f #f))
+(define (sa-fiber-spawn thunk) (jolt-fiber-spawn* thunk #f #f thunk))
+;; The same, with where it was spawned (the fiber's site field) given: a spawn that
+;; wraps the caller's body names the body, or the site its go form passed.
+(define (jolt-fiber-spawn-at thunk site) (jolt-fiber-spawn* thunk #f #f site))
 
 ;; F's interrupt box, made the first time it is needed. Only F's own code or a
 ;; spawn that binds a Thread object before F runs reaches here, so no two threads
@@ -762,21 +789,21 @@
 ;; BEFORE it can run: a virtual thread started from a Thread object (java/
 ;; concurrency.ss) binds that object to the fiber there, so the fiber's own
 ;; Thread/currentThread can never see it unbound.
-(define (jolt-fiber-spawn* thunk ibox before-run)
-  (jolt-fiber-spawn-on* (jolt-fiber-pick!) thunk ibox before-run))
+(define (jolt-fiber-spawn* thunk ibox before-run site)
+  (jolt-fiber-spawn-on* (jolt-fiber-pick!) thunk ibox before-run site))
 
 ;; The same, onto carrier c: the default pool's pick or a pool's.
 ;; A fiber is a second execution context beside the one spawning it, so the spawn
 ;; turns the single-threaded fast paths off for good (locks.ss jolt-mt?), before
 ;; the fiber can run.
-(define (jolt-fiber-spawn-on* c thunk ibox before-run)
+(define (jolt-fiber-spawn-on* c thunk ibox before-run site)
   (jolt-mark-mt!)
   (let ((f (make-jolt-fiber
             'ready thunk #f #f #f #f
             (make-jolt-dslice (jolt-slice-stack-param)
                               (jolt-slice-ns-param)
                               #f)
-            c #f '() 0 #f #f 0 #f ibox #f #f #f #f 0 #f #f)))
+            c #f '() 0 #f #f 0 #f ibox #f #f #f #f 0 #f #f site)))
     (jolt-fiber-register! f)
     (when ibox (jolt-fiber-own-ibox! f ibox))
     (when before-run (before-run f))
@@ -787,15 +814,17 @@
 ;; A hang is a fiber parked on something that never comes, and a native sample of the
 ;; process shows only the carrier idle in kevent. So every fiber is held, weakly (a
 ;; finished one is collected as before), from its spawn, and (jolt-fiber-dump port) writes
-;; each: its state, carrier, what it is parked on, its engine ticks, and for a parked
-;; fiber the frames of the continuation it will resume (Chez's inspector: each frame's
-;; procedure name and source), innermost first. It reads and prints; it changes nothing.
+;; each: its state, carrier, what it is parked on, its engine ticks, where it was spawned,
+;; and for a parked fiber the frames of the continuation it will resume (Chez's inspector:
+;; each frame's procedure name and source), innermost first. It reads and prints; it
+;; changes nothing but the requests for running fibers' frames (jolt-fiber-frames-wanted).
 ;; SIGINFO runs it (fibers-async.ss), on the thread whose event check takes the signal: a
 ;; main carrier idle in its poller's kevent wakes for it. A forked child lists the fibers it
 ;; inherited as they were at the fork: those of the forking thread's carrier can resume in
-;; it, those of the carriers fork(2) did not copy never will (their carrier is not this one). It cannot reach a thread that is
-;; in a foreign call, a condition wait (a promise's deref) or a lock, which run no event
-;; check: a parked fiber's frames are reachable from any thread, a running thread's are not.
+;; it, those of the carriers fork(2) did not copy never will (their carrier is not this
+;; one). It cannot reach a thread that is in a foreign call, a condition wait (a promise's
+;; deref) or a lock, which run no event check: a parked fiber's frames are reachable from
+;; any thread, a running fiber's only from its own carrier, at its next safe point.
 ;; A weak list, not a weak table, pushed without a lock: a spawn CASes one weak pair onto
 ;; the box (a weak eq-hashtable's insert under a mutex cost 0.45 us a spawn, 20%). The pairs
 ;; whose fiber was collected are dropped when the pushes reach twice the live count at the
@@ -876,45 +905,152 @@
                           (format "the procedure ~a" (or (and code (code 'name)) "?"))))
         (else "a value")))
 
-(define (jolt-fiber-dump port)
-  (let* ((fs (jolt-fiber-registry-live))
-         (carrier-index (lambda (c) (let ((cs jolt-fiber-carriers))
-                                      (and cs (let loop ((i 0))
-                                                (cond ((fx=? i (vector-length cs)) #f)
-                                                      ((eq? c (vector-ref cs i)) i)
-                                                      (else (loop (fx+ i 1)))))))))
-         (live (filter (lambda (f) (not (memq (jolt-fiber-state f) '(done dead)))) fs)))
-    (fprintf port "jolt fiber dump: ~a live fibers of ~a held, on thread ~a~%"
-             (length live) (length fs) (get-thread-id))
-    (for-each
-      (lambda (f n)
-        (fprintf port "fiber ~a: ~a, carrier ~a, parked on ~a, wait state ~a, ~a ticks~%"
-                 n (jolt-fiber-state f) (or (carrier-index (jolt-fiber-carrier f)) "of a pool")
-                 (jolt-fiber-describe-wait (jolt-fiber-parked-on f))
-                 (or (jolt-fiber-wstate f) "none") (jolt-fiber-ticks f))
-        (cond
-          ;; a running fiber's k is the one it last parked with, stale: only a parked one's is shown
-          ((and (eq? 'parked (jolt-fiber-state f)) (jolt-fiber-k f))
-           => (lambda (k)
-                (let ((frames (jolt-continuation-frames k 40)))
-                  (let loop ((fr frames) (i 0))
-                    (cond ((null? (cdr fr))
-                           (unless (fx=? 0 (car fr)) (fprintf port "  ... ~a more frames~%" (car fr))))
-                          (else
-                           (let* ((v (cadar fr))
-                                  (t (and v (with-output-to-string (lambda () (write v)))))
-                                  (vars (caddar fr)))
-                             ;; a frame's source form, or its length where it is longer than a line
-                             (fprintf port "  ~a ~a~a~a~%" i (or (caar fr) "?")
-                                      (if (null? vars) "" (format " [~{~a~^ ~}]" vars))
-                                      (cond ((not t) "")
-                                            ((fx>? (string-length t) 160) (format " (a form of ~a chars)" (string-length t)))
-                                            (else (string-append " " t)))))
-                           (loop (cdr fr) (fx+ i 1))))))))
-          ((jolt-fiber-sm f) => (lambda (sm) (fprintf port "  a CPS step: ~a~%" (jolt-fiber-describe-wait sm))))
-          (else (fprintf port "  no saved continuation (~a)~%" (jolt-fiber-state f)))))
-      live (iota (length live)))
-    (flush-output-port port)))
+;; Where fiber f was spawned (its site field): "spawned at ns:line" for a go form, else by
+;; the procedure its spawner handed over: a fn literal's code name, jfn$<ns>/<def>$<n>
+;; (backend_scheme fnsrc-name), says the def it was written in, which is the fn that
+;; spawned it; a defined fn is named by its var (rt.ss proc-name-of).
+(define (jolt-fiber-site-text f)
+  (let ((s (jolt-fiber-site f)))
+    (cond
+      ((string? s) (string-append "spawned at " s))
+      ((procedure? s)
+       (let* ((p (proc-name-of s))
+              (code ((inspect/object s) 'code))
+              (nm (and code (code 'name))))
+         (cond
+           (p (format "spawned running ~a/~a" (car p) (cdr p)))
+           ((and (string? nm) (fx>? (string-length nm) 4) (string=? "jfn$" (substring nm 0 4)))
+            (let* ((body (substring nm 4 (string-length nm)))
+                   (slash (let loop ((i 0)) (cond ((fx=? i (string-length body)) #f)
+                                                  ((char=? #\/ (string-ref body i)) i)
+                                                  (else (loop (fx+ i 1))))))
+                   (dollar (and slash (let loop ((i (fx+ slash 1)))
+                                        (cond ((fx=? i (string-length body)) #f)
+                                              ((char=? #\$ (string-ref body i)) i)
+                                              (else (loop (fx+ i 1))))))))
+              (cond ((not (and slash dollar)) (string-append "spawned by " body))
+                    ((fx=? dollar (fx+ slash 1))
+                     (format "spawned by a fn at the top level of ~a" (substring body 0 slash)))
+                    (else (format "spawned by ~a" (substring body 0 dollar))))))
+           (nm (format "spawned running ~a" nm))
+           (else "spawned by a procedure with no name"))))
+      ((record? s) (format "spawned running a ~a" (record-type-name (record-rtd s))))
+      (else "spawned at a place not known"))))
+
+;; The frames of continuation k, innermost first: each frame's procedure, the vars it
+;; names, and its source form where the code carries one.
+(define (jolt-fiber-print-frames port k)
+  (let loop ((fr (jolt-continuation-frames k 40)) (i 0))
+    (cond ((null? (cdr fr))
+           (unless (fx=? 0 (car fr)) (fprintf port "  ... ~a more frames~%" (car fr))))
+          (else
+           (let* ((v (cadar fr))
+                  (t (and v (with-output-to-string (lambda () (write v)))))
+                  (vars (caddar fr)))
+             ;; a frame's source form, or its length where it is longer than a line
+             (fprintf port "  ~a ~a~a~a~%" i (or (caar fr) "?")
+                      (if (null? vars) "" (format " [~{~a~^ ~}]" vars))
+                      (cond ((not t) "")
+                            ((fx>? (string-length t) 160) (format " (a form of ~a chars)" (string-length t)))
+                            (else (string-append " " t)))))
+           (loop (cdr fr) (fx+ i 1))))))
+
+;; A running fiber's frames are on its carrier's stack, which Chez lets only that thread
+;; read (inspect/object reads a continuation; another thread's live stack is none). So a
+;; dump that asks for them (SIGINFO's) leaves each running fiber here, held weakly, with
+;; its number in the dump and the port, and the fiber prints its own at its next safe
+;; point: the preemption handler, while it holds no lock (jolt-fiber-preempt-handler), at
+;; most a quantum on. Nothing waits for it. A dump replaces the last one's requests, and
+;; makes them once it has written itself; each answer is made as text and written whole
+;; under jolt-fiber-frames-mu, so two never interleave on the port.
+(define jolt-fiber-frames-wanted (box '()))
+(define-process-local jolt-fiber-frames-mu (make-mutex))
+(define (jolt-fiber-frames-answer! f)
+  (let retry ()
+    (let* ((old (unbox jolt-fiber-frames-wanted))
+           (e (find (lambda (e) (eq? (car e) f)) old)))
+      (when e
+        (if (box-cas! jolt-fiber-frames-wanted old (remq e old))
+            (let ((port (cddr e))
+                  (text (call/cc
+                          (lambda (k)
+                            (call-with-string-output-port
+                              (lambda (p)
+                                (fprintf p "fiber ~a (running at the dump), ~a, at its next safe point:~%"
+                                         (cadr e) (jolt-fiber-site-text f))
+                                (jolt-fiber-print-frames p k)))))))
+              (jolt-with-mutex jolt-fiber-frames-mu
+                (put-string port text)
+                (flush-output-port port)))
+            (retry))))))
+
+;; (jolt-fiber-dump port [follow?]): the header (each carrier's thread, Chez's and the OS's,
+;; and the fiber it runs), then every live fiber, the running ones first and then by ticks,
+;; most first, so a fiber that spins is at the top; each with where it was spawned. follow?
+;; (SIGINFO's dump, whose port lives as long as the process) asks each running fiber for its
+;; frames at its next safe point (jolt-fiber-frames-wanted).
+(define jolt-fiber-dump
+  (case-lambda
+    ((port) (jolt-fiber-dump port #f))
+    ((port follow?)
+     (let* ((fs (jolt-fiber-registry-live))
+            (cs (or jolt-fiber-carriers '#()))
+            (carrier-index (lambda (c) (let loop ((i 0))
+                                         (cond ((fx=? i (vector-length cs)) #f)
+                                               ((eq? c (vector-ref cs i)) i)
+                                               (else (loop (fx+ i 1)))))))
+            (running? (lambda (f) (eq? 'running (jolt-fiber-state f))))
+            (live (list-sort
+                    (lambda (a b) (or (and (running? a) (not (running? b)))
+                                      (and (eq? (running? a) (running? b))
+                                           (> (jolt-fiber-ticks a) (jolt-fiber-ticks b)))))
+                    (filter (lambda (f) (not (memq (jolt-fiber-state f) '(done dead)))) fs)))
+            (numbered (map cons live (iota (length live))))
+            ;; the default pool's carriers, in order, then each pool carrier a fiber names
+            (carriers (let loop ((l live) (acc (reverse (vector->list cs))))
+                        (cond ((null? l) (reverse acc))
+                              ((memq (jolt-fiber-carrier (car l)) acc) (loop (cdr l) acc))
+                              (else (loop (cdr l) (cons (jolt-fiber-carrier (car l)) acc))))))
+            (pool-n 0))
+       (fprintf port "jolt fiber dump: ~a live fibers of ~a held, on thread ~a~%"
+                (length live) (length fs) (get-thread-id))
+       (for-each
+         (lambda (c)
+           (let ((ids (jolt-carrier-os-thread c))
+                 (on (filter (lambda (e) (and (running? (car e)) (eq? c (jolt-fiber-carrier (car e)))))
+                             numbered)))
+             (fprintf port "carrier ~a: ~a, ~a~%"
+                      (or (carrier-index c)
+                          (begin (set! pool-n (fx+ pool-n 1)) (format "~a of a pool" (fx- pool-n 1))))
+                      (if ids
+                          (format "thread ~a, os thread ~a" (car ids) (or (cdr ids) "not known"))
+                          "no thread started")
+                      (if (null? on)
+                          "running no fiber"
+                          (format "running fiber ~{~a~^, ~}" (map cdr on))))))
+         carriers)
+       (for-each
+         (lambda (e)
+           (let ((f (car e)) (n (cdr e)))
+             (fprintf port "fiber ~a: ~a, carrier ~a, parked on ~a, wait state ~a, ~a ticks, ~a~%"
+                      n (jolt-fiber-state f) (or (carrier-index (jolt-fiber-carrier f)) "of a pool")
+                      (jolt-fiber-describe-wait (jolt-fiber-parked-on f))
+                      (or (jolt-fiber-wstate f) "none") (jolt-fiber-ticks f)
+                      (jolt-fiber-site-text f))
+             (cond
+               ;; a running fiber's k is the one it last parked with, stale: only a parked one's is shown
+               ((and (eq? 'parked (jolt-fiber-state f)) (jolt-fiber-k f))
+                => (lambda (k) (jolt-fiber-print-frames port k)))
+               ((and follow? (running? f))
+                (fprintf port "  running: its frames follow, as fiber ~a, at its next safe point~%" n))
+               ((jolt-fiber-sm f) => (lambda (sm) (fprintf port "  a CPS step: ~a~%" (jolt-fiber-describe-wait sm))))
+               (else (fprintf port "  no saved continuation (~a)~%" (jolt-fiber-state f))))))
+         numbered)
+       (flush-output-port port)
+       (when follow?
+         (set-box! jolt-fiber-frames-wanted
+                   (map (lambda (e) (weak-cons (car e) (cons (cdr e) port)))
+                        (filter (lambda (e) (running? (car e))) numbered))))))))
 
 ;; --- preemption (swish's quantum, erlang.ss:872 and @yield) ------------------
 ;; Without this a fiber only ever leaves its carrier at a channel op, so a
@@ -1113,6 +1249,8 @@
       ;; again for another client (a sample, a run-interruptible poll), and a
       ;; fire between the enqueue and the switch would queue this fiber twice.
       (else
+       ;; a dump asked for the frames of the fibers running at it (jolt-fiber-frames-wanted)
+       (unless (null? (unbox jolt-fiber-frames-wanted)) (jolt-fiber-frames-answer! f))
        (disable-interrupts)
        (jolt-fiber-bump-preempts! f)
        (jolt-fiber-state-set! f 'ready)
@@ -2058,13 +2196,15 @@
   ;; test/chez/main-carrier-test.clj on stock Chez 10, none in 20 with the pool fixed).
   (when (foreign-entry? "(cs)collect_sweepers")
     ((foreign-procedure "(cs)collect_sweepers" (iptr) iptr) 0))
+  (jolt-carrier-os-thread-set! (vector-ref jolt-fiber-carriers 0) (jolt-thread-ids))
   (let* ((c (vector-ref jolt-fiber-carriers 0))
          (box (vector #f #f #f))    ; done? value error
-         (f (sa-fiber-spawn
+         (f (jolt-fiber-spawn-at
               (lambda ()
                 (guard (e (#t (vector-set! box 2 e) (vector-set! box 0 #t)))
                   (vector-set! box 1 (thunk))
-                  (vector-set! box 0 #t))))))
+                  (vector-set! box 0 #t)))
+              thunk)))
     (let loop ()
       (jolt-fiber-drain! c)
       (let* ((fired (jolt-timers-run-due!)) (next (cdr fired)))
@@ -2131,7 +2271,7 @@
     (vector-set! v 0 c0)
     (do ((i 1 (fx+ i 1))) ((fx=? i n))
       (vector-set! v i (make-jolt-carrier (make-mutex) (make-condition) #f #f #f
-                                          (make-jolt-dslice #f #f #f) #f #f 0 0 0 0 #f 0)))
+                                          (make-jolt-dslice #f #f #f) #f #f 0 0 0 0 #f 0 #f)))
     (set! jolt-fiber-carriers v)
     (do ((i 0 (fx+ i 1))) ((fx=? i n))
       (let ((c (vector-ref v i)) (name (string-append "jolt-carrier-" (number->string i))))
@@ -2165,6 +2305,7 @@
 ;; checked under the mutex AFTER a drain, so a stopped carrier finishes its
 ;; queue first.
 (define (jolt-fiber-carrier-loop c)
+  (jolt-carrier-os-thread-set! c (jolt-thread-ids))
   ;; its idle wait is asleep (locks.ss): a fiber queued is what wakes it, which the detector reads
   (jolt-asleep-raw-counts #t)
   (let loop ()
@@ -2257,6 +2398,7 @@
 ;; A pool carrier's loop: the default carrier loop, except a stop only ends it
 ;; once nothing placed on it is left to run.
 (define (jolt-fiber-pool-carrier-loop c)
+  (jolt-carrier-os-thread-set! c (jolt-thread-ids))
   (let loop ()
     (jolt-fiber-drain! c)
     (jolt-lock! (jolt-carrier-mu c))
@@ -2278,7 +2420,7 @@
     (do ((i 0 (fx+ i 1))) ((fx=? i n))
       (vector-set! v i
         (make-jolt-carrier (make-mutex) (make-condition) #f #f #f
-                           (make-jolt-dslice #f #f #f) #f #f 0 0 0 0 p 0)))
+                           (make-jolt-dslice #f #f #f) #f #f 0 0 0 0 p 0 #f)))
     (jolt-pool-carriers-set! p v)
     (do ((i 0 (fx+ i 1))) ((fx=? i n))
       (let ((c (vector-ref v i)))
@@ -2319,12 +2461,14 @@
   (when (jolt-carrier-stop? c) (condition-signal (jolt-carrier-cv c)))
   (jolt-unlock! (jolt-carrier-mu c)))
 
-;; (jolt-fiber-pool-spawn p thunk) -> fiber, or #f if p is shut down.
-(define (jolt-fiber-pool-spawn p thunk)
+;; (jolt-fiber-pool-spawn p thunk site) -> fiber, or #f if p is shut down; site is
+;; where it was spawned (the fiber record's site field).
+(define (jolt-fiber-pool-spawn p thunk site)
   (let ((c (jolt-fiber-pool-reserve! p)))
     (and c
          (jolt-fiber-spawn-on* c thunk #f
-           (lambda (f) (jolt-fiber-monitor! f (lambda (err) (jolt-fiber-pool-release! c))))))))
+           (lambda (f) (jolt-fiber-monitor! f (lambda (err) (jolt-fiber-pool-release! c))))
+           site))))
 
 ;; (jolt-fiber-pool-shutdown! p) -> void. No new spawns; each carrier ends once
 ;; the fibers already on it have finished. Does not wait for them.

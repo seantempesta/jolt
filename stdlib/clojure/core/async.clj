@@ -436,18 +436,29 @@
           (when-not (sm-bail? e) (throw e))
           nil)))))
 
+(defn- go-site
+  "Where a go form is, \"ns:line\", for the fiber dump (host/chez/fibers.ss
+  jolt-fiber-dump): one string constant every spawn from the form shares. nil
+  when the reader gave the form no line."
+  [form]
+  (when-let [line (:line (meta form))]
+    (str (ns-name *ns*) ":" line)))
+
 (defmacro go
   "Spawn body as a process and return a channel carrying its value. Parking ops
   inside the body — including ones in functions it calls — park the process."
   [& body]
-  (if-let [f (sm-cps-go-body &env body)]
-    (list 'clojure.core.async/__sm-spawn f)
-    (list 'clojure.core.async/go-spawn (list* 'fn* [] body))))
+  (let [site (go-site &form)
+        [spawn f] (if-let [f (sm-cps-go-body &env body)]
+                    ['clojure.core.async/__sm-spawn f]
+                    ['clojure.core.async/go-spawn (list* 'fn* [] body)])]
+    (if site (list spawn f site) (list spawn f))))
 
 (defmacro go-loop
   "(go (loop bindings body...))"
   [bindings & body]
-  (list 'clojure.core.async/go (list* 'clojure.core/loop bindings body)))
+  (with-meta (list 'clojure.core.async/go (list* 'clojure.core/loop bindings body))
+    (meta &form)))
 
 ;; --- alts -------------------------------------------------------------------
 ;; do-alts uses a per-call handler registered on each channel (no poll loop).

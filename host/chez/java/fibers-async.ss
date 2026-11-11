@@ -179,33 +179,38 @@
 ;; read in fibers.ss (host setter jolt-fiber-carrier-count-set! for tests);
 ;; jolt-fiber-ensure-carrier! starts it at the first :fiber go spawn.
 
-;; (jolt-fiber-go-spawn thunk) -> buffered(1) channel. Conveys the parent's
-;; dynamic slice (sa-fiber-spawn reads the spawner's bindings; *txn* is never
-;; conveyed — a child spawned inside a dosync cannot join the parent's txn,
-;; the same rule async-go-spawn-thread enforces for threads).
-(define (jolt-fiber-go-spawn thunk)
-  (let ((w (ac-make 1 'fixed #f)))
-    (go-chan-register! w)                     ; before the spawn — see async.ss
-    (sa-fiber-spawn
-     (lambda ()
-       (*txn* #f)
-       (let ((r (guard (e (#t (cons #f e))) (cons #t (jolt-invoke thunk)))))
-         (if (car r)
-             (when (not (jolt-nil? (cdr r))) (jolt-async-give w (cdr r)))
-             (begin
-               (async-report-uncaught! "go/fiber body (channel closed)" (cdr r))
-               ;; Record it on the FIBER as well as on the channel. This guard is
-               ;; what keeps a throwing body from killing the fiber, which is
-               ;; right — the channel still has to be closed — but it also means
-               ;; the fiber reaches jolt-fiber-done! looking like a success, and
-               ;; a gate asking the fiber directly would read the failure as a
-               ;; clean run. The sm backend (sm.ss jolt-sm-drive) reaches
-               ;; jolt-fiber-dead! instead, which sets the same field.
-               (jolt-fiber-error-set! (jolt-current-fiber) (cdr r))))
-         ;; closes w, after publishing the outcome to the channel's monitors
-         (go-chan-finish! w (and (not (car r)) (cdr r))))))
-    (jolt-fiber-ensure-carrier!)
-    w))
+;; (jolt-fiber-go-spawn thunk site) -> buffered(1) channel; site is where it was
+;; spawned (the fiber record's site field): the "ns:line" a go form passes, else
+;; thunk. Conveys the parent's dynamic slice (sa-fiber-spawn reads the spawner's
+;; bindings; *txn* is never conveyed — a child spawned inside a dosync cannot join
+;; the parent's txn, the same rule async-go-spawn-thread enforces for threads).
+(define jolt-fiber-go-spawn
+  (case-lambda
+    ((thunk) (jolt-fiber-go-spawn thunk thunk))
+    ((thunk site)
+      (let ((w (ac-make 1 'fixed #f)))
+        (go-chan-register! w)                     ; before the spawn — see async.ss
+        (jolt-fiber-spawn-at
+         (lambda ()
+           (*txn* #f)
+           (let ((r (guard (e (#t (cons #f e))) (cons #t (jolt-invoke thunk)))))
+             (if (car r)
+                 (when (not (jolt-nil? (cdr r))) (jolt-async-give w (cdr r)))
+                 (begin
+                   (async-report-uncaught! "go/fiber body (channel closed)" (cdr r))
+                   ;; Record it on the FIBER as well as on the channel. This guard is
+                   ;; what keeps a throwing body from killing the fiber, which is
+                   ;; right — the channel still has to be closed — but it also means
+                   ;; the fiber reaches jolt-fiber-done! looking like a success, and
+                   ;; a gate asking the fiber directly would read the failure as a
+                   ;; clean run. The sm backend (sm.ss jolt-sm-drive) reaches
+                   ;; jolt-fiber-dead! instead, which sets the same field.
+                   (jolt-fiber-error-set! (jolt-current-fiber) (cdr r))))
+             ;; closes w, after publishing the outcome to the channel's monitors
+             (go-chan-finish! w (and (not (car r)) (cdr r)))))
+         site)
+        (jolt-fiber-ensure-carrier!)
+        w))))
 
 ;; Monitoring a go block is backend-neutral and lives with the go surface in
 ;; async.ss (go-chan-register! / go-chan-finish! / the go-monitor var). It
@@ -330,11 +335,12 @@
 ;; same arguments.
 (define (async-fiber-execute r)
   (let ((thunk (runnable->thunk r)))
-    (sa-fiber-spawn
+    (jolt-fiber-spawn-at
      (lambda ()
        (*txn* #f)
        (guard (e (#t (async-report-uncaught! "fiber-execute task" e)))
-         (jolt-invoke thunk))))
+         (jolt-invoke thunk)))
+     thunk)
     ;; a carrier may not exist yet on the very first spawn (fiber-spawn's own
     ;; postlude does this too) — without it the fiber sits ready and unrun.
     (jolt-fiber-ensure-carrier!)
@@ -421,7 +427,7 @@
       (let ((p (jolt-dump-port!)))
         (guard (e (#t (fprintf p "jolt fiber dump failed: ~a~%"
                                (if (condition? e) (call-with-string-output-port (lambda (p) (display-condition e p))) e))))
-          (jolt-fiber-dump p)
+          (jolt-fiber-dump p #t)
           (flush-output-port p))))))
 ;; The interrupt's throwable is a jolt value, raised as a throw would raise it,
 ;; so the fiber's own try/catch sees exactly what the caller passed.
@@ -456,7 +462,7 @@
 ;; reported (jolt-fiber-watch-unread!).
 (def-var! "jolt.host" "fiber-spawn"
   (lambda (f)
-    (let ((fib (sa-fiber-spawn (lambda () (*txn* #f) (jolt-invoke f)))))
+    (let ((fib (jolt-fiber-spawn-at (lambda () (*txn* #f) (jolt-invoke f)) f)))
       (jolt-fiber-watch-unread! fib)
       (jolt-fiber-ensure-carrier!)
       fib)))
@@ -499,7 +505,7 @@
   (lambda (fib) (or (jolt-fiber-pool-of fib) jolt-nil)))
 (def-var! "jolt.host" "fiber-pool-spawn"
   (lambda (p f)
-    (let ((fib (jolt-fiber-pool-spawn p (lambda () (*txn* #f) (jolt-invoke f)))))
+    (let ((fib (jolt-fiber-pool-spawn p (lambda () (*txn* #f) (jolt-invoke f)) f)))
       (if fib (begin (jolt-fiber-watch-unread! fib) fib) jolt-nil))))
 (def-var! "jolt.host" "fiber-pool-shutdown!"
   (lambda (p) (jolt-fiber-pool-shutdown! p) jolt-nil))

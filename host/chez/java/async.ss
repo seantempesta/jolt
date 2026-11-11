@@ -1094,10 +1094,15 @@
 ;; below and the workload table in the overlay's thread-call). jolt-fiber-go-spawn
 ;; is defined in fibers-async.ss, which loads after this file; the reference
 ;; resolves at call time, before any :fiber spawn can happen.
-(define (async-go-spawn thunk)
-  (if (eq? (go-backend-current) jolt-go-backend-fiber)
-      (jolt-fiber-go-spawn thunk)
-      (async-go-spawn-thread thunk)))
+;; (go-spawn thunk site): site is the "ns:line" of the go form, which its expansion
+;; passes when the reader gave the form a line (the overlay's go), for the fiber dump.
+(define async-go-spawn
+  (case-lambda
+    ((thunk) (async-go-spawn thunk thunk))
+    ((thunk site)
+     (if (eq? (go-backend-current) jolt-go-backend-fiber)
+         (jolt-fiber-go-spawn thunk site)
+         (async-go-spawn-thread thunk)))))
 
 ;; (fiber-spawn thunk) — ALWAYS a fiber, whatever *go-backend* says. This is the
 ;; other half of the thread-spawn bargain: thread-spawn asks for an OS thread by
