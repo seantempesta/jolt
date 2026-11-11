@@ -427,8 +427,15 @@
 ;; so the fiber's own try/catch sees exactly what the caller passed.
 (def-var! "jolt.host" "fiber-interrupt!"
   (lambda (fib throwable) (if (jolt-fiber-interrupt! fib throwable) #t #f)))
+;; A fiber its killer ended is not reported unread (jolt-fiber-watch-unread!): the
+;; killer chose that end and holds the fiber, as Java reports no ThreadDeath. Cleared
+;; only when the kill lands (true); interrupt! leaves the mark, since the fiber may
+;; catch it, and one that dies of it is reported, as an exception leaving a run is.
 (def-var! "jolt.host" "fiber-kill!"
-  (lambda (fib throwable) (if (jolt-fiber-kill! fib throwable) #t #f)))
+  (lambda (fib throwable)
+    (if (jolt-fiber-kill! fib throwable)
+        (begin (jolt-fiber-unread-set! fib #f) #t)
+        #f)))
 (def-var! "jolt.host" "fiber-masked" (lambda (f) (jolt-fiber-masked (lambda () (jolt-invoke f)))))
 (def-var! "jolt.host" "fiber-unmasked" (lambda (f) (jolt-fiber-unmasked (lambda () (jolt-invoke f)))))
 ;; Unguarded full collect for the R8 gate: System/gc swallows Chez's
