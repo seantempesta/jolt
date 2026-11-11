@@ -1022,14 +1022,18 @@
 ;; conveys its value once then closes (a nil result just closes). Dynamic bindings
 ;; are conveyed (Chez inherits the thread-parameter at fork; we install explicitly).
 
-;; Print an uncaught-exception report to stderr — the JVM routes a thread body's
-;; throw to the default uncaught-exception handler; silence here made a throwing
-;; worker indistinguishable from one that returned nil. Reporting failures are
-;; themselves swallowed (a worker must never die reporting).
+;; An uncaught throw of a go block, a fiber body, a fiber-execute task or a
+;; transducer's completion goes where a thread's goes (jolt-thread-uncaught!,
+;; concurrency.ss): to the default uncaught-exception handler when the program set
+;; one (Thread/setDefaultUncaughtExceptionHandler; core.async's go blocks reach it
+;; on the JVM through the pool thread they die on), with no thread to name, else
+;; to stderr -- silence here made a throwing worker indistinguishable from one
+;; that returned nil, and stderr alone told no one in a program that has a place
+;; for its errors. Reporting failures are themselves swallowed (a worker must
+;; never die reporting).
 (define (async-report-uncaught! where e)
   (guard (_ (#t #f))
-    (display (string-append "Exception in " where ":\n") (current-error-port))
-    (jolt-report-throwable e (current-error-port)))
+    (jolt-thread-uncaught! #f e (string-append "Exception in " where ":\n")))
   #f)
 
 ;; shared nil-put guard (was pasted at three put sites)

@@ -2690,7 +2690,7 @@
          (h (or (and th (jhost? th) (vector-ref (jhost-state th) 11))
                 default-uncaught-handler)))
     (if h
-        (guard (_ (#t #f)) (jolt-fi-call h "uncaughtException" th x))
+        (guard (_ (#t #f)) (jolt-fi-call h "uncaughtException" (or th jolt-nil) x))
         (guard (_ (#t #f))
           (display label (current-error-port))
           (jolt-report-throwable e (current-error-port))))))
