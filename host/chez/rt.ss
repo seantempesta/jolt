@@ -1030,8 +1030,19 @@
             (jolt-throw t))
           (error 'jolt (cadr p))))))
 ;; After each collection, on each thread that took part (sa-gc-install-after-rendezvous!): the
-;; policy's pending error, then the stack check.
-(define (jolt-after-collection!) (jolt-gc-raise-pending!) (jolt-stack-check!))
+;; policy's pending error, the stack check, then the spawned fibers collected with an error
+;; nobody read (jolt-fibers-collected!).
+(define (jolt-after-collection!)
+  (jolt-gc-raise-pending!)
+  (jolt-stack-check!)
+  (jolt-fibers-collected!))
+;; Report the spawned fibers collected with an error nobody read (fibers.ss
+;; jolt-fiber-unread-drain!). Run after the rendezvous above, and after a collection the program
+;; asked for (jolt-collect-full!), which with one thread active collects at once and passes no
+;; rendezvous. The reporter is fibers-async.ss's, called only for a fiber it watched, so never
+;; before that file is loaded.
+(define (jolt-fibers-collected!)
+  (jolt-fiber-unread-drain! (lambda (e) (jolt-fiber-report-unread! e))))
 ;; --- the GC overhead limit ----------------------------------------------------
 ;; The JVM's answer to a heap that fits but only just (UseGCOverheadLimit, on by
 ;; default; G1CollectedHeap::update_gc_overhead_counter in the JDK): after each
@@ -1306,16 +1317,17 @@
 ;; A full collection asked for by the program (System/gc, Runtime.gc,
 ;; jolt.host/gc-full!) measures the live set as the policy's own do, so what the
 ;; heap may grow by afterwards is sized from it rather than from whatever was live
-;; at the policy's last full one. Raises what sa-gc-collect raises.
+;; at the policy's last full one, then reports the fibers it collected with an error nobody
+;; read (jolt-fibers-collected!). Raises what sa-gc-collect raises.
 ;; The measuring is the collector's work too (sa-collector-work): none of it is counted
 ;; to the thread that asked.
-(define (jolt-collect-full!) (sa-collector-work jolt-collect-full-now!))
+(define (jolt-collect-full!) (sa-collector-work jolt-collect-full-now!) (jolt-fibers-collected!))
 (define (jolt-collect-full-now!)
   (sa-gc-collect-now)
   (set! gc-live-after-full (sa-bytes-allocated)))
 ;; System.gc and Runtime.gc: a hint, which never throws. The guard is inside the uncounted
 ;; extent, so what it allocates is not the caller's either.
-(define (jolt-collect-full-hint!) (sa-collector-work jolt-collect-full-hint-now!))
+(define (jolt-collect-full-hint!) (sa-collector-work jolt-collect-full-hint-now!) (jolt-fibers-collected!))
 (define (jolt-collect-full-hint-now!) (guard (e (#t #f)) (jolt-collect-full-now!)))
 ;; How far the heap may grow past the live set before the older generations are
 ;; collected: garbage promoted before then stays, so work that holds nothing can

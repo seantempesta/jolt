@@ -110,8 +110,12 @@
           ;; engine ticks this fiber has run, summed over its dispatches (jolt-ticks)
           (mutable ticks)
           ;; its lazy-seq claims (seq.ss force-claimer), made at its first claim, or #f
-          (mutable claimer))
-  (nongenerative jolt-fiber-v10))
+          (mutable claimer)
+          ;; #t while nobody has read this fiber's outcome, for a fiber whose
+          ;; error is reported if it is collected unread (jolt-fiber-unread-watch!);
+          ;; #f for every other fiber, and once a monitor is registered on it
+          (mutable unread))
+  (nongenerative jolt-fiber-v11))
 
 ;; --- the per-fiber dynamic slice ---------------------------------------------
 ;; R2 (jolt-nvpr.3). jolt's `binding` macro pushes by calling the
@@ -772,7 +776,7 @@
             (make-jolt-dslice (jolt-slice-stack-param)
                               (jolt-slice-ns-param)
                               #f)
-            c #f '() 0 #f #f 0 #f ibox #f #f #f #f 0 #f)))
+            c #f '() 0 #f #f 0 #f ibox #f #f #f #f 0 #f #f)))
     (jolt-fiber-register! f)
     (when ibox (jolt-fiber-own-ibox! f ibox))
     (when before-run (before-run f))
@@ -1558,6 +1562,52 @@
         (unless (null? ms)
           (guard (e (#t #f)) ((car ms) out))
           (loop (cdr ms)))))))
+
+;; --- an error nobody read ----------------------------------------------------
+;; A fiber spawned to be joined (jolt.fibers/spawn) keeps its error for join or
+;; monitor! to read, and a fiber nobody joins or monitors would lose it without a
+;; word. Reporting at its end would be wrong: a join may come later and rethrow
+;; it. So the rule is a rejected promise's (Node's unhandledRejection, asyncio's
+;; "Task exception was never retrieved"): an error nobody read is reported once,
+;; when the fiber is collected, since nobody can read it after that.
+;;
+;; jolt-fiber-unread-watch! marks a fiber unread and registers it with a guardian;
+;; a monitor's registration (fibers-async.ss fiber-monitor!, which join goes
+;; through) clears the mark. After each collection, jolt-fiber-unread-drain! takes
+;; every collected fiber from the guardian and hands REPORT the error of each that
+;; still has the mark and ended with one. Only the fibers marked are reported, so
+;; a go body, a virtual thread or a fiber-execute task, whose throw already reaches
+;; the handler (async.ss async-report-uncaught!), never is.
+;;
+;; Registering takes no lock: Chez puts a guardian entry on the registering
+;; thread's own list (cpprim.ss $install-guardian, the thread context's
+;; guardian-entries), with no event check inside it. Taking one from the guardian
+;; is a plain pop of the guardian's queue, so the drain pops under a mutex, and
+;; reports after releasing it.
+(define jolt-fiber-unread-guardian (make-guardian))
+(define-process-local jolt-fiber-unread-mu (make-mutex))
+(define (jolt-fiber-unread-watch! f)
+  (jolt-fiber-unread-set! f #t)
+  (jolt-fiber-unread-guardian f))
+;; (jolt-fiber-unread-drain! report) -> void. Run after a collection, at a safe
+;; point of the thread that took part (rt.ss jolt-after-collection!). REPORT runs
+;; user code (an uncaught-exception handler), so the drain waits while the thread
+;; holds any of the runtime's locks (the stack check's rule): the fibers stay in
+;; the guardian, and the next collection on a thread holding none takes them. Each
+;; fiber leaves the guardian once, so it is reported at most once, and a report
+;; that collects again only drains what is left.
+(define (jolt-fiber-unread-drain! report)
+  (when (fx=? 0 (jolt-locks-held))
+    (let loop ((fs (jolt-with-mutex jolt-fiber-unread-mu
+                     (let pop ((acc '()))
+                       (let ((f (jolt-fiber-unread-guardian)))
+                         (if f (pop (cons f acc)) acc))))))
+      (unless (null? fs)
+        (let ((f (car fs)))
+          (when (and (jolt-fiber-unread f) (jolt-fiber-error f))
+            (jolt-fiber-unread-set! f #f)
+            (report (jolt-fiber-error f))))
+        (loop (cdr fs))))))
 
 ;; --- the scheduler ----------------------------------------------------------
 ;; Resume (or first-run) fiber f on ITS carrier's thread, returning to the

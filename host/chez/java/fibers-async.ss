@@ -445,11 +445,28 @@
 ;; monitors fired), which is exactly what join/monitor! read. The raw park
 ;; protocol (fiber-park-commit!/fiber-to-scheduler!) stays out of the public
 ;; namespace — its commit/switch discipline belongs to the poller.
+;; Its error is the caller's to read, so a fiber collected with it unread is
+;; reported (jolt-fiber-watch-unread!).
 (def-var! "jolt.host" "fiber-spawn"
   (lambda (f)
     (let ((fib (sa-fiber-spawn (lambda () (*txn* #f) (jolt-invoke f)))))
+      (jolt-fiber-watch-unread! fib)
       (jolt-fiber-ensure-carrier!)
       fib)))
+;; A spawned fiber's error that nobody read is reported when the fiber is collected
+;; (fibers.ss jolt-fiber-unread-drain!), where every other uncaught throw goes. The
+;; drain runs after each collection (rt.ss jolt-after-collection!), so the first
+;; watch makes sure that hook is installed: a run with no stack limit and no heap
+;; policy installs none. A target with no collection rendezvous to hook answers #f,
+;; and there an unread error goes unreported, as before.
+(define jolt-fiber-unread-hooked? #f)
+(define (jolt-fiber-watch-unread! fib)
+  (unless jolt-fiber-unread-hooked?
+    (set! jolt-fiber-unread-hooked? #t)
+    (sa-gc-install-after-rendezvous! jolt-after-collection!))
+  (jolt-fiber-unread-watch! fib))
+(define (jolt-fiber-report-unread! e)
+  (async-report-uncaught! "fiber whose error was never read" e))
 ;; Pools besides the default (fibers.ss, jolt-fiber-pool-make). A spawn into a
 ;; pool is fiber-spawn with the carrier taken from the pool; nil back means the
 ;; pool is shut down, which jolt.fibers/spawn reports.
@@ -466,16 +483,19 @@
   (lambda (fib) (or (jolt-fiber-pool-of fib) jolt-nil)))
 (def-var! "jolt.host" "fiber-pool-spawn"
   (lambda (p f)
-    (or (jolt-fiber-pool-spawn p (lambda () (*txn* #f) (jolt-invoke f)))
-        jolt-nil)))
+    (let ((fib (jolt-fiber-pool-spawn p (lambda () (*txn* #f) (jolt-invoke f)))))
+      (if fib (begin (jolt-fiber-watch-unread! fib) fib) jolt-nil))))
 (def-var! "jolt.host" "fiber-pool-shutdown!"
   (lambda (p) (jolt-fiber-pool-shutdown! p) jolt-nil))
 (def-var! "jolt.host" "fiber-instance?" (lambda (x) (if (jolt-fiber? x) #t #f)))
 (def-var! "jolt.host" "fiber-yield" (lambda () (sa-fiber-yield) jolt-nil))
 ;; The callback gets what a jolt catch would bind: the unwrapped error for a
-;; fiber that died, nil for a clean completion.
+;; fiber that died, nil for a clean completion. Registering reads the fiber's
+;; outcome (join comes through here too), so its error is not reported unread:
+;; the callback is handed it, exactly once.
 (def-var! "jolt.host" "fiber-monitor!"
   (lambda (fib cb)
+    (jolt-fiber-unread-set! fib #f)
     (jolt-fiber-monitor! fib
       (lambda (err) (jolt-invoke cb (if err (jolt-unwrap-throw err) jolt-nil))))
     jolt-nil))
