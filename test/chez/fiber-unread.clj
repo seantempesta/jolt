@@ -84,6 +84,29 @@
       (result (and (= 1000 (count @seen)) (= (set (map #(str "many " %) (range 1000))) (set @seen)))
               (str (count @seen) " reports, " (count (set @seen)) " distinct")))
 
+  ;; a fiber ended by kill! is not reported: its killer chose its end (Java reports no
+  ;; ThreadDeath); one ended by interrupt! is, as an exception leaving a thread's run is
+  "killed"
+  (do (handler!)
+      ((fn [] (let [fib (f/spawn (fn [] @(promise)))]
+                (settle #(= :parked (f/state fib)))
+                (f/kill! fib (ex-info "killed" {}))
+                (wait-ended fib))))
+      (Thread/sleep 5)
+      (collect!)
+      (result (and (= [] @seen) (control-reported?)) (pr-str @seen)))
+
+  "interrupted"
+  (do (handler!)
+      ((fn [] (let [fib (f/spawn (fn [] @(promise)))]
+                (settle #(= :parked (f/state fib)))
+                (f/interrupt! fib (ex-info "interrupted" {}))
+                (wait-ended fib))))
+      (Thread/sleep 5)
+      (settle #(seq @seen))
+      (collect!)
+      (result (= ["interrupted"] @seen) (pr-str @seen)))
+
   "stderr"
   (do (drop-throwing! "to stderr" 1)
       (collect!)

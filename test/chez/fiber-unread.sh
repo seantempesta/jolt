@@ -7,7 +7,7 @@ root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
 tmp="${TMPDIR:-/tmp}/fiber-unread.$$"
 fails=0
-for m in unread joined-later monitored value many stderr; do
+for m in unread joined-later monitored value many killed interrupted stderr; do
   JOLT_AOT_CACHE=0 bin/jolt run test/chez/fiber-unread.clj "$m" > "$tmp.out" 2> "$tmp.err"
   tail -1 "$tmp.out" | grep "^fiber-unread $m: " || echo "fiber-unread $m: FAIL (no answer)"
   if [ "$m" = stderr ]; then
