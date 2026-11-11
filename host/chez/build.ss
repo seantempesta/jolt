@@ -3659,9 +3659,16 @@
 (define (bld-cache-put! from to)
   (let ((tmp (string-append to ".tmp" (number->string (get-process-id)))))
     (guard (e (#t (guard (e2 (#t #f)) (when (file-exists? tmp) (delete-file tmp))) #f))
-      (bld-copy-file! from tmp)
-      (rename-file tmp to)
-      #t)))
+      ;; an empty file is no compiled unit and no image: never an entry (two builds
+      ;; of one directory at once, one of them killed, left one under a key, and
+      ;; every later build of that text linked in a unit that defines nothing)
+      (and (bld-nonempty-file? from)
+           (begin (bld-copy-file! from tmp)
+                  (rename-file tmp to)
+                  #t)))))
+;; Is PATH a file that holds something?
+(define (bld-nonempty-file? path)
+  (guard (e (#t #f)) (and (file-exists? path) (> (sa-file-size path) 0))))
 ;; Copy a cache entry to TO; #f when there is none. Another build's prune can
 ;; delete the entry between the existence check and the read, which is a miss.
 ;; A hit moves the entry's mtime to now: the prunes evict oldest mtime first, so
@@ -3670,6 +3677,9 @@
 (define (bld-cache-fetch! cache to)
   (guard (e (#t #f))
     (and (file-exists? cache)
+         ;; an empty entry is a miss, and goes: nothing that wrote it can have meant it
+         (or (bld-nonempty-file? cache)
+             (begin (guard (e (#t #f)) (delete-file cache)) #f))
          (begin
            (bld-copy-file! cache to)
            (guard (e (#t #f))           ; a cache we cannot mark is still a hit
@@ -4088,15 +4098,18 @@
 ;; under a temp name and renamed into place only once complete: a child that
 ;; raises, runs out of heap or is killed part way leaves nothing, and the parent
 ;; compiles that unit again in process, where a failure reports itself.
+;; Where this process writes PATH before it is whole: its own name, so two
+;; builds of one directory never write one file.
+(define (bld-part-path path) (string-append path ".part" (number->string (get-process-id))))
 (define (bld-run-job! job)
   (let ((src (vector-ref job 0)) (so (vector-ref job 1)) (vso (vector-ref job 2))
         (mode (vector-ref job 3)) (codec (vector-ref job 4)))
-    (let ((so-part (string-append so ".part")))
+    (let ((so-part (bld-part-path so)))
       (parameterize ((bld-block-profile (vector-ref job 5)))
         (bld-chez-compile-app-file mode src so-part))
       (rename-file so-part so))
     (when vso
-      (let ((vso-part (string-append vso ".part")))
+      (let ((vso-part (bld-part-path vso)))
         (when (sa-vfasl-convert-object-file so vso-part codec)
           (rename-file vso-part vso))))))
 
@@ -4178,8 +4191,13 @@
       (for-each
         (lambda (k)
           (let ((u (car k)))
-            (unless (and exe (file-exists? (cadr u)))
-              (bld-chez-compile-app-file mode (car u) (cadr u)))
+            ;; what a child left whole stands; anything else compiles here, to a
+            ;; name of this process's own and then renamed, as a child does, so no
+            ;; other build of this directory ever reads it half written
+            (unless (and exe (bld-nonempty-file? (cadr u)))
+              (let ((part (bld-part-path (cadr u))))
+                (bld-chez-compile-app-file mode (car u) part)
+                (rename-file part (cadr u))))
             (when cache?
               (bld-cache-store! (cadr u) (bld-unit-cache-so (cadr k)))
               (let ((vso (string-append (cadr u) ".vfasl")))
