@@ -566,6 +566,17 @@
 (define jolt-slice-txn-param
   (guard (e (#t (make-thread-parameter #f)))
     *txn*))
+;; The thread's record of the throw it is handling (rt.ss jolt-throw-cont and
+;; jolt-throw-sitep, which a catch that completes clears, jolt-catch-complete!;
+;; jolt-fault-captured, a host fault's). A fiber that dies of a throw dies in
+;; resume*'s guard, which is no catch, so its carrier kept that throw's
+;; continuation -- the dead fiber's stack, and the fiber in it -- until the next
+;; throw on that carrier: the fiber was never collected. Its death is where that
+;; throw was handled, so jolt-fiber-dead! clears them. Captured the same guarded
+;; way (unbound, so empty, on the standalone load).
+(define jolt-fiber-throw-slots
+  (guard (e (#t '()))
+    (list jolt-throw-cont jolt-throw-sitep jolt-fault-captured)))
 
 ;; The scheduler's own slice — the caller's dynamic state at drain entry —
 ;; kept per carrier in one mutable record so the per-run capture allocates
@@ -1744,6 +1755,8 @@
 
 (define (jolt-fiber-dead! f e)
   (jolt-fiber-finish! f 'dead e)
+  ;; the throw is handled here: the carrier forgets it (jolt-fiber-throw-slots)
+  (for-each (lambda (p) (when (p) (p #f))) jolt-fiber-throw-slots)
   (set-virtual-register! jolt-vreg-current-fiber 0)
   (jolt-fiber-k-set! f #f)
   (jolt-fiber-sm-set! f #f)
