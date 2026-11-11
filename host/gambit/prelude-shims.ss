@@ -827,6 +827,19 @@
        (jolt-locks-enter!)
        setup
        (dynamic-wind before (jolt-masked-body body) (jolt-masked-cleanup lv after))))))
+;; locks.ss jolt-claim-wind: here a plain wind, entered masked, whose
+;; after-thunk releases the claimer's innermost claim. No chain to reuse a link
+;; on, and no fibers, so the claimer needs no winder and no fiber holds one.
+(define-syntax jolt-claim-wind
+  (syntax-rules ()
+    ((_ cl held d body)
+     (let ((lv (- (jolt-locks-held) 1)))
+       (dynamic-wind jolt-finally-in
+                     (jolt-masked-body (lambda () body))
+                     (jolt-masked-after lv (force-release-top! cl)))))))
+(define (jolt-claim-winder out) #f)
+(define (jolt-fiber-claimer f) #f)
+(define (jolt-fiber-claimer-set! f cl) #f)
 ;; seq.ss force-claimed!'s waiting, for a cell another fiber is forcing. No fiber
 ;; exists here, so a waiter never has a carrier to give away (wait-turn answers
 ;; #f and it waits as a thread) and none can leave the CPU holding a lock.

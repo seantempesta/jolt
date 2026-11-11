@@ -135,7 +135,9 @@
 ;; A running tail's claim: the pending word it replaced, the fiber or thread
 ;; running it, and this process's token -- a claim that arrives in a state image
 ;; belongs to a force that is not running, and is put back on the way to claiming.
-(define-record-type tail-claim (fields tail owner token) (nongenerative jolt-tail-claim-v1))
+;; Made once for each depth of each owner's forces and reused (force-claimer,
+;; below), so tail is set on every claim; only the owner reads it of a live claim.
+(define-record-type tail-claim (fields (mutable tail) owner token) (nongenerative jolt-tail-claim-v2))
 ;; the tail's position, for the compare-and-swap that claims a cell
 ;; (cell-force-claimed!, below). Checked at load: a wrong index would corrupt a
 ;; neighbouring field silently.
@@ -466,53 +468,119 @@
 ;; that is not this process's claim is stale and is cleared on the way to
 ;; claiming.
 ;;
-;; (force-claimed! lazy-seq-node body): body re-reads the node and either delivers
-;; its published tail or, holding the claim, runs the thunk and publishes. Its only
-;; users are lazy seq nodes, so their lock field's index and accessors are named
-;; here, not passed: a parameter the after-thunk captures is a word in its closure
-;; on every force.
+;; A force allocates nothing. Each owner has one force-claimer, made the first
+;; time it claims: its claim pair (the same pair in every node it holds, since
+;; the claim names the owner and the node names itself), a stack of what it
+;; holds -- the node or cell at each depth of its nested forces, a lazy seq's
+;; body forcing another -- and one winder whose after-thunk releases the
+;; innermost entry (locks.ss jolt-claim-wind). Claims nest exactly as the
+;; winder chain does, so every unwind past one of those winders, and every
+;; normal return, releases the top of the stack, and nothing per force says
+;; which node to release. A fresh claim pair, a closure for the body, two
+;; masked thunks and dynamic-wind's winder and link cost a forced node 128
+;; bytes, more than the node itself, once a second mutator existed.
+;;
+;; (force-claimed! lazy-seq-node run): (run node) re-reads the node and either
+;; delivers its published tail or, holding the claim, runs the thunk and
+;; publishes. RUN is a top-level procedure of the node, never a closure.
 ;; force-walking marks a lazy seq whose own thunk has run while its walk is
 ;; still going (lazy-bridge.ss lazyseq-realize!): pending to everyone but the
 ;; walker, who reaches it only by reentry, so another forcer waits on the claim.
 (define force-walking (list 'lazyseq-walking))
 (define (force-pending? t) (or (procedure? t) (lazy-src? t) (jolt-lazyseq? t) (tail-claim? t) (eq? t force-walking)))
 (define force-claim-token (list 'forcing))
-(define (force-owner) (or (jolt-current-fiber) (get-thread-id)))
-(define (force-claimed! cell body)
-  (let ((me (force-owner)))
+;; held: three slots a depth -- the node or cell claimed there (#f once
+;; released, so a finished force pins nothing), that depth's tail-claim for a
+;; cell (made once, its tail set at each claim), and the winder-chain link
+;; jolt-claim-wind last made there (weakly held).
+(define-record-type force-claimer
+  (fields claim owner (mutable winder) (mutable depth) (mutable held))
+  (nongenerative jolt-force-claimer-v1))
+(define (new-force-claimer owner)
+  (let ((cl (make-force-claimer (cons force-claim-token owner) owner #f 0 (make-vector 24 #f))))
+    (force-claimer-winder-set! cl (jolt-claim-winder (lambda () (force-unwind! cl))))
+    ;; the claim pair is published by every claiming CAS from now on: its fields first
+    (memory-order-release)
+    cl))
+;; The owner is the FIBER when the forcer runs on one, and the thread otherwise:
+;; a fiber keeps its claimer in its record, a thread in virtual register 15,
+;; which a new thread starts at fixnum 0.
+(define (current-force-claimer)
+  (let ((f (jolt-current-fiber)))
+    (if f
+        (or (jolt-fiber-claimer f)
+            (let ((cl (new-force-claimer f))) (jolt-fiber-claimer-set! f cl) cl))
+        (let ((cl (virtual-register 15)))
+          (if (eq? cl 0)
+              (let ((cl (new-force-claimer (get-thread-id)))) (set-virtual-register! 15 cl) cl)
+              cl)))))
+;; The held vector with slots for depth D, grown when it has none yet.
+(define-syntax force-claimer-slots
+  (syntax-rules ()
+    ((_ cl d) (let ((held (force-claimer-held cl)))
+                (if (fx<? (fx* 3 d) (vector-length held)) held (force-claimer-grow! cl))))))
+(define (force-claimer-grow! cl)
+  (let* ((held (force-claimer-held cl)) (new (make-vector (fx* 2 (vector-length held)) #f)))
+    (do ((i 0 (fx+ i 1))) ((fx=? i (vector-length held))) (vector-set! new i (vector-ref held i)))
+    (force-claimer-held-set! cl new)
+    new))
+;; Release the innermost claim: a node's lock goes back to #f; a cell's word goes
+;; back to the pending tail if the claim is still there (a raise, an escape)
+;; and is left alone if the run published its answer. Cannot raise. Syntax: the
+;; normal exit of every claimed force runs it.
+(define-syntax force-release-top!
+  (syntax-rules ()
+    ((_ e)
+     (let* ((cl e)
+            (d (fx- (force-claimer-depth cl) 1))
+            (held (force-claimer-held cl))
+            (i (fx* d 3))
+            (x (vector-ref held i)))
+       (vector-set! held i #f)
+       (force-claimer-depth-set! cl d)
+       (if (jolt-lazyseq? x)
+           (begin
+             ;; the published tail is ordered before the claim clears (see force-claimed!)
+             (memory-order-release)
+             (sa-record-cas! x jolt-lazyseq-lock-index (force-claimer-claim cl) #f))
+           (let ((tc (vector-ref held (fx+ i 1))))
+             (when (eq? (cseq-tail x) tc) (sa-record-cas! x cseq-tail-index tc (tail-claim-tail tc)))))))))
+;; The winder's after-thunk: an unwind past a claim. Masked while it releases, so
+;; an interrupt's escape cannot land between the pop and the store.
+(define (force-unwind! cl)
+  (jolt-locks-enter!)
+  (force-release-top! cl)
+  (jolt-locks-exit!))
+(define (force-claimed! cell run)
+  (let* ((cl (current-force-claimer)) (claim (force-claimer-claim cl)))
     (let retry ((spins 0))
       (let ((c (jolt-lazyseq-lock cell)))
         (cond
-          ((not (force-pending? (jolt-lazyseq-thunk cell))) (body))
+          ((not (force-pending? (jolt-lazyseq-thunk cell))) (run cell))
           ((not c)
-           ;; Masked from before the claim until the wind holds it, and from the
-           ;; body's return until it is released (jolt-wind*, locks.ss): an
+           ;; Masked from before the claim until the winder holds it, and from the
+           ;; body's return until it is released (jolt-claim-wind, locks.ss): an
            ;; interrupt's escape in either gap left the claim held, and every
            ;; other forcer of the cell waited on it for good.
-           (let ((claim (cons force-claim-token me)) (lv (jolt-locks-held)))
-             (jolt-locks-enter!)
-             ;; the claim is a fresh pair: release its stores before the CAS
-             ;; publishes it, or a reader can see the pointer before the token
-             ;; and take a live claim for a stale one
-             (memory-order-release)
+           (jolt-locks-enter!)
+           (let* ((d (force-claimer-depth cl)) (held (force-claimer-slots cl d)))
              (if (sa-record-cas! cell jolt-lazyseq-lock-index #f claim)
                  ;; A compare-and-swap orders nothing but its own word: the acquire
                  ;; makes every store the previous holder released visible to this
-                 ;; owner's re-read of the tail, and the release orders the
-                 ;; published tail before the claim clears -- without them the
-                 ;; cleared claim can be seen ahead of the tail, a second forcer
-                 ;; claims a cell that only looks pending, and its thunk runs twice.
+                 ;; owner's re-read of the tail, and the release in
+                 ;; force-release-top! orders the published tail before the claim
+                 ;; clears -- without them the cleared claim can be seen ahead of the
+                 ;; tail, a second forcer claims a cell that only looks pending, and
+                 ;; its thunk runs twice.
                  (begin
                    (memory-order-acquire)
-                   (dynamic-wind
-                     jolt-finally-in
-                     (jolt-masked-body body)
-                     (jolt-masked-after lv (memory-order-release) (sa-record-cas! cell jolt-lazyseq-lock-index claim #f))))
+                   (vector-set! held (fx* d 3) cell)
+                   (force-claimer-depth-set! cl (fx+ d 1))
+                   (jolt-claim-wind cl held d (run cell)))
                  (begin (jolt-locks-exit!) (retry spins)))))
+          ((eq? c claim) (run cell))                    ; this owner's own claim: recursion
           ((and (pair? c) (eq? (car c) force-claim-token))
-           (if (eqv? (cdr c) me)
-               (body)                                   ; this owner's own claim: recursion
-               (begin (force-wait! spins (cdr c)) (retry (fx+ spins 1)))))
+           (force-wait! spins (cdr c)) (retry (fx+ spins 1)))
           (else (sa-record-cas! cell jolt-lazyseq-lock-index c #f) (retry spins)))))))
 ;; One round of waiting on a cell OWNER is running.
 (define (force-wait! spins owner)
@@ -582,7 +650,7 @@
 ;; an exit, and keeps the claim). The claim lived in a lock field on every cell;
 ;; in the word, it costs a cell nothing.
 (define (cell-force-claimed! s)
-  (let ((me (force-owner)))
+  (let* ((cl (current-force-claimer)) (me (force-claimer-owner cl)))
     (let retry ((spins 0))
       (let ((w (cseq-tail s)))
         (cond
@@ -596,29 +664,33 @@
           ((jolt-lazyseq? w) (force-lazyseq w))
           ((not w) (let ((r (cseq-cvec-more s #t))) (cseq-publish-tail! s r) r))
           (else
-           ;; Masked from before the claim until the wind holds it (jolt-wind*,
-           ;; locks.ss): an escape between the two left the cell claimed by an
-           ;; owner that would never publish. The body publishes before it
-           ;; returns, so the far edge needs nothing.
-           (let ((claim (make-tail-claim w me force-claim-token)))
-             (jolt-locks-enter!)
-             ;; a fresh record, published by the CAS: release its fields first
+           ;; Masked from before the claim until the winder holds it, and from
+           ;; the run's return until it is released (jolt-claim-wind, locks.ss).
+           (jolt-locks-enter!)
+           (let* ((d (force-claimer-depth cl))
+                  (held (force-claimer-slots cl d))
+                  (tc (or (vector-ref held (fx+ (fx* d 3) 1))
+                          (let ((tc (make-tail-claim #f me force-claim-token)))
+                            (vector-set! held (fx+ (fx* d 3) 1) tc)
+                            tc))))
+             (tail-claim-tail-set! tc w)
+             ;; this depth's claim, its tail just set: release its fields before the CAS publishes it
              (memory-order-release)
-             (if (sa-record-cas! s cseq-tail-index w claim)
+             (if (sa-record-cas! s cseq-tail-index w tc)
                  (begin
                    (memory-order-acquire)
-                   ;; the after-thunk puts the pending word back only if the claim is still
-                   ;; the word: once the answer is in, it is not, and no flag is needed
-                   (dynamic-wind
-                     jolt-finally-in
-                     (lambda ()
-                       (jolt-locks-exit!)
-                       (let ((r (cseq-run-tail w)))
-                         (memory-order-release)
-                         (sa-record-cas! s cseq-tail-index claim r)
-                         r))
-                     (lambda () (when (eq? (cseq-tail s) claim) (sa-record-cas! s cseq-tail-index claim w)))))
+                   (vector-set! held (fx* d 3) s)
+                   (force-claimer-depth-set! cl (fx+ d 1))
+                   ;; the release puts the pending word back only if the claim is
+                   ;; still the word: once the answer is in, it is not
+                   (jolt-claim-wind cl held d (cell-run-claimed! s w tc)))
                  (begin (jolt-locks-exit!) (retry spins))))))))))
+;; Run a claimed cell's tail W and publish the answer over its claim TC.
+(define (cell-run-claimed! s w tc)
+  (let ((r (cseq-run-tail w)))
+    (memory-order-release)
+    (sa-record-cas! s cseq-tail-index tc r)
+    r))
 
 ;; The empty seq (Clojure's empty list ()), distinct from nil; the empty-list-t
 ;; record (one field, its metadata) is defined in values.ss. A metadata-bearing

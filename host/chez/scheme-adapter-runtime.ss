@@ -2048,6 +2048,14 @@
 ;; chain on exit and would silently undo it. See jolt-park-drop-finallys!.
 (define (sa-current-winders) (#%$current-winders))
 (define (sa-current-winders-set! w) (#%$current-winders w))
+;; The same read and write as syntax, for a path that does them on every
+;; element (locks.ss jolt-claim-wind): Chez compiles each to one thread-context
+;; field access, where the procedures above are a call each.
+(define-syntax sa-winders (syntax-rules () ((_) (#%$current-winders))))
+(define-syntax sa-winders-set! (syntax-rules () ((_ w) (#%$current-winders w))))
+;; (sa-make-winder in out) -> a winder to put on the chain by hand, made once and
+;; reused (locks.ss jolt-claim-wind). No attachments: its thunks read none.
+(define (sa-make-winder in out) (#%$record sa-winder-rtd in out '()))
 
 ;; (sa-record-cas! r i old new): compare-and-swap field i (0-based) of record r,
 ;; answering whether it swapped. What lets a lazy cell be claimed for forcing

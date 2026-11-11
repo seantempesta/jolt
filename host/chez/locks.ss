@@ -176,6 +176,44 @@
        setup
        (dynamic-wind before (jolt-masked-body body) (jolt-masked-cleanup lv after))))))
 
+;; (jolt-claim-wind cl held d body): BODY run with force-claimer CL's winder on
+;; the chain, for the claim the caller made masked and pushed at depth D of CL,
+;; whose slots are HELD (seq.ss force-claimed!). The same edges as jolt-wind*,
+;; entered already masked, with nothing allocated: the winder is CL's own, made
+;; once, and its after-thunk releases CL's innermost claim, which is this one
+;; whenever an unwind passes it. Its before-thunk is jolt-finally-in, so a park
+;; drops it from the chain and keeps the claim (fibers.ss
+;; jolt-park-drop-finallys!). The link that puts it on the chain is kept in a
+;; weak slot of depth D and reused while the chain under it is the same, which
+;; in a walk is every element: a link made of the same winder and the same chain
+;; is the same chain, and the weak slot pins nothing once the link is out of use.
+;; Every step is an inline register or field access but the release's CAS; the
+;; chain writes happen in this frame, which is what a chain write needs (see
+;; sa-current-winders-set!).
+(define-syntax jolt-claim-wind
+  (syntax-rules ()
+    ((_ cl held d body)
+     (let* ((old (sa-winders))
+            (wp (vector-ref held (fx+ (fx* d 3) 2)))
+            (c (and wp (car wp))))
+       (sa-winders-set!
+        (if (and (pair? c) (eq? (cdr c) old)) c (jolt-claim-link! held d (force-claimer-winder cl) old)))
+       (jolt-locks-exit!)
+       (let ((r body))
+         (jolt-locks-enter!)
+         (sa-winders-set! old)
+         (force-release-top! cl)
+         (jolt-locks-exit!)
+         r)))))
+;; A new link (winder . old) for depth D, kept weakly in HELD's slot for it.
+(define (jolt-claim-link! held d winder old)
+  (let ((i (fx+ (fx* d 3) 2)) (c (cons winder old)))
+    (let ((wp (vector-ref held i)))
+      (if wp (set-car! wp c) (vector-set! held i (weak-cons c #f))))
+    c))
+;; A claimer's winder: OUT runs on an unwind past it, nothing on a rewind.
+(define (jolt-claim-winder out) (sa-make-winder jolt-finally-in out))
+
 ;; NOTE on how a refused preemption is remembered. It is NOT remembered here.
 ;; The obvious design — a pending flag, honoured when the outermost region exits
 ;; — would have to park from inside a dynamic-wind's after-thunk, since that is

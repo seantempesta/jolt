@@ -1700,6 +1700,8 @@
 ;; slot 13: ticks.ss jolt-vreg-ticks
 ;; slot 14: printing.ss jolt-vreg-deref-printing — the cycle check's state for
 ;;   the IDeref values this thread is printing
+;; slot 15: seq.ss force-claimer — this thread's lazy-seq claims (a fiber keeps
+;;   its own in its record). The last free slot.
 ;; Effective *print-readably* for the readable renderer's string/char cases. The
 ;; print family stashes its override in the slot above — a virtual-register write
 ;; is ~1ns vs a pmap alloc + fold + two thread-parameter writes per dynamic

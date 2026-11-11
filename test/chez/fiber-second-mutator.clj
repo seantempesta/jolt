@@ -51,8 +51,26 @@
         (run! #(.join %) ts)
         [(.get m :k) @errs]))))
 
+;; a forced node costs the same bytes after the first fiber as before it: the claim the safe
+;; path takes allocates nothing (seq.ss force-claimer). Measured in one process, the walk's
+;; bytes a node before any fiber exists and after one has, for a lazy seq node (the claim on
+;; its lock) and an iterate cell (the claim in its tail word). The claim cost a node 128
+;; bytes (a lazy seq node) and 144 (an iterate cell) before the claim was made once an owner.
+(defn- bytes-now [] (jolt.host/scheme-eval-string "(sstats-bytes (statistics))"))
+(defn- hand [n] (lazy-seq (when (pos? n) (cons n (hand (dec n))))))
+(def walks {:lazy-seq #(count (hand 20000)) :iterate #(count (take 20000 (iterate inc 0)))})
+(defn- walk-bytes [f] (f) (apply min (for [_ (range 3)] (let [b0 (bytes-now)] (f) (- (bytes-now) b0)))))
+(defn- node-bytes [] (into {} (for [[k f] walks] [k (quot (walk-bytes f) 20000)])))
+(defn lazy-alloc []
+  (let [fast (node-bytes)
+        _ (.join (vthread (fn [] 1)))
+        safe (node-bytes)
+        extra (into {} (for [[k b] safe] [k (- b (fast k))]))]
+    (if (every? #(<= % 2) (vals extra)) :same [:extra-bytes-a-node extra :fast fast :safe safe])))
+
 (def cases
-  {"lazy-twice"     [lazy-twice     [1 [1 2] [1 2]]]
+  {"lazy-alloc"     [lazy-alloc     :same]
+   "lazy-twice"     [lazy-twice     [1 [1 2] [1 2]]]
    "iterator-twice" [iterator-twice [[1 2 3 4] [1 2 3 4]]]
    "chm-compute"    [chm-compute    [8 []]]})
 

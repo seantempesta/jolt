@@ -108,8 +108,10 @@
           (mutable exit-k)
           (mutable edge-k)
           ;; engine ticks this fiber has run, summed over its dispatches (jolt-ticks)
-          (mutable ticks))
-  (nongenerative jolt-fiber-v9))
+          (mutable ticks)
+          ;; its lazy-seq claims (seq.ss force-claimer), made at its first claim, or #f
+          (mutable claimer))
+  (nongenerative jolt-fiber-v10))
 
 ;; --- the per-fiber dynamic slice ---------------------------------------------
 ;; R2 (jolt-nvpr.3). jolt's `binding` macro pushes by calling the
@@ -759,7 +761,7 @@
             (make-jolt-dslice (jolt-slice-stack-param)
                               (jolt-slice-ns-param)
                               #f)
-            c #f '() 0 #f #f 0 #f ibox #f #f #f #f 0)))
+            c #f '() 0 #f #f 0 #f ibox #f #f #f #f 0 #f)))
     (jolt-fiber-register! f)
     (when ibox (jolt-fiber-own-ibox! f ibox))
     (when before-run (before-run f))

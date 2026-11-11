@@ -4,7 +4,7 @@
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
 fails=0
-for m in lazy-twice iterator-twice chm-compute; do
+for m in lazy-alloc lazy-twice iterator-twice chm-compute; do
   JOLT_AOT_CACHE=0 bin/jolt run test/chez/fiber-second-mutator.clj "$m" 2>&1 | tail -1 | grep "^fiber-second-mutator $m: " || echo "fiber-second-mutator $m: FAIL (no answer)"
 done > "${TMPDIR:-/tmp}/fiber-second-mutator.$$"
 cat "${TMPDIR:-/tmp}/fiber-second-mutator.$$"

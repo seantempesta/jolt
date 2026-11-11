@@ -104,13 +104,14 @@
     ((and (procedure? t) (not jolt-mt?)) (lazyseq-realize! x))
     ((lazyseq-fail? t) (raise (lazyseq-fail-condition t)))
     ((not jolt-mt?) (lazyseq-realize! x))
-    (else
-     (force-claimed! x
-       (lambda ()
-         (let ((t (jolt-lazyseq-thunk x)))
-           (cond ((or (cseq? t) (jolt-nil? t)) t)
-                 ((lazyseq-fail? t) (raise (lazyseq-fail-condition t)))
-                 (else (lazyseq-realize! x)))))))))
+    (else (force-claimed! x lazyseq-realize-claimed!))))
+;; What force-claimed! runs for X: its answer if another forcer published one
+;; meanwhile, else X realized. A top-level procedure, so a force allocates no closure.
+(define (lazyseq-realize-claimed! x)
+  (let ((t (jolt-lazyseq-thunk x)))
+    (cond ((or (cseq? t) (jolt-nil? t)) t)
+          ((lazyseq-fail? t) (raise (lazyseq-fail-condition t)))
+          (else (lazyseq-realize! x)))))
 ;; The node's word is a seq (the answer), the walking marker (a thunk called and
 ;; not answered: running now -- a reentrant force, which the reference also runs
 ;; again -- or failed, which it reruns: either way run what the node kept), a
@@ -198,26 +199,28 @@
 ;; the answer recorded on it (under its claim while the thunk runs, when threads
 ;; may share it). A failure is recorded on the node and raised.
 (define (lazyseq-step node)
-  (define (settled-or-run)
-    (let ((t (jolt-lazyseq-thunk node)))
-      (cond ((or (cseq? t) (jolt-nil? t)) t)
-            ((lazyseq-fail? t) (raise (lazyseq-fail-condition t)))
-            ((jolt-lazyseq? t) t)
-            ;; a `lazy-seq` node's thunk stays on it while it runs (lazyseq-realize!)
-            ((and (procedure? t) (eq? (jolt-lazyseq-val node) lazyseq-rerun-tag))
-             (let ((r (t)))
-               (when jolt-mt? (memory-order-release))
-               (jolt-lazyseq-thunk-set! node r)
-               r))
-            (else
-             (let ((r (lazyseq-take-call! node (if (eq? t lazyseq-walking) (lazyseq-rerun-thunk node) t))))
-               (lazyseq-publish! node r #f)
-               r)))))
   (let ((t (jolt-lazyseq-thunk node)))
     (cond ((or (cseq? t) (jolt-nil? t)) t)
           ((jolt-lazyseq? t) t)
-          ((not jolt-mt?) (settled-or-run))
-          (else (force-claimed! node settled-or-run)))))
+          ((not jolt-mt?) (lazyseq-settled-or-run node))
+          (else (force-claimed! node lazyseq-settled-or-run)))))
+;; The step's work on NODE, under its claim when threads may share it. A
+;; top-level procedure, so a force allocates no closure.
+(define (lazyseq-settled-or-run node)
+  (let ((t (jolt-lazyseq-thunk node)))
+    (cond ((or (cseq? t) (jolt-nil? t)) t)
+          ((lazyseq-fail? t) (raise (lazyseq-fail-condition t)))
+          ((jolt-lazyseq? t) t)
+          ;; a `lazy-seq` node's thunk stays on it while it runs (lazyseq-realize!)
+          ((and (procedure? t) (eq? (jolt-lazyseq-val node) lazyseq-rerun-tag))
+           (let ((r (t)))
+             (when jolt-mt? (memory-order-release))
+             (jolt-lazyseq-thunk-set! node r)
+             r))
+          (else
+           (let ((r (lazyseq-take-call! node (if (eq? t lazyseq-walking) (lazyseq-rerun-thunk node) t))))
+             (lazyseq-publish! node r #f)
+             r)))))
 ;; The answer into the word, behind a fence on the multi-threaded path so the
 ;; answer's own fields are visible before the word that points to them. val lets
 ;; go of the rerun thunk, as the reference nulls fn once invoke has returned.
