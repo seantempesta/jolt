@@ -459,12 +459,15 @@
 
 ;; close! (idempotent): mark closed, flush a stateful transducer's completion,
 ;; notify pending alt handlers, and wake everyone. ac-close! assumes the lock is
-;; held; the public form takes it.
+;; held; the public form takes it. A completion's throw is reported on a fiber of
+;; its own: the report runs the program's uncaught-exception handler, which may
+;; park, and nothing parks holding a channel's mutex.
 (define (ac-close! ch)
   (unless (async-chan-closed? ch)
     (async-chan-closed?-set! ch #t)
     (when (async-chan-xrf ch)
-      (guard (e (#t (async-report-uncaught! "transducer completion on close!" e)))
+      (guard (e (#t (async-callback-execute
+                     (lambda () (async-report-uncaught! "transducer completion on close!" e)))))
         (ac-xrf-apply ch)))
     (ac-notify! ch)
     ;; claim+deliver to every remaining alt-taker (nil) and alt-putter (#f)
@@ -971,8 +974,18 @@
 ;; and a callback a fiber (2.2 us / 6 KB against a thread's 8 us / 87 KB, 93af2568).
 ;; A put or take nobody ever completes holds nothing up. No cap: the channel has no
 ;; MAX-QUEUE-SIZE on pending ops (header).
+;; The spawn behind both (and fiber-execute's, fibers-async.ss): THUNK on a fiber of
+;; its own, its throw reported. It parks nothing, so a holder of a channel's mutex
+;; may call it (alt-deliver! does, and ac-close! for a report).
 (define (async-callback-execute thunk)
-  (async-fiber-execute (lambda () (*txn* #f) (thunk))))
+  (sa-fiber-spawn
+   (lambda ()
+     (*txn* #f)
+     (guard (e (#t (async-report-uncaught! "fiber-execute task" e)))
+       (thunk))))
+  ;; a carrier may not exist yet on the very first spawn (fiber-spawn's own
+  ;; postlude does this too) — without it the fiber sits ready and unrun.
+  (jolt-fiber-ensure-carrier!))
 ;; A waiter whose wake is CALL-CB, given what the channel delivers: #t/#f for a
 ;; put, the value (nil when closed) for a take.
 (define (async-callback-waiter call-cb)

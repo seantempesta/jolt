@@ -330,14 +330,7 @@
 ;; same arguments.
 (define (async-fiber-execute r)
   (let ((thunk (runnable->thunk r)))
-    (sa-fiber-spawn
-     (lambda ()
-       (*txn* #f)
-       (guard (e (#t (async-report-uncaught! "fiber-execute task" e)))
-         (jolt-invoke thunk))))
-    ;; a carrier may not exist yet on the very first spawn (fiber-spawn's own
-    ;; postlude does this too) — without it the fiber sits ready and unrun.
-    (jolt-fiber-ensure-carrier!)
+    (async-callback-execute (lambda () (jolt-invoke thunk)))
     jolt-nil))
 (cca-def! "fiber-execute" async-fiber-execute)
 
