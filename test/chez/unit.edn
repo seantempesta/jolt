@@ -1862,6 +1862,12 @@
   ;; and nothing reaches the port underneath it (the outer with-out-str stays empty)
   {:suite "pprint-writer" :expr "(do (require 'clojure.pprint) (let [sw (java.io.StringWriter.)] [(with-out-str (binding [*out* sw] (clojure.pprint/pprint {:a 1}))) (str sw)]))" :expected "[\"\" \"{:a 1}\\n\"]"}
   {:suite "pprint-writer" :expr "(do (require 'clojure.pprint) (let [sw (java.io.StringWriter.)] [(with-out-str (binding [*out* sw] (clojure.pprint/cl-format true \"~a!\" 1))) (str sw)]))" :expected "[\"\" \"1!\"]"}
+  ;; with-out-str's *out* frame is pushed once, not again when a fiber parked inside
+  ;; it resumes: the second push outlived the capture, so *out* after it was the
+  ;; root writer, and a pprint whose value parked in a nested capture (a lazy
+  ;; element's pr-str) wrote its column read to that root writer and threw
+  {:suite "with-out-str-park" :expr "(let [p (promise) sw (java.io.StringWriter.)] (Thread/startVirtualThread (fn [] (deliver p (binding [*out* sw] (let [s (with-out-str (print \"a\") (Thread/sleep 5) (print \"b\"))] [s (identical? *out* sw)]))))) (deref p 5000 :hung))" :expected "[\"ab\" true]"}
+  {:suite "with-out-str-park" :expr "(do (require 'clojure.pprint) (let [p (promise)] (Thread/startVirtualThread (fn [] (deliver p (try (with-out-str (clojure.pprint/pprint (map (fn [x] (with-out-str (Thread/sleep 2)) x) (range 3)))) (catch Throwable e (ex-message e)))))) (deref p 5000 :hung)))" :expected "\"(0 1 2)\\n\""}
   {:suite "pprint-pp" :expr "(do (require 'clojure.pprint) (binding [*1 {:a 1}] (with-out-str (clojure.pprint/pp))))" :expected "\"{:a 1}\\n\""}
   {:suite "pprint-pp" :expr "(do (require 'clojure.pprint) (macroexpand-1 '(clojure.pprint/pp)))" :expected "(clojure.pprint/pprint clojure.core/*1)"}
   {:suite "sbdirect" :expr "(let [bos (java.io.ByteArrayOutputStream.) ps (java.io.PrintStream. bos) r (.printf ps \"%d-%s\" (to-array [1 \"b\"]))] (.flush ps) [(str bos) (identical? r ps)])" :expected "[\"1-b\" true]"}

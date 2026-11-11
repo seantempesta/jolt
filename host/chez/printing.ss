@@ -496,24 +496,28 @@
 ;; what keeps an INNER rebinding working: (with-out-str (binding [*out* sw] …))
 ;; pushes over this frame and still wins, exactly as on the JVM. The binding stack
 ;; lives in dyn-binding.ss, loaded after this file — resolved at call time.
+;;
+;; The frame is scoped by dyn-with-frame, pushed once and the stack restored on
+;; the way out, never pushed by a before-thunk: a fiber that parked inside the
+;; capture resumed with its saved stack, frame included, and the before-thunk
+;; then pushed a second one that outlived the capture, leaving *out* the root
+;; writer for the rest of the extent.
 (define (jolt-with-out-str thunk)
   (with-output-to-string
     (lambda ()
-      (let ((cell (var-cell-lookup "clojure.core" "*out*")))
-        ;; masked at its edges (jolt-wind*, locks.ss): an interrupt's escape
-        ;; before the pop left *out* bound to this dead string port
+      (let ((cell (var-cell-lookup "clojure.core" "*out*"))
+            (body (lambda () (parameterize ((jolt-pprint-hook-suppressed #t)) (jolt-invoke thunk)))))
         (jolt-wind*
-          (lambda ()
-            (when cell
-              (jolt-push-thread-bindings (jolt-hash-map cell (var-cell-root cell)))))
+          (lambda () #f)
           #f
-          (lambda () (parameterize ((jolt-pprint-hook-suppressed #t)) (jolt-invoke thunk)))
+          (if cell
+              (lambda () (dyn-with-frame (list (cons cell (var-cell-root cell))) body))
+              body)
           ;; a high unit still waiting for its low one ends the capture as the
           ;; lone half it is (U+FFFD) rather than staying pending for a port
           ;; that is gone, whichever way the body leaves
-          (begin (unless (fx=? sink-pending-live 0)
-                   (display (jolt-port-text (current-output-port) "")))
-                 (when cell (jolt-pop-thread-bindings))))))))
+          (unless (fx=? sink-pending-live 0)
+            (display (jolt-port-text (current-output-port) ""))))))))
 
 ;; __eprint / __eprintf: stderr seams. Flush each write — like the JVM's
 ;; auto-flushing System.err — so a long-running process (a server that never

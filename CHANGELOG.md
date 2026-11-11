@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`with-out-str` leaves `*out*` as it found it when a fiber parks inside it.** Its `*out*` frame was pushed by a before-thunk, which ran again when the parked fiber resumed with its saved stack, so a second frame outlived the capture and `*out*` stayed the root writer. A `pprint` whose value parked in a nested capture (a lazy element's `pr-str`) then threw `No matching field found: fields for class java.io.PrintWriter`.
 - **A class a library provides is found from every fiber and thread that reaches it first at once.** Its provider loads on the first reference that misses, and the claim settled before the load ran, so a second fiber or thread referring to the class meanwhile was told `No dependency provides java.net.ServerSocket`. It now waits for that load, through the same wait a `require` takes on another context's load of a namespace (its cycle check and watchdog included), and looks again.
 
 - **The AOT cache is kept under a byte budget, least recently used first.** Inside a generation nothing was ever removed, so a cache shared by checkouts on many trees grew without end (27 GB in 30,845 artifacts on one machine). A process that publishes now prunes the whole cache to `JOLT_CACHE_MB` (default 8192), as the build-unit cache is kept under `JOLT_BUILD_CACHE_MB`: a hit moves its artifact's mtime to now, nothing younger than a minute is removed, and a `.so` goes before its `.scm`, so a reader sees a whole artifact or a miss.
