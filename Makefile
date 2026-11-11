@@ -191,7 +191,7 @@ CI-GATES := submodules values recordinline corpus nsaudit unit documented grenad
   hasheq narrowhash \
   protoret accfix pic narrow directlink mintgate directcall defmetacells staticsite arraymap recfast recfold arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flonumdisp flarr \
   fnform poolshape coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost recordshadow emittedheads adaptercheck hostprops normalizecheck hostregistry hostarity enummodel imagecoverage lazyshims foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke numequivalloc analyzealloc emitalloc treeseqcost imagefnforms \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost recordshadow emittedheads adaptercheck hostprops normalizecheck hostregistry hostarity enummodel imagecoverage lazyshims foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke numequivalloc analyzealloc emitalloc treeseqcost hashsetbulkcost imagefnforms \
   gatebootsmoke aotcachesmoke aotcachepathsmoke aotcachesourcepathsmoke aotcachestarfilesmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck buildunitwrite threadeddeadlock forkheldlocks oomafterrendezvous heaphistogram siginfodump \
   systemstreams closedstdout stderrsplit userdirpaths mimetypes utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer ticks interruptnest monitorescape windescape threadsafety maskedacquire ioerrno cas flow tickbudget remotechan
@@ -1612,6 +1612,11 @@ emitalloc:
 # one push, under a ceiling; same order and laziness as Clojure's definition.
 treeseqcost:
 	@bin/jolt run test/tree_seq_cost_test.clj
+
+# HashSet and ArrayList bulk methods (retainAll, removeAll, containsAll, addAll)
+# ask the argument's contains once an element: ticks at n and 10n grow ~10x.
+hashsetbulkcost:
+	@bin/jolt run test/hashset_bulk_cost_test.clj
 
 # *compiler-options* {:image-fn-forms false} compiles without image registration
 # (a third less allocation); JOLT_COMPILER_OPTIONS sets the root at start.

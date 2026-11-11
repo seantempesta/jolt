@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`HashSet.retainAll`, `ArrayList.removeAll` and `ArrayList.retainAll` ask the argument's `contains` once an element.** `HashSet.retainAll` scanned its argument for every element of the set (two sets of 10,000: 175.5M engine ticks, now 1.4M), and ArrayList's two removed through the iterator, shifting the array once a removal (28.6M, now 1.06M), where the JDK's `batchRemove` makes one pass.
+
 - **A woken thread no longer reads as waiting.** A thread its waker had woken read `WAITING` until the scheduler ran it, so under load a main carrier found nothing could wake it, and died stuck or told a wait about to be answered. The waker clears it, as it already did for the all-asleep detector.
 
 - **`SimpleDateFormat` prints milliseconds.** `S` had no case, so `.SSS` came out as letters, and a `java.util.Date` printed through `print-method` was an `#inst` no reader would take.

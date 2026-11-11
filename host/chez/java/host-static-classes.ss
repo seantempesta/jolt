@@ -350,16 +350,26 @@
   jolt-nil)
 (define (al-remove-if self pred)
   (when (jolt-nil? pred) (throw-jvm 'NullPointerException jolt-nil))
+  (al-remove-where self (lambda (x) (jolt-truthy? (jolt-fi-call pred "test" x)))))
+;; removeAll / retainAll: ArrayList's batchRemove, one pass that asks the
+;; argument's own contains (cd-has?, coll-defaults.ss) once an element. The
+;; AbstractCollection default they fell to removed through the iterator, one
+;; shift of the array a removal: n x removals.
+(define (al-remove-all self c keep?)
+  (when (jolt-nil? c) (throw-jvm 'NullPointerException jolt-nil))
+  (al-remove-where self (if keep? (lambda (x) (not (cd-has? c x))) (lambda (x) (cd-has? c x)))))
+;; removeIf's walk over DROP?, a Scheme predicate
+(define (al-remove-where self drop?)
   (if (al-linked? self)
       (let ((it (al-iterator self)))
         (let loop ((any #f))
           (if (ali-has-next? it)
-              (if (jolt-truthy? (jolt-fi-call pred "test" (ali-next it))) (begin (ali-remove it) (loop #t)) (loop any))
+              (if (drop? (ali-next it)) (begin (ali-remove it) (loop #t)) (loop any))
               any)))
       (let* ((e (al-mc self)) (n (al-cnt self))
              (dead (let loop ((i 0) (acc '()))
                      (if (fx=? i n) acc
-                         (loop (fx+ i 1) (if (jolt-truthy? (jolt-fi-call pred "test" (al-ref self i))) (cons i acc) acc))))))
+                         (loop (fx+ i 1) (if (drop? (al-ref self i)) (cons i acc) acc))))))
         (al-check! self e)
         (if (null? dead) #f
             (let ((keep (let loop ((i (fx- n 1)) (dead dead) (acc '()))
@@ -403,6 +413,8 @@
   (list
     (cons "forEach" al-for-each)
     (cons "removeIf" al-remove-if)
+    (cons "removeAll" (lambda (self c) (al-remove-all self c #f)))
+    (cons "retainAll" (lambda (self c) (al-remove-all self c #t)))
     (cons "replaceAll" al-replace-all)
     (cons "sort" al-sort)
     (cons "add" (lambda (self . a)
@@ -1912,13 +1924,15 @@
                                              (begin (hashtable-delete! (hm-tbl self) x) (hm-drop-key! self x) #t)
                                              ch))
                                        #f (seq->list (jolt-seq c)))))
+        ;; the argument's own contains once an element (cd-has?, coll-defaults.ss),
+        ;; as AbstractCollection's: a hashed argument is one lookup an element
         (cons "retainAll" (lambda (self c)
-                            (let ((keep (seq->list (jolt-seq c))))
-                              (fold-left (lambda (ch x)
-                                           (if (exists (lambda (k) (jolt=2 k x)) keep)
-                                               ch
-                                               (begin (hashtable-delete! (hm-tbl self) x) (hm-drop-key! self x) #t)))
-                                         #f (hs->list self)))))
+                            (when (jolt-nil? c) (throw-jvm 'NullPointerException jolt-nil))
+                            (fold-left (lambda (ch x)
+                                         (if (cd-has? c x)
+                                             ch
+                                             (begin (hashtable-delete! (hm-tbl self) x) (hm-drop-key! self x) #t)))
+                                       #f (hs->list self))))
         (cons "clone" (lambda (self) ((hs-ctor (jhost-tag self)) (list->cseq (hs->list self)))))
         ;; HashMap$KeyIterator: fail-fast over the set's modCount
         (cons "iterator" (lambda (self) (hs-iterator self)))
