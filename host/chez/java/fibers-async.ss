@@ -459,11 +459,20 @@
 ;; watch makes sure that hook is installed: a run with no stack limit and no heap
 ;; policy installs none. A target with no collection rendezvous to hook answers #f,
 ;; and there an unread error goes unreported, as before.
+;;
+;; The install happens once, under jolt-fiber-unread-mu: two threads' first spawns
+;; at once would otherwise both enter it, and its own test of whether the
+;; rendezvous is already wrapped is unlocked too, so the rendezvous could be
+;; wrapped twice and the hook run twice a collection, for good. Every spawn after
+;; the first reads the flag alone. The other installs (rt.ss jolt-install-gc-
+;; policy!, jolt-stack-limit-set!) run only at startup, on the one thread.
 (define jolt-fiber-unread-hooked? #f)
 (define (jolt-fiber-watch-unread! fib)
   (unless jolt-fiber-unread-hooked?
-    (set! jolt-fiber-unread-hooked? #t)
-    (sa-gc-install-after-rendezvous! jolt-after-collection!))
+    (jolt-with-mutex jolt-fiber-unread-mu
+      (unless jolt-fiber-unread-hooked?
+        (sa-gc-install-after-rendezvous! jolt-after-collection!)
+        (set! jolt-fiber-unread-hooked? #t))))
   (jolt-fiber-unread-watch! fib))
 (define (jolt-fiber-report-unread! e)
   (async-report-uncaught! "fiber whose error was never read" e))
