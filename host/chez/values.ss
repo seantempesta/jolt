@@ -60,15 +60,9 @@
 (define jolt-replacement-char (integer->char #xFFFD))
 (define jolt-replacement-string (string jolt-replacement-char))
 
-;; Has a second OS thread ever been started? #f until the first fork-thread
-;; (lazy-bridge.ss shadows it to flip this), never #f again. The lock-free
-;; paths that are only unsafe under real concurrency — a lazy node's first
-;; force (seq.ss), the metadata table's read (natives-meta.ss) — skip their
-;; fences and claims while it is #f. Defined here, in the first shared file,
-;; because seq.ss and natives-meta.ss load long before lazy-bridge.ss and read
-;; it as soon as they run.
-(define jolt-mt? #f)
-(define (jolt-mark-mt!) (set! jolt-mt? #t))
+;; jolt-mt? and jolt-mark-mt!, the one "a second execution context exists" flag the
+;; single-threaded fast paths read, are defined in locks.ss, which loads before this
+;; file and before fibers.ss (whose spawn sets it).
 
 ;; A fixnum's decimal text. Chez's number->string is (format "~d" x): the
 ;; general formatter, ~230 ns for a fixnum, and its control-string cache sits

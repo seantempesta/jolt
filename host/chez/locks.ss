@@ -68,6 +68,29 @@
 ;; Their current values (a mutex, a condition, a vector of mutexes): what a test of the rule holds.
 (define (jolt-process-locals) (map (lambda (r) ((car r))) (getprop 'jolt 'process-locals '())))
 
+;; Has a second execution context ever existed in this process: a second OS thread,
+;; or any fiber? #f until the first one is made, never #f again. It is set where a
+;; context is made and nowhere else: fork-thread (lazy-bridge.ss shadows it), the
+;; fiber spawn (fibers.ss jolt-fiber-spawn-on*), and a shutdown hook's registration,
+;; which is what makes the dormant signal watcher run jolt code (java/concurrency.ss).
+;; A fiber counts as a thread does: the fibers of one carrier interleave at every
+;; park and preemption, so a lazy node one of them is forcing can be forced by
+;; another, and the context that spawned a fiber runs beside it.
+;;
+;; The lock-free paths that are only unsafe with a second mutator -- a lazy node's
+;; first force (lazy-bridge.ss, seq.ss), a ConcurrentHashMap's or a Properties'
+;; monitor (java/host-static-classes.ss), the metadata table's read
+;; (natives-meta.ss) -- skip their fences, claims and monitors while it is #f.
+;; Setting it is race-free for the reason the fork gives: it is set by the creating
+;; context before the new one can run (a fiber is enqueued after it, under its
+;; carrier's mutex), so the new context reads it set.
+;;
+;; Here, in the file every runtime loads first (scheme-adapter-runtime.ss, rt.ss,
+;; and fibers.ss's own gate), so fibers.ss can set it and values.ss, seq.ss and
+;; natives-meta.ss can read it as soon as they load.
+(define jolt-mt? #f)
+(define (jolt-mark-mt!) (set! jolt-mt? #t))
+
 ;; Slot 7: how many locks this carrier currently holds. Per thread, like the
 ;; other virtual registers, and a fresh thread starts it at fixnum 0 — which is
 ;; the correct answer for a thread that never runs fibers.

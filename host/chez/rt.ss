@@ -2890,8 +2890,8 @@
 ;; lacks the binding, and only a caller that actually asks for a thread id should
 ;; fail there rather than the whole runtime failing to load.
 (def-var! "jolt.host" "thread-id" (lambda () (get-thread-id)))
-;; Whether the runtime has left its single-threaded lazy path (values.ss
-;; jolt-mt?): #t once a second thread could run jolt code, never #f again. A gate
+;; Whether the runtime has left its single-threaded lazy path (locks.ss
+;; jolt-mt?): #t once a second thread or any fiber could run jolt code, never #f again. A gate
 ;; reads it to pin that a program which starts no thread of its own keeps the
 ;; cheap path.
 (def-var! "jolt.host" "multi-threaded?" (lambda () jolt-mt?))

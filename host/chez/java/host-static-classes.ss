@@ -1027,10 +1027,11 @@
 ;; wait in chm-await-key! for another's claim on a key to end.
 (define (chm-state tbl) (vector tbl '() 0 '() (make-monitor) 0))
 (define (hm-chm? self) (string=? (jhost-tag self) "chm"))
-;; Before a second thread exists (jolt-mt?, values.ss) there is no writer to
-;; exclude, so the body runs as it is: the monitor is most of a single-threaded
-;; put's cost. Unless another owner holds a claim (chm-claim!): fibers drained on
-;; this one thread can, and waiting that claim out needs the monitor.
+;; Before a second thread or any fiber exists (jolt-mt?, locks.ss) there is no
+;; writer to exclude, so the body runs as it is: the monitor is most of a
+;; single-threaded put's cost. A claim by another owner (chm-claim!) needs a
+;; second context, so the claims test below only ever passes then; it stays as
+;; the statement of what the shortcut assumes.
 (define-syntax with-chm
   (syntax-rules ()
     ((_ self e ...)

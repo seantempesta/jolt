@@ -44,18 +44,18 @@
                (jolt-nil? (jolt-lazyseq-meta x)))
     (error 'lazy-bridge.ss "jolt-lazyseq-lock-index does not address the lock field")))
 
-;; Thread-safety for lazy realization is only needed once a second OS thread can
-;; touch a shared, not-yet-realized node. In single-threaded programs — all of ys
+;; Thread-safety for lazy realization is only needed once a second execution
+;; context (an OS thread, or a fiber) can touch a shared, not-yet-realized node. In single-threaded programs — all of ys
 ;; and the overwhelming majority of code — a lazy node needs no exclusion at all,
 ;; and because iterate/repeat/cycle and every map/filter chunk tail is a lazy
 ;; node, anything paid per node is paid per element of idiomatic seq pipelines.
 ;;
-;; `jolt-mt?` (values.ss) starts #f and flips to #t the first time a real OS
-;; thread is spawned (fork-thread is shadowed below). This is race-free: a
-;; single thread is either forking or forcing, never both, so no node is being
-;; realized on the lock-free path at the instant the flag turns on; and
-;; fork-thread establishes happens-before, so the spawned child observes the
-;; flip. Once multi-threaded, a first force claims the node by compare-and-swap
+;; `jolt-mt?` (locks.ss) starts #f and flips to #t the first time a second
+;; context is made: an OS thread (fork-thread is shadowed below) or a fiber
+;; (fibers.ss jolt-fiber-spawn-on*). This is race-free: a single context is
+;; either spawning or forcing, never both, so no node is being realized on the
+;; lock-free path at the instant the flag turns on; and the spawn establishes
+;; happens-before, so the new context observes the flip. Once multi-threaded, a first force claims the node by compare-and-swap
 ;; for the duration (seq.ss force-claimed!) and publishes behind a release
 ;; fence; reads stay free.
 

@@ -70,9 +70,9 @@
     (meta-gen-bump!) (memory-order-release)
     (hashtable-delete! meta-table k)
     (memory-order-release) (meta-gen-bump!)))
-;; Single-threaded (jolt-mt? #f, values.ss) there is no writer to race and the
+;; Single-threaded (jolt-mt? #f, locks.ss) there is no writer to race and the
 ;; plain lookup is the whole read; the fences and the generation check are for
-;; a process that has started a second thread.
+;; a process that has started a second thread or a fiber.
 (define (meta-table-get k)
   (if (not jolt-mt?)
       (hashtable-ref meta-table k #f)

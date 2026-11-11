@@ -749,7 +749,11 @@
   (jolt-fiber-spawn-on* (jolt-fiber-pick!) thunk ibox before-run))
 
 ;; The same, onto carrier c: the default pool's pick or a pool's.
+;; A fiber is a second execution context beside the one spawning it, so the spawn
+;; turns the single-threaded fast paths off for good (locks.ss jolt-mt?), before
+;; the fiber can run.
 (define (jolt-fiber-spawn-on* c thunk ibox before-run)
+  (jolt-mark-mt!)
   (let ((f (make-jolt-fiber
             'ready thunk #f #f #f #f
             (make-jolt-dslice (jolt-slice-stack-param)
