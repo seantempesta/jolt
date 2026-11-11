@@ -1040,8 +1040,11 @@
 ;; jolt-fiber-unread-drain!). Run after the rendezvous above, and after a collection the program
 ;; asked for (jolt-collect-full!), which with one thread active collects at once and passes no
 ;; rendezvous. The reporter is fibers-async.ss's, called only for a fiber it watched, so never
-;; before that file is loaded.
-(define (jolt-fibers-collected!)
+;; before that file is loaded. The drain is the collector's work (sa-collector-work): what it
+;; allocates (its lock's winders, the list of fibers taken) is not counted to the thread a
+;; collection happened to run on, so a call that collects reads the same bytes as one that does not.
+(define (jolt-fibers-collected!) (sa-collector-work jolt-fibers-collected-now!))
+(define (jolt-fibers-collected-now!)
   (jolt-fiber-unread-drain! (lambda (e) (jolt-fiber-report-unread! e))))
 ;; --- the GC overhead limit ----------------------------------------------------
 ;; The JVM's answer to a heap that fits but only just (UseGCOverheadLimit, on by
