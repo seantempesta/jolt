@@ -1595,6 +1595,10 @@
     (jolt-adjust-interrupts! (jolt-current-disable-count) base)
     ;; Back on the scheduler: whatever escape brought us here is over.
     (jolt-park-unwinding-set! #f)
+    ;; The continuation is spent, and its frames hold F: kept in the carrier until
+    ;; its next dispatch, it kept the last fiber each carrier ran from being
+    ;; collected. Nothing reads it before the next dispatch sets it again.
+    (jolt-carrier-sched-k-set! c #f)
     ;; The fiber parked, finished, or died: its setter-written dynamic state
     ;; (binding frames, current ns) is still live on the carrier — a continuation
     ;; escape does not undo a setter write (R0(a)). fiber -> scheduler: revert to
