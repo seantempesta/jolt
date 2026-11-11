@@ -191,7 +191,7 @@ CI-GATES := submodules values recordinline corpus nsaudit unit documented grenad
   hasheq narrowhash \
   protoret accfix pic narrow directlink mintgate directcall defmetacells staticsite arraymap recfast recfold arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flonumdisp flarr \
   fnform poolshape coreproc traceemit traceeval degradedbacktrace \
-  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost recordshadow emittedheads adaptercheck hostprops normalizecheck hostregistry hostarity enummodel imagecoverage lazyshims foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke numequivalloc analyzealloc emitalloc treeseqcost hashsetbulkcost imagefnforms \
+  inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost recordshadow emittedheads adaptercheck hostprops normalizecheck hostregistry hostarity enummodel imagecoverage lazyshims foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke numequivalloc analyzealloc emitalloc treeseqcost hashsetbulkcost imagefnforms imagelegacyclaim \
   gatebootsmoke aotcachesmoke aotcachebudget providerfirstuse fibersecondmutator fiberuncaught aotcachepathsmoke aotcachesourcepathsmoke aotcachestarfilesmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck buildunitwrite threadeddeadlock forkheldlocks oomafterrendezvous heaphistogram siginfodump \
   systemstreams closedstdout stderrsplit userdirpaths mimetypes utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer ticks interruptnest monitorescape windescape threadsafety maskedacquire ioerrno cas flow tickbudget remotechan
@@ -1622,6 +1622,11 @@ hashsetbulkcost:
 # (a third less allocation); JOLT_COMPILER_OPTIONS sets the root at start.
 imagefnforms:
 	@bin/jolt run test/image_fn_forms_test.clj
+
+# A cell an older runtime wrote mid-force (its claim a jolt-tail-claim-v1) restores
+# pending, and forces to its value (state-image.ss image-legacy-tail-claim?).
+imagelegacyclaim:
+	@bin/jolt run test/image_legacy_claim_test.clj | tail -1 | grep '^image-legacy-claim: ok$$'
 
 # An unhinted method call allocates its argument vector and at most one arg
 # list: no arm converts the rest args before testing the receiver.

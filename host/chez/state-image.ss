@@ -505,6 +505,16 @@
   (and (record? x)
        (record-rtd x)
        (eq? (record-type-uid (record-rtd x)) 'jolt-ex-info-record-v1)))
+;; A cell's claim from an image written while the cell was being forced, by a
+;; runtime whose tail-claim was jolt-tail-claim-v1 (tail owner token). The uid is
+;; retired (seq.ss tail-claim is v2), so the fasl materializes the old rtd and the
+;; instance is not a tail-claim?: read as a realized tail it came back as the
+;; cell's rest. No force is running in a restored image, so it restores as what a
+;; stale claim is put back to, the pending word it carries (field 0).
+(define (image-legacy-tail-claim? x)
+  (and (record? x)
+       (record-rtd x)
+       (eq? (record-type-uid (record-rtd x)) 'jolt-tail-claim-v1)))
 ;; A map from an image written before the meta slot (format <= 7). Two
 ;; generations: chez-pmap-v5 (root cnt hasheq) is the current layout minus the
 ;; slot; chez-pmap-v4 (root cnt order hasheq all-kw, format <= 6) has a trie
@@ -1170,6 +1180,8 @@
                       (walk-ref-restore (image-ref-val x) x path))
                      ((and restore? (image-legacy-ref? x))
                       (walk-ref-restore (legacy-ref-val x) x path))
+                     ((and restore? (image-legacy-tail-claim? x))
+                      (walk ((record-accessor (record-rtd x) 0) x) path))
                      ((and restore? (image-legacy-jrec? x))
                       (walk-legacy-jrec x path))
                      ((and restore? (image-legacy-ex-info? x))
