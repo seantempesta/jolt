@@ -1599,16 +1599,25 @@
     (cond ((null? ps) #f)
           ((member class (vector-ref (car ps) 2)) (car ps))
           (else (loop (cdr ps))))))
-;; The latch holds #f (not attempted), 'ok, or 'failed — the install namespace was
-;; on the source roots and raised while loading. 'failed is what separates a
-;; dependency the caller forgot to declare from one that is declared and broken;
-;; see unknown-class-message.
+;; The latch holds #f (not attempted), (loading . context) while the context that
+;; claimed it loads it, then 'ok, or 'failed — the install namespace was on the
+;; source roots and raised while loading. 'failed is what separates a dependency
+;; the caller forgot to declare from one that is declared and broken; see
+;; unknown-class-message.
+;;
+;; The claim settles before the load, so a class reference from ANOTHER fiber or
+;; thread while the load runs finds no pending claim, and missed: two fibers
+;; opening their first socket at once, one of them was told "No dependency
+;; provides java.net.Socket". It now waits for the load to end
+;; (lib-await-provider!), as a require waits for another context's load of the
+;; same namespace, and looks again.
+(define lib-providers-loading 0)   ; providers between their claim and their latch's last value
 (define (lib-load-provider! p)
-  ;; claim the load: whoever flips the latch from #f does it, everyone else sees
-  ;; a provider that has already had its chance and moves on.
+  ;; claim the load: whoever flips the latch from #f does it; another context
+  ;; that misses on one of its classes meanwhile waits for it to end
   (and (jolt-with-mutex lib-claims-mu
          (and (not (unbox (vector-ref p 3)))
-              (begin (set-box! (vector-ref p 3) 'ok)
+              (begin (ldr-provider-claimed! (vector-ref p 3))
                      (lib-claim-settled! p)
                      #t)))
        ;; The claim is settled from here whatever happens next, so registrations
@@ -1620,8 +1629,7 @@
        ;; Either half is a reason for the caller to look again, so the answer is
        ;; their OR: a class can become resolvable through a replay alone.
        (let* ((loaded (and (find-ns-file (vector-ref p 0))
-                           (begin (guard (c (#t (set-box! (vector-ref p 3) 'failed)
-                                                (lib-replay-deferred! p)
+                           (begin (guard (c (#t (lib-provider-settle! p 'failed)
                                                 (raise c)))
                                     ;; the mark comes from load-namespace* itself
                                     ;; (lib-with-install-ns-mark), which is the
@@ -1629,8 +1637,25 @@
                                     ;; namespace reached by a plain require.
                                     (load-namespace (vector-ref p 0)))
                                   #t)))
-              (replayed (lib-replay-deferred! p)))
+              (replayed (lib-provider-settle! p 'ok)))
          (or loaded replayed))))
+;; Replay what was held against the claim, then give the latch its last value and
+;; wake whoever waits on it, on every exit; answers whether anything was replayed.
+(define (lib-provider-settle! p state)
+  (let ((replayed (guard (c (#t (ldr-provider-settled! (vector-ref p 0) (vector-ref p 3) state)
+                                (raise c)))
+                    (lib-replay-deferred! p))))
+    (ldr-provider-settled! (vector-ref p 0) (vector-ref p 3) state)
+    replayed))
+;; A miss on a class whose provider another context is loading: wait for that load
+;; to end (loader.ss ldr-await-provider!) and answer #t, so the caller looks
+;; again. #f when no provider is loading the class, or when this context is the
+;; one loading it (a reference from inside its own install namespace). Read only
+;; while some provider is loading, so it costs nothing on any other miss.
+(define (lib-await-provider! class)
+  (and (fx>? lib-providers-loading 0)
+       (let ((p (lib-provider-for class)))
+         (and p (ldr-await-provider! (vector-ref p 0) (vector-ref p 3))))))
 
 ;; RFC 0014's resolution step: a class reference that MISSES the registry
 ;; autoloads the provider that declares the class, and retries.
@@ -1654,7 +1679,8 @@
   (or (lazy-shims-class! class)
       (and lib-any-pending-claims?
            (let ((p (hashtable-ref lib-pending-claims-tbl class #f)))
-             (and p (lib-load-provider! p))))))
+             (and p (lib-load-provider! p))))
+      (lib-await-provider! class)))
 
 ;; The provider that DECLARES this class and has not had its chance yet — meaning
 ;; the registration about to happen is somebody else's, and must wait. #f when

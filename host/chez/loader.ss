@@ -2925,6 +2925,55 @@
           (jolt-condition-wait ldr-load-cv ldr-load-mu ldr-wait-slice)
           #f))))
 
+;; A library class provider (host-static.ss lib-load-provider!) is loaded once, by
+;; the context that claims it, and a class reference from another context while
+;; it loads waits here, through this protocol's own wait: the claimer is recorded
+;; in the provider's LATCH, (loading . context), from its claim to its last value,
+;; which spans its install namespace's load and the replay after it. The wait is
+;; on the install namespace's name, so ldr-end-load! and ldr-provider-settled! both
+;; wake it, the watchdog bounds a thread's, and the cycle walk sees it: a claimer
+;; whose install namespace needs a namespace this context is loading is a
+;; deadlocked require, raised, not a hang. Answers #t when it waited, #f when no
+;; other context holds the latch.
+(define (ldr-await-provider! ns latch)
+  (let ((me (ldr-load-ctx))
+        (waited #f)
+        (deadline (and (> ldr-wait-limit-ms 0) (+ (sa-real-time-ms) ldr-wait-limit-ms))))
+    (jolt-lock-wait ldr-load-mu
+      (lambda ()
+        (let loop ()
+          (let ((s (unbox latch)))
+            (if (and (pair? s) (not (eqv? (cdr s) me)))
+                (let ((chain (ldr-wait-cycle (cdr s) me)))
+                  (when chain
+                    (throw-jvm (quote IllegalStateException)
+                      (string-append
+                        "Deadlocked require: " (ldr-ctx-str me) " is about to wait on the"
+                        " class provider " ns " (loading on " (ldr-ctx-str (cdr s)) "), and "
+                        (ldr-wait-chain-str chain) ", which closes back on "
+                        (ldr-ctx-str me) ".")))
+                  (set! waited #t)
+                  (hashtable-set! ldr-waiting me ns)
+                  (or (ldr-wait-for-load! ns deadline) (loop)))
+                (ldr-decided! me waited))))))))
+;; The latch and the count of providers loading change under ldr-load-mu, which
+;; the wait reads them under.
+(define (ldr-provider-claimed! latch)
+  (jolt-with-mutex ldr-load-mu
+    (set-box! latch (cons 'loading (ldr-load-ctx)))
+    (set! lib-providers-loading (fx+ lib-providers-loading 1))))
+;; The provider's latch takes its last value, and everyone waiting on it wakes.
+(define (ldr-provider-settled! ns latch state)
+  (jolt-with-mutex ldr-load-mu
+    (when (pair? (unbox latch))
+      (set! lib-providers-loading (fx- lib-providers-loading 1)))
+    (set-box! latch state)
+    (let ((fs (hashtable-ref ldr-fiber-waiters ns '())))
+      (unless (null? fs)
+        (hashtable-delete! ldr-fiber-waiters ns)
+        (for-each sa-fiber-resume fs)))
+    (condition-broadcast ldr-load-cv)))
+
 ;; Call with ldr-load-mu HELD. Would `me` waiting on `name` (owned by `owner`) close
 ;; a cycle? Follow owner -> what it waits on -> who owns that -> …; if the chain
 ;; reaches `me`, everyone in it is waiting on everyone else. Returns the chain as a
