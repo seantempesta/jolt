@@ -360,7 +360,7 @@
 
 (define (jrec-pic-desc x) (and (jrec? x) (jrec-desc x)))
 
-(define rec-tbl-mu (make-mutex))
+(define-process-local rec-tbl-mu (make-mutex))
 
 (define chez-record-type-tbl
   (make-hashtable string-hash string=?))
@@ -379,7 +379,7 @@
 (define chez-deftype-ctor-tag-box
   (box (make-weak-eq-hashtable)))
 
-(define chez-deftype-ctor-tag-mu (make-mutex))
+(define-process-local chez-deftype-ctor-tag-mu (make-mutex))
 
 (define (deftype-ctor-tag p)
   (hashtable-ref (unbox chez-deftype-ctor-tag-box) p #f))
@@ -443,7 +443,7 @@
 (define chez-record-fields-tbl
   (make-hashtable string-hash string=?))
 
-(define chez-infer-map-mu (make-mutex))
+(define-process-local chez-infer-map-mu (make-mutex))
 
 (define chez-infer-registry-gen 0)
 
@@ -792,7 +792,7 @@
 
 (define jrec-dbl-flags-tbl (make-weak-eq-hashtable))
 
-(define jrec-dbl-flags-mu (make-mutex))
+(define-process-local jrec-dbl-flags-mu (make-mutex))
 
 (define (jrec-dbl-flags inst)
   (let* ((d (jrec-desc inst))
@@ -868,7 +868,7 @@
 
 (define jrdesc-class-hash-tbl (make-weak-eq-hashtable))
 
-(define jrdesc-class-hash-mu (make-mutex))
+(define-process-local jrdesc-class-hash-mu (make-mutex))
 
 (define (jrdesc-class-hash d)
   (or (hashtable-ref jrdesc-class-hash-tbl d #f)
@@ -1102,7 +1102,7 @@
 
 (define jrdesc-ifc-tbl (make-weak-eq-hashtable))
 
-(define jrdesc-ifc-mutex (make-mutex))
+(define-process-local jrdesc-ifc-mutex (make-mutex))
 
 (define (jrdesc-ifc d) (hashtable-ref jrdesc-ifc-tbl d #f))
 
@@ -1868,7 +1868,7 @@
 
 (define pm-key-eq-cache (make-weak-eq-hashtable))
 
-(define pm-key-eq-mu (make-mutex))
+(define-process-local pm-key-eq-mu (make-mutex))
 
 (define (intern-pm-key proto method)
   (let* ((inner (hashtable-ref pm-key-eq-cache proto #f))
@@ -1991,7 +1991,7 @@
 (define type-class-memo
   (make-hashtable string-hash string=?))
 
-(define type-class-memo-mu (make-mutex))
+(define-process-local type-class-memo-mu (make-mutex))
 
 (define (type-implements-class? type-tag qname)
   (let* ((epoch (jrdesc-ifc-epoch))
@@ -4049,7 +4049,7 @@
 
 (define reify-shape-memo (make-weak-eq-hashtable))
 
-(define reify-shape-mu (make-mutex))
+(define-process-local reify-shape-mu (make-mutex))
 
 (define (reify-shape-layout shape)
   (or (hashtable-ref reify-shape-memo shape #f)
@@ -4188,7 +4188,7 @@
 
 (define reify-satisfies-memo (make-weak-eq-hashtable))
 
-(define reify-satisfies-mu (make-mutex))
+(define-process-local reify-satisfies-mu (make-mutex))
 
 (define (reify-satisfies? obj pn-str)
   (let* ((protos (jreify-protos obj))
