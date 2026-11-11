@@ -3681,7 +3681,12 @@
          (or (bld-nonempty-file? cache)
              (begin (guard (e (#t #f)) (delete-file cache)) #f))
          (begin
-           (bld-copy-file! cache to)
+           ;; to a name of this process's own, then renamed: TO is whole or absent to
+           ;; any other build of this directory (one storing TO as it was being
+           ;; written here read it empty, and stored that)
+           (let ((part (bld-part-path to)))
+             (bld-copy-file! cache part)
+             (rename-file part to))
            (guard (e (#t #f))           ; a cache we cannot mark is still a hit
              (let ((t (current-time)))
                (set-file-mtime-millis! cache (+ (* (time-second t) 1000)
