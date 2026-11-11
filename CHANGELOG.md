@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The AOT cache is kept under a byte budget, least recently used first.** Inside a generation nothing was ever removed, so a cache shared by checkouts on many trees grew without end (27 GB in 30,845 artifacts on one machine). A process that publishes now prunes the whole cache to `JOLT_CACHE_MB` (default 8192), as the build-unit cache is kept under `JOLT_BUILD_CACHE_MB`: a hit moves its artifact's mtime to now, nothing younger than a minute is removed, and a `.so` goes before its `.scm`, so a reader sees a whole artifact or a miss.
+
 - **`HashSet.retainAll`, `ArrayList.removeAll` and `ArrayList.retainAll` ask the argument's `contains` once an element.** `HashSet.retainAll` scanned its argument for every element of the set (two sets of 10,000: 175.5M engine ticks, now 1.4M), and ArrayList's two removed through the iterator, shifting the array once a removal (28.6M, now 1.06M), where the JDK's `batchRemove` makes one pass.
 
 - **A woken thread no longer reads as waiting.** A thread its waker had woken read `WAITING` until the scheduler ran it, so under load a main carrier found nothing could wake it, and died stuck or told a wait about to be answered. The waker clears it, as it already did for the all-asleep detector.

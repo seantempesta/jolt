@@ -985,6 +985,84 @@
                   (aot-info (string-append "pruning superseded generation " (cdr p)))
                   (aot-delete-tree (cdr p)))
                 doomed))))
+;; Inside a generation nothing is superseded in place: an artifact is keyed by
+;; content, so an edit to a namespace publishes new artifacts for it and for
+;; every namespace whose key folds it, and the old ones stay. The generation
+;; bound counts runtimes, not bytes, so a cache shared by checkouts on many
+;; trees grew without end. The whole root is kept under a byte budget
+;; (JOLT_CACHE_MB, default 8192) the way the build-unit cache is
+;; (build.ss bld-prune-build-cache!): least recently used first, a hit moving
+;; its .so's mtime to now (aot-mark-used!), pruned once by each process that
+;; publishes. Nothing younger than aot-prune-grace-seconds goes, so what another
+;; process just wrote or just hit stays while it loads; the .so goes before its
+;; .scm, so a reader sees a whole artifact or a miss; and a .so deleted between
+;; a hit's test and its load fails the load, which recompiles
+;; (aot-safe-load-or-recompile). The key sidecars stay: small, and a key with
+;; no artifact under it is a miss. Only a regular .so or .scm directly in a
+;; generation's v1 is ever deleted, and never through a symbolic link.
+(define (aot-cache-budget-bytes)
+  (let ((v (let ((e (getenv "JOLT_CACHE_MB"))) (and e (string->number e)))))
+    (* 1024 1024 (if (and (real? v) (> v 0)) v 8192))))
+(define (aot-now-ms)
+  (let ((t (current-time)))
+    (+ (* (time-second t) 1000) (quotient (time-nanosecond t) 1000000))))
+(define (aot-mark-used! so)
+  (guard (e (else #f))                  ; an artifact we cannot mark is still a hit
+    (set-file-mtime-millis! so (aot-now-ms))))
+(define (aot-ext f)
+  (let ((n (string-length f)))
+    (cond ((and (fx>? n 3) (string=? (substring f (fx- n 3) n) ".so")) ".so")
+          ((and (fx>? n 4) (string=? (substring f (fx- n 4) n) ".scm")) ".scm")
+          (else #f))))
+(define (aot-real-dir? p) (and (file-directory? p) (not (file-symbolic-link? p))))
+;; Every artifact under ROOT, as #(last-use-ms bytes so-path scm-path): its use
+;; is the later of its two files' mtimes. A file that vanishes under the walk is
+;; not counted.
+(define (aot-cache-artifacts root)
+  (let ((t (make-hashtable string-hash string=?)))
+    (for-each
+      (lambda (g)
+        (let ((v1 (string-append root "/" g "/v1")))
+          (when (and (aot-real-dir? (string-append root "/" g)) (aot-real-dir? v1))
+            (for-each
+              (lambda (f)
+                (let ((ext (aot-ext f)) (p (string-append v1 "/" f)))
+                  (when ext
+                    (guard (e (else #f))
+                      (when (file-regular? p #f)
+                        (let* ((ms (sa-file-mtime-ms p)) (n (sa-file-size p))
+                               (base (substring p 0 (fx- (string-length p) (string-length ext))))
+                               (a (or (hashtable-ref t base #f)
+                                      (let ((a (vector 0 0 #f #f))) (hashtable-set! t base a) a))))
+                          (vector-set! a 0 (max ms (vector-ref a 0)))
+                          (vector-set! a 1 (+ n (vector-ref a 1)))
+                          (vector-set! a (if (string=? ext ".so") 2 3) p)))))))
+              (directory-list v1)))))
+      (if (aot-real-dir? root) (directory-list root) '()))
+    (vector->list (hashtable-values t))))
+(define (aot-prune-to-budget! root limit)
+  (guard (e (else #f))
+    (let ((now (aot-now-ms))
+          (prefix (string-append root "/")))
+      (define (doomed! p)
+        (when (and p (fx>? (string-length p) (string-length prefix))
+                   (string=? prefix (substring p 0 (string-length prefix))))
+          (delete-file p #f)))
+      (let loop ((as (sort (lambda (a b) (> (vector-ref a 0) (vector-ref b 0)))
+                           (aot-cache-artifacts root)))
+                 (total 0))
+        (unless (null? as)
+          (let* ((a (car as)) (t (+ total (vector-ref a 1))))
+            (when (and (> t limit) (> (- now (vector-ref a 0)) (* 1000 aot-prune-grace-seconds)))
+              (aot-info (string-append "evicting " (or (vector-ref a 2) (vector-ref a 3))))
+              (doomed! (vector-ref a 2))
+              (doomed! (vector-ref a 3)))
+            (loop (cdr as) t)))))))
+(define aot-budget-pruned? #f)
+(define (aot-prune-to-budget-once!)
+  (unless aot-budget-pruned?
+    (set! aot-budget-pruned? #t)
+    (aot-prune-to-budget! (aot-cache-dir) (aot-cache-budget-bytes))))
 ;; The generation is stamped and swept once per process, on the first consult.
 ;; The cache is an optimisation, so a generation this process cannot create (a
 ;; sandbox that denies ~/.jolt, a read-only mount, a root another process just
@@ -2098,7 +2176,8 @@
               (sa-compile-file scm tmp-so #f))
             (rename-replace! tmp-so so)
             (unless (file-exists? so)
-              (aot-info (string-append "no .so produced for " name))))))))
+              (aot-info (string-append "no .so produced for " name)))))
+      (aot-prune-to-budget-once!))))
 ;; Evaluate a namespace's top-level forms from COMPILED code — an embedded fasl,
 ;; an AOT-cached .so, a classpath artifact. RT.load brackets a compiled class's
 ;; init with the compiler-flag vars exactly as Compiler.load brackets a source
@@ -2303,6 +2382,7 @@
                            '() deps)))
        (if (file-exists? so)
            (begin (aot-info (string-append "hit " name))
+                  (aot-mark-used! so)
                   (parameterize ((aot-dep-sink #f) (io-file-read-sink #f))
                     (aot-safe-load-or-recompile name file source base assumed-now)))
            (begin (aot-info (string-append "miss " name))
