@@ -40,10 +40,12 @@
 ;;     is forked next, or handed to any process with send-fd!; that process calls open.
 ;;
 ;; Pumps (the :pump option):
-;;   :thread (default) — one OS thread each, blocking in recv(2) / on the channel: the
-;;     kernel wakes the reader itself, the shortest path for one busy end.
-;;   :fiber — fibers over a non-blocking socket, parked on jolt.io-poller's one
-;;     readiness thread: thousands of ends cost no thread each.
+;;   :fiber (default) — fibers over a non-blocking socket, parked on jolt.io-poller:
+;;     thousands of ends cost no thread each, and under jolt.host/main-carrier-run! the
+;;     poller waits on the main thread itself, so a process holding ends stays one OS
+;;     thread and can still fork (jolt.host/fork-alone refuses a process with another active).
+;;   :thread — one OS thread each, blocking in recv(2) / on the channel: the kernel wakes
+;;     the reader itself, the shortest path for one busy end in a process that never forks.
 ;;
 ;; Forking and threads. fork(2) copies only the calling thread. A child that opens
 ;; an end runs pump threads, so it must come from a process that is safe to fork
@@ -481,10 +483,10 @@
     :codec    {:encode :decode} over byte-arrays (default edn-codec)
     :encode-error  (fn [v t]) the value to send in place of v when the codec threw t
               encoding it (default unencodable-error); the end stays open
-    :pump     :thread (default) or :fiber"
+    :pump     :fiber (default) or :thread"
   ([fd] (open fd {}))
   ([fd {:keys [buf in-buf out-buf in close-in? codec pump encode-error]
-        :or {buf 16 close-in? true codec edn-codec pump :thread encode-error unencodable-error}}]
+        :or {buf 16 close-in? true codec edn-codec pump :fiber encode-error unencodable-error}}]
    (clofork! fd)
    (when (= pump :fiber) (fcntl fd F-SETFL (bit-or O-NONBLOCK (fcntl fd F-GETFL 0))))
    (let [end {:fd fd
