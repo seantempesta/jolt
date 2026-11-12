@@ -658,7 +658,7 @@
         ;; tokens are what a multimethod table (print-method) compares keys with.
         ;; Both pairs are in eq-fast-probes, so the registry refuses an arm that
         ;; would claim one. (juuid/jhost load later: runtime forward refs, as jrec.)
-        ((and (juuid? a) (juuid? b)) (string=? (juuid-s a) (juuid-s b)))
+        ((and (juuid? a) (juuid? b)) (jolt-uuid=? a b))
         ((and (jhost? a) (jhost? b) (jclass? a) (jclass? b)) (jclass=? a b))
         ;; nil is equal only to nil (the eq? clause above answered that pair),
         ;; and two base scalars of different kinds are never equal. Both used to

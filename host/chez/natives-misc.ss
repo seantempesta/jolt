@@ -5,16 +5,35 @@
 ;; (jolt-str-render-one for %s / str of a uuid).
 
 ;; --- UUID --------------------------------------------------------------------
-;; A uuid is a record wrapping its canonical 36-char lowercase string. str -> the
-;; bare string; pr-str -> #uuid "…"; not map?/coll?.
-;; A UUID holds its canonical string and its two 64-bit halves (unsigned), read
-;; once when it is made: compare and hashCode use the halves, which they used to
-;; re-parse from the hex text on every call.
+;; A UUID is its two 64-bit halves (unsigned): =, compare and hashCode read them.
+;; str -> the canonical 36-char lowercase text; pr-str -> #uuid "…"; not map?/coll?.
+;; A uuid made from text keeps that text; one made from its halves or its 16 bytes
+;; (UUID. msb lsb, a stored uuid read back) holds none, and str writes it from the
+;; halves when asked, as the JVM's toString does: a uuid used as a key or compared
+;; never pays for 36 four-byte chars it does not show.
 (define-record-type juuid
-  (fields s msb lsb)
-  (protocol (lambda (new) (lambda (s) (new s (uuid-half-u s 0) (uuid-half-u s 16)))))
-  (nongenerative chez-juuid-v2))
+  (fields text msb lsb)
+  (protocol (lambda (new)
+              (case-lambda
+                ((s) (new s (uuid-half-u s 0) (uuid-half-u s 16)))
+                ((msb lsb) (new #f msb lsb)))))
+  (nongenerative chez-juuid-v3))
 (define (jolt-uuid-pred? x) (juuid? x))
+;; The canonical text: the one it was made from, else written from the halves.
+(define (juuid-s u) (or (juuid-text u) (uuid-halves->text (juuid-msb u) (juuid-lsb u))))
+(define (jolt-uuid=? a b) (and (= (juuid-msb a) (juuid-msb b)) (= (juuid-lsb a) (juuid-lsb b))))
+(define (uuid-halves->text msb lsb)
+  ;; four 32-bit fixnum words, so no nibble is read off a bignum
+  (let ((s (make-string 36 #\-))
+        (w (vector (bitwise-arithmetic-shift-right msb 32) (bitwise-and msb #xFFFFFFFF)
+                   (bitwise-arithmetic-shift-right lsb 32) (bitwise-and lsb #xFFFFFFFF))))
+    (let loop ((j 0))
+      (if (fx=? j 32)
+          s
+          (let ((x (vector-ref w (fxsrl j 3))))
+            (string-set! s (uuid-hex-pos j)
+                         (string-ref hexd (fxand (fxsrl x (fx* 4 (fx- 7 (fxand j 7)))) 15)))
+            (loop (fx+ j 1)))))))
 
 (define hexd "0123456789abcdef")
 ;; Position of hex digit j within the 8-4-4-4-12 layout: one extra character for
@@ -83,11 +102,14 @@
         (else (fx- (char->integer c) 55))))
 ;; unsigned value of the 16 hex digits starting at digit index `start` (0 = msb,
 ;; 16 = lsb), mapped through the 8-4-4-4-12 layout by uuid-hex-pos.
+;; Two 32-bit words in fixnums, joined once: a bignum per digit was most of a parse.
 (define (uuid-half-u s start)
-  (let loop ((j start) (acc 0))
-    (if (fx=? j (fx+ start 16))
-        acc
-        (loop (fx+ j 1) (+ (* acc 16) (uuid-hexv (string-ref s (uuid-hex-pos j))))))))
+  (define (word from)
+    (let loop ((j from) (acc 0))
+      (if (fx=? j (fx+ from 8))
+          acc
+          (loop (fx+ j 1) (fxior (fxsll acc 4) (uuid-hexv (string-ref s (uuid-hex-pos j))))))))
+  (+ (bitwise-arithmetic-shift-left (word start) 32) (word (fx+ start 8))))
 (define (uuid-msb-u u) (juuid-msb u))
 (define (uuid-lsb-u u) (juuid-lsb u))
 ;; two distinct uuids: jolt=2 and jolt-hash answer uuids ahead of the arm walk, so

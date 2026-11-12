@@ -216,7 +216,7 @@
   '(("host/chez/seq.ss" jolt-var-unbound? jolt-var-unbound-ns jolt-var-unbound-name
                         jreify? jreify-protos jolt-transient?)
     ("host/chez/natives-meta.ss" juuid? jvol?)
-    ("host/chez/values.ss" jhost? juuid? juuid-s)
+    ("host/chez/values.ss" jhost? juuid? jolt-uuid=?)
     ("host/chez/hasheq.ss" jhost? juuid?)))
 (define (forward-refs path)
   (let ((here (hashtable-ref load-index path #f))
