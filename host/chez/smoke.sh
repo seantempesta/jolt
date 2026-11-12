@@ -2416,20 +2416,20 @@ check '(do (require (quote jolt.nrepl)) (boolean (some #(= "pr-str" (clojure.str
 # words, then ex / root-ex as the CLASS of the exception and of its root cause
 # with eval-error, then done on its own. A read error is wrapped in an
 # ExceptionInfo there, so that is what ex names.
-check '(do (require (quote jolt.nrepl)) (let [sent (atom [])] ((var jolt.nrepl/built-in-handler) {"op" "eval" "code" "(throw (ex-info \"outer\" {} (ArithmeticException. \"inner\")))" :reply #(swap! sent conj %)}) (mapv #(into (sorted-map) %) @sent)))' '[{"err" "Execution error (ArithmeticException) at (REPL:1).\ninner\n"} {"ex" "class clojure.lang.ExceptionInfo", "root-ex" "class java.lang.ArithmeticException", "status" ["eval-error"]} {"status" ["done"]}]'
+check '(do (require (quote jolt.nrepl)) (let [sent (atom [])] ((var jolt.nrepl/built-in-handler) {"op" "eval" "code" "(throw (ex-info \"outer\" {} (ArithmeticException. \"inner\")))" :reply #(swap! sent conj %)}) (mapv #(into (sorted-map) %) @sent)))' '[{"err" "Execution error (ArithmeticException) at user/eval3 (REPL:1).\ninner\n"} {"ex" "class clojure.lang.ExceptionInfo", "root-ex" "class java.lang.ArithmeticException", "status" ["eval-error"]} {"status" ["done"]}]'
 check '(do (require (quote jolt.nrepl)) (let [sent (atom [])] ((var jolt.nrepl/built-in-handler) {"op" "eval" "code" "(defn broken [x]" :reply #(swap! sent conj %)}) (mapv #(into (sorted-map) %) @sent)))' '[{"err" "Syntax error reading source at (REPL:1:17).\nEOF while reading\n"} {"ex" "class clojure.lang.ExceptionInfo", "root-ex" "class java.lang.RuntimeException", "status" ["eval-error"]} {"status" ["done"]}]'
-check '(do (require (quote jolt.nrepl)) (let [r (jolt.nrepl/evaluate "1\n\n(/ 1 0)" "user")] [(:err r) (:err-msg r) (:ex-class r) (:root-ex-class r)]))' '["Divide by zero" "Execution error (ArithmeticException) at (REPL:3).\nDivide by zero\n" "class java.lang.ArithmeticException" "class java.lang.ArithmeticException"]'
+check '(do (require (quote jolt.nrepl)) (let [r (jolt.nrepl/evaluate "1\n\n(/ 1 0)" "user")] [(:err r) (:err-msg r) (:ex-class r) (:root-ex-class r)]))' '["Divide by zero\n  trace:\n    user/eval3 (NO_SOURCE_FILE:3)\n" "Execution error (ArithmeticException) at user/eval3 (REPL:3).\nDivide by zero\n" "class java.lang.ArithmeticException" "class java.lang.ArithmeticException"]'
 # Called from a fn that keeps its frame, as an nREPL server's session worker
 # does. evaluate's own frames don't always make it into the trace, so a cut at
 # them missed: the caller's frame then named the error's location.
-check '(do (require (quote jolt.nrepl)) (defn ev-caller [] (let [r (jolt.nrepl/evaluate "(/ 1 0)" "user")] r)) (let [r (ev-caller)] [(:err-msg r) (:err r)]))' '["Execution error (ArithmeticException) at (REPL:1).\nDivide by zero\n" "Divide by zero"]'
-check '(do (require (quote jolt.nrepl)) (defn ev-caller [] (let [r (jolt.nrepl/evaluate "(/ 1 0)" "user" {:out (fn [_])})] r)) (let [r (ev-caller)] [(:err-msg r) (:err r)]))' '["Execution error (ArithmeticException) at (REPL:1).\nDivide by zero\n" "Divide by zero"]'
+check '(do (require (quote jolt.nrepl)) (defn ev-caller [] (let [r (jolt.nrepl/evaluate "(/ 1 0)" "user")] r)) (let [r (ev-caller)] [(:err-msg r) (:err r)]))' '["Execution error (ArithmeticException) at user/eval3 (REPL:1).\nDivide by zero\n" "Divide by zero\n  trace:\n    user/eval3 (NO_SOURCE_FILE:1)\n"]'
+check '(do (require (quote jolt.nrepl)) (defn ev-caller [] (let [r (jolt.nrepl/evaluate "(/ 1 0)" "user" {:out (fn [_])})] r)) (let [r (ev-caller)] [(:err-msg r) (:err r)]))' '["Execution error (ArithmeticException) at user/eval3 (REPL:1).\nDivide by zero\n" "Divide by zero\n  trace:\n    user/eval3 (NO_SOURCE_FILE:1)\n"]'
 check '(do (require (quote jolt.nrepl)) (jolt.nrepl/evaluate "(defn nf [x] (/ x 0))" "user") (defn ev-caller [] (let [r (jolt.nrepl/evaluate "(nf 1)" "user" {:out (fn [_])})] r)) (:err-msg (ev-caller)))' '"Execution error (ArithmeticException) at user/nf (REPL:1).\nDivide by zero\n"'
 # A fn the caller's stack also holds is still the eval'd code's frame when the
 # code calls it: only the trace's outer end is the caller's.
-check '(do (require (quote jolt.nrepl)) (jolt.nrepl/evaluate "(defn nf [x] (let [r (/ x 0)] r))" "user") (defn g [f] (let [r (f)] r)) (defn ev-caller [] (let [r (jolt.nrepl/evaluate "(let [v (g (fn [] (let [q (nf 1)] q)))] v)" "user" {:out (fn [_])})] r)) (let [r (g ev-caller)] (vec (remove #(re-find #"\$" %) (map clojure.string/trim (rest (clojure.string/split-lines (:err r))))))))' '["trace:" "user/nf" "user/g"]'
+check '(do (require (quote jolt.nrepl)) (jolt.nrepl/evaluate "(defn nf [x] (let [r (/ x 0)] r))" "user") (defn g [f] (let [r (f)] r)) (defn ev-caller [] (let [r (jolt.nrepl/evaluate "(let [v (g (fn [] (let [q (nf 1)] q)))] v)" "user" {:out (fn [_])})] r)) (let [r (g ev-caller)] (vec (remove #(re-find #"\$" %) (map clojure.string/trim (rest (clojure.string/split-lines (:err r))))))))' '["trace:" "user/nf" "user/g" "user/eval4 (NO_SOURCE_FILE:1)"]'
 check '(do (require (quote jolt.nrepl)) (let [r (jolt.nrepl/evaluate "(let [a] a)" "user")] [(:err-msg r) (:ex-class r)]))' '["Syntax error macroexpanding clojure.core/let at (REPL:1:1).\nCall to clojure.core/let did not conform to spec.\n[a] - failed: even-number-of-forms? at: [:bindings] spec: :clojure.core.specs.alpha/bindings\n" "class clojure.lang.Compiler$CompilerException"]'
-check '(do (require (quote jolt.nrepl)) (let [e (ex-info "boom" {:a 1})] [(jolt.nrepl/err->msg e) (jolt.nrepl/err->msg e {:line 4})]))' '["Execution error (ExceptionInfo).\nboom\n" "Execution error (ExceptionInfo) at (REPL:4).\nboom\n"]'
+check '(do (require (quote jolt.nrepl)) (let [e @(future (ex-info "boom" {:a 1}))] [(jolt.nrepl/err->msg e) (jolt.nrepl/err->msg e {:line 4})]))' '["Execution error (ExceptionInfo).\nboom\n" "Execution error (ExceptionInfo) at (REPL:4).\nboom\n"]'
 # An undefined name is a compile error over nREPL as it is on the JVM and in
 # `jolt -e` / `jolt repl`. evaluate used to bind *allow-unresolved-vars* true,
 # so `x` interned an unbound var and returned it, and (defn f [] later) compiled
@@ -2441,7 +2441,7 @@ check '(do (require (quote jolt.nrepl)) (let [sent (atom [])] ((var jolt.nrepl/b
 # wrapper before evaluate catches it (a break handler before the stack unwinds
 # sits there). Unbound, nil, it evaluates directly.
 check '(do (require (quote jolt.nrepl)) (def seen (atom [])) (binding [jolt.nrepl/*eval-wrapper* (fn [thunk] (swap! user/seen conj (str *ns*)) (thunk))] [(:value (jolt.nrepl/evaluate "(+ 1 2)" "user")) (:value (jolt.nrepl/evaluate "(+ 2 2)" "user" {:load true})) @user/seen]))' '["3" "4" ["user" "user"]]'
-check '(do (require (quote jolt.nrepl)) (def seen (atom nil)) (let [r (binding [jolt.nrepl/*eval-wrapper* (fn [thunk] (try (thunk) (catch Throwable t (reset! user/seen (ex-message t)) (throw t))))] (jolt.nrepl/evaluate "(/ 1 0)" "user"))] [@user/seen (:err r)]))' '["Divide by zero" "Divide by zero"]'
+check '(do (require (quote jolt.nrepl)) (def seen (atom nil)) (let [r (binding [jolt.nrepl/*eval-wrapper* (fn [thunk] (try (thunk) (catch Throwable t (reset! user/seen (ex-message t)) (throw t))))] (jolt.nrepl/evaluate "(/ 1 0)" "user"))] [@user/seen (:err r)]))' '["Divide by zero" "Divide by zero\n  trace:\n    user/eval3 (NO_SOURCE_FILE:1)\n    jfn$user/$0\n"]'
 check '(do (require (quote jolt.nrepl)) (nil? jolt.nrepl/*eval-wrapper*))' 'true'
 # eval-string / load-string with a source path, as Compiler.load takes one: the
 # forms carry it as :file and *file* / *source-path* are the path and its name;
@@ -2500,7 +2500,7 @@ jx_check "a warm hit that throws still wraps" '["Syntax error macroexpanding at 
 rm -rf "$rq"
 # nREPL's err for a load's failure with no frame of the user's names the failing
 # form in the loaded text, from the wrapper: (REPL:2) for line 2 of the string.
-check '(do (require (quote jolt.nrepl)) (let [sent (atom [])] ((var jolt.nrepl/built-in-handler) {"op" "eval" "code" "(load-string \"nil\\n(/ 1 0)\")" :reply #(swap! sent conj %)}) (get (first @sent) "err")))' '"Execution error (ArithmeticException) at (REPL:2).\nDivide by zero\n"'
+check '(do (require (quote jolt.nrepl)) (let [sent (atom [])] ((var jolt.nrepl/built-in-handler) {"op" "eval" "code" "(load-string \"nil\\n(/ 1 0)\")" :reply #(swap! sent conj %)}) (get (first @sent) "err")))' '"Execution error (ArithmeticException) at user/eval4 (REPL:2).\nDivide by zero\n"'
 # The err text is the JVM's: jolt's "(did you mean …?)" stays on :err and the
 # exception's message, and is left out of err->msg.
 check '(do (require (quote jolt.nrepl)) (let [r (jolt.nrepl/evaluate "(mapp inc [1])" "user")] [(:err-msg r) (boolean (re-find #"did you mean map" (:err r)))]))' '["Syntax error compiling at (REPL:1:1).\nUnable to resolve symbol: mapp in this context\n" true]'
