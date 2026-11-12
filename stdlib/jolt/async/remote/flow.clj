@@ -52,25 +52,30 @@
 
 (defn fork!
   "Fork child, a fn of one end, as proc pid of running flow g: a remote-pair, then
-  jolt.host/fork-alone. In the child: (child end), end opened over the child's descriptor
-  (opts' :pump, :codec, :buf), then :out closed and :sent awaited, so all the child put
-  reaches the parent, and the child exits 0, or 1 when child threw (said on stderr); it
-  never returns into the caller's frames. In the parent: the child's descriptor is closed and
+  jolt.host/fork-alone. In the child, first, every stream descriptor but 0-2, its own and
+  those of (:keep opts) is closed (jolt.async.remote/close-streams-but!); then (child end), end
+  opened over the child's descriptor (opts' :pump, :codec, :buf). A child that throws puts the
+  throw on :out as its last value, ::flow/error's shape ({::flow/pid pid ::flow/ex
+  (Throwable->map e)}), nothing on stderr. Then :out is closed and :sent awaited, so all the
+  child put reaches the parent, and the child exits 0, or 1 when child threw; it never returns
+  into the caller's frames. In the parent: the child's descriptor is closed and
   the child becomes proc pid of g (proc over the parent's end: in-port (:in opts, default :in)
   carries what the flow sends it, out-port (:out opts, default :out) what the child puts, its
   end delivered last), with (:conns opts) added, by one update! of the config last applied.
   Answers {:pid child-os-pid}, or {:refused n} when fork-alone refuses (another thread was
   active: n is -2) and nothing is added. The caller reaps the child (waitpid)."
-  [g pid child {:keys [in out conns] :or {in :in out :out} :as opts}]
-  (let [ropts (dissoc opts :in :out :conns)
+  [g pid child {:keys [in out conns keep] :or {in :in out :out} :as opts}]
+  (let [ropts (dissoc opts :in :out :conns :keep)
         [end fd] (r/remote-pair ropts)
         os-pid (jolt.host/fork-alone)]
     (cond
       (zero? os-pid)
-      (let [mine (r/open fd ropts)
+      (let [_ (r/close-streams-but! (conj (set keep) fd))
+            mine (r/open fd ropts)
             ok (try (child mine) true
+                    ;; the throw is data for the parent, its last value (stderr is for a dead process's last words)
                     (catch Throwable t
-                      (binding [*out* *err*] (println "jolt.async.remote.flow/fork! child threw:" (ex-message t)) (flush))
+                      (a/>!! (:out mine) {::flow/pid pid ::flow/ex (Throwable->map t)})
                       false))]
         (a/close! (:out mine))
         (a/<!! (:sent mine))

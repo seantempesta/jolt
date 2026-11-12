@@ -155,6 +155,19 @@
            fds))
        (finally (ffi/free sv))))))
 
+(ffi/defcfn ^:private c-lseek "lseek" [:int :int64 :int] :int64)
+
+(defn close-streams-but!
+  "Close every stream descriptor this process holds (a socket, pipe or FIFO: one lseek refuses) but 0-2 and those of
+  keep, a set. What a forked child calls first (jolt.async.remote.flow/fork! does): it holds the stream ends it is given
+  and no other, so a stream's end of file is the end of the processes it was made for (ProcessBuilder's rule). A file
+  stays open: a native library's own (LMDB's lock) is not the child's to close. Read from /dev/fd, the descriptors open now."
+  [keep]
+  (doseq [s (.list (java.io.File. "/dev/fd")) :let [fd (parse-long s)]
+          :when (and fd (< 2 fd) (not (contains? keep fd)) (neg? (c-lseek fd 0 1)))]
+    (native/c-close fd))
+  nil)
+
 (defn close-fd! "Close a raw descriptor (one handed on to another process)." [fd]
   (swap! held disj fd)
   (first (native/c-close fd)))
