@@ -322,8 +322,24 @@
 (defn- alt-top [n] (let [r (alt-a n)] r))
 (let [st (.getStackTrace (try (alt-top 1500) (catch Exception x x)))]
   (ok= (count st) 1024 "a trace past 1024 frames is capped at the JVM's depth")
-  (ok= (.getClassName (last st)) "stack_trace_test$alt_top"
+  ;; the program's outermost frame; the launcher's own (jolt.main) lie outside it, as on the JVM
+  (ok= (first (last (own-frames st))) "stack_trace_test$alt_top"
        "...keeping its outermost frame as well as its innermost"))
+
+;; a fn whose tail form is a try/finally (or a binding, which expands to one) keeps its
+;; frame in a throw's trace, as on the JVM, however many tail calls and throws lie below
+;; its body's last call: the finally's wind must not erase the fn it sits in
+(def ^:dynamic *fin* nil)
+(defn- fin-thrower [] (throw (ex-info "fin" {})))
+(defn- fin-middle [] (fin-thrower))
+(defn- fin-tail [] (try (fin-middle) (finally nil)))
+(defn- fin-catch-tail [] (try (fin-middle) (catch IllegalStateException _ nil) (finally nil)))
+(defn- fin-binding [] (binding [*fin* 1] (fin-middle)))
+(doseq [[f nm] [[fin-tail "stack_trace_test$fin_tail"] [fin-catch-tail "stack_trace_test$fin_catch_tail"]
+                [fin-binding "stack_trace_test$fin_binding"]]]
+  (let [names (frame-names (try (f) (catch Exception x x)))]
+    (ok= (boolean (some #{nm} names)) true (str nm " (its tail form a try/finally) is in the trace: " names))
+    (ok= (first names) "stack_trace_test$fin_thrower" (str "...under its innermost frame: " names))))
 
 (let [n @passes f @fails]
   (doseq [m f] (println "stack-trace FAIL " m))

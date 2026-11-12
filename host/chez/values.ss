@@ -254,6 +254,11 @@
 ;; The body is never reached for its value — a finally has no before-thunk — so
 ;; #f is arbitrary.
 (define jolt-finally-in (lambda () #f))
+;; A tail finally's frame keeper (emit-try): the back end passes the finally's wind to it, so the fn the
+;; try sits in stays a live frame under the wind, as on the JVM, and a throw's trace names it. A
+;; top-level procedure Chez does not inline into the caller: a let, call-with-values or call/1cc around
+;; the wind was folded back into a tail call once the body closes over the fn's jolt-site-call.
+(define (jolt-frame-keep v) v)
 
 ;; The older seam, still used by HOST dynamic-winds that want exit-only cleanup
 ;; but cannot use the marker because they need a real before-thunk of their own

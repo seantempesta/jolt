@@ -1325,7 +1325,7 @@
                   ;; jolt-finally-in is that dynamic-wind's before-thunk, emitted
                   ;; by name because the fiber park recognises it with eq? — a
                   ;; shadowed or inlined copy would make the finally run mid-park.
-                  "dynamic-wind" "jolt-finally-in"
+                  "dynamic-wind" "jolt-finally-in" "jolt-frame-keep"
                   ;; host interop (emit-invoke static call, :host-new,
                   ;; :host-static field ref).
                   "host-new" "host-static-call" "host-static-ref" "host-late-var-ref"
@@ -4242,7 +4242,19 @@
 ;; try began. A non-tail call restores them when it returns, but a throw does not
 ;; return: what the throw and the calls it left behind stored would stay there, and
 ;; the next host fault would report the thrower as its innermost frame.
+;; A finally in a fn's tail position keeps the fn's frame (Chez): its wind is passed to
+;; jolt-frame-keep (values.ss), a call Chez does not fold into a tail call, at the body's line,
+;; and its body is non-tail inside it. In tail position the wind erased the fn's frame, and the
+;; one site slot naming an erased caller was overwritten by any tail call or throw below the
+;; body's last call, so the fn the try sat in (a tail `binding` too) was missing from a throw's
+;; trace (test/chez/stack-trace-test.clj, fin-tail). One frame per tail finally, as on the JVM.
+(declare emit-try*)
 (defn- emit-try [node]
+  (if (and (:finally node) *tail?* (not= :gambit (target)))
+    (with-site (if (and (map? (:body node)) (node-line (:body node))) (:body node) node)
+      (str "(jolt-frame-keep " (binding [*tail?* false] (emit-try* node)) ")"))
+    (emit-try* node)))
+(defn- emit-try* [node]
   (let [ts (when (and (:catch-sym node) (trace-frames?)) (fresh-label "_ts$"))
         to (when ts (fresh-label "_to$"))
         core (if-let [cs (:catch-sym node)]
