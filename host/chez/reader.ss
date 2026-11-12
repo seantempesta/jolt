@@ -378,6 +378,15 @@
 
 ;; opening quote already consumed; read to the closing quote, processing escapes.
 (define (rdr-read-string-lit s i end)
+  ;; nearly every literal has no escape: scan to its closing quote and take it as one substring (4 bytes a
+  ;; character); the per-character list below (a cons each, then reversed: ~32 bytes a character) is for
+  ;; a literal with a backslash, from its start
+  (let scan ((j i))
+    (cond ((fx>= j end) (rdr-read-string-lit/escapes s i end))
+          ((char=? (string-ref s j) #\") (values (substring s i j) (fx+ j 1)))
+          ((char=? (string-ref s j) #\\) (rdr-read-string-lit/escapes s i end))
+          (else (scan (fx+ j 1))))))
+(define (rdr-read-string-lit/escapes s i end)
   (let loop ((i i) (acc '()))
     (when (>= i end) (rdr-eof-error s i "EOF while reading string"))
     (let ((c (string-ref s i)))
@@ -797,7 +806,7 @@
 ;; Forms are read left-to-right, so the indices queried are non-decreasing within
 ;; one source string — keep a cursor and count newlines only over the delta
 ;; (O(n) total, not O(n^2)). A different string or a backward index resets it.
-(define rdr-pos-cursor (make-thread-parameter #f))   ; #f | (vector s i line col)
+(define rdr-pos-cursor (make-thread-parameter #f))   ; #f | (vector s i line col), this thread's own
 (define (rdr-line-col-at s i)
   (let* ((cur (rdr-pos-cursor))
          (reuse (and (vector? cur) (eq? (vector-ref cur 0) s)
@@ -807,7 +816,11 @@
          (c0 (if reuse (vector-ref cur 3) 1)))
     (let loop ((k k0) (line l0) (col c0))
       (if (fx>=? k i)
-          (begin (rdr-pos-cursor (vector s k line col)) (values line col))
+          ;; the cursor is the thread's (a thread parameter): moved in place, never a new vector a form
+          (begin (if (vector? cur)
+                     (begin (vector-set! cur 0 s) (vector-set! cur 1 k) (vector-set! cur 2 line) (vector-set! cur 3 col))
+                     (rdr-pos-cursor (vector s k line col)))
+                 (values line col))
           (if (char=? (string-ref s k) #\newline)
               (loop (fx+ k 1) (fx+ line 1) 1)
               (loop (fx+ k 1) line (fx+ col 1)))))))

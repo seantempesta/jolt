@@ -383,7 +383,8 @@
                       (if (some? m) (recur (assoc ret (::flow/pid m) m)) ret)))]
           ;; jolt: take's go-loop ends only when reply closes (a late pong is dropped)
           (async/close! reply)
-          ret))
+          ;; jolt: how many reports the sliding ::flow/report chan dropped, as the answer's metadata (its keys stay pids)
+          (some-> ret (with-meta {::flow/report-dropped (jolt.host/chan-dropped (:report @rt))}))))
       (pause-proc [_ pid] (locked #(send-control! rt [pid] #::flow{:command ::flow/pause})))
       (resume-proc [_ pid] (locked #(send-control! rt [pid] #::flow{:command ::flow/resume})))
       (ping-proc [_ pid timeout-ms]

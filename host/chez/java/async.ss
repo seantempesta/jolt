@@ -181,7 +181,7 @@
       (ac-intr-wait! (async-chan-mu ch) (async-chan-cv ch) (lambda () (ac-cv-wait ch)) reg)
       (begin (ac-cv-wait ch) #t)))
 
-(define (ac-qnew) (vector '() '() 0))
+(define (ac-qnew) (vector '() '() 0 0))   ; front, rear, length, values a dropping or sliding buffer dropped
 (define (ac-qlen ch) (vector-ref (async-chan-items ch) 2))
 (define (ac-qempty? ch) (fx=? 0 (vector-ref (async-chan-items ch) 2)))
 (define (ac-qpush! ch entry)
@@ -204,6 +204,8 @@
     (cond ((memq entry (vector-ref q 0)) (vector-set! q 0 (remq entry (vector-ref q 0))))
           (else (vector-set! q 1 (remq entry (vector-ref q 1)))))
     (vector-set! q 2 (fx- (vector-ref q 2) 1))))
+(define (ac-qdropped+! ch)
+  (let ((q (async-chan-items ch))) (vector-set! q 3 (fx+ (vector-ref q 3) 1))))
 (define (ac-qdrop-oldest! ch)
   (let ((q (async-chan-items ch)))
     (ac-qfront! q)
@@ -213,8 +215,8 @@
 ;; enqueue honoring the buffer kind (used by the transducer step + buffered puts).
 (define (ac-buf-give! ch v)
   (case (async-chan-kind ch)
-    ((dropping) (when (< (ac-qlen ch) (async-chan-cap ch)) (ac-qpush! ch (cons v #f))))
-    ((sliding)  (when (>= (ac-qlen ch) (async-chan-cap ch)) (ac-qdrop-oldest! ch))
+    ((dropping) (if (< (ac-qlen ch) (async-chan-cap ch)) (ac-qpush! ch (cons v #f)) (ac-qdropped+! ch)))
+    ((sliding)  (when (>= (ac-qlen ch) (async-chan-cap ch)) (ac-qdrop-oldest! ch) (ac-qdropped+! ch))
                 (ac-qpush! ch (cons v #f)))
     ((promise)  (when (ac-qempty? ch) (ac-qpush! ch (cons v #f))))  ; first value stays
     (else       (ac-qpush! ch (cons v #f))))      ; fixed: caller ensured room
@@ -1451,6 +1453,10 @@
 
 ;; --- install clojure.core.async ---------------------------------------------
 (define (cca-def! name v) (def-var! "clojure.core.async" name v))
+;; (jolt.host/chan-dropped ch): how many values ch's dropping or sliding buffer has dropped, as a count
+;; that only grows (a flow's ::flow/report slides; its ping shows the count: never a silent loss)
+(def-var! "jolt.host" "chan-dropped"
+  (lambda (ch) (if (async-chan? ch) (vector-ref (async-chan-items ch) 3) 0)))
 (cca-def! "__set-port-reader!" (lambda (f) (set! jolt-async-port-reader f) jolt-nil))
 (cca-def! "__port" jolt-async-port)
 ;; alts!'s ports with each take port that is not a channel read as the promise-chan reading it
