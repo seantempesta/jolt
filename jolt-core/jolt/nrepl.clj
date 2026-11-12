@@ -231,6 +231,13 @@
 
 (declare frame-location)
 
+(declare frame-location)
+(defn- repl-own-frame?
+  "A frame line naming a fn of the REPL itself (jolt.nrepl, jolt.main), by its name or its
+  fn literal's jfn$ label."
+  [line]
+  (boolean (some->> (frame-location line) :symbol namespace (re-find #"^(jfn\$)?jolt\.(nrepl|main)$"))))
+
 (defn- eval-frames
   "The frame lines of an eval error, innermost first, cut where the eval began;
   empty for a read or compile error in the eval'd text, whose frames would be
@@ -261,10 +268,13 @@
                     (when (str/starts-with? s head)
                       (cut-at-eval (str/split-lines (subs s (count head))) printing? outer?))))
                 (catch :default _ nil))]
-      (vec (or (seq own)
-               (when-let [bt (try (jolt.host/backtrace-string) (catch :default _ nil))]
-                 (cut-at-eval (remove #(= (str/trim %) "trace:") (str/split-lines bt))
-                              printing? outer?))))))))
+      ;; the REPL's own fns (evaluate's run, inside the try the eval is cut at) are no frame of
+      ;; the eval'd code's: kept live now that a tail binding keeps its fn's frame
+      (vec (remove repl-own-frame?
+                   (or (seq own)
+                       (when-let [bt (try (jolt.host/backtrace-string) (catch :default _ nil))]
+                         (cut-at-eval (remove #(= (str/trim %) "trace:") (str/split-lines bt))
+                                      printing? outer?)))))))))
 
 (defn- frame-location
   "{:symbol :source :line} named by a frame line, nil for one that names no
