@@ -867,13 +867,19 @@
 ;; parent's go loops, root's procs in every fork of a Seon root. Every fiber that could be
 ;; resumed is held by what would resume it, so the weak registry lists it. Called by
 ;; jolt-after-fork-child!, while the child is its one thread.
+;; The registry then lists only the child's own fibers: a 'forked one is no work of this process,
+;; so its quiescence, its deadlock check and its dump never count it (a child whose own work waited
+;; was never quiescent while it held its parent's go loops: fiber-quiescent-test's fork case).
 (define (jolt-fibers-forget-the-parents!)
   (let ((self (jolt-current-fiber)))
     (for-each (lambda (f)
                 (unless (or (eq? f self) (memq (jolt-fiber-state f) '(done dead)))
                   (jolt-fiber-state-set! f 'forked)
                   (jolt-fiber-next-set! f #f)))
-              (jolt-fiber-registry-live))))
+              (jolt-fiber-registry-live))
+    (set-box! jolt-fiber-registry
+              (fold-right weak-cons '()
+                          (filter (lambda (f) (not (eq? 'forked (jolt-fiber-state f)))) (jolt-fiber-registry-live))))))
 
 ;; up to limit frames of continuation k as (name source-datum-or-#f vars), innermost first,
 ;; and how many were left: the last element is that count, 0 when none. A compiled Clojure
