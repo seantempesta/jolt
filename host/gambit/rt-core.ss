@@ -607,6 +607,20 @@
 ;; here reaches that seam, so it clears nothing that matters.
 (define (var-redefined-clear!)
   (hashtable-clear! var-redefined-set))
+;; A var's validator and watches, as ARef.validate and notifyWatches (the cell's
+;; fields, ordered as volatiles: see var-cell). var-notify is called after the root
+;; is stored: the watches' load-acquire follows the root's store-release, so a def
+;; and an add-watch-then-deref never both miss (the varwatchorder gate). No lock:
+;; none is needed for that order, and a def is not a read-modify-write.
+(define (var-validate c v)
+  (let ((vf (var-cell-validator c)))
+    (when (and (not (jolt-nil? vf)) (jolt-not (jolt-invoke1 vf v)))
+      (jolt-iref-state-throw))))
+(define (var-notify c old new)
+  (let ((ws (var-cell-watches c)))
+    (unless (null? ws)
+      (for-each (lambda (kv) (jolt-invoke4 (cdr kv) (car kv) c old new))
+                (reverse ws)))))
 (define (def-var! ns name v)
   ;; first def of a given proc wins, so an alias like (def inc' inc) — which binds
   ;; the SAME proc to a second var — doesn't rename inc.
@@ -619,7 +633,13 @@
     ;; so a forward declaration is not a redefinition.
     (when (not (jolt-var-unbound? (var-cell-root c)))
       (hashtable-set! var-redefined-set (string-append ns "/" name) #t))
-    (var-root-set! c v) (var-cell-defined?-set! c #t) c))
+    ;; Var.bindRoot's order: validate, store the root, then read the watches and
+    ;; call them (atoms.ss var-notify, the varwatchorder gate)
+    (let ((old (var-cell-root c)))
+      (var-validate c v)
+      (var-root-set! c v) (var-cell-defined?-set! c #t)
+      (var-notify c old v)
+      c)))
 ;; Linked vars — see host/chez/rt.ss var-root-set!. The Gambit seed is minted
 ;; var-routed (gen-seed.ss sets no mint flags), so nothing links here yet; the
 ;; funnel is mirrored so a def-var-linked! form loads if one ever arrives.

@@ -420,38 +420,16 @@
                          "notifyWatches: not a watchable reference")))
   jolt-nil)
 
-;; vars are watchable IRefs, as Clojure's Var is an ARef: a root change (def, intern,
-;; alter-var-root, with-redefs, .bindRoot) validates, stores the root, and then reads
-;; the watches and calls them, as Var.bindRoot does. The cell keeps its own watches and
-;; validator (rt.ss var-cell), ordered as volatiles: the root's store is a
-;; store-release, the watches' load after it a load-acquire, and add-watch a
-;; sequentially consistent CAS, so a def and a thread that adds a watch and then reads
-;; the var never both miss (the varwatchorder gate). No lock: none is needed for that
-;; order, and a def is not a read-modify-write.
+;; vars are watchable IRefs, as Clojure's Var is an ARef. The cell keeps its own
+;; watches and validator (rt.ss var-cell), and a root change validates, stores the
+;; root, then reads the watches and calls them (rt.ss var-notify): def and intern
+;; through def-var!, alter-var-root, with-redefs and .bindRoot through
+;; jolt-alter-var-root (dyn-binding.ss).
 ;; the watch alist moves by CAS like an atom's: two threads adding at once both land
 (define (var-watches-update! c f)
   (let retry ()
     (let* ((ws (var-cell-watches c)) (nws (f ws)))
       (unless (var-cell-watches-cas! c ws nws) (retry)))))
-(define (var-validate c v)
-  (let ((vf (var-cell-validator c)))
-    (when (and (not (jolt-nil? vf)) (jolt-not (jolt-invoke1 vf v)))
-      (jolt-iref-state-throw))))
-;; call after the root is stored: the load-acquire of the watches follows the
-;; root's store-release
-(define (var-notify c old new)
-  (let ((ws (var-cell-watches c)))
-    (unless (null? ws)
-      (for-each (lambda (kv) (jolt-invoke4 (cdr kv) (car kv) c old new))
-                (reverse ws)))))
-(define def-var!-root def-var!)
-(set! def-var!
-  (lambda (ns name v)
-    (let* ((c (jolt-var ns name)) (old (var-cell-root c)))
-      (var-validate c v)
-      (let ((r (def-var!-root ns name v)))
-        (var-notify c old v)
-        r))))
 
 (def-var! "clojure.core" "atom" jolt-atom-new)
 (def-var! "clojure.core" "deref" jolt-deref)
