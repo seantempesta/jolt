@@ -2441,7 +2441,18 @@
                                (when vi conv)
                                " a" signature ")"))
                         "))")
-            proc (str "(or p (begin (set! p (or " scoped " " fp ")) p))")
+            ;; Where the resolved procedure is kept: inside a def, a cache cell of the
+            ;; def's scope, so the SITE resolves its symbol once for the process, as a
+            ;; JVM FFI binding resolves at load. A cfn evaluated in a let or a loop
+            ;; makes a fresh closure each time, and with the cell in the closure each
+            ;; one resolved again: two dlsym walks over every loaded object a call
+            ;; (seon.sqlite's with-row-calls, six bindings a call, 2026-11-12). At top
+            ;; level, with no def scope, the closure keeps it, as before.
+            cells *cache-cells*
+            p (if cells
+                (let [c (fresh-label "_cfn$")] (swap! cells conj c) c)
+                "p")
+            proc (str "(or " p " (begin (set! " p " (or " scoped " " fp ")) " p "))")
             call-args (if ret-aggregate? (into [native-destination] native-args) native-args)
             call (str "(" proc
                       (when (seq call-args) (str " " (str/join " " call-args))) ")")
@@ -2468,7 +2479,8 @@
                    ;; as it is (the constructor, not a helper: one call less).
                    (= "float" (:rettype node)) (str "(make-jfloat " call ")")
                    :else call)
-            binding (str "(let ((p #f)) (lambda (" (str/join " " wrapper-params) ") " body "))")]
+            lam (str "(lambda (" (str/join " " wrapper-params) ") " body ")")
+            binding (if cells lam (str "(let ((p #f)) " lam ")"))]
         (if (or (seq aggregates) ret-aggregate?)
           (str "(let () "
                (str/join " "
