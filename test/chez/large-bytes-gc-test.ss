@@ -61,6 +61,7 @@
 (stays-put "aclone"                  "(aclone (byte-array 70000))")
 (stays-put ".getBytes"               "(.getBytes (apply str (repeat 70000 \\a)))")
 (stays-put "a bytevector coerced"    "(byte-array (.getBytes (apply str (repeat 70000 \\a))))")
+(stays-put "a byte array coerced"   "(byte-array (byte-array 70000))")
 
 ;; --- the bench's shape: a big freed array first, then the live one ------------
 ;; gc-arrays' order: a 64MB long array freed, then the 8MB byte array, with live

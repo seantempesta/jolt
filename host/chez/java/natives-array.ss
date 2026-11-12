@@ -533,7 +533,7 @@
 ;; fallback), so (byte-array a-byte-array) is one block copy, not a seq of boxed
 ;; elements, a list and a refill (1 us and 7 KB for 64 bytes, every konserve key).
 (define (na-backing-copy v)
-  (cond ((bytevector? v) (bytevector-copy v))
+  (cond ((bytevector? v) (na-bytes-copy v))   ; a large one immobile, as every door to one
         ((fxvector? v) (fxvector-copy v))
         ((flvector? v) (flvector-copy v))
         ((string? v) (string-copy v))

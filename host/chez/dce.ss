@@ -291,7 +291,14 @@
     "clojure.core/<" "clojure.core/<=" "clojure.core/>" "clojure.core/>="
     ;; FileTime.from(Instant) (nio-file.ss) reads the Instant's epoch millis
     ;; through inst-ms, so fs/set-last-modified-time with an Instant needs it
-    "clojure.core/inst-ms"))
+    "clojure.core/inst-ms"
+    ;; the library seams (java/host-static-classes.ss): each one's short arity calls
+    ;; its own var with the default opts. They are the runtime's def-var!s, not the
+    ;; prelude's, so no shake can drop them; rooted so the guard reads one rule
+    "clojure.core/__register-class!" "clojure.core/__register-compare!"
+    "clojure.core/__register-pr!" "clojure.core/__register-str!"
+    "clojure.core/__register-hash!" "clojure.core/__register-eq!"
+    "clojure.core/__register-instance-check!"))
 
 ;; --- reading a minted blob (prelude.ss) into records ------------------------
 ;; The prelude is a flat list of (guard CLAUSE (def-var! "ns" "name" V)) forms (+ the

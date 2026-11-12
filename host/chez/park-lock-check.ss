@@ -119,6 +119,16 @@
 ;; every bit as much a call.
 (define user-code-calls '(jolt-invoke))
 
+;; Calls that hand their argument to ANOTHER thread or fiber to run: the thunk runs
+;; there, holding none of this one's locks, and calling the spawn parks nothing
+;; (fork-thread starts an OS thread; a fiber spawn enqueues one). So the thunk's
+;; body is no call of the definition that spawns it and is not under its lock —
+;; counted as one, a timer thread forked under its mutex read as a park of the
+;; forker's, and so did every channel op that schedules a callback on a fiber.
+;; A region INSIDE the thunk is still read: it is the new context's.
+(define spawn-calls
+  '(fork-thread fork-thread/daemon sa-fiber-spawn jolt-fiber-spawn-at async-callback-execute))
+
 ;; The lock region. Only jolt-with-mutex: a MONITOR is not a counted lock —
 ;; ownership is a field, which is what lets a fiber hold one across a park — so
 ;; jolt-with-monitor bodies are not regions and must not be flagged.
@@ -242,6 +252,11 @@
             ((eq? head lock-form)
              (when (pair? (cdr x)) (walk (cadr x) in-lock? emit))
              (when (pair? (cdr x)) (walk-forms (cddr x) #t emit)))
+            ;; another context's code: only what it does under a lock of its own
+            ((memq head spawn-calls)
+             (emit head in-lock? #t)
+             (walk-forms (cdr x) #f
+               (lambda (sym in-lock? operator?) (when in-lock? (emit sym in-lock? operator?)))))
             (else
              (if (symbol? head)
                  (emit head in-lock? #t)

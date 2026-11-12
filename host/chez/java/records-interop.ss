@@ -50,7 +50,6 @@
 ;; the prelude loads -- clojure.pprint compiling a format with a numeric param
 ;; -- died on the unbound name and silently dropped the def.
 (define user-instance-checks '())   ; ((fn . claim) ...), claim #f or (tables-only? . class-names|#f)
-(define (user-instance-checks-empty?) (null? user-instance-checks))
 ;; May an arm with CLAIM answer (instance? TNAME VAL)? An arm without a claim may
 ;; answer anything. A claim (__register-instance-check!'s {:kind :table} and/or
 ;; {:classes #{...}}) limits it to host tables and/or to those class names.

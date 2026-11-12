@@ -331,25 +331,60 @@
             ((string=? (substring s i (fx+ i m)) from)
              (loop (fx+ i m) (cons to (cons (substring s start i) acc)) (fx+ i m)))
             (else (loop (fx+ i 1) acc start))))))
+;; Where the pool is a TABLE -- (_kt$T (jolt-consts N '#(v "ns" "name" ...))) with one
+;; (_kc$N (vector-ref _kt$T i)) per entry, entry i the vector's i-th entry -- the
+;; cell for an op is found through its entry's index; the older per-cell binding,
+;; (_kc$N (jolt-var "ns" "name")), is still read.
+(define park-ops
+  (list (cons "__sm-take" sm-call-take) (cons "__sm-put" sm-call-put)
+        (cons "__sm-take!!" sm-call-take!!) (cons "__sm-put!!" sm-call-put!!)))
+(define (string-index-of s sub from)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let find ((k from))
+      (cond ((fx>? (fx+ k m) n) #f)
+            ((string=? (substring s k (fx+ k m)) sub) k)
+            (else (find (fx+ k 1)))))))
+;; the name of the cell whose binding's init begins at J: back to the binding's "("
+(define (cell-before s j)
+  (let ((open (let back ((k (fx- j 1))) (if (char=? (string-ref s k) #\() k (back (fx- k 1))))))
+    (substring s (fx+ open 1) j)))
+(define (rewrite-cell s cell op)
+  (string-replace-all s (string-append "(var-cell-deref " cell ")") (cdr (assoc op park-ops))))
 (define (canonical-park-spellings s)
-  (fold-left
-   (lambda (s op)
-     (let* ((bind-tail (string-append " (jolt-var \"clojure.core.async\" \"" (car op) "\"))"))
-            (n (string-length s)) (m (string-length bind-tail)))
-       ;; each "(_kc$N" immediately followed by bind-tail names a cell for this op
-       (let loop ((i 0) (s s))
-         (let ((j (let find ((k i)) (cond ((fx>? (fx+ k m) (string-length s)) #f)
-                                          ((string=? (substring s k (fx+ k m)) bind-tail) k)
-                                          (else (find (fx+ k 1)))))))
-           (if (not j)
-               s
-               (let* ((open (let back ((k (fx- j 1))) (if (char=? (string-ref s k) #\() k (back (fx- k 1)))))
-                      (cell (substring s (fx+ open 1) j)))
-                 (loop (fx+ j m)
-                       (string-replace-all s (string-append "(var-cell-deref " cell ")") (cdr op)))))))))
-   s
-   (list (cons "__sm-take" sm-call-take) (cons "__sm-put" sm-call-put)
-         (cons "__sm-take!!" sm-call-take!!) (cons "__sm-put!!" sm-call-put!!))))
+  (let* ((s (fold-left
+             (lambda (s op)
+               (let ((bind-tail (string-append " (jolt-var \"clojure.core.async\" \"" (car op) "\"))")))
+                 (let loop ((i 0) (s s))
+                   (let ((j (string-index-of s bind-tail i)))
+                     (if (not j) s (loop (fx+ j (string-length bind-tail)) (rewrite-cell s (cell-before s j) (car op))))))))
+             s park-ops)))
+    ;; each table: its name, and its entries read as data
+    (let tables ((from 0) (s s))
+      (let ((c (string-index-of s " (jolt-consts " from)))
+        (if (not c)
+            s
+            (let* ((tbl (cell-before s c))
+                   (v (string-index-of s "'#(" c))
+                   (entries (vector->list (read (open-input-string (substring s (fx+ v 1) (string-length s))))))
+                   ;; widths as jolt-consts (rt.ss) reads them: k, v and s carry ns and
+                   ;; name, every other tag (a site) nothing
+                   (s (let entry ((es entries) (i 0) (s s))
+                        (cond
+                          ((null? es) s)
+                          ((not (memq (car es) '(k v s))) (entry (cdr es) (fx+ i 1) s))
+                          (else
+                            (let ((ns (cadr es)) (name (caddr es)))
+                              (entry (cdddr es) (fx+ i 1)
+                                     (if (and (eq? (car es) 'v) (equal? ns "clojure.core.async") (assoc name park-ops))
+                                         (let* ((tail (string-append "vector-ref " tbl " " (number->string i) "))"))
+                                                (k (string-index-of s tail 0)))
+                                           (if (not k)
+                                               s
+                                               ;; back over "(#3%vector-ref" to the space before it
+                                               (let ((open (let back ((q (fx- k 1))) (if (char=? (string-ref s q) #\() q (back (fx- q 1))))))
+                                                 (rewrite-cell s (cell-before s (fx- open 1)) name))))
+                                         s))))))))
+              (tables (fx+ c 1) s)))))))
 (define (emit-scheme src)
   (canonical-park-spellings (jolt-analyze-emit-form (jolt-ce-read src) "user")))
 
