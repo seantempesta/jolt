@@ -1493,7 +1493,16 @@
              (even? (length kvs))
              (let ((r (jrec-assoc-fields coll kvs)))
                (and r (meta-carry coll r))))
-        (apply %r-jolt-assoc coll kvs))))
+        (if (and (pair? kvs) (pair? (cdr kvs)) (even? (length kvs)))
+            (meta-carry
+              coll
+              (let loop ((coll coll) (kvs kvs))
+                (if (null? kvs)
+                    coll
+                    (loop
+                      (jolt-assoc1 coll (car kvs) (cadr kvs))
+                      (cddr kvs)))))
+            (apply %r-jolt-assoc coll kvs)))))
 
 (define (jrec->map-without r drop-k)
   (let* ((fkeys (jrdesc-fkeys (jrec-desc r)))

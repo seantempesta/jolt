@@ -598,10 +598,16 @@
                  (loop (cddr kv)))))
            (make-jrec* (jrec-desc coll) (jrec-ext coll) 0 nv)))))
 (define %r-jolt-assoc jolt-assoc)
+;; the rest list is walked as it is: an (apply %r-jolt-assoc coll kvs) consed it again for every
+;; multi-key assoc of a map (seon.render-cost-test/a-flush-places-what-moved, 1.28x its bytes)
 (set! jolt-assoc (lambda (coll . kvs)
   (or (and (jrec? coll) (pair? kvs) (pair? (cdr kvs)) (pair? (cddr kvs)) (even? (length kvs))
            (let ((r (jrec-assoc-fields coll kvs))) (and r (meta-carry coll r))))
-      (apply %r-jolt-assoc coll kvs))))
+      (if (and (pair? kvs) (pair? (cdr kvs)) (even? (length kvs)))
+          (meta-carry coll
+            (let loop ((coll coll) (kvs kvs))
+              (if (null? kvs) coll (loop (jolt-assoc1 coll (car kvs) (cadr kvs)) (cddr kvs)))))
+          (apply %r-jolt-assoc coll kvs)))))
 ;; dissoc: a deftype implementing IPersistentMap/without answers through it.
 ;; Removing a declared field downgrades a plain record to a map (JVM parity); an
 ;; extension key drops from the ext map (normalized back to jolt-nil when empty).
