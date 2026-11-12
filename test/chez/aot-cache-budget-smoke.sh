@@ -1,11 +1,11 @@
 #!/bin/sh
-# aot-cache budget: the AOT cache is kept under JOLT_CACHE_MB, least recently
-# used first (loader.ss aot-prune-to-budget!).
+# aot-cache budget: the AOT cache is kept under JOLT_CACHE_MB, oldest written
+# first (loader.ss aot-prune-to-budget!), and a hit writes nothing.
 #
 # Three namespaces are published and aged an hour, 40 and 20 minutes (their
 # files' mtimes set back), the oldest is then hit, and a fourth is published
 # under a budget that holds about three and a half of them: the one evicted is
-# the oldest USED (the middle one), not the oldest written, whose hit kept it.
+# the oldest WRITTEN (a), whose hit left its mtime where it was.
 # Every namespace still loads after, the evicted one by recompiling; an
 # artifact deleted behind the loader's back recompiles; a young artifact
 # survives a budget of nothing; and nothing outside the cache directory is
@@ -68,27 +68,28 @@ age 1200 "$(art c so)" "$(art c scm)"
 one="$(bytes "$(art b so)" "$(art b scm)")"
 three="$(bytes "$(art a so)" "$(art a scm)" "$(art b so)" "$(art b scm)" "$(art c so)" "$(art c scm)")"
 
-# a hit on the oldest moves it to the front
+# a hit on the oldest writes nothing: its .so keeps the mtime it was aged to
+a_before="$(perl -e 'print +(stat shift)[9]' "$(art a so)")"
 out="$(run $big a)"
-a_age=$(( $(date +%s) - $(perl -e 'print +(stat shift)[9]' "$(art a so)") ))
-[ "$out" = "a45" ] && [ "$a_age" -lt 60 ] && pass "a hit marks its artifact used (${a_age}s ago)" \
-  || fail "the hit answered '$out', its .so last used ${a_age}s ago"
+a_after="$(perl -e 'print +(stat shift)[9]' "$(art a so)")"
+[ "$out" = "a45" ] && [ "$a_after" = "$a_before" ] && pass "a hit writes nothing to its artifact" \
+  || fail "the hit answered '$out', its .so mtime moved $a_before -> $a_after"
 
 # the fourth publishes under a budget of three and a half artifacts
 budget="$(perl -e 'printf "%.6f", ($ARGV[0] + $ARGV[1] / 2) / 1048576' "$three" "$one")"
 out="$(run "$budget" d)"
 [ "$out" = "d45" ] || fail "the fourth answered '$out'"
-if [ -z "$(art b so)" ] && [ -z "$(art b scm)" ]; then pass "the least recently used (b) was evicted, .so and .scm"
-else fail "b was not evicted: $(art b so) $(art b scm)"; fi
-for n in a c d; do
+if [ -z "$(art a so)" ] && [ -z "$(art a scm)" ]; then pass "the oldest written (a) was evicted, .so and .scm, its hit notwithstanding"
+else fail "a was not evicted: $(art a so) $(art a scm)"; fi
+for n in b c d; do
   [ -n "$(art $n so)" ] && [ -n "$(art $n scm)" ] && pass "$n kept" || fail "$n was evicted"
 done
-[ -n "$(find "$cache" -name 'mylib.b-*' ! -name '*.so' ! -name '*.scm' -type f | head -1)" ] \
-  && pass "b's key sidecars stay" || fail "b's key sidecars were deleted"
+[ -n "$(find "$cache" -name 'mylib.a-*' ! -name '*.so' ! -name '*.scm' -type f | head -1)" ] \
+  && pass "a's key sidecars stay" || fail "a's key sidecars were deleted"
 
 # every one still loads; the evicted one recompiles and is published again
 out="$(run $big a b c d)"
-[ "$out" = "a45b45c45d45" ] && [ -n "$(art b so)" ] && pass "all four load after the prune: $out" \
+[ "$out" = "a45b45c45d45" ] && [ -n "$(art a so)" ] && pass "all four load after the prune: $out" \
   || { fail "after the prune: '$out'"; cat "$work/err"; }
 
 # an artifact deleted behind the loader's back is a miss that recompiles

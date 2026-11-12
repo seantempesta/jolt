@@ -211,8 +211,8 @@
 (ok "changing one unit recompiles that unit only" (= compiled-again 1))
 (set! bld-chez-compile-file real-compile)
 
-;; The prune drops the least recently USED entries: a hit marks its entry, so an
-;; entry every build reads is not evicted just for having been created first.
+;; The prune drops the oldest WRITTEN entries, and a hit writes nothing: an entry
+;; created first goes first however often it is read.
 (define lru (at "lru-cache"))
 (bld-mkdir-p lru)
 (for-each (lambda (f) (delete-file (string-append lru "/" f))) (directory-list lru))
@@ -221,14 +221,14 @@
 (write-text! lru-b (make-string 1000 #\b))
 (set-file-mtime-millis! lru-a 1000000000000)      ; a: created long ago
 (set-file-mtime-millis! lru-b 1500000000000)      ; b: newer, never read
-(ok "a cache hit marks its entry as used"
+(ok "a cache hit writes nothing to its entry"
     (and (bld-cache-fetch! lru-a (at "lru-out.so"))
-         (> (sa-file-mtime-ms lru-a) 1500000000000)))
+         (= (sa-file-mtime-ms lru-a) 1000000000000)))
 (putenv "JOLT_BUILD_CACHE_DIR" lru)
 (putenv "JOLT_BUILD_CACHE_MB" (number->string (/ 1500.0 1024 1024)))
 (bld-prune-build-cache!)
-(ok "…so over budget the prune keeps it and drops the older-used entry"
-    (and (file-exists? lru-a) (not (file-exists? lru-b))))
+(ok "…so over budget the prune drops the oldest written, read or not"
+    (and (not (file-exists? lru-a)) (file-exists? lru-b)))
 (putenv "JOLT_BUILD_CACHE_MB" "2048")
 (putenv "JOLT_BUILD_CACHE_DIR" ucache)
 

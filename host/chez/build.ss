@@ -3671,9 +3671,9 @@
   (guard (e (#t #f)) (and (file-exists? path) (> (sa-file-size path) 0))))
 ;; Copy a cache entry to TO; #f when there is none. Another build's prune can
 ;; delete the entry between the existence check and the read, which is a miss.
-;; A hit moves the entry's mtime to now: the prunes evict oldest mtime first, so
-;; the mtime has to say when the entry was last USED, or an entry every build
-;; reads goes first merely for having been created first.
+;; A hit writes nothing to the entry: the prunes evict the oldest written first
+;; (loader.ss aot-prune-to-budget! says why), and an entry evicted while still
+;; in use is a miss that compiles and stores it anew.
 (define (bld-cache-fetch! cache to)
   (guard (e (#t #f))
     (and (file-exists? cache)
@@ -3687,10 +3687,6 @@
            (let ((part (bld-part-path to)))
              (bld-copy-file! cache part)
              (rename-file part to))
-           (guard (e (#t #f))           ; a cache we cannot mark is still a hit
-             (let ((t (current-time)))
-               (set-file-mtime-millis! cache (+ (* (time-second t) 1000)
-                                                (quotient (time-nanosecond t) 1000000)))))
            #t))))
 
 ;; Compile the runtime half under the runtime profile, reusing a cached fasl

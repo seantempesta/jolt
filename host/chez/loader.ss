@@ -991,10 +991,14 @@
 ;; bound counts runtimes, not bytes, so a cache shared by checkouts on many
 ;; trees grew without end. The whole root is kept under a byte budget
 ;; (JOLT_CACHE_MB, default 8192) the way the build-unit cache is
-;; (build.ss bld-prune-build-cache!): least recently used first, a hit moving
-;; its .so's mtime to now (aot-mark-used!), pruned once by each process that
-;; publishes. Nothing younger than aot-prune-grace-seconds goes, so what another
-;; process just wrote or just hit stays while it loads; the .so goes before its
+;; (build.ss bld-prune-build-cache!): oldest written first, by the mtime its
+;; publish gave it, pruned once by each process that publishes. A hit writes
+;; nothing: a content-addressed entry records no use, and marking each hit was a
+;; metadata write per load of every unit by every process (about 1,300 a minute
+;; on a busy machine, fseventsd at 100%). An entry still in use and evicted is a
+;; miss that recompiles and publishes it anew. Nothing younger than
+;; aot-prune-grace-seconds goes, so what another process just wrote stays while
+;; it loads; the .so goes before its
 ;; .scm, so a reader sees a whole artifact or a miss; and a .so deleted between
 ;; a hit's test and its load fails the load, which recompiles
 ;; (aot-safe-load-or-recompile). The key sidecars stay: small, and a key with
@@ -1006,17 +1010,14 @@
 (define (aot-now-ms)
   (let ((t (current-time)))
     (+ (* (time-second t) 1000) (quotient (time-nanosecond t) 1000000))))
-(define (aot-mark-used! so)
-  (guard (e (else #f))                  ; an artifact we cannot mark is still a hit
-    (set-file-mtime-millis! so (aot-now-ms))))
 (define (aot-ext f)
   (let ((n (string-length f)))
     (cond ((and (fx>? n 3) (string=? (substring f (fx- n 3) n) ".so")) ".so")
           ((and (fx>? n 4) (string=? (substring f (fx- n 4) n) ".scm")) ".scm")
           (else #f))))
 (define (aot-real-dir? p) (and (file-directory? p) (not (file-symbolic-link? p))))
-;; Every artifact under ROOT, as #(last-use-ms bytes so-path scm-path): its use
-;; is the later of its two files' mtimes. A file that vanishes under the walk is
+;; Every artifact under ROOT, as #(written-ms bytes so-path scm-path): when it was
+;; written is the later of its two files' mtimes. A file that vanishes under the walk is
 ;; not counted.
 (define (aot-cache-artifacts root)
   (let ((t (make-hashtable string-hash string=?)))
@@ -2382,7 +2383,6 @@
                            '() deps)))
        (if (file-exists? so)
            (begin (aot-info (string-append "hit " name))
-                  (aot-mark-used! so)
                   (parameterize ((aot-dep-sink #f) (io-file-read-sink #f))
                     (aot-safe-load-or-recompile name file source base assumed-now)))
            (begin (aot-info (string-append "miss " name))
