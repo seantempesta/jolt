@@ -23,17 +23,18 @@
 (define (juuid-s u) (or (juuid-text u) (uuid-halves->text (juuid-msb u) (juuid-lsb u))))
 (define (jolt-uuid=? a b) (and (= (juuid-msb a) (juuid-msb b)) (= (juuid-lsb a) (juuid-lsb b))))
 (define (uuid-halves->text msb lsb)
-  ;; four 32-bit fixnum words, so no nibble is read off a bignum
-  (let ((s (make-string 36 #\-))
-        (w (vector (bitwise-arithmetic-shift-right msb 32) (bitwise-and msb #xFFFFFFFF)
-                   (bitwise-arithmetic-shift-right lsb 32) (bitwise-and lsb #xFFFFFFFF))))
-    (let loop ((j 0))
-      (if (fx=? j 32)
+  ;; the halves' 16 bytes, written by the u64 store: a bignum shift or mask allocates
+  ;; (~400 B each), a byte read does not
+  (let ((s (make-string 36 #\-)) (b (make-bytevector 16)))
+    (bytevector-u64-set! b 0 msb (endianness big))
+    (bytevector-u64-set! b 8 lsb (endianness big))
+    (let loop ((i 0))
+      (if (fx=? i 16)
           s
-          (let ((x (vector-ref w (fxsrl j 3))))
-            (string-set! s (uuid-hex-pos j)
-                         (string-ref hexd (fxand (fxsrl x (fx* 4 (fx- 7 (fxand j 7)))) 15)))
-            (loop (fx+ j 1)))))))
+          (let ((x (bytevector-u8-ref b i)) (j (fx* i 2)))
+            (string-set! s (uuid-hex-pos j) (string-ref hexd (fxsrl x 4)))
+            (string-set! s (uuid-hex-pos (fx+ j 1)) (string-ref hexd (fxand x 15)))
+            (loop (fx+ i 1)))))))
 
 (define hexd "0123456789abcdef")
 ;; Position of hex digit j within the 8-4-4-4-12 layout: one extra character for
@@ -109,7 +110,11 @@
       (if (fx=? j (fx+ from 8))
           acc
           (loop (fx+ j 1) (fxior (fxsll acc 4) (uuid-hexv (string-ref s (uuid-hex-pos j))))))))
-  (+ (bitwise-arithmetic-shift-left (word start) 32) (word (fx+ start 8))))
+  ;; joined by the u32 stores and one u64 read: a bignum shift or add allocates
+  (let ((b (make-bytevector 8)))
+    (bytevector-u32-set! b 0 (word start) (endianness big))
+    (bytevector-u32-set! b 4 (word (fx+ start 8)) (endianness big))
+    (bytevector-u64-ref b 0 (endianness big))))
 (define (uuid-msb-u u) (juuid-msb u))
 (define (uuid-lsb-u u) (juuid-lsb u))
 ;; two distinct uuids: jolt=2 and jolt-hash answer uuids ahead of the arm walk, so

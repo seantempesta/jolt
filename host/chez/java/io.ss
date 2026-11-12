@@ -4057,8 +4057,14 @@
 ;; The halves are kept as they are, unsigned; the text is written when str asks
 ;; (natives-misc.ss juuid-s).
 (define (uuid-from-halves msb lsb)
-  (make-juuid (bitwise-and (jnum->exact msb) #xFFFFFFFFFFFFFFFF)
-              (bitwise-and (jnum->exact lsb) #xFFFFFFFFFFFFFFFF)))
+  ;; a long's 64 bits read back unsigned through a bytevector (a bignum mask allocates)
+  (define (u64 n)
+    (let ((n (jnum->exact n)) (b (make-bytevector 8)))
+      (if (< n 0)
+          (bytevector-s64-set! b 0 n (endianness big))
+          (bytevector-u64-set! b 0 (bitwise-and n #xFFFFFFFFFFFFFFFF) (endianness big)))
+      (bytevector-u64-ref b 0 (endianness big))))
+  (make-juuid (u64 msb) (u64 lsb)))
 (define (uuid-ctor . args)
   (if (= (length args) 2)
       (uuid-from-halves (car args) (cadr args))
