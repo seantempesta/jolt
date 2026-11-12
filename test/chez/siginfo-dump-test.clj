@@ -81,7 +81,11 @@
     (loop [] (when-not (.contains (slurp file) "at its next safe point:") (Thread/sleep 5) (recur)))
     (reset! stop true)
     (a/<!! spinner)
-    (let [follow (subs (slurp file) (+ from (count text)))]
+    ;; the follow-up is found by its own first words, never by the dump's length: the dump's
+    ;; text was read while the follow-up could already be arriving (it began mid-read once)
+    (let [all (subs (slurp file) from)
+          at (.indexOf all "fiber 0 (running at the dump)")
+          follow (if (neg? at) "" (subs all at))]
       (.delete (java.io.File. file))
       (println (str "then:\n" follow))
       (check "the running fiber printed its own frames at its next safe point, the go block's fn among them"
