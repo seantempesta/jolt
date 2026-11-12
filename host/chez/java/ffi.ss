@@ -830,7 +830,8 @@
   (let* ((n (jnum->exact n)) (p (jnum->exact ptr))
          (bv (begin (ffi-check-array-count n) (make-bytevector n))))
     (sa-foreign-bytes-ref! p bv n)
-    (na-bv->bytearray bv)))
+    ;; the bytevector just filled is the array's own: no second copy
+    (make-jolt-array bv 'byte)))
 
 ;; (read-into! ptr arr off n) -> n. Copy n bytes at ptr into arr starting at off
 ;; (the java.io.InputStream/read argument order). Throws rather than writing out
@@ -857,9 +858,13 @@
 (define (ffi-read-into! ptr arr off n)
   (let* ((n (ffi-byte-index n)) (off (ffi-byte-index off)) (p (jnum->exact ptr)))
     (ffi-check-byte-range "read-into!" arr off n)
-    (let ((bv (make-bytevector n)))
-      (sa-foreign-bytes-ref! p bv n)
-      (ja-bv->bytes! bv 0 arr off n)
+    (let ((v (jolt-array-vec arr)))
+      ;; from the start of an array backed by a bytevector the bytes go straight in
+      (if (and (fx=? off 0) (bytevector? v))
+          (sa-foreign-bytes-ref! p v n)
+          (let ((bv (make-bytevector n)))
+            (sa-foreign-bytes-ref! p bv n)
+            (ja-bv->bytes! bv 0 arr off n)))
       n)))
 
 (define ffi-write-array
@@ -868,9 +873,13 @@
     ((ptr arr off n)
      (let* ((n (ffi-byte-index n)) (off (ffi-byte-index off)) (p (jnum->exact ptr)))
        (ffi-check-byte-range "write-array" arr off n)
-       (let ((bv (make-bytevector n)))
-         (ja-bytes->bv! arr off bv 0 n)
-         (sa-foreign-bytes-set! p bv n))
+       (let ((v (jolt-array-vec arr)))
+         ;; from the start of an array backed by a bytevector: its own bytes, no copy
+         (if (and (fx=? off 0) (bytevector? v))
+             (sa-foreign-bytes-set! p v n)
+             (let ((bv (make-bytevector n)))
+               (ja-bytes->bv! arr off bv 0 n)
+               (sa-foreign-bytes-set! p bv n))))
        n))))
 (def-var! "jolt.ffi" "read-array" ffi-read-array)
 (def-var! "jolt.ffi" "read-into!" ffi-read-into!)
