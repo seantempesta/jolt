@@ -459,12 +459,15 @@
 
 ;; close! (idempotent): mark closed, flush a stateful transducer's completion,
 ;; notify pending alt handlers, and wake everyone. ac-close! assumes the lock is
-;; held; the public form takes it.
+;; held; the public form takes it. A completion's throw is reported on a fiber of
+;; its own: the report runs the program's uncaught-exception handler, which may
+;; park, and nothing parks holding a channel's mutex.
 (define (ac-close! ch)
   (unless (async-chan-closed? ch)
     (async-chan-closed?-set! ch #t)
     (when (async-chan-xrf ch)
-      (guard (e (#t (async-report-uncaught! "transducer completion on close!" e)))
+      (guard (e (#t (async-callback-execute
+                     (lambda () (async-report-uncaught! "transducer completion on close!" e)))))
         (ac-xrf-apply ch)))
     (ac-notify! ch)
     ;; claim+deliver to every remaining alt-taker (nil) and alt-putter (#f)
@@ -971,8 +974,21 @@
 ;; and a callback a fiber (2.2 us / 6 KB against a thread's 8 us / 87 KB, 93af2568).
 ;; A put or take nobody ever completes holds nothing up. No cap: the channel has no
 ;; MAX-QUEUE-SIZE on pending ops (header).
-(define (async-callback-execute thunk)
-  (async-fiber-execute (lambda () (*txn* #f) (thunk))))
+;; The spawn behind both (and fiber-execute's, fibers-async.ss): THUNK on a fiber of
+;; its own, its throw reported. It parks nothing, so a holder of a channel's mutex
+;; may call it (alt-deliver! does, and ac-close! for a report).
+;; SITE names the fiber in a dump (fibers.ss jolt-fiber-spawn-at): the caller's own
+;; procedure when it has one, else THUNK.
+(define (async-callback-execute thunk . site)
+  (jolt-fiber-spawn-at
+   (lambda ()
+     (*txn* #f)
+     (guard (e (#t (async-report-uncaught! "fiber-execute task" e)))
+       (thunk)))
+   (if (pair? site) (car site) thunk))
+  ;; a carrier may not exist yet on the very first spawn (fiber-spawn's own
+  ;; postlude does this too) — without it the fiber sits ready and unrun.
+  (jolt-fiber-ensure-carrier!))
 ;; A waiter whose wake is CALL-CB, given what the channel delivers: #t/#f for a
 ;; put, the value (nil when closed) for a take.
 (define (async-callback-waiter call-cb)
@@ -1094,10 +1110,15 @@
 ;; below and the workload table in the overlay's thread-call). jolt-fiber-go-spawn
 ;; is defined in fibers-async.ss, which loads after this file; the reference
 ;; resolves at call time, before any :fiber spawn can happen.
-(define (async-go-spawn thunk)
-  (if (eq? (go-backend-current) jolt-go-backend-fiber)
-      (jolt-fiber-go-spawn thunk)
-      (async-go-spawn-thread thunk)))
+;; (go-spawn thunk site): site is the "ns:line" of the go form, which its expansion
+;; passes when the reader gave the form a line (the overlay's go), for the fiber dump.
+(define async-go-spawn
+  (case-lambda
+    ((thunk) (async-go-spawn thunk thunk))
+    ((thunk site)
+     (if (eq? (go-backend-current) jolt-go-backend-fiber)
+         (jolt-fiber-go-spawn thunk site)
+         (async-go-spawn-thread thunk)))))
 
 ;; (fiber-spawn thunk) — ALWAYS a fiber, whatever *go-backend* says. This is the
 ;; other half of the thread-spawn bargain: thread-spawn asks for an OS thread by

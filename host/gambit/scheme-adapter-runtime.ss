@@ -58,6 +58,11 @@
 ;; Contract: perform a full collection. Degradation: may no-op — callers
 ;; already guard the call and the JVM semantic is only a hint. Gambit's
 ;; collector runs on its own schedule; no-op.
+;; define-process-local: on Chez (locks.ss) a lock a forked child makes afresh. This host
+;; forks no child, so it is a definition. records-gambit.ss, generated from the Chez
+;; records files, names it.
+(define-syntax define-process-local
+  (syntax-rules () ((_ name expr) (define name expr))))
 ;; sa-record-cas!: a record here is a vector with the type id in slot 0, so
 ;; field i is slot i+1; the swap runs under one mutex because a green thread
 ;; can be preempted between the read and the write.

@@ -1413,9 +1413,11 @@
            (string=? pre (substring base 0 pn))
            (string=? suf (substring base (fx- n sn) n))
            (string->number (substring base pn (fx- n sn)))))))
+;; kill(2), looked up at the first poll and kept (scheme-adapter-runtime.ss sa-entry-once)
+(define aot-kill-proc (sa-entry-once (lambda () (jolt-foreign-proc-safe "kill" '(int int) 'int))))
 (define (aot-proc-alive? pid)
   (guard (e (else #f))
-    (let ((f (jolt-foreign-proc-safe "kill" '(int int) 'int)))
+    (let ((f (aot-kill-proc)))
       (and f (fx=? 0 (f pid 0))))))
 ;; The manifest and an empty log go with the worker: each run that missed has
 ;; its own pair, and nothing else reads them once the parent is gone.

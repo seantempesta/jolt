@@ -2851,7 +2851,7 @@
                   (guard (e (#t (jolt-thread-uncaught! obj e "Exception in virtual thread:\n")))
                     (when r (jolt-invoke (runnable->thunk r))))
                   jolt-nil)))
-    (jolt-fiber-spawn* thunk (vector-ref st 4) (lambda (f) (bind-virtual-thread! obj f)))
+    (jolt-fiber-spawn* thunk (vector-ref st 4) (lambda (f) (bind-virtual-thread! obj f)) (or r thunk))
     (jolt-fiber-ensure-carrier!)
     obj))
 (define (unstarted-virtual-thread r name)

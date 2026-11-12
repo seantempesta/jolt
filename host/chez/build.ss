@@ -4058,17 +4058,21 @@
 ;; The executable this process is running, or #f when it cannot be named — then
 ;; units compile in process. Asked of the OS rather than read off argv[0], which
 ;; is whatever the caller passed.
+;; its two C entries, looked up once (scheme-adapter-runtime.ss sa-entry-once)
+(define bld-ns-get-executable-path
+  (sa-entry-once (lambda () (jolt-foreign-proc-safe "_NSGetExecutablePath" '(u8* u8*) 'int))))
+(define bld-readlink (sa-entry-once (lambda () (jolt-foreign-proc-safe "readlink" '(string u8* size_t) 'long))))
 (define (bld-self-exe)
   (guard (e (#t #f))
     (let ((p (case (sa-os-family)
                ((macos)
-                (let ((f (jolt-foreign-proc-safe "_NSGetExecutablePath" '(u8* u8*) 'int)))
+                (let ((f (bld-ns-get-executable-path)))
                   (and f
                        (let ((buf (make-bytevector 4096 0)) (sz (make-bytevector 4 0)))
                          (bytevector-u32-native-set! sz 0 4096)
                          (and (fx=? 0 (f buf sz)) (bld-cstring buf))))))
                ((linux)
-                (let ((f (jolt-foreign-proc-safe "readlink" '(string u8* size_t) 'long)))
+                (let ((f (bld-readlink)))
                   (and f
                        (let* ((buf (make-bytevector 4096 0)) (n (f "/proc/self/exe" buf 4095)))
                          (and (> n 0) (bld-cstring buf))))))

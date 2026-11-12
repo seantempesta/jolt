@@ -299,11 +299,15 @@
 
 ;; --- the spawn --------------------------------------------------------------
 ;; (__sm-spawn body-fn) -> channel, where body-fn is (fn [k] ...). Honors
-;; *go-backend* at spawn time, like async-go-spawn.
-(define (jolt-sm-spawn body-fn)
-  (if (eq? (go-backend-current) jolt-go-backend-fiber)
-      (jolt-sm-fiber-spawn body-fn)
-      (async-go-spawn-thread (lambda () (jolt-invoke body-fn jolt-sm-thread-finish)))))
+;; *go-backend* at spawn time, like async-go-spawn, and takes the go form's site as
+;; async-go-spawn does.
+(define jolt-sm-spawn
+  (case-lambda
+    ((body-fn) (jolt-sm-spawn body-fn body-fn))
+    ((body-fn site)
+     (if (eq? (go-backend-current) jolt-go-backend-fiber)
+         (jolt-sm-fiber-spawn body-fn site)
+         (async-go-spawn-thread (lambda () (jolt-invoke body-fn jolt-sm-thread-finish)))))))
 
 ;; The thunk is RE-ENTRANT — jolt-fiber-resume* runs it again on every cheap park
 ;; — so it must hold nothing that is meant to happen once per fiber.
@@ -321,12 +325,13 @@
 ;; monitor that worked on one and silently answered nil on the other would be
 ;; worse than no monitor at all, because the difference is invisible from the
 ;; jolt side. go-chan-register! lives in async.ss, which rt.ss loads first.
-(define (jolt-sm-fiber-spawn body-fn)
+(define (jolt-sm-fiber-spawn body-fn site)
   (let ((w (ac-make 1 'fixed #f)))
     (go-chan-register! w)
-    (sa-fiber-spawn
+    (jolt-fiber-spawn-at
      (lambda ()
-       (jolt-sm-drive w body-fn)))
+       (jolt-sm-drive w body-fn))
+     site)
     (jolt-fiber-ensure-carrier!)
     w))
 

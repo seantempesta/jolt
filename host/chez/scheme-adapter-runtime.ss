@@ -595,9 +595,25 @@
 ;; for an arch (rt.ss binds _exit through jolt-foreign-proc-safe at its line
 ;; 135, and the first caller of sa-arch is host-static-methods.ss at 1553), and
 ;; re-taking it would re-promote it above every :jolt/native loaded since.
+;;
+;; (sa-entry-once resolve) -> a thunk answering what (resolve) answered at the first
+;; call, #f if it raised. A C entry is looked up once, so a function that calls it
+;; does not: evaluated, (foreign-entry? "f") and (foreign-procedure "f" ...) each look
+;; "f" up through dlsym over every loaded object, and inside a function body they did
+;; so on every call ((System/getenv) twice a call, and the walk of the environment
+;; besides: 46% of one thread of a hung Seon system, 2026-11-12). At the first call,
+;; not at load, for the reason above: the boot takes the process handle after this
+;; file loads. Two threads' first calls both resolve, to the same entry.
+(define (sa-entry-once resolve)
+  (let ((v 'unresolved))
+    (lambda ()
+      (when (eq? v 'unresolved) (set! v (guard (e (#t #f)) (resolve))))
+      v)))
+(define sa-uname-proc
+  (sa-entry-once (lambda () (and (foreign-entry? "uname") (foreign-procedure "uname" (void*) int)))))
 (define (sa-uname-field n)
   (guard (e (#t #f))
-    (and (foreign-entry? "uname")
+    (and (sa-uname-proc)
          (let* ((linux? (eq? (sa-os-family) 'linux))
                 (width (if linux? 65 256))
                 (off (* n width))
@@ -610,7 +626,7 @@
                    (foreign-set! 'unsigned-8 buf i 0)
                    (loop (fx+ i 1)))))
              (lambda ()
-               (and (= 0 ((foreign-procedure "uname" (void*) int) buf))
+               (and (= 0 ((sa-uname-proc) buf))
                     (let loop ((i 0) (acc '()))
                       (let ((b (foreign-ref 'unsigned-8 buf (fx+ off i))))
                         (if (or (fx=? b 0) (fx>=? i (fx- width 1)))
@@ -628,12 +644,17 @@
 ;; JVM's answer for an os.version it cannot read. Read in process: this used to
 ;; run those two programs through the shell, so a machine with an empty PATH,
 ;; or Windows, where the shell is cmd.exe, answered nothing.
+(define sa-sysctlbyname-proc
+  (sa-entry-once
+    (lambda ()
+      (and (foreign-entry? "sysctlbyname")
+           (foreign-procedure "sysctlbyname" (string u8* u8* void* size_t) int)))))
 (define (sa-os-release)
   (guard (e (#t #f))
     (case (sa-os-family)
       ((macos)
-       (and (foreign-entry? "sysctlbyname")
-            (let* ((f (foreign-procedure "sysctlbyname" (string u8* u8* void* size_t) int))
+       (and (sa-sysctlbyname-proc)
+            (let* ((f (sa-sysctlbyname-proc))
                    (out (make-bytevector 64 0))
                    (len (make-bytevector 8 0)))
               (bytevector-u64-native-set! len 0 64)
@@ -672,12 +693,25 @@
       (unless resolved
         (set! resolved #t)
         (guard (e (#t #f)) (load-shared-object "kernel32.dll"))
-        (when (foreign-entry? "GetEnvironmentStringsW")
-          (set! entries
-                (cons (sa-foreign-procedure-runtime "GetEnvironmentStringsW" '() 'void* #f)
-                      (and (foreign-entry? "FreeEnvironmentStringsW")
-                           (sa-foreign-procedure-runtime "FreeEnvironmentStringsW" '(void*) 'int #f))))))
+        (set! entries
+              (and (foreign-entry? "GetEnvironmentStringsW")
+                   (cons (sa-foreign-procedure-runtime "GetEnvironmentStringsW" '() 'void* #f)
+                         (and (foreign-entry? "FreeEnvironmentStringsW")
+                              (sa-foreign-procedure-runtime "FreeEnvironmentStringsW" '(void*) 'int #f))))))
       entries)))
+;; The posix table's reader, resolved once (sa-entry-once): a thunk answering the
+;; current envp (setenv may move it), or #f where neither entry resolves.
+(define sa-posix-envp-reader
+  (sa-entry-once
+    (lambda ()
+      (cond
+        ((foreign-entry? "_NSGetEnviron")
+         (let ((get (foreign-procedure "_NSGetEnviron" () void*)))
+           (lambda () (foreign-ref 'void* (get) 0))))
+        ((foreign-entry? "environ")
+         (let ((addr (foreign-entry "environ")))
+           (lambda () (foreign-ref 'void* addr 0))))
+        (else #f)))))
 (define (sa-environment-pairs)
   (define (c-string addr)
     (let loop ((n 0))
@@ -702,12 +736,7 @@
               (let ((kv (split (c-string p))))
                 (loop (fx+ i 1) (if kv (cons kv acc) acc))))))))
   (define (posix-envp)
-    (cond
-      ((foreign-entry? "_NSGetEnviron")
-       (foreign-ref 'void* ((foreign-procedure "_NSGetEnviron" () void*)) 0))
-      ((foreign-entry? "environ")
-       (foreign-ref 'void* (foreign-entry "environ") 0))
-      (else #f)))
+    (let ((read (sa-posix-envp-reader))) (and read (read))))
   (define (windows-block)
     (and (sa-windows-env-entries)
          (let* ((get (car (sa-windows-env-entries)))
@@ -1076,11 +1105,9 @@
   (unless sa-fbytes-probed?
     (set! sa-fbytes-probed? #t)                ; probe once, even if it throws
     (guard (e (#t #f))
-      (when (foreign-entry? "memcpy")
-        (set! sa-fbytes-in (foreign-procedure "memcpy" (u8* void* size_t) void*))
-        (set! sa-fbytes-out (foreign-procedure "memcpy" (void* u8* size_t) void*)))
-      (when (foreign-entry? "memset")
-        (set! sa-fbytes-zero (foreign-procedure "memset" (void* int size_t) void*))))))
+      (set! sa-fbytes-in (and (foreign-entry? "memcpy") (foreign-procedure "memcpy" (u8* void* size_t) void*)))
+      (set! sa-fbytes-out (and sa-fbytes-in (foreign-procedure "memcpy" (void* u8* size_t) void*)))
+      (set! sa-fbytes-zero (and (foreign-entry? "memset") (foreign-procedure "memset" (void* int size_t) void*))))))
 
 ;; (sa-foreign-bytes-ref! addr bv n) -> void
 ;; Copy the N octets at foreign address ADDR into BV[0,N). Contract: a
@@ -2220,10 +2247,11 @@
 
 (define (sa-term-open)
   (or (and sa-term-procs #t)
-      (and (foreign-entry? "(cs)ee_init_term")
-           ((foreign-procedure "(cs)ee_init_term" (iptr iptr) boolean) -1 -1)
-           (begin
-             (set! sa-term-procs
+      (begin
+        ;; the entries are kept once claimed (sa-entry-once's note on looking up once)
+        (set! sa-term-procs
+          (and (foreign-entry? "(cs)ee_init_term")
+               ((foreign-procedure "(cs)ee_init_term" (iptr iptr) boolean) -1 -1)
                (vector
                  (foreign-procedure "(cs)ee_raw" () void)                       ; 0
                  (foreign-procedure "(cs)ee_noraw" () void)                     ; 1
@@ -2243,8 +2271,8 @@
                  (foreign-procedure "(cs)ee_line_feed" () void)                 ; 15
                  (foreign-procedure "(cs)ee_bell" () void)                      ; 16
                  (foreign-procedure "(cs)ee_pause" () void)                     ; 17
-                 (foreign-procedure "(cs)ee_set_color" (int boolean) void)))    ; 18
-             #t))))
+                 (foreign-procedure "(cs)ee_set_color" (int boolean) void))))  ; 18
+        (and sa-term-procs #t))))
 
 (define (sa-term-raw!) ((sa-term-proc 0)))
 (define (sa-term-cooked!) ((sa-term-proc 1)))

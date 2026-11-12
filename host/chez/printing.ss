@@ -226,18 +226,6 @@
     ;; passing readable? so that if it reaches the #object[…] fallback the content
     ;; is QUOTED, which is the (pr x) vs (print x) difference on the JVM.
     (else (jolt-pr-str/readable x #t))))
-;; A user print-method still outranks everything, including for a fast-path type —
-;; (defmethod print-method String …) is legal on the JVM — so the fast path skips
-;; only the arm walk, never the user-method check.
-(define (jolt-pr-readable-dispatch x)
-  (or (and pr-user-method-render (pr-user-method-render x))
-      (if (pr-fast-type? x)
-          (jolt-pr-readable-base x)
-          (let loop ((as (print-arms-for 1 jolt-pr-readable-arms x)))
-            (cond ((null? as) (jolt-pr-readable-base x))
-                  (((caar as) x) ((cdar as) x))
-                  (else (loop (cdr as))))))))
-
 ;; *print-meta* support. The var is def'd after this file loads, so capture its
 ;; cell lazily; jolt-var-get (patched by dyn-binding.ss) honors a `binding`.
 (define pr-meta-cell #f)
@@ -254,8 +242,8 @@
 ;; no level builds a string of its own for the level above to copy, a string is
 ;; escaped by writing the runs between its escapable characters, map entries and
 ;; set elements are written as they are walked, and a user print-method writes
-;; through a char-writer over the same port. jolt-pr-readable-base and
-;; jolt-pr-readable-dispatch above return strings for the callers that want one;
+;; through a char-writer over the same port. jolt-pr-readable-base above returns
+;; a string for the callers that want one;
 ;; the print family (pr-str, pr, print-method's default) comes through here.
 (define pr-user-method-write #f)    ; (x port) -> #t when a user print-method wrote x
 (define (set-pr-user-method-write! f) (set! pr-user-method-write f))

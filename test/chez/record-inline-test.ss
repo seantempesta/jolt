@@ -210,10 +210,14 @@
    (read-forms "host/chez/rt.ss")))
 (define forward-allowed
   ;; the cold forward arms a checked file may keep: a var or reify called as a
-  ;; function, a transient's count, an unbound-var marker
+  ;; function, a transient's count, an unbound-var marker, and jolt=/jolt-hash's
+  ;; UUID and Class-token pairs, asked after every hot kind and before the arm walk
+  ;; (2dc7bca1)
   '(("host/chez/seq.ss" jolt-var-unbound? jolt-var-unbound-ns jolt-var-unbound-name
                         jreify? jreify-protos jolt-transient?)
-    ("host/chez/natives-meta.ss" juuid? jvol?)))
+    ("host/chez/natives-meta.ss" juuid? jvol?)
+    ("host/chez/values.ss" jhost? juuid? juuid-s)
+    ("host/chez/hasheq.ss" jhost? juuid?)))
 (define (forward-refs path)
   (let ((here (hashtable-ref load-index path #f))
         (allowed (cond ((assoc path forward-allowed) => cdr) (else '())))
