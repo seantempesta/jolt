@@ -2203,10 +2203,48 @@
 ;; Var.threadBound, and the whole reason a var read is not O(binding depth). See
 ;; dyn-binding.ss, which owns it; it lives here because it has to be a field for
 ;; the same reason meta and macro? are.
+;;
+;; root, watches and validator are Clojure's Var.root and ARef's watches and validator,
+;; all three volatile on the JVM, and ordered here as volatiles are: each is stored with
+;; a store-release and read with a load-acquire, and the watches move by a sequentially
+;; consistent CAS (var-cell-watches-cas!). A def stores the root and then reads the
+;; watches; an add-watch CASes the watches and then its caller reads the root; an stlr
+;; or a CAS then an ldar of another location is not reordered, so the two never both
+;; miss (atoms.ss def-var!, the varwatchorder gate). watches is an immutable alist,
+;; '() when unwatched; validator is jolt-nil when there is none. Macros, so a var read
+;; stays an inline load; a value that is not a var-cell goes to the plain accessor for
+;; its error.
 (define-record-type var-cell
-  (fields ns name (mutable root) (mutable defined?) (mutable meta) (mutable macro?)
-          (mutable dyn-bound?) (mutable dynamic?))
-  (nongenerative var-cell-v5))
+  (fields ns name (mutable root var-cell-root-plain var-cell-root-plain-set!)
+          (mutable defined?) (mutable meta) (mutable macro?)
+          (mutable dyn-bound?) (mutable dynamic?)
+          (mutable watches var-cell-watches-plain var-cell-watches-plain-set!)
+          (mutable validator var-cell-validator-plain var-cell-validator-plain-set!))
+  (nongenerative var-cell-v6))
+(define-syntax var-cell-ordered-ref
+  (syntax-rules ()
+    ((_ c i plain) (let ((x c)) (#%$record-ref-acquire (if (var-cell? x) x (plain x)) i)))))
+(define-syntax var-cell-ordered-set!
+  (syntax-rules ()
+    ((_ c i plain v) (let ((x c) (y v))
+                       (#%$record-set-release! (if (var-cell? x) x (plain x)) i y)))))
+(define-syntax var-cell-root
+  (syntax-rules () ((_ c) (var-cell-ordered-ref c 2 var-cell-root-plain))))
+(define-syntax var-cell-root-set!
+  (syntax-rules () ((_ c v) (var-cell-ordered-set! c 2 var-cell-root-plain v))))
+(define-syntax var-cell-watches
+  (syntax-rules () ((_ c) (var-cell-ordered-ref c 8 var-cell-watches-plain))))
+(define-syntax var-cell-validator
+  (syntax-rules () ((_ c) (var-cell-ordered-ref c 9 var-cell-validator-plain))))
+(define-syntax var-cell-validator-set!
+  (syntax-rules () ((_ c v) (var-cell-ordered-set! c 9 var-cell-validator-plain v))))
+;; a strong CAS of the watches: $record-ordered-cas! may refuse spuriously, so a
+;; refusal while the field still holds OLD is tried again (sa-record-cas!)
+(define (var-cell-watches-cas! c old new)
+  (let retry ()
+    (cond ((#%$record-ordered-cas! c 8 old new) #t)
+          ((eq? (var-cell-watches c) old) (retry))
+          (else #f))))
 (define var-table (make-hashtable string-hash string=?))
 (define-process-local var-table-mu (make-mutex))
 ;; var-table-mu covers EVERY mutation of var-table and of ns-has-vars-set below
@@ -2281,7 +2319,7 @@
     (or (hashtable-ref var-table k #f)
         (jolt-with-mutex var-table-mu
           (or (hashtable-ref var-table k #f)
-              (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f #f #f #f #f)))
+              (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f #f #f #f #f '() jolt-nil)))
                 (hashtable-set! var-table k c)
                 (ns-cells-add! c)
                 c))))))
@@ -3002,7 +3040,7 @@
           (let ((c (hashtable-ref var-table k #f)))
             (if c
                 (begin (var-cell-defined?-set! c #t) c)
-                (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t #f #f #f #f)))  ; declared => interned/resolvable
+                (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t #f #f #f #f '() jolt-nil)))  ; declared => interned/resolvable
                   (hashtable-set! var-table k c)
                   (ns-cells-add! c)
                   c)))))))

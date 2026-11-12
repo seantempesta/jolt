@@ -324,7 +324,7 @@
 (define (jolt-set-var! v val)
   (if (var-cell? v)
       (begin
-        (iref-validate v val)
+        (var-validate v val)
         (let ((f (dyn-find-binding-frame v)))
           (cond ((not f)
                  (throw-jvm (quote IllegalStateException)
@@ -371,10 +371,10 @@
     (lambda ()
       (let* ((old (var-cell-root v))
              (new (apply jolt-invoke f old args)))
-        (iref-validate v new)
+        (var-validate v new)
         (var-root-set! v new)
         (var-cell-defined?-set! v #t)
-        (iref-notify v old new)
+        (var-notify v old new)
         new))))
 
 ;; __local-var: a fresh free-standing var cell (not interned). with-local-vars
@@ -399,7 +399,7 @@
                                  local-var-counter))))
          (c (make-var-cell "" name
                            (if (pair? args) (car args) (make-jolt-var-unbound "" name))
-                           #t #f #f #f #t)))
+                           #t #f #f #f #t '() jolt-nil)))
     ;; Clojure builds these with Var/create + setDynamic, so a local var takes a
     ;; thread binding like any other — tools.reader hands one to with-bindings.
     ;; Hence the flag in the constructor above, beside the metadata that says the

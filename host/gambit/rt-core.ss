@@ -533,13 +533,16 @@
 ;; cell) from a cell lazily materialised by a forward `var-deref` / `(var x)` on a
 ;; not-yet-defined name — `resolve` returns the cell iff defined?.
 ;; ns-unmap clears it. Avoids the (def x nil) edge of probing the root.
-;; Mirrors host/chez/rt.ss var-cell-v4 field for field: shared chez files
+;; Mirrors host/chez/rt.ss var-cell-v6 field for field: shared chez files
 ;; (ns.ss meta/macro?, dyn-binding.ss dyn-bound?) read these accessors, so the
 ;; two hosts' cells must not drift (this one sat at v2 while chez moved twice).
+;; watches and validator: Clojure's ARef fields (host/chez/rt.ss, where they are
+;; ordered loads and stores; here plain, the swap under sa-record-cas!'s mutex).
 (define-record-type var-cell
   (fields ns name (mutable root) (mutable defined?) (mutable meta) (mutable macro?)
-          (mutable dyn-bound?) (mutable dynamic?))
-  (nongenerative var-cell-v5))
+          (mutable dyn-bound?) (mutable dynamic?) (mutable watches) (mutable validator))
+  (nongenerative var-cell-v6))
+(define (var-cell-watches-cas! c old new) (sa-record-cas! c 8 old new))
 (define var-table (make-hashtable string-hash string=?))
 ;; The whole-table snapshots host-contract.ss's completion scan reads (mirrors
 ;; host/chez/rt.ss: a locked copy, iterated by the caller outside the lock).
@@ -576,7 +579,7 @@
     (or (hashtable-ref var-table k #f)
         (jolt-with-mutex var-table-mu
           (or (hashtable-ref var-table k #f)
-              (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f #f #f #f #f)))
+              (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f #f #f #f #f '() jolt-nil)))
                 (hashtable-set! var-table k c)
                 (ns-cells-add! c)
                 c))))))
@@ -748,7 +751,7 @@
           (let ((c (hashtable-ref var-table k #f)))
             (if c
                 (begin (var-cell-defined?-set! c #t) c)
-                (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t #f #f #f #f)))  ; declared => interned/resolvable
+                (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t #f #f #f #f '() jolt-nil)))  ; declared => interned/resolvable
                   (hashtable-set! var-table k c)
                   (ns-cells-add! c)
                   c)))))))

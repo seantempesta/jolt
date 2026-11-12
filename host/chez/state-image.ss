@@ -1743,7 +1743,7 @@
                       (let ((nx (make-var-cell (var-cell-ns x) (var-cell-name x)
                                                jolt-nil (var-cell-defined? x)
                                                #f (var-cell-macro? x) #f
-                                               (var-cell-dynamic? x))))
+                                               (var-cell-dynamic? x) '() jolt-nil)))
                         (hashtable-set! memo x nx)
                         (var-cell-root-set! nx (walk (var-cell-root x) (cons vp path)))
                         (var-cell-meta-set! nx (and m (walk m mp)))
