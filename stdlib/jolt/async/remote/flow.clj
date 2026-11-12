@@ -14,8 +14,9 @@
                         in-port (update!) closes ch.
     :outs  {out-id ch}  every value taken from ch (a remote end's :in) is output on
                         [pid out-id] and routed by :conns. When ch closes (the peer
-                        ended or died) the flow's report gets
-                        {::flow/pid pid ::flow/closed out-id}.
+                        ended or died), {::flow/pid pid ::flow/closed out-id} is output
+                        on [pid out-id] after every value taken, so its consumer learns
+                        the end in order, and the flow's report gets it too.
     :sends {id ch}      ch carries [coord msg] pairs: msg is sent to coord, any
                         [pid in-id] in the flow, exactly as a step output keyed by
                         a coord is.
@@ -39,7 +40,9 @@
                ([state _] state)
                ([state cid msg]
                 (cond
-                  (nil? msg) [state {::flow/report [{::flow/pid (::pid state) ::flow/closed cid}]}]
+                  (nil? msg) (let [end {::flow/pid (::pid state) ::flow/closed cid}]
+                               ;; an :outs channel's end is its consumer's last value; a :sends channel has no port of its own
+                               [state (cond-> {::flow/report [end]} (not (sends? cid)) (assoc cid [end]))])
                   (sends? cid) (let [[coord m] msg] [state {coord [m]}])
                   :else [state {cid [msg]}])))]
     {:proc (flow/process step)

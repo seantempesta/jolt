@@ -296,6 +296,10 @@
   (c-kill pid 9)
   (check "the child's death is reported as its out-port closing"
          (await-until 5000 #(some (fn [m] (= :out (::flow/closed m))) [(take-within 50 report-chan)])))
+  (check "the consumer takes the out-port's end as its last value, after every data value"
+         (and (await-until 5000 #(= {::flow/pid :agent ::flow/closed :out} (last @seen)))
+              (= (map #(* 2 %) (range n)) (butlast @seen)))
+         (take-last 2 @seen))
   (check "a send to the dead child's in-port does not wedge the graph"
          (do (a/>!! ch 1) (Thread/sleep 50) (some? (flow/ping-proc g :src))))
   (check "stop answers true" (true? (flow/stop g))))
