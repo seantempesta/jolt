@@ -1019,48 +1019,36 @@
             ["SocketTimeoutException" "Accept timed out"])
   (.close server))
 
-;; connect(endpoint, timeout). A listener that never accepts, with a backlog of
-;; one, stops completing handshakes once the queue is full, so a connect to it
-;; hangs until its timeout — on the JVM as here. macOS stalls the second dial,
-;; Linux the third; the loop takes whichever.
-(defn dial-until-stalled [port ms]
-  (loop [held [] i 0]
-    (let [s (java.net.Socket.)
-          [r el] (elapsed-ms #(thrown (fn [] (.connect s (java.net.InetSocketAddress. "127.0.0.1" port) ms))))]
-      (if (and (= r :no-throw) (< i 16))
-        (recur (conj held s) (inc i))
-        {:held held :result r :ms el :closed? (.isClosed s)}))))
+;; connect(endpoint, timeout). A dial that never completes needs a peer that never answers its SYN.
+;; A listener the test owns cannot be one here: on macOS with SYN cookies
+;; (net.inet.tcp.syncookie=1) a full queue completes or resets a dial, never stalls it (40 of 40
+;; dials completed at backlog 0, 2026-11-12). TEST-NET-1 (192.0.2.1, RFC 5737) is never routed, so a
+;; SYN to it goes unanswered and the dial stalls until its timeout. It is probed once: an address
+;; that does not stall is a red check naming what it answered, never a skip (a check that turns
+;; itself off cannot fail).
+(def stall-address (java.net.InetSocketAddress. "192.0.2.1" 9))
+(defn dial-stalled [ms]
+  (let [s (java.net.Socket.)
+        [r el] (elapsed-ms #(thrown (fn [] (.connect s stall-address ms))))]
+    {:result r :ms el :closed? (.isClosed s)}))
 
-(let [server (java.net.ServerSocket. 0 1)
-      {:keys [held result ms closed?]} (dial-until-stalled (.getLocalPort server) 300)]
-  (if (= result ["SocketException" "Connection reset by peer"])
-    ;; A kernel that resets a dial to a full queue rather than dropping its SYN
-    ;; (macOS 27 does; its SYN cookies, net.inet.tcp.syncookie=1, are the likely
-    ;; reason) lets no dial stall, so nothing can time out: that is said, not counted
-    ;; as a failure. Any other answer is checked.
-    (println "  (this kernel resets a dial to a full listen queue instead of stalling it: the five connect-timeout checks are skipped)")
-    (do
-      (check-eq "a connect that cannot complete times out" result
-                ["SocketTimeoutException" "Connect timed out"])
-      (check-eq "…not before the timeout, nor far past it"
-                (on-time? 300 ms #(let [again (dial-until-stalled (.getLocalPort server) 300)]
-                                    (doseq [s (:held again)] (.close s))
-                                    (:ms again)))
-                true)
-      (check-eq "…and closes the socket" closed? true)
-      (let [p (promise) port (.getLocalPort server)]
-        (fib/spawn (fn [] (deliver p (thrown #(.connect (java.net.Socket.)
-                                                        (java.net.InetSocketAddress. "127.0.0.1" port) 200)))))
-        (check-eq "a fiber's connect times out" (deref p 5000 :hung)
-                  ["SocketTimeoutException" "Connect timed out"]))
-      (let [s (java.net.Socket.) p (promise) port (.getLocalPort server)]
-        (future (deliver p (thrown #(.connect s (java.net.InetSocketAddress. "127.0.0.1" port) 5000))))
-        (Thread/sleep 200)
-        (.close s)
-        (check-eq "close wakes a timed connect" (deref p 3000 :hung)
-                  ["SocketException" "Socket closed"]))))
-  (doseq [s held] (.close s))
-  (.close server))
+(let [{:keys [result ms closed?]} (dial-stalled 300)]
+  (check-eq (str "a connect that cannot complete times out (a dial to " stall-address
+                 " that does not stall says this network answers TEST-NET-1: the connect-timeout checks need one that drops it)")
+            result ["SocketTimeoutException" "Connect timed out"])
+  (when (= result ["SocketTimeoutException" "Connect timed out"])
+    (check-eq "…not before the timeout, nor far past it" (on-time? 300 ms #(:ms (dial-stalled 300))) true)
+    (check-eq "…and closes the socket" closed? true)
+    (let [p (promise)]
+      (fib/spawn (fn [] (deliver p (thrown #(.connect (java.net.Socket.) stall-address 200)))))
+      (check-eq "a fiber's connect times out" (deref p 5000 :hung)
+                ["SocketTimeoutException" "Connect timed out"]))
+    (let [s (java.net.Socket.) p (promise)]
+      (future (deliver p (thrown #(.connect s stall-address 5000))))
+      (Thread/sleep 200)
+      (.close s)
+      (check-eq "close wakes a timed connect" (deref p 3000 :hung)
+                ["SocketException" "Socket closed"]))))
 
 (let [s (java.net.Socket.)]
   (check-eq "a negative connect timeout is refused"
