@@ -1332,7 +1332,7 @@
                   ;; per-site caches: the static member site and the instance?
                   ;; site, each with the constructor its hoisted cell calls
                   "jolt-once-tag" "jolt-once-clear!" "host-static-ref-site" "host-static-proc-site" "host-static-site-make"
-                  "jolt-instance-site" "jolt-instance-site-make"
+                  "jolt-instance-site" "jolt-instance-site-make" "jolt-class-for-site"
                   ;; record/reify protocol-method dispatch (:host-call fallback
                   ;; for any .method not in supported-host-methods).
                   "record-method-dispatch"
@@ -3960,6 +3960,18 @@
       ;; constant, so this needs a pool; it also needs var-cache? so the seed mint
       ;; stays byte-identical, and a callee that IS clojure.core's — an ns that
       ;; defined its own instance-check resolves elsewhere and is called as written.
+      ;; A class named in code ((instance? T x)'s T, a hinted class, a Class value) is
+      ;; jolt.host/jolt-class-for of its name, which interns: a name's token never
+      ;; changes once made. The site keeps the token its first call interned
+      ;; (class-model.ss jolt-class-for-site), so each later call is a slot read and not
+      ;; a hashed lookup of the name (55 ticks a call, most of an instance? of a deftype).
+      ;; Interned at the first call as before, so a type registered before then is found.
+      (and *const-pool* (var-cache?)
+           (= :var (:op fnode)) (= "jolt.host" (:ns fnode)) (= "jolt-class-for" (:name fnode))
+           (= 1 (count arg-nodes)) (= :const (:op (first arg-nodes))) (string? (:val (first arg-nodes))))
+      (let [site (hoist-const-per-site "(jolt-instance-site-make)")]
+        (note-tail-call! tail?)
+        (str "(jolt-class-for-site " site " " (chez-str-lit (:val (first arg-nodes))) ")"))
       (and *const-pool* (var-cache?)
            (= :var (:op fnode)) (= "clojure.core" (:ns fnode)) (= "instance-check" (:name fnode))
            (= 2 (count arg-nodes)))

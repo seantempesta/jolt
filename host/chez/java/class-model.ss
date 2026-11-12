@@ -168,6 +168,12 @@
               (hashtable-set! jolt-class-for-tbl name obj)
               obj)))))
 (def-var! "jolt.host" "jolt-class-for" jolt-class-for)
+;; A code site's class token: the one its first call interned, kept in the site's slot
+;; (a (jolt-instance-site-make) cell the back end hoists), since a name's token never
+;; changes. Two threads filling one slot store the same interned token.
+(define (jolt-class-for-site site name)
+  (or (vector-ref site 0)
+      (let ((c (jolt-class-for name))) (vector-set! site 0 c) c)))
 
 ;; Long/TYPE and its eight siblings are the primitive CLASSES, not their names.
 ;; They are declared beside the rest of each wrapper's statics
