@@ -4240,8 +4240,7 @@
 (declare emit-try*)
 (defn- emit-try [node]
   (if (and (:finally node) *tail?* (not= :gambit (target)))
-    ;; the body's line where it has one (a try node carries none), as the catch's wrapper
-    (with-site (if (and (map? (:body node)) (node-line (:body node))) (:body node) node)
+    (with-site node
       (str "(call-with-values (lambda () " (binding [*tail?* false] (emit-try* node)) ")"
            " (case-lambda ((v) v) (vs (apply values vs))))"))
     (emit-try* node)))
