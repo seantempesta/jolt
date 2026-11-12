@@ -480,7 +480,8 @@
 
 (defn- spawn [pump f]
   (if (= pump :fiber)
-    (jolt.fibers/spawn f)
+    ;; a pump marks itself: never told a deadlock, not counted as the program's work (jolt.host/fiber-pump!)
+    (jolt.fibers/spawn (fn [] (jolt.host/fiber-pump!) (f)))
     (doto (Thread. ^Runnable f) (.setDaemon true) (.start))))
 
 (defn open

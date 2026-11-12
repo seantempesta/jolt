@@ -115,12 +115,15 @@
           ;; error is reported if it is collected unread (jolt-fiber-unread-watch!);
           ;; #f for every other fiber, and once a monitor is registered on it
           (mutable unread)
+          ;; #t for a remote end's pump (jolt.host/fiber-pump!, set by the fiber itself): never told a
+          ;; deadlock, not counted by a quiescence check
+          (mutable pump)
           ;; where it was spawned, for the dump (jolt-fiber-dump-site): the string
           ;; "ns:line" a go form's expansion passes, one constant every spawn from
           ;; that form shares, else the procedure the spawner handed over (its body:
           ;; a fn literal's code name says the fn it was written in). Set at the spawn.
           site)
-  (nongenerative jolt-fiber-v12))
+  (nongenerative jolt-fiber-v13))
 
 ;; --- the per-fiber dynamic slice ---------------------------------------------
 ;; R2 (jolt-nvpr.3). jolt's `binding` macro pushes by calling the
@@ -803,7 +806,7 @@
             (make-jolt-dslice (jolt-slice-stack-param)
                               (jolt-slice-ns-param)
                               #f)
-            c #f '() 0 #f #f 0 #f ibox #f #f #f #f 0 #f #f site)))
+            c #f '() 0 #f #f 0 #f ibox #f #f #f #f 0 #f #f #f site)))
     (jolt-fiber-register! f)
     (when ibox (jolt-fiber-own-ibox! f ibox))
     (when before-run (before-run f))
@@ -2059,6 +2062,27 @@
                                (keyword #f "parked") (with-output-to-string
                                                        (lambda () (jolt-fiber-dump (current-output-port)))))))
 
+;; A remote end's pump (jolt.async.remote: the fibers moving values between a socket and its channels)
+;; marks itself (a field of its own record: one writer, the fiber): it is no work of the program's, so a deadlock is never told to it (its link would die and
+;; carry no report out), and a quiescence check counts every fiber but the pumps.
+(define (jolt-fiber-pump? f) (jolt-fiber-pump f))
+(define (jolt-fiber-mark-pump!) (let ((f (jolt-current-fiber))) (when f (jolt-fiber-pump-set! f #t))))
+
+;; Quiescence, as an event: (jolt.host/on-quiescent! f) registers the one handler (nil removes it), called
+;; with the dump (every fiber and the frames it will resume) the moment a main carrier's program goes
+;; quiescent: no fiber queued, no timer pending, no other thread that may run, and every fiber but a pump
+;; parked; once each time, until a fiber runs again (a pump's run counts, so a handler may hear one state twice:
+;; it ends what it ends once). An idle process that waits for a peer is quiescent
+;; too, so what quiescence means is the handler's: a test runner with a test in flight ends it as a deadlock.
+(define jolt-quiescent-handler #f)
+(define jolt-quiescent-told #f)
+(define (jolt-on-quiescent! f) (set! jolt-quiescent-handler f) (set! jolt-quiescent-told #f))
+(define (jolt-quiescent?)
+  (for-all (lambda (f) (or (jolt-fiber-pump? f) (eq? 'parked (jolt-fiber-state f))))
+           (jolt-fiber-registry-live)))
+(define (jolt-quiescent-dump)
+  (with-output-to-string (lambda () (jolt-fiber-dump (current-output-port)))))
+
 ;; Tell each parked fiber not told yet; answers how many it woke. STILL? (the detector's: the
 ;; asleep epoch has not moved since its check) is asked before each tell, so a wake in between
 ;; tells no more.
@@ -2072,7 +2096,8 @@
                           (if (eq? 'parked (jolt-fiber-state f)) n (fx+ n 1)))
                    n))
              0
-             (filter (lambda (f) (and (eq? 'parked (jolt-fiber-state f)) (not (jolt-fiber-interrupt f))))
+             (filter (lambda (f) (and (eq? 'parked (jolt-fiber-state f)) (not (jolt-fiber-interrupt f))
+                                      (not (jolt-fiber-pump? f))))
                      (jolt-fiber-registry-live))))))
 
 ;; --- all asleep, on threads (locks.ss counts) -----------------------------------
@@ -2209,16 +2234,24 @@
                   (vector-set! box 0 #t)))
               thunk)))
     (let loop ()
+      ;; anything that runs ends a quiescent episode: the next quiescence is told again
+      (when (jolt-carrier-head c) (set! jolt-quiescent-told #f))
       (jolt-fiber-drain! c)
       (let* ((fired (jolt-timers-run-due!)) (next (cdr fired)))
         (cond
           ((vector-ref box 0)
            (jolt-main-carrier-leave! c)
            (if (vector-ref box 2) (raise (vector-ref box 2)) (vector-ref box 1)))
-          ((or (car fired) (jolt-carrier-head c)) (loop))
+          ((or (car fired) (jolt-carrier-head c)) (set! jolt-quiescent-told #f) (loop))
           (else
            (let ((ms (and next (max 0 (mono-ms-until next)))))
+             ;; quiescent: the handler hears it once (it may queue a fiber: the loop runs it next)
+             (when (and jolt-quiescent-handler (not jolt-quiescent-told) (not next)
+                        (not (jolt-other-thread-may-run?)) (jolt-quiescent?))
+               (set! jolt-quiescent-told #t)
+               (jolt-invoke jolt-quiescent-handler (jolt-quiescent-dump)))
              (cond
+               ((jolt-carrier-head c) (void))
                ;; a wait woken by a signal (jolt.io-poller/wake-on-signals!) runs its handler
                ;; now: Chez runs a signal's handler at its next event check, and the loop would
                ;; otherwise go back into kevent before one came

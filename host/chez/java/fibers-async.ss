@@ -693,6 +693,11 @@
         (enable-interrupts)
         pid))))
 (def-var! "jolt.host" "fork-alone" (lambda () (jolt-fork-alone)))
+;; (jolt.host/fiber-pump!): this fiber is a remote end's pump: never told a deadlock, not counted by a
+;; quiescence check (its record's pump field). (jolt.host/on-quiescent! f): f, or nil, hears a main
+;; carrier's quiescence with the dump (fibers.ss jolt-quiescent?).
+(def-var! "jolt.host" "fiber-pump!" (lambda () (jolt-fiber-mark-pump!) jolt-nil))
+(def-var! "jolt.host" "on-quiescent!" (lambda (f) (jolt-on-quiescent! (if (jolt-nil? f) #f f)) jolt-nil))
 ;; (jolt.host/after-fork-add! f): f, a fn of no arguments, runs in every forked child that calls
 ;; after-fork-child!, after the runtime has reset itself. For a library's own state across a fork
 (def-var! "jolt.host" "after-fork-add!"
