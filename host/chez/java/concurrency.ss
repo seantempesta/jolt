@@ -2650,7 +2650,7 @@
                     ((vector-ref st 1) "TERMINATED")
                     ((jolt-thread-state-hook self) => values)
                     (else (let ((w (and (jthread-id st) (thread-wait-state (jthread-id st)))))
-                            (if w (symbol->string w) "RUNNABLE"))))))))
+                            (if w (symbol->string (jolt-thread-state-name w)) "RUNNABLE"))))))))
         (cons "setUncaughtExceptionHandler" (lambda (self h)
           (vector-set! (jhost-state self) 11 (if (jolt-nil? h) #f h))
           jolt-nil))
@@ -3399,9 +3399,15 @@
                      (else (sf-due head)))))
     (when token (vector-set! st 14 token))
     (vector-set! st 9 (fx+ (vector-ref st 9) 1))
-    (if wake
-        (jolt-condition-wait (vector-ref st 3) (vector-ref st 2) (jolt-deadline->timeout wake))
-        (jolt-condition-wait (vector-ref st 3) (vector-ref st 2)))
+    (cond
+      ;; a leader times a delayed task: work that comes by itself
+      (token (jolt-condition-wait (vector-ref st 3) (vector-ref st 2) (jolt-deadline->timeout wake)))
+      ;; the keep-alive (locks.ss jolt-cv-idle-wait): read as "may run", it held a program's
+      ;; quiescence off for 60 s after its last future; Thread.getState answers TIMED_WAITING for
+      ;; it, as the JVM does
+      (wake (jolt-cv-idle-wait (vector-ref st 3) (vector-ref st 2) (jolt-deadline->timeout wake)
+                               (lambda () (fx>? (vector-ref st 10) 0))))
+      (else (jolt-condition-wait (vector-ref st 3) (vector-ref st 2))))
     (vector-set! st 9 (fx- (vector-ref st 9) 1))
     (when (and token (eq? (vector-ref st 14) token)) (vector-set! st 14 #f))))
 ;; With the mutex held, by a worker leaving the idle set for a job or for good: if

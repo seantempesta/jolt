@@ -63,6 +63,51 @@
     (deref p 3000 :hung)
     (let [f (java.io.File. dir (str "dump-" (.pid (java.lang.ProcessHandle/current)) ".txt"))]
       {:line line :file? (and (.exists f) (clojure.string/includes? (slurp f) "quiescence:"))})))
+(defn a-dump-says-what-the-handler-did
+  "The dump's quiescence line after a handler that answered, then one that threw (the program goes on: the
+  waiter left is told the deadlock): [line after the first, line after the second, the waiter's end]."
+  []
+  (let [line #(first (filter (fn [l] (clojure.string/starts-with? l "quiescence:")) (clojure.string/split-lines (jolt.host/fiber-dump))))
+        p (promise) done (promise)]
+    (jolt.fibers/spawn (fn [] (deref p) (deliver done true)))
+    (jolt.host/on-quiescent! (fn [_] (deliver p :go) :answered))
+    (deref done)
+    (let [first-line (line) q (promise) end (promise)]
+      (jolt.fibers/spawn (fn [] (deliver end (try (deref q) :returned (catch Throwable t :told)))))
+      (jolt.host/on-quiescent! (fn [_] (throw (ex-info "handler broke" {}))))
+      ;; the deadlock is told to every waiter, this one too: it reads the waiter's end after
+      (let [e (try (deref end) (catch Throwable _ (deref end)))]
+        (jolt.host/on-quiescent! nil)
+        [first-line (line) e]))))
+(def before-next-io-wait
+  ;; (before-next-io-wait f): f runs once, inside the loop's next wait on the poller (jolt-main-io-wait), which
+  ;; lies between the loop's quiescence check and its last check before a deadlock
+  (scm/eval-string
+    "(lambda (f)
+       (let ((orig jolt-main-io-wait))
+         (set! jolt-main-io-wait (lambda (ms) (set! jolt-main-io-wait orig) (jolt-invoke f) (orig ms)))))"))
+(defn a-thread-ending-after-the-check-is-told-first
+  "What the program's one waiter gets when the only other thread runs at the loop's quiescence check and ends
+  before its last check: :heard when the handler is told (tell first, then deadlock), :told when the deadlock
+  came with the handler never told (the race: dump \"told this spell no\")."
+  []
+  (let [stop (atom false) heard (promise)
+        t (doto (Thread. (fn [] (while (not @stop)))) (.start))]
+    (jolt.host/on-quiescent! (fn [_] (deliver heard :heard)))
+    (before-next-io-wait (fn [] (reset! stop true) (.join t)))
+    (let [r (try (deref heard) (catch Throwable _ :told))]
+      (jolt.host/on-quiescent! nil)
+      r)))
+(defn a-futures-idle-worker-is-no-work
+  "Milliseconds from a fiber's park to the handler's notice, after a future ran: its pool's idle worker waits
+  out a 60 s keep-alive, and it held quiescence off for all of it (read as a thread that may run)."
+  []
+  @(future :ran)
+  (let [heard (promise) p (promise) t0 (System/currentTimeMillis)]
+    (jolt.host/on-quiescent! (fn [_] (deliver p :go) (deliver heard (- (System/currentTimeMillis) t0))))
+    (deref p)
+    (jolt.host/on-quiescent! nil)
+    (deref heard)))
 (defn forked-child-hears-quiescence
   "0 when a child forked beside a parent fiber that waits hears its own quiescence; 99 when its alarm ended it."
   []
@@ -92,7 +137,24 @@
                 {:v v :heard (count @heard) :dump? (boolean (some #(re-find #"fiber" %) @heard)) :got got
                  :fork (forked-child-hears-quiescence)
                  :subprocess (a-subprocess-wait-is-not-quiescent)
-                 :dump (a-dump-names-what-holds-quiescence)})))
+                 :dump (a-dump-names-what-holds-quiescence)
+                 :handler (a-dump-says-what-the-handler-did)
+                 :race (a-thread-ending-after-the-check-is-told-first)
+                 :idle (a-futures-idle-worker-is-no-work)})))
+      _ (when-not (< (:idle res) 5000)
+          (println "FIBER-QUIESCENT-TEST FAILED: quiescence after a future came" (:idle res) "ms after the park")
+          (System/exit 1))
+      res (dissoc res :idle)
+      _ (when-not (= :heard (:race res))
+          (println "FIBER-QUIESCENT-TEST FAILED: a thread that ended after the quiescence check:" (:race res))
+          (System/exit 1))
+      res (dissoc res :race)
+      [l1 l2 hend] (:handler res)
+      res (dissoc res :handler)
+      _ (when-not (and (clojure.string/includes? (str l1) "handler set") (clojure.string/includes? (str l1) "last answer :answered")
+                       (clojure.string/includes? (str l2) "last throw") (clojure.string/includes? (str l2) "handler broke") (= :told hend))
+          (println "FIBER-QUIESCENT-TEST FAILED: the handler's line" (pr-str l1) "then" (pr-str l2) "waiter" hend)
+          (System/exit 1))
       dump (:dump res)
       res (dissoc res :dump)
       line (or (:line dump) "")]

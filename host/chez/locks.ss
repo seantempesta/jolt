@@ -533,7 +533,8 @@
           (jolt-with-mutex thread-state-mu (hashtable-set! thread-state-boxes id b))
           (thread-state-cell (cons id b))
           b))))
-;; The recorded state of thread ID — WAITING, TIMED_WAITING or BLOCKED — or #f.
+;; The recorded state of thread ID — WAITING, TIMED_WAITING, BLOCKED or IDLE (an idle pool worker's
+;; keep-alive, jolt-cv-idle-wait) — or #f.
 (define (thread-wait-state id)
   (let ((b (jolt-with-mutex thread-state-mu (hashtable-ref thread-state-boxes id #f))))
     (and b (unbox b))))
@@ -634,6 +635,33 @@
              (jolt-cv-threads-set! cv (fx- (jolt-cv-threads cv) 1))
              r))
          (call-with-thread-state 'TIMED_WAITING (lambda () (cw-wait cv mu abs-time)))))))
+
+;; An idle pool worker's keep-alive wait on jolt-cv CV (concurrency.ss executor-idle-wait!): timed, but
+;; what ends it by itself is the worker's retirement, never work. It is recorded (IDLE . PENDING?), PENDING?
+;; answering whether its pool holds a task queued: a main carrier's quiescence reads it asleep while
+;; nothing is queued (jolt-thread-asleep-state?). Read at the check, not marked by the waker: a signal
+;; marks every waiter on CV awake (jolt-asleep-woken!), and the ones not woken read awake until their
+;; wait ended, 60 s for a keep-alive. A task handed over is in the queue until the worker that takes it
+;; has left this wait. No value wait: never in jolt-asleep-ids, never told.
+(define jolt-idle-notify (lambda () (void)))   ; fibers.ss: wakes a main carrier's loop
+(define (jolt-cv-idle-wait cv mu abs-time pending?)
+  (when (jolt-current-fiber) (jolt-blocking-refuse 'jolt-condition-wait))
+  (jolt-cv-threads-set! cv (fx+ (jolt-cv-threads cv) 1))
+  (let ((r (call-with-thread-state (cons 'IDLE pending?)
+             (lambda ()
+               ;; a main carrier's loop that waits while this thread may run reads the threads again
+               ;; (as a thread falling asleep wakes it, jolt-asleep-wake-detector!)
+               (jolt-idle-notify)
+               (cw-wait (jolt-cv-cond cv) mu abs-time)))))
+    (jolt-cv-threads-set! cv (fx- (jolt-cv-threads cv) 1))
+    r))
+;; A recorded wait state W that nothing but another's act ends: WAITING, BLOCKED, or an idle pool
+;; worker whose pool has no task queued.
+(define (jolt-thread-asleep-state? w)
+  (or (memq w '(WAITING BLOCKED))
+      (and (pair? w) (eq? (car w) 'IDLE) (not ((cdr w))))))
+;; W as Thread.getState and a dump name it: an idle worker's keep-alive is TIMED_WAITING on the JVM.
+(define (jolt-thread-state-name w) (if (pair? w) 'TIMED_WAITING w))
 
 ;; --- all asleep: a threaded process that nothing can wake ----------------------
 ;; A process run on threads (a test shard, the forks runner: not a main carrier, whose loop sees

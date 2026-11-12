@@ -998,6 +998,12 @@
 ;; most first, so a fiber that spins is at the top; each with where it was spawned. follow?
 ;; (SIGINFO's dump, whose port lives as long as the process) asks each running fiber for its
 ;; frames at its next safe point (jolt-fiber-frames-wanted).
+;; A fiber that holds quiescence off: one that may still run. A pump is no work of the program's; a
+;; parked one waits; a done or dead one never runs again, though the weak registry keeps it until a
+;; collection (it held quiescence off until one, so whether a program was ever quiescent hung on
+;; when the collector ran: a forked test child under load).
+(define (jolt-fiber-holds-quiescence? f)
+  (not (or (jolt-fiber-pump? f) (memq (jolt-fiber-state f) '(parked done dead)))))
 ;; The conditions that hold a main carrier's quiescence off (jolt-main-carrier-run!): each fiber
 ;; that is neither a pump nor parked (the dump's own fiber left out), a timer pending, another
 ;; Jolt thread that may run, a fiber that is no pump waiting on the poller. NUMBERED is the
@@ -1006,19 +1012,18 @@
   (let* ((self (jolt-current-fiber))
          (me (get-thread-id))
          (fibers (filter (lambda (e) (let ((f (car e)))
-                                       (not (or (eq? f self) (jolt-fiber-pump? f)
-                                                (eq? 'parked (jolt-fiber-state f))))))
+                                       (and (not (eq? f self)) (jolt-fiber-holds-quiescence? f))))
                          numbered))
          (timers (guard (_ (#t 0)) (fx- timeout-heap-n timeout-heap-dead)))
          (threads (guard (_ (#t '()))
                     (filter (lambda (id) (and (not (eqv? id me)) (not (eqv? id jolt-timer-thread-id))
-                                              (not (memq (thread-wait-state id) '(WAITING BLOCKED)))))
+                                              (not (jolt-thread-asleep-state? (thread-wait-state id)))))
                             (live-thread-ids))))
          (io (and jolt-io-work-awaited (guard (_ (#t #f)) (jolt-io-work-awaited)))))
     (append
       (map (lambda (e) (format "fiber ~a ~a" (cdr e) (jolt-fiber-state (car e)))) fibers)
       (if (fx>? timers 0) (list (format "~a timer~:p pending" timers)) '())
-      (map (lambda (id) (format "thread ~a ~a" id (thread-wait-state id))) threads)
+      (map (lambda (id) (format "thread ~a ~a" id (jolt-thread-state-name (thread-wait-state id)))) threads)
       (if io (list "a fiber that is no pump waits on the poller") '()))))
 (define jolt-fiber-dump
   (case-lambda
@@ -1063,9 +1068,17 @@
        ;; what holds a main carrier's quiescence off now (jolt-quiescent? and the loop's own
        ;; conditions), read without the locks: the dump runs in a signal's handler, inside
        ;; whatever the thread held. "nothing" when every condition holds.
-       (fprintf port "quiescence: ~a~%"
+       (fprintf port "quiescence: ~a; handler ~a, told this spell ~a, ~a notice~:p, last answer ~a~a~%"
                 (let ((held (jolt-quiescence-held-by numbered)))
-                  (if (null? held) "nothing holds it" (format "held by ~{~a~^; ~}" held))))
+                  (if (null? held) "nothing holds it" (format "held by ~{~a~^; ~}" held)))
+                (if jolt-quiescent-handler "set" "none") (if jolt-quiescent-told "yes" "no")
+                jolt-quiescent-notices
+                (guard (_ (#t "?")) (jolt-pr-str (if (jolt-nil? jolt-quiescent-last-answer) jolt-nil (or jolt-quiescent-last-answer jolt-nil))))
+                (if jolt-quiescent-last-error
+                    (format ", last throw ~a" (guard (_ (#t "?")) (if (condition? jolt-quiescent-last-error)
+                                                                     (call-with-string-output-port (lambda (s) (display-condition jolt-quiescent-last-error s)))
+                                                                     (jolt-pr-str (jolt-unwrap-throw jolt-quiescent-last-error)))))
+                    ""))
        (for-each
          (lambda (e)
            (let ((f (car e)) (n (cdr e)))
@@ -2048,14 +2061,15 @@
       (jolt-main-carrier-run/loop! thunk)))
 
 ;; Another thread than this one that may still run: not parked in an untimed jolt wait (WAITING
-;; or BLOCKED, locks.ss thread-wait-state). A timed one (TIMED_WAITING: a sleep, a deref with a
+;; or BLOCKED, locks.ss thread-wait-state), nor an idle pool worker waiting out its keep-alive with nothing queued (locks.ss jolt-thread-asleep-state?:
+;; it runs only if something else enqueues, and its timeout ends in its retirement). A timed one (TIMED_WAITING: a sleep, a deref with a
 ;; timeout) wakes by itself; one in a foreign call or a raw wait reads as running too. None is
 ;; ever taken for asleep, so a deadlock it is part of is missed, never one invented. The timer
 ;; thread is not one: the loop reads its heap itself (next), so its wait is no work of its own.
 (define (jolt-other-thread-may-run?)
   (let ((me (get-thread-id)))
     (exists (lambda (id) (and (not (eqv? id me)) (not (eqv? id jolt-timer-thread-id))
-                              (not (memq (thread-wait-state id) '(WAITING BLOCKED)))))
+                              (not (jolt-thread-asleep-state? (thread-wait-state id)))))
             (live-thread-ids))))
 
 ;; Nothing can ever wake the program (no fiber queued, no timer, no descriptor awaited, every other
@@ -2110,15 +2124,33 @@
 ;; too, so what quiescence means is the handler's: a test runner with a test in flight ends it as a deadlock.
 (define jolt-quiescent-handler #f)
 (define jolt-quiescent-told #f)
+;; what the dump says of the handler: how many notices it heard, its last answer, its last throw (kept, said
+;; on stderr once, never ended the program: a handler's error is its own, the loop goes on)
+(define jolt-quiescent-notices 0)
+(define jolt-quiescent-last-answer #f)
+(define jolt-quiescent-last-error #f)
 (define (jolt-on-quiescent! f) (set! jolt-quiescent-handler f) (set! jolt-quiescent-told #f))
 (define jolt-io-work-awaited #f)   ; () -> true while a fiber that is no pump waits on the poller; jolt.io-poller's
 (define (jolt-quiescent?)
-  (and (for-all (lambda (f) (or (jolt-fiber-pump? f) (eq? 'parked (jolt-fiber-state f))))
-                (jolt-fiber-registry-live))
+  (and (not (exists jolt-fiber-holds-quiescence? (jolt-fiber-registry-live)))
        ;; a fiber parked on a descriptor the poller watches (a subprocess's exit, a pipe, a
        ;; socket) is waiting on work the poller will deliver, as the deadlock checks count it:
        ;; not quiescent. A pump's wait on its socket is a peer's to end, so it does not count.
        (not (and jolt-io-work-awaited (jolt-io-work-awaited)))))
+;; The handler hears quiescence once a spell, when one is set and the program is quiescent; its answer
+;; and its throw are kept for the dump (a throw is said on stderr, never ends the loop). The caller has
+;; read that nothing else can run: no timer due, no other thread that may run.
+(define (jolt-quiescent-tell!)
+  (when (and jolt-quiescent-handler (not jolt-quiescent-told) (jolt-quiescent?))
+    (set! jolt-quiescent-told #t)
+    (set! jolt-quiescent-notices (fx+ jolt-quiescent-notices 1))
+    (guard (e (#t (set! jolt-quiescent-last-error e)
+                  (guard (_ (#t #f))
+                    (let ((p (current-error-port)))
+                      (fprintf p "jolt: the quiescence handler threw: ~a~%"
+                               (if (condition? e) (call-with-string-output-port (lambda (s) (display-condition e s))) e))
+                      (flush-output-port p)))))
+      (set! jolt-quiescent-last-answer (jolt-invoke jolt-quiescent-handler (jolt-quiescent-dump))))))
 (define (jolt-quiescent-dump)
   (with-output-to-string (lambda () (jolt-fiber-dump (current-output-port)))))
 
@@ -2241,6 +2273,8 @@
             (flush-output-port p)))))))
 
 (set! jolt-asleep-notify jolt-asleep-wake-detector!)
+;; an idle pool worker's keep-alive (locks.ss jolt-cv-idle-wait) is asleep to a main carrier only
+(set! jolt-idle-notify (lambda () (when jolt-main-thread (jolt-main-wake-for-timer!))))
 
 ;; Chez's parallel-collector pool fixer (chez-patches/0008-fixed-sweeper-pool), looked up once,
 ;; at load: a Chez entry, there before any library is loaded. #f on a stock Chez.
@@ -2285,10 +2319,8 @@
           (else
            (let ((ms (and next (max 0 (mono-ms-until next)))))
              ;; quiescent: the handler hears it once (it may queue a fiber: the loop runs it next)
-             (when (and jolt-quiescent-handler (not jolt-quiescent-told) (not next)
-                        (not (jolt-other-thread-may-run?)) (jolt-quiescent?))
-               (set! jolt-quiescent-told #t)
-               (jolt-invoke jolt-quiescent-handler (jolt-quiescent-dump)))
+             (when (and (not next) (not (jolt-other-thread-may-run?)))
+               (jolt-quiescent-tell!))
              (cond
                ((jolt-carrier-head c) (void))
                ;; a wait woken by a signal (jolt.io-poller/wake-on-signals!) runs its handler
@@ -2320,6 +2352,14 @@
                          (jolt-condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c))
                          #t)
                         (else #f)))
+                (void))
+               ;; tell first, then deadlock: nothing can wake it, so the program is quiescent, and a
+               ;; handler not told yet hears that before any waiter is told the deadlock. The check
+               ;; above read the threads earlier; one that ended since (a pool thread finishing) left
+               ;; it unasked there, and the deadlock came with the handler never told. What the
+               ;; handler queues runs on the next pass, as at the top
+               ((begin (jolt-quiescent-tell!)
+                       (jolt-with-mutex (jolt-carrier-mu c) (jolt-carrier-head c)))
                 (void))
                ;; nothing can wake it: each waiter is told and throws in its caller
                ((fx>? (jolt-main-carrier-deliver-deadlock! c) 0) (void))
