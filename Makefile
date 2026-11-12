@@ -1061,6 +1061,7 @@ ffi:
 	@bin/jolt run test/chez/jolt-ffi-arena-test.clj
 	@bin/jolt run test/chez/jolt-ffi-typed-array-test.clj
 	@bin/jolt run test/chez/jolt-ffi-callback-preempt-test.clj
+	@bin/jolt run test/chez/jolt-ffi-site-cache-test.clj
 	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-foreign-thread-test.sh
 	@sh test/chez/ffi-gc-stall-test.sh
