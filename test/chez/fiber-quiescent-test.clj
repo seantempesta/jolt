@@ -43,6 +43,26 @@
     (let [r (clojure.java.shell/sh "sleep" "0.3")]
       (jolt.host/on-quiescent! nil)
       [(:exit r) @heard])))
+(defn a-dump-names-what-holds-quiescence
+  "What jolt.host/fiber-dump's quiescence line says while a fiber waits on a subprocess's exit and a
+  timer is pending, and whether SIGINFO with JOLT_DUMP_DIR set writes dump-<pid>.txt holding it."
+  []
+  (let [dir (str (System/getProperty "java.io.tmpdir") "/fq-dump-" (System/nanoTime))
+        _ (.mkdirs (java.io.File. dir))
+        setenv (scm/eval-string "(let ([f (foreign-procedure \"setenv\" (string string int) int)]) (lambda (k v) (f k v 1)))")
+        kill-self (scm/eval-string "(let ([k (foreign-procedure \"kill\" (int int) int)] [g (foreign-procedure \"getpid\" () int)]) (lambda (s) (k (g) s)))")
+        p (promise)
+        _ (a/go (a/<! (a/thread (clojure.java.shell/sh "sleep" "0.5"))) (deliver p :done))
+        t (a/timeout 2000)
+        _ (Thread/sleep 100)
+        line (first (filter #(clojure.string/starts-with? % "quiescence:") (clojure.string/split-lines (jolt.host/fiber-dump))))]
+    (setenv "JOLT_DUMP_DIR" dir)
+    (kill-self 29)
+    (a/<!! (a/timeout 50))
+    (setenv "JOLT_DUMP_DIR" "")
+    (deref p 3000 :hung)
+    (let [f (java.io.File. dir (str "dump-" (.pid (java.lang.ProcessHandle/current)) ".txt"))]
+      {:line line :file? (and (.exists f) (clojure.string/includes? (slurp f) "quiescence:"))})))
 (defn forked-child-hears-quiescence
   "0 when a child forked beside a parent fiber that waits hears its own quiescence; 99 when its alarm ended it."
   []
@@ -71,7 +91,14 @@
                 (r/close! x) (r/close! y)
                 {:v v :heard (count @heard) :dump? (boolean (some #(re-find #"fiber" %) @heard)) :got got
                  :fork (forked-child-hears-quiescence)
-                 :subprocess (a-subprocess-wait-is-not-quiescent)})))]
+                 :subprocess (a-subprocess-wait-is-not-quiescent)
+                 :dump (a-dump-names-what-holds-quiescence)})))
+      dump (:dump res)
+      res (dissoc res :dump)
+      line (or (:line dump) "")]
+  (when-not (and (clojure.string/includes? line "timer") (:file? dump))
+    (println "FIBER-QUIESCENT-TEST FAILED: the dump's quiescence line" (pr-str line) "file written?" (:file? dump))
+    (System/exit 1))
   (if (= {:v :ended-by-handler :heard 1 :dump? true :got :after :fork 0 :subprocess [0 false]} res)
     (println "FIBER-QUIESCENT-TEST OK")
     (do (println "FIBER-QUIESCENT-TEST FAILED" res) (System/exit 1)))

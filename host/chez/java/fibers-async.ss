@@ -420,7 +420,16 @@
         (guard (e (#t (fprintf p "jolt fiber dump failed: ~a~%"
                                (if (condition? e) (call-with-string-output-port (lambda (p) (display-condition e p))) e))))
           (jolt-fiber-dump p #t)
-          (flush-output-port p))))))
+          (flush-output-port p)
+          ;; JOLT_DUMP_DIR: the dump also goes to <dir>/dump-<pid>.txt, appended, for a process whose
+          ;; descriptor 2 is a pipe to its parent (a forked test child), where stderr's copy is lost
+          (let ((dir (getenv "JOLT_DUMP_DIR")))
+            (when (and dir (not (string=? dir "")))
+              (let ((fp (open-file-output-port (format "~a/dump-~a.txt" dir (proc-c-getpid))
+                                               (file-options no-fail no-truncate append)
+                                               (buffer-mode block) (native-transcoder))))
+                (jolt-fiber-dump fp #f)
+                (close-port fp)))))))))
 ;; The interrupt's throwable is a jolt value, raised as a throw would raise it,
 ;; so the fiber's own try/catch sees exactly what the caller passed.
 (def-var! "jolt.host" "fiber-interrupt!"

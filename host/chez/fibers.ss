@@ -998,6 +998,28 @@
 ;; most first, so a fiber that spins is at the top; each with where it was spawned. follow?
 ;; (SIGINFO's dump, whose port lives as long as the process) asks each running fiber for its
 ;; frames at its next safe point (jolt-fiber-frames-wanted).
+;; The conditions that hold a main carrier's quiescence off (jolt-main-carrier-run!): each fiber
+;; that is neither a pump nor parked (the dump's own fiber left out), a timer pending, another
+;; Jolt thread that may run, a fiber that is no pump waiting on the poller. NUMBERED is the
+;; dump's (fiber . n) list.
+(define (jolt-quiescence-held-by numbered)
+  (let* ((self (jolt-current-fiber))
+         (me (get-thread-id))
+         (fibers (filter (lambda (e) (let ((f (car e)))
+                                       (not (or (eq? f self) (jolt-fiber-pump? f)
+                                                (eq? 'parked (jolt-fiber-state f))))))
+                         numbered))
+         (timers (guard (_ (#t 0)) (fx- timeout-heap-n timeout-heap-dead)))
+         (threads (guard (_ (#t '()))
+                    (filter (lambda (id) (and (not (eqv? id me)) (not (eqv? id jolt-timer-thread-id))
+                                              (not (memq (thread-wait-state id) '(WAITING BLOCKED)))))
+                            (live-thread-ids))))
+         (io (and jolt-io-work-awaited (guard (_ (#t #f)) (jolt-io-work-awaited)))))
+    (append
+      (map (lambda (e) (format "fiber ~a ~a" (cdr e) (jolt-fiber-state (car e)))) fibers)
+      (if (fx>? timers 0) (list (format "~a timer~:p pending" timers)) '())
+      (map (lambda (id) (format "thread ~a ~a" id (thread-wait-state id))) threads)
+      (if io (list "a fiber that is no pump waits on the poller") '()))))
 (define jolt-fiber-dump
   (case-lambda
     ((port) (jolt-fiber-dump port #f))
@@ -1038,6 +1060,12 @@
                           "running no fiber"
                           (format "running fiber ~{~a~^, ~}" (map cdr on))))))
          carriers)
+       ;; what holds a main carrier's quiescence off now (jolt-quiescent? and the loop's own
+       ;; conditions), read without the locks: the dump runs in a signal's handler, inside
+       ;; whatever the thread held. "nothing" when every condition holds.
+       (fprintf port "quiescence: ~a~%"
+                (let ((held (jolt-quiescence-held-by numbered)))
+                  (if (null? held) "nothing holds it" (format "held by ~{~a~^; ~}" held))))
        (for-each
          (lambda (e)
            (let ((f (car e)) (n (cdr e)))
