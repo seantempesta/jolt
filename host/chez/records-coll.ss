@@ -576,6 +576,32 @@
                        (make-jrec-from-existing coll #f #f
                                   (%r-jolt-assoc1 (if (jolt-nil? ext) empty-pmap ext) k v))))))))
       (%r-jolt-assoc1 coll k v))))
+;; assoc of several keys at once: on a record with more than eight fields (its values a spilled vector)
+;; whose assoc is the default and whose keys are all declared fields, the value vector is copied once
+;; and every field set in it, where key by key copied the whole vector once a key (Datahike's DB, ~40
+;; fields, ~380 bytes a copy, several a datom). Anything else is assoc'd key by key as before.
+(define (jrec-assoc-fields coll kvs)
+  (let ((ifc (jrdesc-ifc-of coll)))
+    (and (jrec*? coll)
+         (not (and (not (vector-ref ifc 14)) (jrec-cl coll "assoc")))
+         (let check ((kv kvs))
+           (or (null? kv)
+               (and (keyword? (car kv)) (jrec-field-index coll (car kv)) (check (cddr kv)))))
+         (let ((nv (jrec-vec-copy (jrec*-vals coll))) (flags (vector-ref ifc 15)))
+           (let loop ((kv kvs))
+             (unless (null? kv)
+               (let* ((i (jrec-field-index coll (car kv))) (v (cadr kv))
+                      (v2 (if (and flags (fx< i (vector-length flags)) (vector-ref flags i)
+                                   (number? v) (not (flonum? v)))
+                              (exact->inexact v) v)))
+                 (vector-set! nv i v2)
+                 (loop (cddr kv)))))
+           (make-jrec* (jrec-desc coll) (jrec-ext coll) 0 nv)))))
+(define %r-jolt-assoc jolt-assoc)
+(set! jolt-assoc (lambda (coll . kvs)
+  (or (and (jrec? coll) (pair? kvs) (pair? (cdr kvs)) (pair? (cddr kvs)) (even? (length kvs))
+           (let ((r (jrec-assoc-fields coll kvs))) (and r (meta-carry coll r))))
+      (apply %r-jolt-assoc coll kvs))))
 ;; dissoc: a deftype implementing IPersistentMap/without answers through it.
 ;; Removing a declared field downgrades a plain record to a map (JVM parity); an
 ;; extension key drops from the ext map (normalized back to jolt-nil when empty).
