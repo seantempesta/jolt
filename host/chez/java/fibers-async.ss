@@ -406,6 +406,9 @@
 ;; error port of the code the signal interrupted (an eval's capture), nor the port chosen at boot,
 ;; which for a process started with its two streams on one pipe is stdout's, kept by every fork whose
 ;; descriptor 2 was moved since (a Seon agent's dumps went to its root's log, 2026-10-28).
+;; the dump file's name holds the pid: getpid(2) of the dump's own (process.ss's is a lazy shim, which a
+;; file loaded at boot does not name)
+(define jolt-dump-getpid (jolt-foreign-proc-safe "getpid" '() 'int))
 (define jolt-dump-port #f)
 (define (jolt-dump-port!)
   (or jolt-dump-port
@@ -425,7 +428,7 @@
           ;; descriptor 2 is a pipe to its parent (a forked test child), where stderr's copy is lost
           (let ((dir (getenv "JOLT_DUMP_DIR")))
             (when (and dir (not (string=? dir "")))
-              (let ((fp (open-file-output-port (format "~a/dump-~a.txt" dir (proc-c-getpid))
+              (let ((fp (open-file-output-port (format "~a/dump-~a.txt" dir (jolt-dump-getpid))
                                                (file-options no-fail no-truncate append)
                                                (buffer-mode block) (native-transcoder))))
                 (jolt-fiber-dump fp #f)
