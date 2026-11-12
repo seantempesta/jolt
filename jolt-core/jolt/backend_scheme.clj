@@ -4230,7 +4230,21 @@
 ;; try began. A non-tail call restores them when it returns, but a throw does not
 ;; return: what the throw and the calls it left behind stored would stay there, and
 ;; the next host fault would report the thrower as its innermost frame.
+;; A finally in a fn's tail position keeps the fn's frame (Chez): its wind is called
+;; non-tail, under the call-with-values jolt-try-body uses, at the try's line, and its
+;; body is non-tail inside it. In tail position the wind erased the fn's frame, and the
+;; one site slot that names an erased caller was overwritten by any tail call or throw
+;; below the body's last call, so the fn the try sat in (a tail `binding` too) was
+;; missing from a throw's trace (test/chez/stack-trace-test.clj, fin-tail). One frame
+;; per tail finally, as on the JVM.
+(declare emit-try*)
 (defn- emit-try [node]
+  (if (and (:finally node) *tail?* (not= :gambit (target)))
+    (with-site node
+      (str "(call-with-values (lambda () " (binding [*tail?* false] (emit-try* node)) ")"
+           " (case-lambda ((v) v) (vs (apply values vs))))"))
+    (emit-try* node)))
+(defn- emit-try* [node]
   (let [ts (when (and (:catch-sym node) (trace-frames?)) (fresh-label "_ts$"))
         to (when ts (fresh-label "_to$"))
         core (if-let [cs (:catch-sym node)]
