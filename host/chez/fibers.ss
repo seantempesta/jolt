@@ -2083,9 +2083,14 @@
 (define jolt-quiescent-handler #f)
 (define jolt-quiescent-told #f)
 (define (jolt-on-quiescent! f) (set! jolt-quiescent-handler f) (set! jolt-quiescent-told #f))
+(define jolt-io-work-awaited #f)   ; () -> true while a fiber that is no pump waits on the poller; jolt.io-poller's
 (define (jolt-quiescent?)
-  (for-all (lambda (f) (or (jolt-fiber-pump? f) (eq? 'parked (jolt-fiber-state f))))
-           (jolt-fiber-registry-live)))
+  (and (for-all (lambda (f) (or (jolt-fiber-pump? f) (eq? 'parked (jolt-fiber-state f))))
+                (jolt-fiber-registry-live))
+       ;; a fiber parked on a descriptor the poller watches (a subprocess's exit, a pipe, a
+       ;; socket) is waiting on work the poller will deliver, as the deadlock checks count it:
+       ;; not quiescent. A pump's wait on its socket is a peer's to end, so it does not count.
+       (not (and jolt-io-work-awaited (jolt-io-work-awaited)))))
 (define (jolt-quiescent-dump)
   (with-output-to-string (lambda () (jolt-fiber-dump (current-output-port)))))
 

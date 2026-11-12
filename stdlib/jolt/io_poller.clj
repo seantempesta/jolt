@@ -695,6 +695,11 @@
 
 ;; all asleep on threads: the detector asks whether a descriptor is awaited (fibers.ss jolt-asleep-check!)
 (jolt.host/io-awaited-set! #(awaited? @state))
+;; quiescence: a fiber parked on a descriptor here is the program's work unless it is a remote end's
+;; pump (its socket is a peer's to end); a signal awaited is a peer's act too, so it does not count
+(defn- work-awaited? [st]
+  (some (fn [[_ fm]] (some (fn [[_ e]] (some #(not (jolt.host/fiber-pump? %)) (:waiters e))) fm)) (:fds st)))
+(jolt.host/io-work-awaited-set! #(boolean (work-awaited? @state)))
 
 ;; every forked child resets the table (jolt-after-fork-child!): its kqueue and poller thread are the parent's
 (jolt.host/io-after-fork-set! after-fork!)

@@ -717,6 +717,10 @@
     jolt-nil))
 ;; all asleep on threads (locks.ss, fibers.ss jolt-asleep-check!): jolt.io-poller says whether a
 ;; descriptor is awaited, and its thread's round is counted asleep while none is
+;; quiescence (fibers.ss jolt-quiescent?): jolt.io-poller says whether a fiber that is no pump waits on it
+(def-var! "jolt.host" "io-work-awaited-set!"
+  (lambda (f) (set! jolt-io-work-awaited (lambda () (jolt-truthy? (jolt-invoke f)))) jolt-nil))
+(def-var! "jolt.host" "fiber-pump?" (lambda (f) (and (jolt-fiber? f) (jolt-fiber-pump? f) #t)))
 (def-var! "jolt.host" "io-awaited-set!"
   (lambda (f) (set! jolt-io-awaited (lambda () (jolt-truthy? (jolt-invoke f)))) jolt-nil))
 (def-var! "jolt.host" "asleep-while"

@@ -5,7 +5,7 @@
 ;;
 ;; Run: bin/jolt run test/chez/fiber-quiescent-test.clj   (prints FIBER-QUIESCENT-TEST OK)
 (ns fiber-quiescent-test
-  (:require [clojure.core.async :as a]
+  (:require [clojure.core.async :as a] [clojure.java.shell]
             [jolt.async.remote :as r]
             [jolt.scheme :as scm]))
 
@@ -33,6 +33,16 @@
            (let ([s (foreign-ref 'int b 0)]) (foreign-free b) (if (= (logand s 127) 0) (ash s -8) 99)))))"))
 (def exit-now (scm/eval-string "(let ([e (foreign-procedure \"_exit\" (int) void)]) (lambda (n) (e n)))"))
 (def alarm (scm/eval-string "(let ([a (foreign-procedure \"alarm\" (unsigned) unsigned)]) (lambda (n) (a n)))"))
+(defn a-subprocess-wait-is-not-quiescent
+  "Whether quiescence was heard while the program's one fiber waited on a subprocess's exit (sleep): the
+  poller will wake it, so it is busy, not quiescent (runtime, 2026-11-12: a test child's handler ended a
+  test waiting on git as a deadlock). false is right."
+  []
+  (let [heard (atom false)]
+    (jolt.host/on-quiescent! (fn [_] (reset! heard true)))
+    (let [r (clojure.java.shell/sh "sleep" "0.3")]
+      (jolt.host/on-quiescent! nil)
+      [(:exit r) @heard])))
 (defn forked-child-hears-quiescence
   "0 when a child forked beside a parent fiber that waits hears its own quiescence; 99 when its alarm ended it."
   []
@@ -60,8 +70,9 @@
                     got (a/<!! (:in y))]
                 (r/close! x) (r/close! y)
                 {:v v :heard (count @heard) :dump? (boolean (some #(re-find #"fiber" %) @heard)) :got got
-                 :fork (forked-child-hears-quiescence)})))]
-  (if (= {:v :ended-by-handler :heard 1 :dump? true :got :after :fork 0} res)
+                 :fork (forked-child-hears-quiescence)
+                 :subprocess (a-subprocess-wait-is-not-quiescent)})))]
+  (if (= {:v :ended-by-handler :heard 1 :dump? true :got :after :fork 0 :subprocess [0 false]} res)
     (println "FIBER-QUIESCENT-TEST OK")
     (do (println "FIBER-QUIESCENT-TEST FAILED" res) (System/exit 1)))
   (System/exit 0))

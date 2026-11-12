@@ -86,6 +86,7 @@ fiber-pool?
 fiber-preempt-ticks
 fiber-preempt-ticks-set!
 fiber-pump!
+fiber-pump?
 fiber-result
 fiber-resume
 fiber-spawn
@@ -185,6 +186,7 @@ interrupted?
 invoke-rewriter
 io-after-fork-set!
 io-awaited-set!
+io-work-awaited-set!
 jar-entry-string
 java-hashcode
 jolt-class-for
