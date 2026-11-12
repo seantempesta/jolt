@@ -30,6 +30,12 @@
 (ok "kw diff ns"        (not (eq? (keyword "a" "foo") (keyword #f "foo"))))
 (ok "kw?"               (keyword? (keyword #f "x")))
 (ok "kw not sym"        (not (jolt-symbol? (keyword #f "x"))))
+;; a keyword from its UTF-8 parts in a bytevector (a decoder's): the same interned keyword
+(let ((bv (string->utf8 "seon.dbthreadsünï")))
+  (ok "kw from utf8, ns"     (eq? (keyword-from-utf8 bv 0 7 7 7) (keyword "seon.db" "threads")))
+  (ok "kw from utf8, bare"   (eq? (keyword-from-utf8 bv #f 0 7 7) (keyword #f "threads")))
+  (ok "kw from utf8, non-ASCII" (eq? (keyword-from-utf8 bv 0 7 14 5) (keyword "seon.db" "ünï")))
+  (ok "kw from utf8, new"    (eq? (keyword-from-utf8 bv 4 3 0 4) (keyword ".db" "seon"))))
 
 ;; symbols NOT interned but jolt= by ns/name
 (ok "sym not eq"        (not (eq? (jolt-symbol #f "x") (jolt-symbol #f "x"))))
