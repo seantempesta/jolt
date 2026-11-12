@@ -125,6 +125,19 @@
 (define (dotform-receiver? obj)
   (or (jrec? obj) (jolt-multifn? obj) (procedure? obj) (jolt-transient? obj)
       (dot-coll? obj) (htable-sorted? obj) (jolt-map? obj) (jolt-ex-info-record? obj)))
+;; The method this arm answers (.mname obj a ...) with for a deftype or record
+;; receiver, by its own declared method (the branch below, matched by name and
+;; arity, NARGS counting obj), or #f when an earlier branch of the arm claims the
+;; call (a dashed name, a class field read with no arguments, IFn's invoke or
+;; applyTo on a record that is a map) or the type declares no such arity. A method
+;; call site keeps the answer (host-static.ss rec-site-miss).
+(define (jrec-dot-declared-method obj mname nargs)
+  (and (jrec? obj)
+       (fx>? (string-length mname) 0)
+       (not (char=? (string-ref mname 0) #\-))
+       (not (and (fx=? nargs 1) (jrec-class-field obj mname)))
+       (not (and (or (string=? mname "invoke") (string=? mname "applyTo")) (jolt-map? obj)))
+       (jrec-method-arity obj mname nargs)))
 (register-method-arm! arm-priority-dotform
   (lambda (obj method-name rest-args)
     (let* ((dashed? (and (> (string-length method-name) 0)

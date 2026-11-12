@@ -1197,7 +1197,7 @@
      (let ((c (unbox site)))
        (and c (jhost? obj)
             (let ((t (jhost-tag obj)) (ct (vector-ref c 0)))
-              (or (eq? t ct) (string=? t ct)))
+              (or (eq? t ct) (and (string? ct) (string=? t ct))))
             (eq? (vector-ref c 2) method-dispatch-arms)
             (fx=? (vector-ref c 3) host-methods-epoch)
             (vector-ref c 1))))))
@@ -1220,6 +1220,47 @@
              (let ((r ((cdar as) obj name rest)))
                (if (eq? r 'pass) (loop (cdr as)) r))))))
       (record-method-dispatch obj name (apply jolt-vector argl))))
+;; ---- a method call site on a deftype or record ------------------------------
+;; (.m x a) on a deftype went through record-method-dispatch: an argument vector
+;; built at the site, read back into a list, every arm asked, the type's method
+;; table probed by name and arity, and the method applied: 144 bytes and ~39 ticks
+;; for a one-argument call that does nothing (persistent-sorted-set's lookup makes
+;; several per level, its conj ~10: 560 and 1,391 bytes). The same site box keeps
+;; #(desc proc arms epoch) for a deftype receiver, filled only when the walk below
+;; (record-method-dispatch's, for a receiver that is a jrec) reached the dot-form
+;; arm with every arm ahead of it passing, and that arm answers with the type's own
+;; declared method (dot-forms.ss jrec-dot-declared-method). A hit needs
+;; the same descriptor, the arm list it was filled under, the same derived-interface
+;; epoch (an extend or a redefinition bumps it) and no library override at the
+;; head of the arms; it calls the method's procedure with the arguments in place.
+(define-syntax rec-site-hit
+  (syntax-rules ()
+    ((_ site obj)
+     (let ((c (unbox site)))
+       (and c (eq? (vector-ref c 0) (jrec-desc obj))
+            (eq? (vector-ref c 2) method-dispatch-arms)
+            (fx=? (vector-ref c 3) (jrdesc-ifc-epoch))
+            (vector-ref c 1))))))
+(define (rec-site-miss site obj name argl)
+  (if (and (not (fx=? (caar method-dispatch-arms) arm-priority-user-override))
+           (not (and (null? argl) (or (string=? name "hashCode") (string=? name "hasheq")))))
+      (let ((arms method-dispatch-arms) (epoch (jrdesc-ifc-epoch))
+            (rest (apply jolt-vector argl)))
+        (let loop ((as arms))
+          (cond
+            ((null? as) (record-method-dispatch-base obj name rest))
+            ((and (fx=? (caar as) arm-priority-dotform)
+                  (jrec-dot-declared-method obj name (fx+ 1 (length argl))))
+             => (lambda (f)
+                  (if (procedure? f)
+                      (begin (set-box! site (vector (jrec-desc obj) f arms epoch))
+                             (apply f obj argl))
+                      (let ((r ((cdar as) obj name rest)))
+                        (if (eq? r 'pass) (loop (cdr as)) r)))))
+            (else
+             (let ((r ((cdar as) obj name rest)))
+               (if (eq? r 'pass) (loop (cdr as)) r))))))
+      (record-method-dispatch obj name (apply jolt-vector argl))))
 ;; Any receiver but a jhost goes to record-method-dispatch exactly as an
 ;; uncached site did -- except the clojure.lang read surface on a jolt-native
 ;; persistent map/vector/set ((.valAt ^Associative m k nf), (.count v),
@@ -1234,12 +1275,16 @@
 (define (jolt-host-site-call0 site obj name)
   (cond ((jhost? obj)
          (let ((f (host-site-hit site obj))) (if f (f obj) (host-site-miss site obj name '()))))
+        ((jrec? obj)
+         (let ((f (rec-site-hit site obj))) (if f (f obj) (rec-site-miss site obj name '()))))
         ((and (native-coll-site? obj) (or (string=? name "count") (string=? name "size")))
          (jolt-count obj))
         (else (record-method-dispatch obj name (jolt-vector)))))
 (define (jolt-host-site-call1 site obj name a)
   (cond ((jhost? obj)
          (let ((f (host-site-hit site obj))) (if f (f obj a) (host-site-miss site obj name (list a)))))
+        ((jrec? obj)
+         (let ((f (rec-site-hit site obj))) (if f (f obj a) (rec-site-miss site obj name (list a)))))
         ;; a set has get, and no valAt (clojure.lang.PersistentHashSet is no ILookup): that one walks on and raises
         ((and (native-coll-site? obj) (or (string=? name "get") (and (string=? name "valAt") (not (pset? obj)))))
          (jolt-get obj a))
@@ -1249,6 +1294,8 @@
 (define (jolt-host-site-call2 site obj name a b)
   (cond ((jhost? obj)
          (let ((f (host-site-hit site obj))) (if f (f obj a b) (host-site-miss site obj name (list a b)))))
+        ((jrec? obj)
+         (let ((f (rec-site-hit site obj))) (if f (f obj a b) (rec-site-miss site obj name (list a b)))))
         ;; a set has get, and no valAt (clojure.lang.PersistentHashSet is no ILookup): that one walks on and raises
         ((and (native-coll-site? obj) (or (string=? name "get") (and (string=? name "valAt") (not (pset? obj)))))
          (jolt-get obj a b))
@@ -1256,9 +1303,11 @@
          (jolt-nth obj a b))
         (else (record-method-dispatch obj name (jolt-vector a b)))))
 (define (jolt-host-site-call3 site obj name a b c)
-  (if (jhost? obj)
-      (let ((f (host-site-hit site obj))) (if f (f obj a b c) (host-site-miss site obj name (list a b c))))
-      (record-method-dispatch obj name (jolt-vector a b c))))
+  (cond ((jhost? obj)
+         (let ((f (host-site-hit site obj))) (if f (f obj a b c) (host-site-miss site obj name (list a b c)))))
+        ((jrec? obj)
+         (let ((f (rec-site-hit site obj))) (if f (f obj a b c) (rec-site-miss site obj name (list a b c)))))
+        (else (record-method-dispatch obj name (jolt-vector a b c)))))
 
 ;; java.lang.Number method surface (the boxed-number methods cljc code calls). The
 ;; integer projections wrap modulo their width (ring-codec relies on byteValue
