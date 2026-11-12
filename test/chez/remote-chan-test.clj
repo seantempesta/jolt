@@ -327,6 +327,20 @@
          (await-until 5000 #(= 3 (last @seen))) @seen)
   (flow/stop g))
 
+;; ---- 7b. an output nothing takes is reported, never dropped unseen ---------------------
+;; A proc's own declared output with no connection: what it emits there goes nowhere, and the
+;; report says so, as it does for an output to a proc that left (runtime, 2026-11-12: a child's
+;; ::flow/closed on an unrouted output could vanish with nothing said).
+(defn emit ([] {:ins {:in ""} :outs {:out ""} :workload :io}) ([a] a) ([s _] s) ([s _ m] [s {:out [m]}]))
+(let [g (flow/create-flow {:procs {:emit {:proc (flow/process #'emit)}} :conns []})
+      {:keys [report-chan error-chan]} (flow/start g)
+      _ (flow/resume g)]
+  @(flow/inject g [:emit :in] [:x])
+  (check "an output with no connection: reported as ::flow/undeliverable, naming the output"
+         (= #::flow{:undeliverable [:emit :out] :pid :emit} (take-within 5000 report-chan)))
+  (check "...and the sender's step did not throw" (nil? (take-within 100 error-chan)))
+  (flow/stop g))
+
 ;; ---- 8. a failed send: a busy kernel's ENOBUFS waits, only a gone peer is :dead ------
 ;; Seon's agent a2 lost a ~3 MB answer when the kernel refused its write and the writer read
 ;; the errno as a gone peer. ENOBUFS cannot be made on demand, so the errno's class is checked

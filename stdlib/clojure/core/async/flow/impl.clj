@@ -216,9 +216,14 @@
           (let [k [pid coord]]
             (if-let [[_ c] (find routes k)]
               c
-              ;; nil drops: an unconnected output, or a proc no longer in the plan
-              (when (and (contains? plans pid) (not (contains? (get-in plans [pid :outs]) k)))
-                (throw (ex-info "can't resolve channel with io-id" {:io-id k}))))))))
+              ;; nothing takes it (an unconnected output, or a sender no longer in the plan): dropped,
+              ;; and reported as the vector coord's case is, never nothing, so a value lost on an
+              ;; unrouted output (a child's ::flow/closed) is seen. An output the proc does not
+              ;; declare is still a defect.
+              (if (and (contains? plans pid) (not (contains? (get-in plans [pid :outs]) k)))
+                (throw (ex-info "can't resolve channel with io-id" {:io-id k}))
+                (do (when report (async/put! report #::flow{:undeliverable k :pid pid}))
+                    nil)))))))
     (get-exec [_ context] (or (execs context) (disp/executor-for context)))))
 
 (defn- start-proc! [rt execs {:keys [pid proc args ins]}]
