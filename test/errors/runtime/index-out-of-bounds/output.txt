@@ -2,4 +2,5 @@ Unhandled exception (IndexOutOfBoundsException): index out of bounds
   at ./test/errors/runtime/index-out-of-bounds/input.clj:5:1
   trace:
     input/f (./test/errors/runtime/index-out-of-bounds/input.clj:3)
+    input/eval3 (./test/errors/runtime/index-out-of-bounds/input.clj:5)
 exit: 1

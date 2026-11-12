@@ -1,3 +1,5 @@
 Unhandled exception (ArityException): Wrong number of args (2) passed to: input/f
   at ./test/errors/runtime/wrong-arity/input.clj:5:1
+  trace:
+    input/eval3 (./test/errors/runtime/wrong-arity/input.clj:5)
 exit: 1

@@ -3,4 +3,5 @@ Unhandled exception: Failed to download file!
   at ./test/errors/runtime/uncaught-ex-info/input.clj:6:1
   trace:
     input/-main (./test/errors/runtime/uncaught-ex-info/input.clj:4)
+    input/eval3 (./test/errors/runtime/uncaught-ex-info/input.clj:6)
 exit: 1

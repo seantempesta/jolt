@@ -1,3 +1,5 @@
 Unhandled exception (IllegalArgumentException): Unknown class Nope
   at ./test/errors/runtime/unknown-class-capitalized-ns/input.clj:12:1
+  trace:
+    input/eval3 (./test/errors/runtime/unknown-class-capitalized-ns/input.clj:12)
 exit: 1

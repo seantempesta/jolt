@@ -1,4 +1,6 @@
 Unhandled exception: boom
   ex-data: {:a 1}
   at 1:1
+  trace:
+    user/eval1 (NO_SOURCE_FILE:1)
 exit: 1

@@ -2,4 +2,5 @@ error[read/eof]: EOF while reading
   --> ./test/errors/runtime/read-string-at-runtime/input.clj:5:1
   trace:
     input/parse (./test/errors/runtime/read-string-at-runtime/input.clj:3)
+    input/eval3 (./test/errors/runtime/read-string-at-runtime/input.clj:5)
 exit: 1
