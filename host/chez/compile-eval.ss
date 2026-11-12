@@ -798,7 +798,7 @@
       #f
       (begin (set! jolt-ce-eval-n (fx+ jolt-ce-eval-n 1))
              (string-append "eval" (number->string jolt-ce-eval-n)))))
-(define (jolt-ce-eval-frame ns nm scm)
+(define (jolt-ce-eval-frame ns nm line scm)
   (if (not nm)
       scm
       (begin
@@ -808,7 +808,9 @@
           ;; called as what the registration answers, so Chez cannot inline the fn into the form's
           ;; own code (a small body was, and its frame was gone)
           (string-append "(let ((" b " (lambda () (jolt-frame-keep " scm ")))) ((jolt-eval-frame-register! " b " "
-                         (format "~s" ns) " " (format "~s" nm) ")))")))))
+                         (format "~s" ns) " " (format "~s" nm) " "
+                         ;; the form's line (a form built in code has none: 1, its first)
+                         (number->string (if (fixnum? line) line 1)) ")))")))))
 (define (jolt-compile-eval-form form ns) (jolt-compile-eval-form/outer form ns #f))
 (define (jolt-compile-eval-form/outer form ns outer)
   (if (or (cseq? form) (jolt-lazyseq? form) (empty-list-t? form) (symbol-t? form)
@@ -853,7 +855,7 @@
      ;; in it reports the right place.
      (jolt-enter-form! form)
      (let* ((nm (jolt-ce-eval-name form))
-            (scm (jolt-ce-eval-frame ns nm (jolt-analyze-emit-form form ns)))
+            (scm (jolt-ce-eval-frame ns nm (hc-form-line form) (jolt-analyze-emit-form form ns)))
             (cap (jolt-aot-capture)))            ; tee for the AOT cache (loader.ss)
        (when cap (put-string cap scm) (newline cap))
        ;; the run is a root as much as the compile was: expanding the form ran

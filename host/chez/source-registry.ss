@@ -67,11 +67,11 @@
 ;; The record a frame maps to: by code identity when its def recorded one, else
 ;; (a def whose root was no procedure when registered) by short name.
 ;; An evaluated top-level form's frame (compile-eval.ss jolt-ce-eval-frame), answering the fn: its code ->
-;; #(ns "eval<n>" file #f #f), as the JVM names the fn Compiler.eval wraps a form in (ns$eval<n>).
+;; #(ns "eval<n>" file line #f), as the JVM names the fn Compiler.eval wraps a form in (ns$eval<n>).
 ;; Weak: a REPL makes one per form, and an entry lives as long as its code (a frame on a kept
 ;; continuation holds it).
 (define source-registry-eval-frames (make-weak-eq-hashtable))
-(define (jolt-eval-frame-register! proc ns nm)
+(define (jolt-eval-frame-register! proc ns nm line)
   (let ((code (#%$closure-code proc)))
     (jolt-with-mutex source-registry-mu
       ;; the file as a def's record holds it: *file*, the path being loaded (a trace prints it, an
@@ -81,8 +81,9 @@
                                                                 (and c (let ((f (var-cell-deref c))) (and (string? f) f)))))))
                                          (let ((f (sv "*file*")))
                                            (if (and f (not (string=? f "NO_SOURCE_PATH"))) f (sv "*source-path*"))))
+                                 ;; the form's line, which a report reads when a frame names none;
                                  ;; no code in the value: a weak table's value holding its key keeps it
-                                 #f #f))))
+                                 line #f))))
   proc)
 (define (srcreg-frame-record io nm)
   (let ((code (srcreg-frame-code io)))
