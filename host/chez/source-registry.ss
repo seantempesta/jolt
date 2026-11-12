@@ -75,11 +75,12 @@
   (let ((code (#%$closure-code proc)))
     (jolt-with-mutex source-registry-mu
       ;; the file as a def's record holds it: *file*, the path being loaded (a trace prints it, an
-      ;; element takes its name); in an eval with no file, *source-path* (NO_SOURCE_FILE)
+      ;; element takes its name); in an eval with no file (NO_SOURCE_PATH), *source-path* (NO_SOURCE_FILE), the JVM element's
       (eq-hashtable-set! source-registry-eval-frames code
                          (vector ns nm (let ((sv (lambda (n) (let ((c (var-cell-lookup "clojure.core" n)))
                                                                 (and c (let ((f (var-cell-deref c))) (and (string? f) f)))))))
-                                         (or (sv "*file*") (sv "*source-path*")))
+                                         (let ((f (sv "*file*")))
+                                           (if (and f (not (string=? f "NO_SOURCE_PATH"))) f (sv "*source-path*"))))
                                  #f code))))
   proc)
 (define (srcreg-frame-record io nm)
