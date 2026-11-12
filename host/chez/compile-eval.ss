@@ -560,16 +560,20 @@
               (jolt-ce-set-emit-unit! build-unit)
               (set! ce-build-runtime-unit runtime)))))))
 
-(define (jolt-analyze-emit-form form ns)
-  (ce-outside-build (lambda () (jolt-analyze-emit-form* form ns))))
-(define (jolt-analyze-emit-form* form ns)
+(define (jolt-analyze-emit-form form ns . eval-name)
+  (ce-outside-build (lambda () (jolt-analyze-emit-form* form ns (and (pair? eval-name) (car eval-name))))))
+;; EVAL-NAME (an evaluated form's fn, jolt-ce-eval-name) names the fn literals inside it, as the
+;; JVM names them under the eval fn (user$eval12$fn__13): jfn$<ns>/eval12$<n>
+(define (jolt-analyze-emit-form* form ns eval-name)
   (let* ((ctx (make-analyze-ctx ns))
          (node (jolt-ce-analyze ctx form)))
     (jolt-lint-node! node)
     (let ((tap (jolt-unit-tap))) (when tap (tap form node)))
     (if (hc-compiler-direct-linking?)
         (jolt-direct-link-emit node ctx)
-        (jolt-ce-emit (jolt-ce-run-passes node ctx)))))
+        (if eval-name
+            (jolt-ce-emit (jolt-ce-run-passes node ctx) eval-name)
+            (jolt-ce-emit (jolt-ce-run-passes node ctx))))))
 
 ;; A form compiled under (binding [*compiler-options* {:direct-linking true}] ...)
 ;; gets what `jolt build` gives every app form: calls to the vars defined this
@@ -788,17 +792,21 @@
 ;; direct linking (its defs are top-level defines). The fn's code is registered for the walk
 ;; (source-registry.ss jolt-eval-frame-register!).
 (define jolt-ce-eval-n 0)
-(define (jolt-ce-eval-frame form ns scm)
+;; "eval<n>" for a form evaluated in a fn of its own, else #f
+(define (jolt-ce-eval-name form)
   (if (or (hc-compiler-direct-linking?)
           (not (or (cseq? form) (pvec? form) (pmap? form) (pset? form)))
           (and (cseq? form) (symbol-t? (seq-first form))
                (let ((h (symbol-t-name (seq-first form))))
                  (and (fx>=? (string-length h) 3) (string=? (substring h 0 3) "def")))))
+      #f
+      (begin (set! jolt-ce-eval-n (fx+ jolt-ce-eval-n 1))
+             (string-append "eval" (number->string jolt-ce-eval-n)))))
+(define (jolt-ce-eval-frame ns nm scm)
+  (if (not nm)
       scm
       (begin
-        (set! jolt-ce-eval-n (fx+ jolt-ce-eval-n 1))
-        (let* ((nm (string-append "eval" (number->string jolt-ce-eval-n)))
-               (b (string-append "|" ns "/" nm "|")))
+        (let* ((b (string-append "|" ns "/" nm "|")))
           ;; the body through jolt-frame-keep (values.ss): its last call is not a tail call, so the
           ;; fn stays a frame under it, as the JVM's eval fn does
           ;; called as what the registration answers, so Chez cannot inline the fn into the form's
@@ -848,7 +856,8 @@
      ;; record this form's source location first, so a compile- or run-time error
      ;; in it reports the right place.
      (jolt-enter-form! form)
-     (let* ((scm (jolt-ce-eval-frame form ns (jolt-analyze-emit-form form ns)))
+     (let* ((nm (jolt-ce-eval-name form))
+            (scm (jolt-ce-eval-frame ns nm (jolt-analyze-emit-form form ns nm)))
             (cap (jolt-aot-capture)))            ; tee for the AOT cache (loader.ss)
        (when cap (put-string cap scm) (newline cap))
        ;; the run is a root as much as the compile was: expanding the form ran

@@ -42,8 +42,10 @@
      "print-throwable renders a nil message as null")
 
 ;; --- print-stack-trace ------------------------------------------------------------
-;; The frame list is empty here (tail calls); the throwable line above it is not.
-(let [out (with-out-str (st/print-stack-trace (ex-info "boom" {:a 1})))]
+;; A throwable made on a future's thread has no frame of the program's (the frame of a form
+;; evaluated here would be one, user$eval<n> as on the JVM): its frame list is empty, and the
+;; throwable line above it is not.
+(let [out (with-out-str (st/print-stack-trace @(future (ex-info "boom" {:a 1}))))]
   (ok= (first (str/split-lines out))
        "clojure.lang.ExceptionInfo: boom"
        "print-stack-trace leads with the throwable line")

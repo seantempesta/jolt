@@ -27,7 +27,11 @@
   [elems]
   (->> elems
        (map (fn [e] [(.getClassName e) (.getFileName e)]))
-       (filter (fn [[c _]] (str/starts-with? c "stack_trace_test$")))
+       ;; the fns' frames: the frame of the top-level form evaluating each check
+       ;; (stack_trace_test$eval<n>, as the JVM names it) is not one of the chains
+       ;; the rows pin
+       (filter (fn [[c _]] (and (str/starts-with? c "stack_trace_test$")
+                                (not (re-find #"\$eval\d+$" c)))))
        vec))
 
 ;; The stack read in a non-tail position, as callers do: its frame stays live.
@@ -198,7 +202,7 @@
   (ok= (first (own-frames (.getStackTrace e2))) ["stack_trace_test$thrower" "stack-trace-test.clj"]
        "a rethrow keeps the original frames"))
 (ok= (StackTraceElement->vec (first (.getStackTrace (catch-it))))
-     ['stack_trace_test$thrower 'invoke "stack-trace-test.clj" 158]
+     ['stack_trace_test$thrower 'invoke "stack-trace-test.clj" 162]
      "StackTraceElement->vec names class and method as symbols")
 
 ;; --- a tail call that RETURNED is not a frame of a later throw ------------------
