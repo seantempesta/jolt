@@ -307,8 +307,15 @@
                              (n (in-stream-read-some! self port tmp 0 len)))
                         (if (eof-object? n) -1
                             (begin (ja-bv->bytes! tmp 0 buf off n) (->num n)))))))))))
-   (cons "readAllBytes" (lambda (self) (let ((bv (get-bytevector-all (in-stream-live-port self))))
-                                         (na-byte-array (if (eof-object? bv) (make-bytevector 0) bv)))))
+   ;; a port that knows its length and position (a ByteArrayInputStream's bytevector, a file) reads
+   ;; exactly what remains, once, into the array's own bytevector; get-bytevector-all grows chunks and
+   ;; joins them (7.2 KB to read 1.3 KB, konserve's every node read) and the array copied it again
+   (cons "readAllBytes" (lambda (self)
+                          (let* ((port (in-stream-live-port self))
+                                 (bv (if (and (port-has-port-position? port) (port-has-port-length? port))
+                                         (get-bytevector-n port (max 0 (- (port-length port) (port-position port))))
+                                         (get-bytevector-all port))))
+                            (make-jolt-array (if (eof-object? bv) (make-bytevector 0) bv) 'byte))))
    (cons "skip" (lambda (self n)
                   (let ((port (in-stream-live-port self)) (n (jnum->exact n)))
                     (or (in-stream-skip-by-seek! self port n)
