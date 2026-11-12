@@ -2256,7 +2256,8 @@ aotcachebudget:
 	@sh test/chez/aot-cache-budget-smoke.sh
 
 # A class a library provides is found from any fiber or thread, by many at once
-# on its first use: one load, every reference waits for it.
+# on its first use: one load, every reference waits for it; a first load a
+# budget ends is loaded again by the next reference.
 providerfirstuse:
 	@sh test/chez/provider-first-use.sh
 

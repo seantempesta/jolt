@@ -4,7 +4,7 @@
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
 fails=0
-for m in fiber future thread main-then-fiber fibers futures fibers-and-futures statics-on-fibers; do
+for m in fiber future thread main-then-fiber fibers futures fibers-and-futures statics-on-fibers after-a-spent-budget; do
   JOLT_AOT_CACHE=0 bin/jolt run test/chez/provider-first-use.clj "$m" 2>&1 | tail -1 | grep . || echo "provider-first-use $m: FAIL (no answer)"
 done > "${TMPDIR:-/tmp}/provider-first-use.$$" 
 cat "${TMPDIR:-/tmp}/provider-first-use.$$"

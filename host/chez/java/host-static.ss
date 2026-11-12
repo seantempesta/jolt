@@ -1663,31 +1663,54 @@
 (define lib-providers-loading 0)   ; providers between their claim and their latch's last value
 (define (lib-load-provider! p)
   ;; claim the load: whoever flips the latch from #f does it; another context
-  ;; that misses on one of its classes meanwhile waits for it to end
-  (and (jolt-with-mutex lib-claims-mu
-         (and (not (unbox (vector-ref p 3)))
-              (begin (ldr-provider-claimed! (vector-ref p 3))
-                     (lib-claim-settled! p)
-                     #t)))
-       ;; The claim is settled from here whatever happens next, so registrations
-       ;; held against it are replayed on every exit — including the install
-       ;; namespace being off the roots, and the one that raises. A provider that
-       ;; cannot deliver leaves the class to whoever else registered it, which is
-       ;; what happened before the claim was honoured at all.
-       ;;
-       ;; Either half is a reason for the caller to look again, so the answer is
-       ;; their OR: a class can become resolvable through a replay alone.
-       (let* ((loaded (and (find-ns-file (vector-ref p 0))
-                           (begin (guard (c (#t (lib-provider-settle! p 'failed)
-                                                (raise c)))
-                                    ;; the mark comes from load-namespace* itself
-                                    ;; (lib-with-install-ns-mark), which is the
-                                    ;; only way it can also cover an install
-                                    ;; namespace reached by a plain require.
-                                    (load-namespace (vector-ref p 0)))
-                                  #t)))
-              (replayed (lib-provider-settle! p 'ok)))
-         (or loaded replayed))))
+  ;; that misses on one of its classes meanwhile waits for it to end. Masked from
+  ;; the claim to the wind's push, so no escape lands with the claim made and no
+  ;; winder to give it back (locks.ss, "winds an interrupt cannot split").
+  (let ((lv (jolt-locks-held)))
+    (jolt-locks-enter!)
+    (if (not (jolt-with-mutex lib-claims-mu
+               (and (not (unbox (vector-ref p 3)))
+                    (begin (ldr-provider-claimed! (vector-ref p 3))
+                           (lib-claim-settled! p)
+                           #t))))
+        (begin (jolt-locks-exit!) #f)
+        ;; The latch takes its last value on a return and on a raise. An escape
+        ;; (run-interruptible's budget or interrupt jumps out, never raising) gives
+        ;; the claim back instead: the latch to #f and the claim pending again, so
+        ;; the next reference loads the provider. It stayed (loading . this
+        ;; context) with the claim gone, and every later reference from the thread
+        ;; said "No dependency provides" (a test that spent its budget inside
+        ;; jolt.socket's load left the next 18 without sockets). A park unwinds
+        ;; through here too and is not an end: the load resumes with its claim.
+        (dynamic-wind
+          void
+          (jolt-masked-body
+            (lambda ()
+              ;; The claim is settled from here whatever happens next, so
+              ;; registrations held against it are replayed on every exit —
+              ;; including the install namespace being off the roots, and the one
+              ;; that raises. A provider that cannot deliver leaves the class to
+              ;; whoever else registered it, which is what happened before the
+              ;; claim was honoured at all.
+              ;;
+              ;; Either half is a reason for the caller to look again, so the
+              ;; answer is their OR: a class can become resolvable through a
+              ;; replay alone.
+              (let* ((loaded (and (find-ns-file (vector-ref p 0))
+                                  (begin (guard (c (#t (lib-provider-settle! p 'failed)
+                                                       (raise c)))
+                                           ;; the mark comes from load-namespace* itself
+                                           ;; (lib-with-install-ns-mark), which is the
+                                           ;; only way it can also cover an install
+                                           ;; namespace reached by a plain require.
+                                           (load-namespace (vector-ref p 0)))
+                                         #t)))
+                     (replayed (lib-provider-settle! p 'ok)))
+                (or loaded replayed))))
+          (jolt-masked-cleanup lv
+            (unless (jolt-park-unwinding?)
+              (when (ldr-provider-released! (vector-ref p 0) (vector-ref p 3))
+                (jolt-with-mutex lib-claims-mu (lib-claim-pending! p)))))))))
 ;; Replay what was held against the claim, then give the latch its last value and
 ;; wake whoever waits on it, on every exit; answers whether anything was replayed.
 (define (lib-provider-settle! p state)

@@ -2976,6 +2976,14 @@
         (for-each sa-fiber-resume fs)))
     (condition-broadcast ldr-load-cv)))
 
+;; A load an escape left (run-interruptible's budget or interrupt jumps out of its
+;; body, never raising): the latch goes back to not attempted, so the next
+;; reference loads it again, and everyone waiting wakes to look again. A latch
+;; already given its last value is left as it is. Answers whether it was released.
+(define (ldr-provider-released! ns latch)
+  (and (pair? (unbox latch))
+       (begin (ldr-provider-settled! ns latch #f) #t)))
+
 ;; Call with ldr-load-mu HELD. Would `me` waiting on `name` (owned by `owner`) close
 ;; a cycle? Follow owner -> what it waits on -> who owns that -> …; if the chain
 ;; reaches `me`, everyone in it is waiting on everyone else. Returns the chain as a
