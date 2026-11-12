@@ -2428,7 +2428,7 @@ check '(do (require (quote jolt.nrepl)) (jolt.nrepl/evaluate "(defn nf [x] (/ x 
 # A fn the caller's stack also holds is still the eval'd code's frame when the
 # code calls it: only the trace's outer end is the caller's.
 check '(do (require (quote jolt.nrepl)) (jolt.nrepl/evaluate "(defn nf [x] (let [r (/ x 0)] r))" "user") (defn g [f] (let [r (f)] r)) (defn ev-caller [] (let [r (jolt.nrepl/evaluate "(let [v (g (fn [] (let [q (nf 1)] q)))] v)" "user" {:out (fn [_])})] r)) (let [r (g ev-caller)] (vec (remove #(re-find #"\$" %) (map clojure.string/trim (rest (clojure.string/split-lines (:err r))))))))' '["trace:" "user/nf" "user/g"]'
-check '(do (require (quote jolt.nrepl)) (let [r (jolt.nrepl/evaluate "(let [a] a)" "user")] [(:err-msg r) (:ex-class r)]))' '["Syntax error macroexpanding clojure.core/let at (REPL:1:1).\nBad binding form, expected matched symbol expression pairs\n" "class clojure.lang.Compiler$CompilerException"]'
+check '(do (require (quote jolt.nrepl)) (let [r (jolt.nrepl/evaluate "(let [a] a)" "user")] [(:err-msg r) (:ex-class r)]))' '["Syntax error macroexpanding clojure.core/let at (REPL:1:1).\nCall to clojure.core/let did not conform to spec.\n[a] - failed: even-number-of-forms? at: [:bindings] spec: :clojure.core.specs.alpha/bindings\n" "class clojure.lang.Compiler$CompilerException"]'
 check '(do (require (quote jolt.nrepl)) (let [e (ex-info "boom" {:a 1})] [(jolt.nrepl/err->msg e) (jolt.nrepl/err->msg e {:line 4})]))' '["Execution error (ExceptionInfo).\nboom\n" "Execution error (ExceptionInfo) at (REPL:4).\nboom\n"]'
 # An undefined name is a compile error over nREPL as it is on the JVM and in
 # `jolt -e` / `jolt repl`. evaluate used to bind *allow-unresolved-vars* true,
