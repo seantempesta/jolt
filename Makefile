@@ -194,7 +194,7 @@ CI-GATES := submodules values recordinline corpus nsaudit unit documented grenad
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost foreignlookuponce recordshadow emittedheads adaptercheck hostprops normalizecheck hostregistry hostarity enummodel imagecoverage lazyshims foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke numequivalloc analyzealloc emitalloc treeseqcost hashsetbulkcost imagefnforms imagelegacyclaim \
   gatebootsmoke aotcachesmoke aotcachebudget providerfirstuse fibersecondmutator fiberuncaught fiberunread atomwatchorder varwatchorder buildemptycacheentry aotcachepathsmoke aotcachesourcepathsmoke aotcachestarfilesmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck buildunitwrite threadeddeadlock forkheldlocks oomafterrendezvous heaphistogram siginfodump \
   systemstreams closedstdout stderrsplit userdirpaths mimetypes utf8decode \
-  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer ticks interruptnest monitorescape windescape threadsafety maskedacquire ioerrno cas flow tickbudget remotechan remotedefaultpump remotefork flowerrorkept
+  certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer ticks interruptnest monitorescape windescape threadsafety maskedacquire ioerrno cas flow tickbudget remotechan remotedefaultpump remotefork flowerrorkept flowupdate
 TEST-GATES := submodules selfhost ci
 
 GATE-RECEIPT := target/gate-receipt
@@ -1096,6 +1096,10 @@ continuations:
 # run on fibers, so 200 of them do not need 200 threads.
 flow:
 	@bin/jolt run test/chez/flow-test.clj
+
+# flow/update! changes a running flow in place; a change rewires only the out coords it touches.
+flowupdate:
+	@bin/jolt run test/chez/flow-update-test.clj
 
 # jolt.async.remote: a channel whose other end is another OS process, over a
 # socketpair. FIFO, back-pressure with nothing lost, peer death as close, alts! over

@@ -138,6 +138,59 @@
                  (assoc ms out (assoc m :taps want))))
              {} mults))
 
+(defn- pid-outs-of
+  "pid -> #{out coord}: every output coord a proc is connected through, as producer or consumer."
+  [cmap]
+  (reduce-kv (fn [m out ins] (reduce (fn [m in] (update m (first in) (fnil conj #{}) out))
+                                     (update m (first out) (fnil conj #{}) out) ins))
+             {} cmap))
+
+(defn- route-one
+  "out's route and mult, given its consumers ins (as routes-for decides one): [route mult-or-nil]."
+  [in-chans out ins mult]
+  (if (or mult (< 1 (count ins)) (= (first out) (ffirst ins)))
+    (let [{:keys [src] :as m} (or mult (let [src (async/chan 10)] {:src src :mult (fiber-go (async/mult src)) :taps {}}))]
+      [src m])
+    [(in-chans (first ins)) nil]))
+
+(defn- rewire-delta
+  "jolt (update! O(changed)): the conn map, routes and mults patched for the out coords a change
+  touches (the added and removed conns' outputs, and every output connected to a touched proc),
+  where a full rewire rebuilds them over every proc and conn. Answers {:cmap :conn-set :pid-outs
+  :routes :mults}, or throws on an invalid connection among the touched."
+  [old plans conns in-chans touched]
+  (let [old-set (:conn-set old)
+        new-set (if (identical? conns (:conns old)) old-set (set conns))
+        added (if (identical? new-set old-set) [] (into [] (remove old-set) conns))
+        removed (if (identical? new-set old-set) [] (into [] (remove new-set) (:conns old)))
+        affected (-> #{}
+                     (into (map first) added) (into (map first) removed)
+                     (into (mapcat #(get (:pid-outs old) %)) touched))
+        cmap (as-> (:cmap old) m
+               (reduce (fn [m [out in]] (let [r (disj (get m out #{}) in)] (if (seq r) (assoc m out r) (dissoc m out)))) m removed)
+               (reduce (fn [m [out in]] (update m out (fnil conj #{}) in)) m added))
+        out-ok? (fn [[pid :as out]] (contains? (:outs (plans pid)) out))
+        in-ok? (fn [[pid :as in]] (contains? (:ins (plans pid)) in))
+        _ (doseq [out affected :let [ins (get cmap out)] :when (seq ins)]
+            (when-not (and (out-ok? out) (every? in-ok? ins))
+              (throw (ex-info "invalid connection" {:conn [out (first (remove in-ok? ins))]}))))
+        [routes mults] (reduce (fn [[rs ms] out]
+                                 (let [ins (get cmap out)]
+                                   (if (and (seq ins) (out-ok? out))
+                                     (let [[r m] (route-one in-chans out ins (ms out))]
+                                       [(assoc rs out r) (if m (assoc ms out m) ms)])
+                                     [(dissoc rs out) (dissoc ms out)])))
+                               [(:routes old) (:mults old)] affected)
+        mults (merge mults (retap! (select-keys mults affected) cmap in-chans))
+        pid-outs (as-> (:pid-outs old) po
+                   (reduce (fn [po [out in]] (-> po (update (first out) (fnil conj #{}) out) (update (first in) (fnil conj #{}) out))) po added)
+                   (reduce (fn [po [out in]]
+                             (let [gone? (empty? (get cmap out))]
+                               (cond-> po gone? (update (first out) disj out)
+                                       (not (some #(= (first in) (first %)) (get cmap out))) (update (first in) disj out))))
+                           po removed))]
+    {:cmap cmap :conn-set new-set :pid-outs pid-outs :routes routes :mults mults}))
+
 (defn- send-control!
   "Put cmd on each pid's own control chan, in order (called under the graph lock)."
   [rt pids cmd]
@@ -238,12 +291,10 @@
                        drop-ins (into #{} (remove same-in?) (keys old-ins))
                        make-ins (into #{} (remove same-in?) (keys new-ins))
                        ;; routes change only when the conns do, or a connected proc changed
-                       same-conns? (and (:cmap old) (identical? conns (:conns old)))
-                       conn-pids (if same-conns?
-                                   (:conn-pids old)
-                                   (into #{} (mapcat (fn [[out in]] [(first out) (first in)])) conns))
-                       rewire? (or (not same-conns?) (some conn-pids touched))
-                       cmap (if rewire? (conn-map plans conns) (:cmap old))
+                       first? (nil? (:cmap old))
+                       same-conns? (and (not first?) (identical? conns (:conns old)))
+                       rewire? (or (not same-conns?) (some #(seq (get (:pid-outs old) %)) touched))
+                       cmap (if first? (conn-map plans conns) (:cmap old))
                        kept (- (count plans) (count start))
                        ;; 1. the new in-chans (and castees)
                        in-chans (-> (apply dissoc (:in-chans old) drop-ins)
@@ -253,13 +304,14 @@
                                                               :chan (async/chan (async/sliding-buffer 100))}]))
                                          start))
                        ;; 2. routes and mults: a producer's next send goes the new way
-                       [rts mults] (if rewire?
-                                     (let [new-outs (into {} (mapcat :outs) (vals plans))
-                                           live-mults (into {} (filter (comp #(contains? new-outs %) key)) (:mults old))
-                                           [rts mults] (routes-for in-chans cmap live-mults)]
-                                       [rts (retap! mults cmap in-chans)])
-                                     [(:routes old) (:mults old)])]
-                   (swap! rt assoc :plans plans :defs procs :conns conns :conn-pids conn-pids :cmap cmap
+                       ;; the first apply wires every conn; a later one patches the out coords it touches
+                       {:keys [cmap conn-set pid-outs] rts :routes mults :mults}
+                       (cond first? (let [[rts mults] (routes-for in-chans cmap {})]
+                                      {:cmap cmap :conn-set (set conns) :pid-outs (pid-outs-of cmap)
+                                       :routes rts :mults (retap! mults cmap in-chans)})
+                             rewire? (rewire-delta old plans conns in-chans touched)
+                             :else (select-keys old [:cmap :conn-set :pid-outs :routes :mults]))]
+                   (swap! rt assoc :plans plans :defs procs :conns conns :cmap cmap :conn-set conn-set :pid-outs pid-outs
                           :in-chans in-chans :castees castees :routes rts :mults mults)
                    ;; 3. stop removed and changed procs, awaiting each exit; one that missed
                    ;; its bound is never started twice (every later update retries it)
