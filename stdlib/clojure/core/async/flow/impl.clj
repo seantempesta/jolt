@@ -290,7 +290,9 @@
             (if-let [{:keys [report error]} @rt]
               {:report-chan report :error-chan error :already-running true}
               (let [report (async/chan (async/sliding-buffer 100))
-                    error (async/chan (async/sliding-buffer 100))
+                    ;; jolt: an error is never dropped (a fixed buffer: a proc reporting one waits for room), where
+                    ;; upstream slides; a flow's owner drains :error-chan into whoever can fix what it names
+                    error (async/chan 100)
                     cast (fn [sigid msgs]
                            (doseq [{:keys [select chan]} (vals (:castees @rt))]
                              (when (and select (select sigid))

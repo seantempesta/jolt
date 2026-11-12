@@ -128,7 +128,8 @@
   
   :error-chan - a core.async chan for reading. Any (and only)
   exceptions thrown anywhere on any thread inside a flow will appear
-  in maps sent here. There will at least be a ::flow/ex entry with the
+  in maps sent here (jolt: a fixed buffer of 100, never dropping: a proc
+  reporting an error waits while it is full, so its owner drains it). There will at least be a ::flow/ex entry with the
   exception, and may be additional keys for pid, state, status etc
   depending on the context of the error."
   [g] (g/start g))
