@@ -781,6 +781,30 @@
 ;; OUTER is the form the user wrote that FORM was unrolled from, a macro call
 ;; whose (do ...) expansion it is a child of, or #f. jolt.profile names a form's
 ;; code after it: a defrecord's methods are in its children.
+;; An evaluated form runs in a fn of its own, named as the JVM's Compiler.eval names the fn it
+;; wraps a form in: ns/eval<n>, so the form is a frame of a throw's trace (ns$eval<n>), and
+;; clojure.main's triage names it, as a REPL error says "at user/eval12 (REPL:1)". A form whose
+;; head is a def… symbol is evaluated as it stands, as on the JVM, and so is one compiled with
+;; direct linking (its defs are top-level defines). The fn's code is registered for the walk
+;; (source-registry.ss jolt-eval-frame-register!).
+(define jolt-ce-eval-n 0)
+(define (jolt-ce-eval-frame form ns scm)
+  (if (or (hc-compiler-direct-linking?)
+          (not (or (cseq? form) (pvec? form) (pmap? form) (pset? form)))
+          (and (cseq? form) (symbol-t? (seq-first form))
+               (let ((h (symbol-t-name (seq-first form))))
+                 (and (fx>=? (string-length h) 3) (string=? (substring h 0 3) "def")))))
+      scm
+      (begin
+        (set! jolt-ce-eval-n (fx+ jolt-ce-eval-n 1))
+        (let* ((nm (string-append "eval" (number->string jolt-ce-eval-n)))
+               (b (string-append "|" ns "/" nm "|")))
+          ;; the body through jolt-frame-keep (values.ss): its last call is not a tail call, so the
+          ;; fn stays a frame under it, as the JVM's eval fn does
+          ;; called as what the registration answers, so Chez cannot inline the fn into the form's
+          ;; own code (a small body was, and its frame was gone)
+          (string-append "(let ((" b " (lambda () (jolt-frame-keep " scm ")))) ((jolt-eval-frame-register! " b " "
+                         (format "~s" ns) " " (format "~s" nm) ")))")))))
 (define (jolt-compile-eval-form form ns) (jolt-compile-eval-form/outer form ns #f))
 (define (jolt-compile-eval-form/outer form ns outer)
   (if (or (cseq? form) (jolt-lazyseq? form) (empty-list-t? form) (symbol-t? form)
@@ -824,7 +848,7 @@
      ;; record this form's source location first, so a compile- or run-time error
      ;; in it reports the right place.
      (jolt-enter-form! form)
-     (let* ((scm (jolt-analyze-emit-form form ns))
+     (let* ((scm (jolt-ce-eval-frame form ns (jolt-analyze-emit-form form ns)))
             (cap (jolt-aot-capture)))            ; tee for the AOT cache (loader.ss)
        (when cap (put-string cap scm) (newline cap))
        ;; the run is a root as much as the compile was: expanding the form ran

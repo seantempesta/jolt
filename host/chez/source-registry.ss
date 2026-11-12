@@ -66,10 +66,26 @@
     (let ((c (io 'code))) (and c (c 'value)))))
 ;; The record a frame maps to: by code identity when its def recorded one, else
 ;; (a def whose root was no procedure when registered) by short name.
+;; An evaluated top-level form's frame (compile-eval.ss jolt-ce-eval-frame), answering the fn: its code ->
+;; #(ns "eval<n>" #f #f code), as the JVM names the fn Compiler.eval wraps a form in (ns$eval<n>).
+;; Weak: a REPL makes one per form, and an entry lives as long as its code (a frame on a kept
+;; continuation holds it).
+(define source-registry-eval-frames (make-weak-eq-hashtable))
+(define (jolt-eval-frame-register! proc ns nm)
+  (let ((code (#%$closure-code proc)))
+    (jolt-with-mutex source-registry-mu
+      ;; the file is the source's name as the form is evaluated, *source-path* (a loaded file's, or
+      ;; NO_SOURCE_FILE in an eval), as a JVM StackTraceElement's file is
+      (eq-hashtable-set! source-registry-eval-frames code
+                         (vector ns nm (let ((c (var-cell-lookup "clojure.core" "*source-path*")))
+                                         (and c (let ((f (var-cell-deref c))) (and (string? f) f))))
+                                 #f code))))
+  proc)
 (define (srcreg-frame-record io nm)
   (let ((code (srcreg-frame-code io)))
     (or (and code (jolt-with-mutex source-registry-mu
-                    (hashtable-ref source-registry-by-code code #f)))
+                    (or (hashtable-ref source-registry-by-code code #f)
+                        (eq-hashtable-ref source-registry-eval-frames code #f))))
         (let ((src (hashtable-ref source-registry nm #f)))
           (and (vector? src) (not (vector-ref src 4)) src)))))
 (def-var! "jolt.host" "register-source!" jolt-register-source!)
