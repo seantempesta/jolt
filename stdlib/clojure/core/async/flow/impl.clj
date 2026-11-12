@@ -350,8 +350,10 @@
       clojure.core.async.flow.impl.graph.Update
       (update-flow [_ d]
         (locked (fn []
-                  (reset! current (select-keys d [:procs :conns]))
-                  (if @rt (apply! d) {:running false})))))))
+                  ;; d a fn: of the definition last applied, under the lock, as swap! takes one
+                  (let [d (if (fn? d) (d @current) d)]
+                    (reset! current (select-keys d [:procs :conns]))
+                    (if @rt (apply! d) {:running false}))))))))
 
 (defn- finish-outputs!
   "jolt (V1's one change to the proc loop): a stop that arrives while a step's outputs are

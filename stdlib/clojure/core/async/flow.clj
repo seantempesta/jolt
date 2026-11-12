@@ -145,8 +145,9 @@
   awaited; added (or changed) procs are started, paused, then resumed. A connection
   whose consumers changed gets a new route: an output with one consumer writes straight
   into that consumer's channel, several share a mult; only a replaced mult's own buffer
-  can lose messages. Returns {:added #{pids} :removed #{pids} :rewired #{out-coords}
-  :running true|{::flow/running #{pids}}}."
+  can lose messages. new-config may be a fn of the config last applied ({:procs :conns}),
+  called under the flow's lock, as swap! takes one, so two updates compose. Returns
+  {:added #{pids} :removed #{pids} :rewired #{out-coords} :running true|{::flow/running #{pids}}}."
   [g new-config] (g/update-flow g new-config))
 
 (defn pause

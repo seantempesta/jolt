@@ -4,7 +4,9 @@
 ;; part in :conns, update!, ping, pause and stop like any other, and Flow's own
 ;; resolver routes what arrives.
 (ns jolt.async.remote.flow
-  (:require [clojure.core.async.flow :as flow]))
+  (:require [clojure.core.async :as a]
+            [clojure.core.async.flow :as flow]
+            [jolt.async.remote :as r]))
 
 (defn proc
   "A proc-def (a value for :procs) for a process outside this flow.
@@ -47,3 +49,39 @@
                   :else [state {cid [msg]}])))]
     {:proc (flow/process step)
      :chan-opts (into {} (map (fn [[k ch]] [k {:chan ch}])) ins)}))
+
+(defn fork!
+  "Fork child, a fn of one end, as proc pid of running flow g: a remote-pair, then
+  jolt.host/fork-alone. In the child: (child end), end opened over the child's descriptor
+  (opts' :pump, :codec, :buf), then :out closed and :sent awaited, so all the child put
+  reaches the parent, and the child exits 0, or 1 when child threw (said on stderr); it
+  never returns into the caller's frames. In the parent: the child's descriptor is closed and
+  the child becomes proc pid of g (proc over the parent's end: in-port (:in opts, default :in)
+  carries what the flow sends it, out-port (:out opts, default :out) what the child puts, its
+  end delivered last), with (:conns opts) added, by one update! of the config last applied.
+  Answers {:pid child-os-pid}, or {:refused n} when fork-alone refuses (another thread was
+  active: n is -2) and nothing is added. The caller reaps the child (waitpid)."
+  [g pid child {:keys [in out conns] :or {in :in out :out} :as opts}]
+  (let [ropts (dissoc opts :in :out :conns)
+        [end fd] (r/remote-pair ropts)
+        os-pid (jolt.host/fork-alone)]
+    (cond
+      (zero? os-pid)
+      (let [mine (r/open fd ropts)
+            ok (try (child mine) true
+                    (catch Throwable t
+                      (binding [*out* *err*] (println "jolt.async.remote.flow/fork! child threw:" (ex-message t)) (flush))
+                      false))]
+        (a/close! (:out mine))
+        (a/<!! (:sent mine))
+        (System/exit (if ok 0 1)))
+
+      (neg? os-pid)
+      (do (r/close! end) (r/close-fd! fd) {:refused os-pid})
+
+      :else
+      (do (r/close-fd! fd)
+          (flow/update! g (fn [cfg] (-> cfg
+                                        (assoc-in [:procs pid] (proc {:ins {in (:out end)} :outs {out (:in end)}}))
+                                        (update :conns (fnil into []) conns))))
+          {:pid os-pid}))))

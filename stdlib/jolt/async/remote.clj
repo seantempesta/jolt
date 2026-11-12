@@ -463,7 +463,7 @@
                 (recur held)
                 (dead! end))))))
       (catch Throwable t (dead! end) (shut! end) (throw t))
-      (finally (ffi/free (first @scratch)) (finish! end)))))
+      (finally (ffi/free (first @scratch)) (finish! end) (a/put! (:sent end) true)))))
 
 (defn- spawn [pump f]
   (if (= pump :fiber)
@@ -473,8 +473,9 @@
 (defn open
   "Make an end over connected stream socket fd, which this end then owns: it becomes
   close-on-fork, and it is closed once both directions are done (:fd is then no
-  longer this end's to touch). Answers {:in ch :out ch :fd fd} (plus private keys
-  close! uses).
+  longer this end's to touch). Answers {:in ch :out ch :fd fd :sent ch} (plus private keys
+  close! uses); :sent, a promise-chan, answers true once the writer is done (after a close! of
+  :out, the end frame is written), so a process may exit without losing what it put.
 
   opts:
     :buf      buffer of :in and of :out (default 16); :in-buf and :out-buf set one
@@ -494,10 +495,12 @@
               :out (a/chan (or out-buf buf))
               :close-in? close-in?
               :encode (:encode codec) :decode (:decode codec) :encode-error encode-error
-              :pump pump ::lock (Object.) ::live (volatile! 2)}]
+              :pump pump ::lock (Object.) ::live (volatile! 2)
+              ;; delivered once the writer is done: every value put on :out, and the end frame after a close!, written
+              :sent (a/promise-chan)}]
      (spawn pump #(reader end))
      (spawn pump #(writer end))
-     (select-keys end [:in :out :fd ::lock ::live]))))
+     (select-keys end [:in :out :fd :sent ::lock ::live]))))
 
 (defn remote-pair
   "[end fd]: an end in this process, and the raw descriptor of the other end for the
