@@ -39,10 +39,10 @@
 (define hexd "0123456789abcdef")
 ;; Position of hex digit j within the 8-4-4-4-12 layout: one extra character for
 ;; each hyphen already passed (they sit after hex digits 8, 12, 16 and 20).
+;; Two-argument fx+ only: the five-argument form went through a rest list, 48 B a
+;; call and 32 calls a uuid's text.
 (define (uuid-hex-pos j)
-  (fx+ j
-       (if (fx>=? j 8) 1 0) (if (fx>=? j 12) 1 0)
-       (if (fx>=? j 16) 1 0) (if (fx>=? j 20) 1 0)))
+  (cond ((fx<? j 8) j) ((fx<? j 12) (fx+ j 1)) ((fx<? j 16) (fx+ j 2)) ((fx<? j 20) (fx+ j 3)) (else (fx+ j 4))))
 ;; v4 from 16 bytes of OS entropy (jolt-random-bytes), NOT from the seeded PRNG:
 ;; v4 UUIDs get used as session ids and reset tokens, where a guessable value is a
 ;; forgeable one. RFC 4122 then overwrites 6 of the 128 bits — version 4 in the
