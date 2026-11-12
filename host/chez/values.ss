@@ -318,6 +318,26 @@
                   (hashtable-set! keyword-table-bare name kw)
                   kw))))))
 (define (keyword? x) (keyword-t? x))
+;; The keyword whose UTF-8 ns (ns-at #f: none) and name lie in bytevector bv, as a
+;; decoder holds them (konserve's jfasl). ASCII text, the usual case, is read straight
+;; into the intern key, so a keyword already interned costs that one string and not a
+;; copy and a string per part; anything else goes through keyword as usual.
+(define (keyword-from-utf8 bv ns-at ns-len name-at name-len)
+  (define (ascii? at n) (let loop ((i 0)) (or (fx=? i n) (and (fx<? (bytevector-u8-ref bv (fx+ at i)) 128) (loop (fx+ i 1))))))
+  (define (fill! s to at n) (do ((i 0 (fx+ i 1))) ((fx=? i n)) (string-set! s (fx+ to i) (integer->char (bytevector-u8-ref bv (fx+ at i))))))
+  (define (text at n) (let ((b (make-bytevector n))) (bytevector-copy! bv at b 0 n) (utf8->string b)))
+  (cond
+    ((not (ascii? name-at name-len))
+     (keyword (and ns-at (text ns-at ns-len)) (text name-at name-len)))
+    ((not ns-at)
+     (let ((s (make-string name-len))) (fill! s 0 name-at name-len) (keyword #f s)))
+    ((not (ascii? ns-at ns-len)) (keyword (text ns-at ns-len) (text name-at name-len)))
+    (else
+     (let ((k (make-string (fx+ ns-len 1 name-len) #\x0)))
+       (fill! k 0 ns-at ns-len)
+       (fill! k (fx+ ns-len 1) name-at name-len)
+       (or (hashtable-ref keyword-table k #f)
+           (keyword (substring k 0 ns-len) (substring k (fx+ ns-len 1) (string-length k))))))))
 
 ;; --- symbols: ns + name + meta; NOT interned (meta varies), = by ns/name ------
 ;; The ns/name STRINGS are pooled (like JVM Symbol.intern, which .intern()s them):
