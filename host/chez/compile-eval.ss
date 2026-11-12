@@ -560,20 +560,16 @@
               (jolt-ce-set-emit-unit! build-unit)
               (set! ce-build-runtime-unit runtime)))))))
 
-(define (jolt-analyze-emit-form form ns . eval-name)
-  (ce-outside-build (lambda () (jolt-analyze-emit-form* form ns (and (pair? eval-name) (car eval-name))))))
-;; EVAL-NAME (an evaluated form's fn, jolt-ce-eval-name) names the fn literals inside it, as the
-;; JVM names them under the eval fn (user$eval12$fn__13): jfn$<ns>/eval12$<n>
-(define (jolt-analyze-emit-form* form ns eval-name)
+(define (jolt-analyze-emit-form form ns)
+  (ce-outside-build (lambda () (jolt-analyze-emit-form* form ns))))
+(define (jolt-analyze-emit-form* form ns)
   (let* ((ctx (make-analyze-ctx ns))
          (node (jolt-ce-analyze ctx form)))
     (jolt-lint-node! node)
     (let ((tap (jolt-unit-tap))) (when tap (tap form node)))
     (if (hc-compiler-direct-linking?)
         (jolt-direct-link-emit node ctx)
-        (if eval-name
-            (jolt-ce-emit (jolt-ce-run-passes node ctx) eval-name)
-            (jolt-ce-emit (jolt-ce-run-passes node ctx))))))
+        (jolt-ce-emit (jolt-ce-run-passes node ctx)))))
 
 ;; A form compiled under (binding [*compiler-options* {:direct-linking true}] ...)
 ;; gets what `jolt build` gives every app form: calls to the vars defined this
@@ -857,7 +853,7 @@
      ;; in it reports the right place.
      (jolt-enter-form! form)
      (let* ((nm (jolt-ce-eval-name form))
-            (scm (jolt-ce-eval-frame ns nm (jolt-analyze-emit-form form ns nm)))
+            (scm (jolt-ce-eval-frame ns nm (jolt-analyze-emit-form form ns)))
             (cap (jolt-aot-capture)))            ; tee for the AOT cache (loader.ss)
        (when cap (put-string cap scm) (newline cap))
        ;; the run is a root as much as the compile was: expanding the form ran

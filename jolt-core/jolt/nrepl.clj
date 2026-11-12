@@ -281,7 +281,8 @@
   would name, as it skips the core's frames."
   [line]
   (when-let [{:keys [symbol]} (frame-location line)]
-    (not (re-find #"^(clojure|jolt)\." (namespace symbol)))))
+    ;; a fn literal's frame line is its label, jfn$<ns>/<def>$<n>: the ns is after the jfn$
+    (not (re-find #"^(jfn\$)?(clojure|jolt)\." (namespace symbol)))))
 
 (defn- simple-class-name [c]
   (when c (last (str/split (name c) #"\."))))
