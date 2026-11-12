@@ -693,11 +693,11 @@
       (unless resolved
         (set! resolved #t)
         (guard (e (#t #f)) (load-shared-object "kernel32.dll"))
-        (when (foreign-entry? "GetEnvironmentStringsW")
-          (set! entries
-                (cons (sa-foreign-procedure-runtime "GetEnvironmentStringsW" '() 'void* #f)
-                      (and (foreign-entry? "FreeEnvironmentStringsW")
-                           (sa-foreign-procedure-runtime "FreeEnvironmentStringsW" '(void*) 'int #f))))))
+        (set! entries
+              (and (foreign-entry? "GetEnvironmentStringsW")
+                   (cons (sa-foreign-procedure-runtime "GetEnvironmentStringsW" '() 'void* #f)
+                         (and (foreign-entry? "FreeEnvironmentStringsW")
+                              (sa-foreign-procedure-runtime "FreeEnvironmentStringsW" '(void*) 'int #f))))))
       entries)))
 ;; The posix table's reader, resolved once (sa-entry-once): a thunk answering the
 ;; current envp (setenv may move it), or #f where neither entry resolves.
@@ -1105,11 +1105,9 @@
   (unless sa-fbytes-probed?
     (set! sa-fbytes-probed? #t)                ; probe once, even if it throws
     (guard (e (#t #f))
-      (when (foreign-entry? "memcpy")
-        (set! sa-fbytes-in (foreign-procedure "memcpy" (u8* void* size_t) void*))
-        (set! sa-fbytes-out (foreign-procedure "memcpy" (void* u8* size_t) void*)))
-      (when (foreign-entry? "memset")
-        (set! sa-fbytes-zero (foreign-procedure "memset" (void* int size_t) void*))))))
+      (set! sa-fbytes-in (and (foreign-entry? "memcpy") (foreign-procedure "memcpy" (u8* void* size_t) void*)))
+      (set! sa-fbytes-out (and sa-fbytes-in (foreign-procedure "memcpy" (void* u8* size_t) void*)))
+      (set! sa-fbytes-zero (and (foreign-entry? "memset") (foreign-procedure "memset" (void* int size_t) void*))))))
 
 ;; (sa-foreign-bytes-ref! addr bv n) -> void
 ;; Copy the N octets at foreign address ADDR into BV[0,N). Contract: a
@@ -2249,10 +2247,11 @@
 
 (define (sa-term-open)
   (or (and sa-term-procs #t)
-      (and (foreign-entry? "(cs)ee_init_term")
-           ((foreign-procedure "(cs)ee_init_term" (iptr iptr) boolean) -1 -1)
-           (begin
-             (set! sa-term-procs
+      (begin
+        ;; the entries are kept once claimed (sa-entry-once's note on looking up once)
+        (set! sa-term-procs
+          (and (foreign-entry? "(cs)ee_init_term")
+               ((foreign-procedure "(cs)ee_init_term" (iptr iptr) boolean) -1 -1)
                (vector
                  (foreign-procedure "(cs)ee_raw" () void)                       ; 0
                  (foreign-procedure "(cs)ee_noraw" () void)                     ; 1
@@ -2272,8 +2271,8 @@
                  (foreign-procedure "(cs)ee_line_feed" () void)                 ; 15
                  (foreign-procedure "(cs)ee_bell" () void)                      ; 16
                  (foreign-procedure "(cs)ee_pause" () void)                     ; 17
-                 (foreign-procedure "(cs)ee_set_color" (int boolean) void)))    ; 18
-             #t))))
+                 (foreign-procedure "(cs)ee_set_color" (int boolean) void))))  ; 18
+        (and sa-term-procs #t))))
 
 (define (sa-term-raw!) ((sa-term-proc 0)))
 (define (sa-term-cooked!) ((sa-term-proc 1)))

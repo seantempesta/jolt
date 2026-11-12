@@ -2178,6 +2178,10 @@
 
 (set! jolt-asleep-notify jolt-asleep-wake-detector!)
 
+;; Chez's parallel-collector pool fixer (chez-patches/0008-fixed-sweeper-pool), looked up once,
+;; at load: a Chez entry, there before any library is loaded. #f on a stock Chez.
+(define jolt-collect-sweepers
+  (and (foreign-entry? "(cs)collect_sweepers") (foreign-procedure "(cs)collect_sweepers" (iptr) iptr)))
 (define (jolt-main-carrier-run/loop! thunk)
   (when jolt-fiber-pool-started?
     (error 'jolt-main-carrier-run! "fibers already run on carrier threads: call it before the first fiber"))
@@ -2194,8 +2198,7 @@
   ;; (chez-patches/0008-fixed-sweeper-pool), it is fixed at none; a stock Chez can still
   ;; start them beside the runtime's own watcher thread (measured: 1-2 faulting runs in 10 of
   ;; test/chez/main-carrier-test.clj on stock Chez 10, none in 20 with the pool fixed).
-  (when (foreign-entry? "(cs)collect_sweepers")
-    ((foreign-procedure "(cs)collect_sweepers" (iptr) iptr) 0))
+  (when jolt-collect-sweepers (jolt-collect-sweepers 0))
   (jolt-carrier-os-thread-set! (vector-ref jolt-fiber-carriers 0) (jolt-thread-ids))
   (let* ((c (vector-ref jolt-fiber-carriers 0))
          (box (vector #f #f #f))    ; done? value error
