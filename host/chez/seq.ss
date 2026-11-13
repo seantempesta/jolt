@@ -1770,8 +1770,15 @@
     (else (jolt-invoke f a b))))
 (define (jolt-invoke-t3 f a b c) (if (procedure? f) (if (fxlogbit? 3 (procedure-arity-mask f)) (f a b c) (jolt-proc-arity-error f 3)) (jolt-invoke f a b c)))
 (define (jolt-invoke-t4 f a b c d) (if (procedure? f) (if (fxlogbit? 4 (procedure-arity-mask f)) (f a b c d) (jolt-proc-arity-error f 4)) (jolt-invoke f a b c d)))
+;; five to eight arguments, as t3/t4: a raw procedure is called with them as they came. Past four
+;; the back end called variadic jolt-invoke, which consed them into a list to apply the fn
+;; (16 bytes an argument per call; a Datom's five-field constructor 80 B over the record).
+(define (jolt-invoke-t5 f a b c d e) (if (procedure? f) (if (fxlogbit? 5 (procedure-arity-mask f)) (f a b c d e) (jolt-proc-arity-error f 5)) (jolt-invoke f a b c d e)))
+(define (jolt-invoke-t6 f a b c d e g) (if (procedure? f) (if (fxlogbit? 6 (procedure-arity-mask f)) (f a b c d e g) (jolt-proc-arity-error f 6)) (jolt-invoke f a b c d e g)))
+(define (jolt-invoke-t7 f a b c d e g h) (if (procedure? f) (if (fxlogbit? 7 (procedure-arity-mask f)) (f a b c d e g h) (jolt-proc-arity-error f 7)) (jolt-invoke f a b c d e g h)))
+(define (jolt-invoke-t8 f a b c d e g h i) (if (procedure? f) (if (fxlogbit? 8 (procedure-arity-mask f)) (f a b c d e g h i) (jolt-proc-arity-error f 8)) (jolt-invoke f a b c d e g h i)))
 
-;; jolt-invoke0..4: the same calls, from code that is not traced -- clojure.core,
+;; jolt-invoke0..8: the same calls, from code that is not traced -- clojure.core,
 ;; the runtime's own Scheme -- calling a fn value that may be. A traced fn's tail
 ;; call stores its site pair in the slot (vreg 2, rt.ss jolt-vreg-site), and it
 ;; stands for that fn only while the tail call runs. When the call returns to
@@ -1814,6 +1821,30 @@
           (jolt-site-kept (f a b c d))
           (jolt-proc-arity-error f 4))
       (jolt-site-kept (jolt-invoke-t4 f a b c d))))
+(define (jolt-invoke5 f a b c d e)
+  (if (procedure? f)
+      (if (fxlogbit? 5 (procedure-arity-mask f))
+          (jolt-site-kept (f a b c d e))
+          (jolt-proc-arity-error f 5))
+      (jolt-site-kept (jolt-invoke-t5 f a b c d e))))
+(define (jolt-invoke6 f a b c d e g)
+  (if (procedure? f)
+      (if (fxlogbit? 6 (procedure-arity-mask f))
+          (jolt-site-kept (f a b c d e g))
+          (jolt-proc-arity-error f 6))
+      (jolt-site-kept (jolt-invoke-t6 f a b c d e g))))
+(define (jolt-invoke7 f a b c d e g h)
+  (if (procedure? f)
+      (if (fxlogbit? 7 (procedure-arity-mask f))
+          (jolt-site-kept (f a b c d e g h))
+          (jolt-proc-arity-error f 7))
+      (jolt-site-kept (jolt-invoke-t7 f a b c d e g h))))
+(define (jolt-invoke8 f a b c d e g h i)
+  (if (procedure? f)
+      (if (fxlogbit? 8 (procedure-arity-mask f))
+          (jolt-site-kept (f a b c d e g h i))
+          (jolt-proc-arity-error f 8))
+      (jolt-site-kept (jolt-invoke-t8 f a b c d e g h i))))
 
 ;; ============================================================================
 ;; chunked-seq accessors — the host side of the Clojure IChunkedSeq contract
