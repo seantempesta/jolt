@@ -415,7 +415,7 @@ fiberspoll:
 	@JOLT_IO_POLLER=poll $(CHEZ) --script host/chez/cli.ss test/chez/poller-retirement.clj
 	@JOLT_IO_POLLER=poll $(CHEZ) --script host/chez/cli.ss test/chez/poller-direct.clj
 
-fibers:
+fibers: testbin
 	@$(CHEZ) --script test/chez/fibers-test.ss
 	@$(CHEZ) --script test/chez/fibers-state-test.ss
 	@$(CHEZ) --script test/chez/fibers-chan-test.ss
@@ -429,21 +429,21 @@ fibers:
 	@$(CHEZ) --script test/chez/fibers-monitor-test.ss
 	@$(CHEZ) --script test/chez/fibers-interrupt-test.ss
 	@$(CHEZ) --script test/chez/async-io-thread-test.ss
-	@bin/jolt run test/chez/async-callback-test.clj
-	@bin/jolt run test/chez/fork-child-test.clj
-	@perl -e 'alarm 120; exec @ARGV' bin/jolt run test/chez/main-carrier-monitor-test.clj
-	@bin/jolt run test/chez/main-carrier-test.clj
-	@bin/jolt run test/chez/main-carrier-throw-test.clj
-	@bin/jolt run test/chez/main-carrier-wake-test.clj
-	@perl -e 'alarm 120; exec @ARGV' bin/jolt run test/chez/main-carrier-stuck-test.clj
-	@perl -e 'alarm 120; exec @ARGV' bin/jolt run test/chez/main-carrier-sh-test.clj
-	@bin/jolt run test/chez/main-carrier-returns-test.clj
-	@bin/jolt run test/chez/main-carrier-leaves-its-detector-test.clj
-	@bin/jolt run test/chez/main-carrier-timer-throw-test.clj
-	@bin/jolt run test/chez/timer-throw-test.clj
-	@bin/jolt run test/chez/main-carrier-load-ns-test.clj
-	@bin/jolt run test/chez/nested-budget-test.clj
-	@bin/jolt run test/chez/process-fiber-reap-test.clj
+	@target/release/jolt run test/chez/async-callback-test.clj
+	@target/release/jolt run test/chez/fork-child-test.clj
+	@perl -e 'alarm 120; exec @ARGV' target/release/jolt run test/chez/main-carrier-monitor-test.clj
+	@target/release/jolt run test/chez/main-carrier-test.clj
+	@target/release/jolt run test/chez/main-carrier-throw-test.clj
+	@target/release/jolt run test/chez/main-carrier-wake-test.clj
+	@perl -e 'alarm 120; exec @ARGV' target/release/jolt run test/chez/main-carrier-stuck-test.clj
+	@perl -e 'alarm 120; exec @ARGV' target/release/jolt run test/chez/main-carrier-sh-test.clj
+	@target/release/jolt run test/chez/main-carrier-returns-test.clj
+	@target/release/jolt run test/chez/main-carrier-leaves-its-detector-test.clj
+	@target/release/jolt run test/chez/main-carrier-timer-throw-test.clj
+	@target/release/jolt run test/chez/timer-throw-test.clj
+	@target/release/jolt run test/chez/main-carrier-load-ns-test.clj
+	@target/release/jolt run test/chez/nested-budget-test.clj
+	@target/release/jolt run test/chez/process-fiber-reap-test.clj
 	@out="$$($(CHEZ) --script host/chez/cli.ss test/chez/sync-classes-test.clj 2>&1)"; \
 	  if printf '%s' "$$out" | grep -q 'SYNC-CLASSES-TEST OK'; then echo "fibers: sync-classes-test OK"; \
 	  else printf '%s\n' "$$out" | tail -20; echo "fibers: sync-classes-test FAILED"; exit 1; fi
@@ -1056,17 +1056,17 @@ loaderconf: testbin
 # not :blocking pins the collector the callback needs — and the two signatures
 # the collect-safe convention cannot carry, which jolt must refuse in its own
 # words rather than leave to Chez's expander.
-ffi:
+ffi: testbin
 	@$(CHEZ) --script test/chez/ffi-binding-test.ss
 	@sh test/chez/ffi-widths-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-layout-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-aggregate-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-stack-args-test.sh "$(CHEZ)"
-	@bin/jolt run test/chez/jolt-ffi-scoped-test.clj
-	@bin/jolt run test/chez/jolt-ffi-arena-test.clj
-	@bin/jolt run test/chez/jolt-ffi-typed-array-test.clj
-	@bin/jolt run test/chez/jolt-ffi-callback-preempt-test.clj
-	@bin/jolt run test/chez/jolt-ffi-site-cache-test.clj
+	@target/release/jolt run test/chez/jolt-ffi-scoped-test.clj
+	@target/release/jolt run test/chez/jolt-ffi-arena-test.clj
+	@target/release/jolt run test/chez/jolt-ffi-typed-array-test.clj
+	@target/release/jolt run test/chez/jolt-ffi-callback-preempt-test.clj
+	@target/release/jolt run test/chez/jolt-ffi-site-cache-test.clj
 	@sh test/chez/ffi-native-error-test.sh "$(CHEZ)"
 	@sh test/chez/ffi-foreign-thread-test.sh
 	@sh test/chez/ffi-gc-stall-test.sh
@@ -2253,7 +2253,7 @@ devbootsmoke: devboot
 # built binary is a second, genuinely different runtime — case (k) needs it to
 # check that two runtimes sharing a version string still key separately.
 aotcachesmoke: testbin
-	@sh test/chez/aot-cache-smoke.sh
+	@JOLT_BIN=target/release/jolt sh test/chez/aot-cache-smoke.sh
 
 # A namespace loaded from the AOT cache registers the line-marker table its
 # artifact carries, so its first trace never scans the whole .scm.
@@ -2307,8 +2307,8 @@ buildemptycacheentry: testbin
 # System/in, System/out, System/err: the process streams and the classes the JVM
 # reports for them. Needs a real pipe on stdin, so it is a script rather than a
 # corpus row.
-systemstreams:
-	@sh test/chez/system-streams-smoke.sh
+systemstreams: testbin
+	@JOLT_BIN=target/release/jolt sh test/chez/system-streams-smoke.sh
 
 # A process stream whose reader has gone away drops writes instead of raising,
 # and checkError says so, as the JVM's PrintStream does (#1331). Runs the CLI

@@ -19,7 +19,9 @@ fails=0
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
 
-jolt="bin/jolt"
+# the binary under test: make passes target/release/jolt (0.1 s a boot against the source
+# launcher's ~5 s, which this gate paid on every case); bin/jolt without a build
+jolt="${JOLT_BIN:-bin/jolt}"
 cache="$(mktemp -d)"
 tmp="$(mktemp -d)"
 mkdir -p "$tmp/src/mylib"
