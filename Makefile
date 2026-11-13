@@ -2252,8 +2252,10 @@ devbootsmoke: devboot
 # cases, bypass semantics). Drives dev bin/jolt; no Maven jars required. The
 # built binary is a second, genuinely different runtime — case (k) needs it to
 # check that two runtimes sharing a version string still key separately.
+# Its cases count a miss's .so when the run ends: the built binary compiles a miss in a
+# background worker unless JOLT_AOT_ASYNC=0 (phase 7 unsets it to test the worker).
 aotcachesmoke: testbin
-	@JOLT_BIN=target/release/jolt sh test/chez/aot-cache-smoke.sh
+	@JOLT_AOT_ASYNC=0 JOLT_BIN=target/release/jolt sh test/chez/aot-cache-smoke.sh
 
 # A namespace loaded from the AOT cache registers the line-marker table its
 # artifact carries, so its first trace never scans the whole .scm.
