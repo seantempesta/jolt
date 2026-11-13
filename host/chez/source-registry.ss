@@ -243,9 +243,12 @@
 ;; A frame's OWN line — where its execution is paused, which Chez annotates with
 ;; the position of the call that CREATED the frame: the call site inside the
 ;; caller, exactly what the JVM prints for a frame. Resolve the frame's
-;; (source-name . offset) through the marker lookup: a .scm path resolves via the
-;; on-disk marker table (jolt-marker-line-in-file), a synthetic eval name via the
-;; eval registry (jolt-eval-source-line). #f when the frame carries no source or
+;; (source-name . offset) through the marker lookup: a namespace's code through the
+;; table its unit or cached artifact registered as it loaded (a built binary's unit,
+;; build.ss bld-write-unit!; an AOT artifact, loader.ss aot-publish-artifact!), a
+;; synthetic eval name via the eval registry (jolt-eval-source-line). The .scm itself
+;; is never read: every path that loads marked code registers its table, so the whole-
+;; file scan a first trace once paid is gone. #f when the frame carries no source or
 ;; no marker precedes its offset — the renderer then falls back to the defn line.
 ;; Exception-proof: the reporter runs while an error is being reported.
 (define (srcreg-source-pair-entry pair ns)
@@ -255,7 +258,7 @@
            (cond
              ((jolt-eval-source-name? name) (jolt-eval-source-entry name offset))
              ((jolt-baked-marker-table ns) => (lambda (t) (jolt-marker-line-from-table t offset)))
-             (else (jolt-marker-entry-in-file name offset)))))))
+             (else #f))))))
 
 ;; The logical frames one physical frame stands for, innermost first, or '() for
 ;; a frame a trace leaves out: unnamed, or plumbing that maps to no jolt fn. nm
@@ -536,7 +539,6 @@
 ;; Deliberately NOT handled (the emitter cannot produce them): #; datum
 ;; comments, and bar-delimited |symbol| syntax containing #|.
 (define jolt-marker-cache-text (make-hashtable string-hash string=?))
-(define jolt-marker-cache-file (make-hashtable string-hash string=?))
 
 ;; Forward scan -> sorted vector of (start . line) pairs, one per real marker.
 (define (jolt-marker-table text)
@@ -1176,23 +1178,6 @@
 ;; a single reading per side keeps the two sides consistent with each other.
 (def-var! "jolt.host" "profile-stats"
   (lambda () (apply jolt-vector (vector->list (sa-stats)))))
-
-;; Convenience wrapper for a generated file on disk. Cached per path+mtime: the
-;; same .scm serves every frame of a backtrace, so read+scan it once. Whole-
-;; second mtime granularity means a file regenerated within the same second can
-;; serve a stale table — acceptable on a debug path, never a correctness claim.
-(define (jolt-marker-entry-in-file path offset)
-  (define (read-table)
-    (call-with-input-file path
-      (lambda (p) (jolt-marker-table (get-string-all p)))))
-  (let* ((mtime (div (sa-file-mtime-ms path) 1000))
-         (entry (hashtable-ref jolt-marker-cache-file path #f)))
-    (unless (and entry (= (car entry) mtime))
-      (set! entry (cons mtime (read-table)))
-      (hashtable-set! jolt-marker-cache-file path entry))
-    (jolt-marker-line-from-table (cdr entry) offset)))
-(define (jolt-marker-line-in-file path offset)
-  (jolt-marker-entry-line (jolt-marker-entry-in-file path offset)))
 
 ;; Render a list of (frame-name . record) pairs (innermost/deepest first) to a
 ;; backtrace string. record is a source vector #(ns name file line) -> "ns/name

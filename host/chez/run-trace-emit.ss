@@ -262,13 +262,7 @@
   (gate-check "(12) offset at the line-2 call" (jolt-marker-line-at-offset e (+ i2 8)) 2)
   (gate-check "(12) offset inside the line-3 marker" (jolt-marker-line-at-offset e (+ i3 3)) 3)
   (gate-check "(12) offset at the line-3 call" (jolt-marker-line-at-offset e (+ i3 8)) 3)
-  (gate-check "(12) offset past the last call" (jolt-marker-line-at-offset e (+ i3 30)) 3)
-  ;; the file wrapper reads the same generated text from disk
-  (let ((p (format "~a/jolt-marker-r1-~a.scm" (host-temp-dir) (random 1000000))))
-    (call-with-output-file p (lambda (out) (display e out)))
-    (gate-check "(12) file wrapper resolves the same line"
-                (jolt-marker-line-in-file p (+ i3 3)) 3)
-    (delete-file p)))
+  (gate-check "(12) offset past the last call" (jolt-marker-line-at-offset e (+ i3 30)) 3))
 
 ;; --- (12b) integration: the R1B defect — a user string's fake marker ----------
 ;; (def s (fn [] (sink "#|L999|# oops"))) — the string literal carries the exact

@@ -682,7 +682,7 @@
 (define jolt-asleep-epoch 0)                   ; moves on every enter, leave, thread start and end
 (define jolt-asleep-ids (make-eqv-hashtable))   ; thread id -> while it is asleep: (cv . mu) in a
                                                ; value wait (to tell), #t in a raw one
-(define jolt-boot-thread-id (get-thread-id))    ; the thread the process started on
+;; the thread the process started on: jolt-boot-thread-id, rt.ss's (upstream's); every use is in a body run after load
 (define jolt-asleep-on (make-weak-eq-hashtable)) ; cv -> ids asleep on it, for its waker
 (define jolt-asleep-told (make-eqv-hashtable))  ; thread id -> the error to raise in its wait
 (define jolt-asleep-uncounted (make-thread-parameter #f)) ; the detector's own wait
