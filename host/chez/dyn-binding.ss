@@ -478,3 +478,11 @@
 ;; the pre-chain values).
 (def-var! "clojure.core" "var-get" jolt-var-get)
 (def-var! "clojure.core" "deref" jolt-deref)
+
+;; jolt.host/*on-root-change* (rt.ss var-root-set!): a fn called with each var whose root is written while it
+;; is bound; jolt.host/on-root-change binds it around a thunk. Defined here, after the binding machinery, so
+;; var-root-set! reads it only once a binding can exist.
+(def-dynvar! "jolt.host" "*on-root-change*" jolt-nil)
+(set! jolt-on-root-change-cell (var-cell-lookup "jolt.host" "*on-root-change*"))
+(def-var! "jolt.host" "on-root-change"
+  (lambda (f thunk) (dyn-with-frame (list (cons jolt-on-root-change-cell f)) (lambda () (jolt-invoke0 thunk)))))
