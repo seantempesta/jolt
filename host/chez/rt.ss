@@ -2563,6 +2563,12 @@
 ;; not splice the old body. #f until then, so a root write pays one test.
 (define var-root-write-hook #f)
 (define (set-var-root-write-hook! f) (set! var-root-write-hook f))
+;; The caller's own notice of a root write (jolt.host/on-root-change): a jolt fn
+;; called with the var once its root is written, on this thread, for the extent
+;; on-root-change binds it. A REPL binds it around an eval to note what the eval
+;; redefined, whatever the definition came through (a def, load-string of a
+;; computed string, intern, alter-var-root). #f otherwise: one test per root write.
+(define jolt-on-root-change (make-thread-parameter #f))
 (define (var-root-set! c v)
   (when var-root-write-hook (var-root-write-hook c))
   (let ((l (hashtable-ref var-linked-tbl c #f)))
@@ -2575,7 +2581,11 @@
         (jolt-with-mutex var-linked-mu
           (var-cell-root-set! c v)
           ((cdr l) v))
-        (var-cell-root-set! c v))))
+        (var-cell-root-set! c v)))
+  ;; after the write and outside the mutex; unbound while it runs, so a root it
+  ;; writes itself is not noted again
+  (let ((h (jolt-on-root-change)))
+    (when h (parameterize ((jolt-on-root-change #f)) (jolt-invoke1 h c)))))
 ;; The jv$ symbol a linked var is bound under, or #f. jolt.host/seed-callable?
 ;; answers it so an app's direct call site applies the binding itself (backend
 ;; emit-invoke) rather than a root hoisted once at load.
@@ -2882,6 +2892,9 @@
 ;; bytes-allocated is the live heap (what survived the last collection, plus what
 ;; has been allocated since); current/maximum-memory-bytes are what Chez holds from
 ;; the OS now and at its peak — the RSS-shaped numbers a runtime memory gauge wants.
+;; thunk run with f called on every var root this thread writes meanwhile (var-root-set!'s jolt-on-root-change)
+(def-var! "jolt.host" "on-root-change"
+  (lambda (f thunk) (parameterize ((jolt-on-root-change f)) (jolt-invoke0 thunk))))
 (def-var! "jolt.host" "bytes-allocated"      (lambda () (sa-bytes-allocated)))
 (def-var! "jolt.host" "current-memory-bytes" (lambda () (sa-total-memory-bytes)))
 (def-var! "jolt.host" "maximum-memory-bytes" (lambda () (sa-max-memory-bytes)))
