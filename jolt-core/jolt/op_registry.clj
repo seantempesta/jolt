@@ -258,7 +258,12 @@
    ;; var-deref. Emitted bare (call name == op name).
    "protocol-dispatch1" {:call "protocol-dispatch1" :arity #(= % 3)}
    "protocol-dispatch2" {:call "protocol-dispatch2" :arity #(= % 4)}
-   "protocol-dispatch3" {:call "protocol-dispatch3" :arity #(= % 5)}})
+   "protocol-dispatch3" {:call "protocol-dispatch3" :arity #(= % 5)}
+   "protocol-dispatch4" {:call "protocol-dispatch4" :arity #(= % 6)}
+   "protocol-dispatch5" {:call "protocol-dispatch5" :arity #(= % 7)}
+   "protocol-dispatch6" {:call "protocol-dispatch6" :arity #(= % 8)}
+   "protocol-dispatch7" {:call "protocol-dispatch7" :arity #(= % 9)}
+   "protocol-dispatch8" {:call "protocol-dispatch8" :arity #(= % 10)}})
 
 ;; --- derived accessor tables (edit per-op facts above, not here) -------------
 (def native-ops

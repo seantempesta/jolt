@@ -13,14 +13,15 @@
 ;; thread_bytes_allocated), which a collection never lowers and no other
 ;; thread adds to: each arm builds N records into one array and reads the
 ;; difference, so the array's own bytes are outside both readings.
-;; And a call of five to eight arguments allocates nothing.
+;; And a call of five to eight arguments, or of a protocol method of four, allocates nothing.
 ;; Run: target/release/jolt run test/record_ctor_alloc_test.clj
 (require '[jolt.scheme :as scm])
 
 (def thread-bytes
   (scm/eval-string "(foreign-procedure \"(cs)thread_bytes_allocated\" () uptr)"))
 
-(deftype T3 [a b c])
+(defprotocol P4 (m4 [x a b c]))
+(deftype T3 [a b c] P4 (m4 [_ x y z] x))
 (deftype T10 [a b c d e f g h i j])
 (deftype T12 [a b c d e f g h i j k l])
 
@@ -64,4 +65,10 @@
         c8 (quot (let [b0 (thread-bytes)] (dotimes [_ n] (f8 *x* 2 3 4 5 6 7 8)) (- (thread-bytes) b0)) n)]
     (println (str "record-ctor-alloc a call of 5 arguments " c5 " B, of 8 " c8 " B"))
     (when (or (pos? c5) (pos? c8)) (fail! "a call of 5 or 8 arguments allocated " c5 " / " c8 " B")))
+  ;; a protocol method of four parameters: it went to variadic protocol-dispatch,
+  ;; a vector of the extra args made a list and applied (208 B a call)
+  (let [r (T3. 1 2 3)
+        p4 (quot (let [b0 (thread-bytes)] (dotimes [_ n] (m4 r *x* 2 3)) (- (thread-bytes) b0)) n)]
+    (println (str "record-ctor-alloc a 4-parameter protocol call " p4 " B"))
+    (when (pos? p4) (fail! "a 4-parameter protocol call allocated " p4 " B")))
   (println "record-ctor-alloc OK"))

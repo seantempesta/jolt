@@ -1292,7 +1292,7 @@
                   "make-jrec" "jrec-field-at" "jrec-field-set!"
                   "devirt-resolve" "devirt-resolve-fl"
                   "register-clone*" "protocol-resolve"
-                  "protocol-dispatch1" "protocol-dispatch2" "protocol-dispatch3"
+                  "protocol-dispatch1" "protocol-dispatch2" "protocol-dispatch3" "protocol-dispatch4" "protocol-dispatch5" "protocol-dispatch6" "protocol-dispatch7" "protocol-dispatch8"
                   "jolt->fl" "jolt->fx" "jolt->fx-ret"
                   ;; the bit-op inline (bit-fx-ops): its fixnum guard and the
                   ;; four Chez fixnum ops it open-codes to; flonum?/fixnum? also

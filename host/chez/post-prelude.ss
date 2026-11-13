@@ -437,7 +437,12 @@
                   ;; roots and a value built from one is as unwritable as any
                   (cons "protocol-dispatch1" protocol-dispatch1)
                   (cons "protocol-dispatch2" protocol-dispatch2)
-                (cons "protocol-dispatch3" protocol-dispatch3)))
+                (cons "protocol-dispatch3" protocol-dispatch3)
+                (cons "protocol-dispatch4" protocol-dispatch4)
+                (cons "protocol-dispatch5" protocol-dispatch5)
+                (cons "protocol-dispatch6" protocol-dispatch6)
+                (cons "protocol-dispatch7" protocol-dispatch7)
+                (cons "protocol-dispatch8" protocol-dispatch8)))
 
 ;; *compiler-options*' root from JOLT_COMPILER_OPTIONS, an EDN map, read once at
 ;; start: what JVM Clojure takes from the clojure.compiler.* system properties. A

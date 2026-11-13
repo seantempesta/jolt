@@ -2677,6 +2677,21 @@
 (define (protocol-dispatch3 proto-name method-name obj a b)
   ((protocol-resolve proto-name method-name obj) obj a b))
 
+(define (protocol-dispatch4 proto-name method-name obj a b c)
+  ((protocol-resolve proto-name method-name obj) obj a b c))
+
+(define (protocol-dispatch5 proto-name method-name obj a b c d)
+  ((protocol-resolve proto-name method-name obj) obj a b c d))
+
+(define (protocol-dispatch6 proto-name method-name obj a b c d e)
+  ((protocol-resolve proto-name method-name obj) obj a b c d e))
+
+(define (protocol-dispatch7 proto-name method-name obj a b c d e g)
+  ((protocol-resolve proto-name method-name obj) obj a b c d e g))
+
+(define (protocol-dispatch8 proto-name method-name obj a b c d e g h)
+  ((protocol-resolve proto-name method-name obj) obj a b c d e g h))
+
 (define (protocol-dispatch proto-name method-name obj
          rest-args)
   (let ((rest (if (jolt-nil? rest-args)
@@ -4465,6 +4480,31 @@
   "clojure.core"
   "protocol-dispatch3"
   (lambda (pn mn obj a b) (protocol-dispatch3 pn mn obj a b)))
+
+(def-var!
+  "clojure.core"
+  "protocol-dispatch4"
+  (lambda (pn mn obj a b c) (protocol-dispatch4 pn mn obj a b c)))
+
+(def-var!
+  "clojure.core"
+  "protocol-dispatch5"
+  (lambda (pn mn obj a b c d) (protocol-dispatch5 pn mn obj a b c d)))
+
+(def-var!
+  "clojure.core"
+  "protocol-dispatch6"
+  (lambda (pn mn obj a b c d e) (protocol-dispatch6 pn mn obj a b c d e)))
+
+(def-var!
+  "clojure.core"
+  "protocol-dispatch7"
+  (lambda (pn mn obj a b c d e g) (protocol-dispatch7 pn mn obj a b c d e g)))
+
+(def-var!
+  "clojure.core"
+  "protocol-dispatch8"
+  (lambda (pn mn obj a b c d e g h) (protocol-dispatch8 pn mn obj a b c d e g h)))
 
 (def-var!
   "clojure.core"

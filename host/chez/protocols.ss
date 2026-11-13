@@ -1132,6 +1132,18 @@
   ((protocol-resolve proto-name method-name obj) obj a))
 (define (protocol-dispatch3 proto-name method-name obj a b)
   ((protocol-resolve proto-name method-name obj) obj a b))
+;; four to eight parameters, positional as 1-3 are: the variadic fallback below took a vector of
+;; the extra args, made it a list and applied the impl (208 B a 4-parameter call).
+(define (protocol-dispatch4 proto-name method-name obj a b c)
+  ((protocol-resolve proto-name method-name obj) obj a b c))
+(define (protocol-dispatch5 proto-name method-name obj a b c d)
+  ((protocol-resolve proto-name method-name obj) obj a b c d))
+(define (protocol-dispatch6 proto-name method-name obj a b c d e)
+  ((protocol-resolve proto-name method-name obj) obj a b c d e))
+(define (protocol-dispatch7 proto-name method-name obj a b c d e g)
+  ((protocol-resolve proto-name method-name obj) obj a b c d e g))
+(define (protocol-dispatch8 proto-name method-name obj a b c d e g h)
+  ((protocol-resolve proto-name method-name obj) obj a b c d e g h))
 ;; the variadic fallback (a declared arity of 4+ args) takes a seqable rest.
 (define (protocol-dispatch proto-name method-name obj rest-args)
   (let ((rest (if (jolt-nil? rest-args) '() (seq->list rest-args))))

@@ -830,9 +830,9 @@
        (register-protocol-methods! ~pkey [~@(map (fn [s] (name (first s))) sigs)])
        ;; one fn clause per declared arity. The protocol/method NAMES pass as
        ;; strings so the body compiles as a plain invoke (not symbol-as-var). The
-       ;; common 1/2/3-param arities call positional protocol-dispatchN, which
-       ;; applies the impl directly — no rest-list cons; 4+ params fall back to the
-       ;; variadic protocol-dispatch with a vector of the extra args.
+       ;; 1 to 8 params call positional protocol-dispatchN, which applies the impl
+       ;; directly — no rest-list cons; 9+ params fall back to the variadic
+       ;; protocol-dispatch with a vector of the extra args.
        ~@(map (fn [sig]
                 (let [pn pkey
                       mnm (first sig)
@@ -869,6 +869,7 @@
                                    (= n 1) (list ps (list 'clojure.core/protocol-dispatch1 pn mn obj))
                                    (= n 2) (list ps (list 'clojure.core/protocol-dispatch2 pn mn obj (nth ps 1)))
                                    (= n 3) (list ps (list 'clojure.core/protocol-dispatch3 pn mn obj (nth ps 1) (nth ps 2)))
+                                   (<= 4 n 8) (list ps (list* (symbol "clojure.core" (str "protocol-dispatch" n)) pn mn ps))
                                    :else   (list ps (list 'clojure.core/protocol-dispatch pn mn obj (vec (rest ps)))))))]
                   (if (seq arglists)
                     `(def ~(with-meta mnm mmeta) (fn* ~@(map clause arglists)))
