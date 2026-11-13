@@ -1213,7 +1213,7 @@
 
 ;; --- declare the hot clojure.core primitives so resolve-global sees them ------
 ;; Mirrors backend_scheme.clj native-ops keys (op-registry entries with a :call)
-;; minus the internal protocol-dispatch{1,2,3} emit helpers, which are not
+;; minus the internal protocol-dispatch1..8 emit helpers, which are not
 ;; clojure.core names. The emitter lowers each of these inline, so the declared
 ;; cell's unbound root is never deref'd. host/chez/manifest-check.sh fails CI if
 ;; this list drifts from native-ops.

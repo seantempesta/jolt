@@ -2262,6 +2262,20 @@
             (if (and co (vector-ref co i)) (jolt-rec-dbl a) a) ...))
        (args (slow args))))))
 
+(define-syntax jrec-spill-ctor
+  (syntax-rules ()
+    ((_ desc co slow (a ...) (i ...))
+     (case-lambda
+       ((a ...)
+        (make-jrec*
+          desc
+          jolt-nil
+          0
+          (vector
+            (if (and co (vector-ref co i)) (jolt-rec-dbl a) a)
+            ...)))
+       (args (slow args))))))
+
 (define (make-deftype-ctor name-sym field-kws . rest-args)
   (let* ((tag (string-append
                 (chez-current-ns)
@@ -2355,6 +2369,20 @@
                  ((8)
                   (jrec-fixed-ctor make-jrec8 desc co slow
                     (a0 a1 a2 a3 a4 a5 a6 a7) (0 1 2 3 4 5 6 7)))
+                 ((9)
+                  (jrec-spill-ctor desc co slow
+                    (a0 a1 a2 a3 a4 a5 a6 a7 a8) (0 1 2 3 4 5 6 7 8)))
+                 ((10)
+                  (jrec-spill-ctor desc co slow
+                    (a0 a1 a2 a3 a4 a5 a6 a7 a8 a9) (0 1 2 3 4 5 6 7 8 9)))
+                 ((11)
+                  (jrec-spill-ctor desc co slow
+                    (a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10)
+                    (0 1 2 3 4 5 6 7 8 9 10)))
+                 ((12)
+                  (jrec-spill-ctor desc co slow
+                    (a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11)
+                    (0 1 2 3 4 5 6 7 8 9 10 11)))
                  (else (lambda args (slow args))))))
     (class-ctor-set! tag ctor)
     (when (and (not (lazy-shims-provides?
@@ -2677,20 +2705,28 @@
 (define (protocol-dispatch3 proto-name method-name obj a b)
   ((protocol-resolve proto-name method-name obj) obj a b))
 
-(define (protocol-dispatch4 proto-name method-name obj a b c)
+(define (protocol-dispatch4 proto-name method-name obj a b
+         c)
   ((protocol-resolve proto-name method-name obj) obj a b c))
 
-(define (protocol-dispatch5 proto-name method-name obj a b c d)
+(define (protocol-dispatch5 proto-name method-name obj a b c
+         d)
   ((protocol-resolve proto-name method-name obj) obj a b c d))
 
-(define (protocol-dispatch6 proto-name method-name obj a b c d e)
-  ((protocol-resolve proto-name method-name obj) obj a b c d e))
+(define (protocol-dispatch6 proto-name method-name obj a b c
+         d e)
+  ((protocol-resolve proto-name method-name obj) obj a b c d
+    e))
 
-(define (protocol-dispatch7 proto-name method-name obj a b c d e g)
-  ((protocol-resolve proto-name method-name obj) obj a b c d e g))
+(define (protocol-dispatch7 proto-name method-name obj a b c
+         d e g)
+  ((protocol-resolve proto-name method-name obj) obj a b c d e
+    g))
 
-(define (protocol-dispatch8 proto-name method-name obj a b c d e g h)
-  ((protocol-resolve proto-name method-name obj) obj a b c d e g h))
+(define (protocol-dispatch8 proto-name method-name obj a b c
+         d e g h)
+  ((protocol-resolve proto-name method-name obj) obj a b c d e
+    g h))
 
 (define (protocol-dispatch proto-name method-name obj
          rest-args)
@@ -4484,27 +4520,32 @@
 (def-var!
   "clojure.core"
   "protocol-dispatch4"
-  (lambda (pn mn obj a b c) (protocol-dispatch4 pn mn obj a b c)))
+  (lambda (pn mn obj a b c)
+    (protocol-dispatch4 pn mn obj a b c)))
 
 (def-var!
   "clojure.core"
   "protocol-dispatch5"
-  (lambda (pn mn obj a b c d) (protocol-dispatch5 pn mn obj a b c d)))
+  (lambda (pn mn obj a b c d)
+    (protocol-dispatch5 pn mn obj a b c d)))
 
 (def-var!
   "clojure.core"
   "protocol-dispatch6"
-  (lambda (pn mn obj a b c d e) (protocol-dispatch6 pn mn obj a b c d e)))
+  (lambda (pn mn obj a b c d e)
+    (protocol-dispatch6 pn mn obj a b c d e)))
 
 (def-var!
   "clojure.core"
   "protocol-dispatch7"
-  (lambda (pn mn obj a b c d e g) (protocol-dispatch7 pn mn obj a b c d e g)))
+  (lambda (pn mn obj a b c d e g)
+    (protocol-dispatch7 pn mn obj a b c d e g)))
 
 (def-var!
   "clojure.core"
   "protocol-dispatch8"
-  (lambda (pn mn obj a b c d e g h) (protocol-dispatch8 pn mn obj a b c d e g h)))
+  (lambda (pn mn obj a b c d e g h)
+    (protocol-dispatch8 pn mn obj a b c d e g h)))
 
 (def-var!
   "clojure.core"

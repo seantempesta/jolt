@@ -170,13 +170,13 @@ fi
 # resolve-global classifies them (the emitter lowers each inline, so the declared
 # cell's unbound root is never deref'd). The set must mirror jolt.op-registry's
 # native-ops — op-registry entries with a :call — minus the internal
-# protocol-dispatch{1,2,3} emit helpers, which are not clojure.core names. The two
+# protocol-dispatch1..8 emit helpers, which are not clojure.core names. The two
 # live in different layers (.ss vs .clj) and can't derive from each other in code,
 # so this pins them: a new native op that isn't declared (or vice versa) fails here.
 sed -n '/^(def op-registry/,/^;; --- derived accessor tables/p' jolt-core/jolt/op_registry.clj \
   | grep -E '^[[:space:]]*\{?"[^"]+"[[:space:]]+\{.*:call' \
   | grep -oE '^[[:space:]]*\{?"[^"]+"' | grep -oE '"[^"]+"' | tr -d '"' \
-  | grep -vxE 'protocol-dispatch[123]' | LC_ALL=C sort -u > "$tmp/native"
+  | grep -vxE 'protocol-dispatch[1-8]' | LC_ALL=C sort -u > "$tmp/native"
 sed -n '/declare the hot clojure.core primitives/,/^;; --- install/p' host/chez/host-contract.ss \
   | grep -v 'declare-var!' | grep -oE '"[^"]+"' | tr -d '"' | LC_ALL=C sort -u > "$tmp/declare"
 if ! diff -u "$tmp/native" "$tmp/declare" > "$tmp/nd"; then
