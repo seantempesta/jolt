@@ -4178,12 +4178,12 @@
        ;; eliminating jolt-invoke / var-deref / rest-list / ctor call / hashtable
        ;; lookup AND the field vector. After per-site desc-cell warmup the hot
        ;; path is: cell read -> make-jrecN — one allocation, no lookups, no
-       ;; dispatch. The shape comes from the unit's record-shapes (set-record-shapes!).
+       ;; dispatch (past eight fields, a spill record and its field vector). The
+       ;; shape comes from the unit's record-shapes (set-record-shapes!).
        (let [key (str (:ns fnode) "/" (:name fnode))
              shape (get (ctor-shapes) key)]
          (and (= :var (:op fnode)) shape
-              (= (count (get shape :fields)) (count args))
-              (<= (count args) 6)))
+              (= (count (get shape :fields)) (count args))))
        (emit-record-ctor (get (ctor-shapes) (str (:ns fnode) "/" (:name fnode))) arg-nodes args)
       ;; a late-bound :var call head can hold a procedure OR a non-applicable
       ;; value the RT dispatches (multimethod, keyword/coll IFn) — route via
@@ -4697,11 +4697,12 @@
                    (str "(host-static-ref " (chez-str-lit (:class node)) " "
                         (chez-str-lit (:member node)) ")")))
     ;; (R. f …) on a record whose shape the unit knows is its positional ctor,
-    ;; the one (->R f …) already inlines — same arity rule. Anything else (a host
-    ;; class, the JVM's (R. f … meta ext) arity) is the runtime's class lookup.
+    ;; the one (->R f …) already inlines, at any field count (emit-record-ctor
+    ;; spills past eight). Anything else (a host class, the JVM's (R. f … meta
+    ;; ext) arity) is the runtime's class lookup.
     :host-new (let [arg-nodes (:args node)
                     s (record-shape-for-class (:class node))]
-                (if (and s (= (count (get s :fields)) (count arg-nodes)) (<= (count arg-nodes) 6))
+                (if (and s (= (count (get s :fields)) (count arg-nodes)))
                   (emit-record-ctor s arg-nodes (mapv emit arg-nodes))
                   (str "(host-new " (chez-str-lit (:class node))
                        (let [args (map emit arg-nodes)]

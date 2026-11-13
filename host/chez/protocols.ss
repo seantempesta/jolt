@@ -654,6 +654,17 @@
      (case-lambda
        ((a ...) (mk desc jolt-nil 0 (if (and co (vector-ref co i)) (jolt-rec-dbl a) a) ...))
        (args (slow args))))))
+;; Past eight fields the record spills (jrec*: its fields in one vector): the
+;; positional arity builds that vector from its arguments, as the backend's
+;; inline emission does, where the variadic ctor consed a rest list, filled a
+;; field vector and applied make-jrec to it, which turned it back into a list
+;; (a ten-field record: 464 bytes where its vector and record are 144).
+(define-syntax jrec-spill-ctor
+  (syntax-rules ()
+    ((_ desc co slow (a ...) (i ...))
+     (case-lambda
+       ((a ...) (make-jrec* desc jolt-nil 0 (vector (if (and co (vector-ref co i)) (jolt-rec-dbl a) a) ...)))
+       (args (slow args))))))
 (define (make-deftype-ctor name-sym field-kws . rest-args)
   (let* ((tag (string-append (chez-current-ns) "." (symbol-t-name name-sym)))
          (kws (seq->list field-kws))
@@ -735,6 +746,11 @@
                    ((6) (jrec-fixed-ctor make-jrec6 desc co slow (a0 a1 a2 a3 a4 a5) (0 1 2 3 4 5)))
                    ((7) (jrec-fixed-ctor make-jrec7 desc co slow (a0 a1 a2 a3 a4 a5 a6) (0 1 2 3 4 5 6)))
                    ((8) (jrec-fixed-ctor make-jrec8 desc co slow (a0 a1 a2 a3 a4 a5 a6 a7) (0 1 2 3 4 5 6 7)))
+                   ((9) (jrec-spill-ctor desc co slow (a0 a1 a2 a3 a4 a5 a6 a7 a8) (0 1 2 3 4 5 6 7 8)))
+                   ((10) (jrec-spill-ctor desc co slow (a0 a1 a2 a3 a4 a5 a6 a7 a8 a9) (0 1 2 3 4 5 6 7 8 9)))
+                   ((11) (jrec-spill-ctor desc co slow (a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10) (0 1 2 3 4 5 6 7 8 9 10)))
+                   ((12) (jrec-spill-ctor desc co slow (a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11)
+                                          (0 1 2 3 4 5 6 7 8 9 10 11)))
                    (else (lambda args (slow args))))))
     ;; Register the ctor under its fully-qualified tag ("ns.Name") — a bare
     ;; (Name. …) in the DEFINING ns is qualified to this by the analyzer, so a

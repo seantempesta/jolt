@@ -2124,13 +2124,13 @@
             (jolt-with-mutex host-new-cache-mu
               (hashtable-set! host-new-cache class (cons epoch ctor))))
           ctor))))
-(define (host-new class . args)
+(define (host-new-apply class args)
   (let ((ctor (host-new-ctor class)))
     (cond
       (ctor (apply ctor args))
       ;; the constructor may live in a provider that has not loaded yet — autoload
       ;; and retry once before falling through to the var / no-ctor paths.
-      ((lib-try-autoload! class) (apply host-new class args))
+      ((lib-try-autoload! class) (host-new-apply class args))
       ;; deftype/defrecord: the type name is bound as a VAR (the
       ;; make-deftype-ctor closure) in its defining ns, not a registered host class.
       ;; Resolve it in the current ns / clojure.core and invoke it — so (P. args)
@@ -2147,3 +2147,21 @@
                (if (lib-provider-for class)
                    (unknown-class-message class)
                    (string-append "No matching ctor found for class " class)))))))))
+;; (Name. a …) at its arity: a found ctor is called with the arguments as they
+;; came, never consed into a list to apply it (16 bytes a field per object
+;; built: a ten-field record cost 464 bytes where it is 144). Only the arities
+;; a record has inline slots for and a little past are fixed; a longer call and
+;; every miss take host-new-apply.
+(define-syntax host-new-fixed
+  (syntax-rules ()
+    ((_ (a ...) ...)
+     (case-lambda
+       ((class a ...) (let ((ctor (host-new-ctor class)))
+                        (if ctor (ctor a ...) (host-new-apply class (list a ...)))))
+       ...
+       ((class . args) (host-new-apply class args))))))
+(define host-new
+  (host-new-fixed () (a0) (a0 a1) (a0 a1 a2) (a0 a1 a2 a3) (a0 a1 a2 a3 a4)
+                  (a0 a1 a2 a3 a4 a5) (a0 a1 a2 a3 a4 a5 a6) (a0 a1 a2 a3 a4 a5 a6 a7)
+                  (a0 a1 a2 a3 a4 a5 a6 a7 a8) (a0 a1 a2 a3 a4 a5 a6 a7 a8 a9)
+                  (a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10) (a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11)))
