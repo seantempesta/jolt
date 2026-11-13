@@ -2159,8 +2159,20 @@
     ;; published, and the namespace (already loaded) just misses again next run
     (guard (e (else (aot-info (string-append "could not cache " name (ldr-condition-suffix e)))
                     (delete-file tmp-scm #f) (delete-file tmp-so #f) #f))
-      (let ((out (open-output-file tmp-scm 'replace)))
+      (let ((out (open-output-file tmp-scm 'replace))
+            ;; the captured code's line-marker table, carried in the artifact as a binary's
+            ;; unit carries its own (build.ss bld-write-unit!): a frame through a namespace
+            ;; loaded from the cache then finds its line by a lookup in the registered
+            ;; table, never by reading and scanning the whole .scm on its first trace (4.7M
+            ;; ticks for seon.main's largest units, paid by whichever trace came first, so a
+            ;; fork's first trace cost depended on what its parent had indexed). Read off
+            ;; the string as it is written, before anything appended, so no offset moves.
+            (table (jolt-marker-table captured)))
         (put-string out captured)
+        (when (fx>? (vector-length table) 0)
+          (put-string out (string-append "\n;; === source line markers ===\n(jolt-register-marker-table! '"
+                                         (with-output-to-string (lambda () (write (list name))))
+                                         " '" (with-output-to-string (lambda () (write table))) ")")))
         ;; the first-def stamps this load made, replayed against whatever
         ;; file the artifact is loaded for (aot-replay-def-ordinals!)
         (put-string out (format "\n(aot-replay-def-ordinals! '~s)" (reverse (vector-ref stamps 1))))
