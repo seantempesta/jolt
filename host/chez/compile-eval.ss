@@ -373,6 +373,12 @@
                (lambda (a p) a))))
     (sa-profile-compile (lambda () (eval ann (interaction-environment))))))
 
+;; #(compiles hits) of this process's top-level forms: a compile is Chez compiling
+;; a form's emitted text, a hit its code loaded from the cache.
+(define jolt-eval-compile-counts (vector 0 0))
+(define (jolt-ce-count! i)
+  (vector-set! jolt-eval-compile-counts i (fx+ 1 (vector-ref jolt-eval-compile-counts i))))
+
 ;; (with-meta sym m) -> sym, else x — an (ns ^:no-doc name …) yields the name with
 ;; reader metadata as a with-meta form; strip it to read the bare ns symbol.
 (define (ce-unwrap-meta x)
@@ -861,6 +867,7 @@
        ;; the run is a root as much as the compile was: expanding the form ran
        ;; macros, whose tail sites would otherwise be what a throw here reports.
        (jolt-site-reset!)
+       (jolt-ce-count! 0)
        (jolt-run-unit
          (lambda ()
            (if (jolt-ce-trace-frames?)
