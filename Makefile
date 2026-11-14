@@ -123,7 +123,7 @@ endif
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotframetable aotfingerprint asynctimer buildlibsmoke buildsmoke reprobuildsmoke profilebuildsmoke embeddedresources \
   aotcachebudget providerfirstuse fibersecondmutator fiberuncaught fiberunread atomwatchorder varwatchorder buildemptycacheentry aotcachepathsmoke aotcachesourcepathsmoke aotcachestarfilesmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
-  readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling recordctoralloc rootchange forkafterwake forkbesidenative pipereadfailure forkbound flowstuckcontrol evalbydigest forkquiescenthandler zipmemory lazyscaling \
+  readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling recordctoralloc rootchange forkafterwake forkbesidenative pipereadfailure forkbound flowstuckcontrol evalbydigest forkquiescenthandler fifoopenparks blockingopencollects zipmemory lazyscaling \
   devbootsmoke devirt directlink mintgate ffi fibers fiberspoll fieldjoin fieldnum fieldread flarr fnform poolshape coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inferscaling inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance libperf mandelbrot-num mathfl mvnhttp defmetacells staticsite gcpolicy stacklimit lazyretain \
@@ -185,7 +185,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values recordinline corpus nsaudit unit documented grenadine clishim mvnhttp readscaling gcpolicy stacklimit footprint lazyretain compilescaling applyscaling recordctoralloc rootchange forkafterwake forkbesidenative pipereadfailure forkbound flowstuckcontrol evalbydigest forkquiescenthandler lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio stdlibratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
+CI-GATES := submodules values recordinline corpus nsaudit unit documented grenadine clishim mvnhttp readscaling gcpolicy stacklimit footprint lazyretain compilescaling applyscaling recordctoralloc rootchange forkafterwake forkbesidenative pipereadfailure forkbound flowstuckcontrol evalbydigest forkquiescenthandler fifoopenparks blockingopencollects lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio stdlibratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
   smoke tracesmoke errorreport errorkinds buildsmoke embeddedresources reprobuildsmoke profilebuildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym ffiloadfail continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke systemexitsmoke ziparchiveerrors zipreadscopepark zipindexpreempt \
   transient sortedcoll rrbprop rrbscaling stateimage infer inferscaling wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
@@ -1140,6 +1140,13 @@ flowstuckcontrol:
 # A forked child starts with no quiescence handler (the parent's closes over its socket and state)
 forkquiescenthandler:
 	@bin/jolt run test/chez/fork-quiescent-handler-test.clj
+
+# A FIFO's open and reads park their fiber on the poller, both directions, so the main carrier runs on (task
+# jolt.host/a-blocking-call-on-a-main-carrier-parks); a thread waiting in an open or a read leaves the collector running.
+fifoopenparks:
+	@perl -e 'alarm 60; exec @ARGV' bin/jolt run test/chez/fifo-open-parks-test.clj
+blockingopencollects:
+	@perl -e 'alarm 60; exec @ARGV' bin/jolt run test/chez/blocking-open-collects-test.clj
 
 # ::flow/report may drop, never silently: ping's answer carries the count (::flow/report-dropped).
 flowreportdropped:

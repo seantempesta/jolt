@@ -576,7 +576,7 @@
 (define (read-file-bytes path)
   (if (jar-path? path)
       (or (jar-path-bytes path) (jar-path-missing path))
-      (with-port (open-file-input-port path)
+      (with-port (jolt-open-file-input-port path)
         (lambda (p) (let ((bv (get-bytevector-all p))) (if (eof-object? bv) (bytevector) bv))))))
 
 ;; Write an embedded bytevector resource out to a path. make-boot-file needs the
@@ -584,7 +584,7 @@
 (define (jolt-spill-embedded! name path)
   (let ((bv (jolt-embedded-bytes name)))
     (unless bv (error 'jolt-spill-embedded! "no embedded bytes for" name))
-    (with-port (open-file-output-port path (file-options no-fail) (buffer-mode block))
+    (with-port (jolt-open-file-output-port path (file-options no-fail) (buffer-mode block))
       (lambda (p) (put-bytevector p bv)))))
 
 ;; Frame an app boot onto a file that already holds the stub bytes. Layout:
@@ -597,7 +597,7 @@
   (let* ((head (read-file-bytes path))           ; the stub bytes already written
          (lb (make-bytevector 8 0)))
     (bytevector-u64-set! lb 0 (bytevector-length boot-bv) (endianness little))
-    (with-port (open-file-output-port path (file-options no-fail) (buffer-mode block))
+    (with-port (jolt-open-file-output-port path (file-options no-fail) (buffer-mode block))
       (lambda (p)
         (put-bytevector p head)
         (put-bytevector p boot-bv)
@@ -1069,7 +1069,7 @@
             err
             (begin (c-close-fd fd) 0)))
       (guard (e ((i/o-file-already-exists-error? e) io-EEXIST))
-        (close-port (open-file-output-port p (file-options)))
+        (close-port (jolt-open-file-output-port p (file-options)))
         0)))
 
 ;; Temp entries are named and made the JDK's way (TempFileHelper, and
@@ -2576,7 +2576,7 @@
        (or (jar-path-bytes path) (jar-path-missing path))
        (apply read-file-bytes-on-disk path given))))
 (define (read-file-bytes-on-disk path . given)
-  (with-port (open-path-guarded (if (pair? given) (car given) path) path (lambda (p) (open-file-input-port p)))
+  (with-port (open-path-guarded (if (pair? given) (car given) path) path (lambda (p) (jolt-open-file-input-port p)))
     (lambda (p)
       ;; A port with no meaningful length — a fifo, a character device — reports
       ;; 0 or raises; both fall back to the growing read, which is correct for
@@ -3162,7 +3162,7 @@
                   (unless (io-encoding-known? enc)
                     (close-port (open-path-guarded given p
                                   (lambda (rp)
-                                    (open-file-output-port rp
+                                    (jolt-open-file-output-port rp
                                       (if (io-append? opts)
                                           (file-options no-fail no-truncate append)
                                           (file-options no-fail))
@@ -3177,7 +3177,7 @@
     (when (file-directory? p) (file-open-error given p))
     (if (io-append? opts)
         (with-port (open-path-guarded given p
-                     (lambda (rp) (open-file-output-port rp (file-options no-fail no-truncate append)
+                     (lambda (rp) (jolt-open-file-output-port rp (file-options no-fail no-truncate append)
                                                          (buffer-mode block))))
           (lambda (port) (put-bytevector port bytes)))
         ;; In place, as the JVM's FileOutputStream does: a rename REPLACES the
@@ -3188,7 +3188,7 @@
         ;; to overwrite them), so the old tail goes after the write, when there
         ;; is one. A device or fifo reports length 0 and has no tail.
         (with-port (open-path-guarded given p
-                     (lambda (rp) (open-file-output-port rp (file-options no-fail no-truncate)
+                     (lambda (rp) (jolt-open-file-output-port rp (file-options no-fail no-truncate)
                                                          (buffer-mode block))))
           (lambda (port)
             (put-bytevector port bytes)
