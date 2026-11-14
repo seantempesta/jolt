@@ -1934,10 +1934,22 @@
 (define (io-path-may-wait? p)
   (and (string? p) io-c-open-waits (jolt-current-fiber)
        (not (file-regular? p)) (file-exists? p) (not (file-directory? p))))
-;; THUNK's values, the C call it makes run on an OS thread while this fiber parks; off a fiber, here.
-(define (io-elsewhere thunk)
+;; THUNK's values, the C call it makes run on an OS thread while this fiber parks on a promise (the base
+;; runtime's: core.async's thread is not loaded until a program requires it); off a fiber, here. A wait the
+;; fiber's interrupt ends leaves the thread to finish its call; LATE, when given, is applied to what it
+;; answers then (an open's descriptor, closed).
+(define (io-elsewhere thunk . late)
   (if (jolt-current-fiber)
-      (apply values (jolt-fiber-<! (async-go-spawn-thread (lambda () (call-with-values thunk list)))))
+      (let ((p (jolt-promise-new)) (gone (box #f)))
+        (fork-thread/daemon #t
+          (lambda ()
+            (jolt-thread-name-set! (get-thread-id) "jolt-io-wait")
+            (let ((r (guard (e (#t (cons 'raised e))) (cons 'values (call-with-values thunk list)))))
+              (jolt-deliver p r)
+              (when (and (unbox gone) (pair? late) (eq? (car r) 'values))
+                (apply (car late) (cdr r))))))
+        (let ((r (guard (e (#t (set-box! gone #t) (raise e))) (jolt-promise-deref p))))
+          (if (eq? (car r) 'raised) (raise (cdr r)) (apply values (cdr r)))))
       (thunk)))
 (define (io-c-path p)
   (let* ((bv (string->utf8 p)) (n (bytevector-length bv)) (m (sa-foreign-alloc (fx+ n 1))))
@@ -1946,7 +1958,8 @@
     m))
 (define (io-open-elsewhere p flags)
   (let ((cp (io-c-path p)))
-    (let-values (((fd err) (io-elsewhere (lambda () (io-c-open-waits cp (fxior flags io-O-CLOEXEC))))))
+    (let-values (((fd err) (io-elsewhere (lambda () (io-c-open-waits cp (fxior flags io-O-CLOEXEC)))
+                                         (lambda (fd err) (when (>= fd 0) (proc-c-close fd))))))
       (sa-foreign-free cp)
       (when (< fd 0)
         (raise (condition (if (= err 13) (make-i/o-file-protection-error p) (make-i/o-filename-error p))
