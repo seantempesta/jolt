@@ -683,7 +683,7 @@
     ;; closes the ends it inherited), oldest first
     (for-each (lambda (h) (h)) (reverse jolt-after-fork-hooks))))
 (def-var! "jolt.host" "after-fork-child!" (lambda () (jolt-after-fork-child!) jolt-nil))
-;; (jolt.host/fork-alone [ms]) -> the child's pid in the parent, 0 in the child, -3 when no other
+;; (jolt.host/fork-alone ms) -> the child's pid in the parent, 0 in the child, -3 when no other
 ;; thread parked within ms. The one way to fork a jolt process. A fork beside a
 ;; thread running Scheme gives the child that thread's half-done work, so Chez's fork_alone waits,
 ;; under the tc mutex, for every other thread to park (in a wait or a collect-safe call), woken by
@@ -698,19 +698,16 @@
 ;; nothing of a platform without fork(2).
 (define jolt-fork-alone
   (let ((fork-alone #f))
-    (case-lambda
-      (() (jolt-fork-alone -1))
-      ((bound-ms)
-       (unless fork-alone (set! fork-alone (foreign-procedure "(cs)fork_alone" (iptr) int)))
-       (disable-interrupts)
-       (let ((pid (fork-alone bound-ms)))
-         (when (= pid 0) (jolt-after-fork-child!))
-         (enable-interrupts)
-         pid)))))
-;; (jolt.host/fork-alone) waits with no bound; (jolt.host/fork-alone ms) answers -3 when no other thread
-;; has parked within ms, and (jolt.host/fork-holders) then names who held it.
-(def-var! "jolt.host" "fork-alone"
-  (case-lambda (() (jolt-fork-alone)) ((ms) (jolt-fork-alone (jnum->exact ms)))))
+    (lambda (bound-ms)
+      (unless fork-alone (set! fork-alone (foreign-procedure "(cs)fork_alone" (iptr) int)))
+      (disable-interrupts)
+      (let ((pid (fork-alone bound-ms)))
+        (when (= pid 0) (jolt-after-fork-child!))
+        (enable-interrupts)
+        pid))))
+;; (jolt.host/fork-alone ms): every fork states its bound; -3 when no other thread has parked within ms, and
+;; (jolt.host/fork-holders) then names who held it. There is no unbounded wait.
+(def-var! "jolt.host" "fork-alone" (lambda (ms) (jolt-fork-alone (jnum->exact ms))))
 ;; (jolt.host/fork-holders) -> [{:id n :name s} ...]: the threads other than this one that hold a fork now (Chez
 ;; fork_hold_state: active, running Scheme or in a C call that is not collect-safe), what a fork's bound names
 (define jolt-fork-holders

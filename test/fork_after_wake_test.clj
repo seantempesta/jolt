@@ -7,7 +7,7 @@
 (require '[clojure.core.async :as a] '[jolt.scheme :as scm])
 (def exit-now (scm/eval-string "(foreign-procedure \"_exit\" (int) void)"))
 (def wait-exit (scm/eval-string "(let ([waitpid (foreign-procedure \"waitpid\" (int uptr int) int)]) (lambda (pid) (let ([b (foreign-alloc 4)]) (waitpid pid b 0) (foreign-free b) 0)))"))
-(defn try-fork [] (let [pid (jolt.host/fork-alone)] (cond (zero? pid) (exit-now 0) (neg? pid) :refused :else (do (wait-exit pid) :forked))))
+(defn try-fork [] (let [pid (jolt.host/fork-alone 10000)] (cond (zero? pid) (exit-now 0) (neg? pid) :refused :else (do (wait-exit pid) :forked))))
 (let [c (a/chan)
       _ (a/go (a/<! c))
       n 100

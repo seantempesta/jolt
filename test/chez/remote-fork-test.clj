@@ -24,7 +24,7 @@
 (defn- run-child [g pid child]
   (let [to (a/chan 256)]
     (flow/update! g (fn [c] (assoc-in c [:procs (keyword (str (name pid) "-sink"))] {:proc (flow/process #'sink) :args {:to to}})))
-    (let [forked (rflow/fork! g pid child {:conns [[[pid :out] [(keyword (str (name pid) "-sink")) :in]]]})
+    (let [forked (rflow/fork! g pid child {:fork-wait-ms 10000 :conns [[[pid :out] [(keyword (str (name pid) "-sink")) :in]]]})
           got (loop [acc []] (let [v (a/<!! to)] (if (and (map? v) (::flow/closed v)) (conj acc v) (recur (conj acc v)))))]
       [forked got])))
 

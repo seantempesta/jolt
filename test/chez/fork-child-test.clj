@@ -15,7 +15,7 @@
 
 ;; the one way to fork: jolt.host/fork-alone counts the active threads and forks under Chez's
 ;; $tc-mutex, and the child has reset itself before interrupts return
-(defn fork-alone [_reset?] (jolt.host/fork-alone))
+(defn fork-alone [_reset?] (jolt.host/fork-alone 10000))
 (def wait-exit
   (scm/eval-string
     "(let ([waitpid (foreign-procedure \"waitpid\" (int uptr int) int)])
