@@ -65,6 +65,10 @@ done
 age 3600 "$(art a so)" "$(art a scm)"
 age 2400 "$(art b so)" "$(art b scm)"
 age 1200 "$(art c so)" "$(art c scm)"
+# the runs' own -e forms are cached too (loader.ss aot-form-code, v1/forms), in the same budget: aged oldest, so they
+# go first and the namespace artifacts are evicted in the order this test sets
+forms="$(find "$cache" -path '*/forms/*' -type f)"
+[ -z "$forms" ] || age 7200 $forms
 one="$(bytes "$(art b so)" "$(art b scm)")"
 three="$(bytes "$(art a so)" "$(art a scm)" "$(art b so)" "$(art b scm)" "$(art c so)" "$(art c scm)")"
 
