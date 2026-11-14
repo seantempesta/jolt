@@ -589,7 +589,9 @@
 (define proc-fa-close   (jolt-foreign-proc-safe "posix_spawn_file_actions_addclose" '(void* int) 'int))
 (define proc-fa-destroy (jolt-foreign-proc-safe "posix_spawn_file_actions_destroy"  '(void*) 'int))
 (define proc-c-spawn (jolt-foreign-proc-safe "posix_spawn" '(void* string void* void* void* void*) 'int))
-(define proc-c-read  (jolt-foreign-proc-blocking "read"  '(int void* size_t) 'ssize_t))
+;; (values got errno): the errno is the read's own (rt.ss jolt-foreign-proc-blocking-errno)
+(define proc-c-read  (jolt-foreign-proc-blocking-errno "read"  '(int void* size_t) 'ssize_t))
+(define proc-c-write-errno (jolt-foreign-proc-blocking-errno "write" '(int void* size_t) 'ssize_t))
 
 ;; posix_spawn_file_actions_addclosefrom_np(fa, 3): one file action that closes
 ;; every descriptor at or above 3 in the child, after the dup2s below have put
@@ -644,7 +646,7 @@
 ;; path means falling back to Chez's fork with SIGINT ignored in the child.
 (define proc-spawn-fd-ok?
   (and proc-c-pipe proc-c-close proc-fa-init proc-fa-dup2 proc-fa-close
-       proc-fa-destroy proc-c-spawn proc-c-read proc-c-write #t))
+       proc-fa-destroy proc-c-spawn proc-c-read proc-c-write-errno #t))
 
 ;; marshal a string list into a NULL-terminated char**; returns (array . cstrs)
 ;; so the caller can free every allocation once posix_spawn has copied them.
@@ -827,7 +829,7 @@
                   ;; top of every iteration: a fiber woken by a shut resumes here
                   (if (proc-fd-shut-now? l)
                       0
-                      (let ((got (proc-c-read fd buf want)))
+                      (let-values (((got err) (proc-c-read fd buf want)))
                         (cond
                           ((> got 0)
                            (proc-buf->bv! buf bv start got scratch)
@@ -835,15 +837,19 @@
                           ;; the write end is gone and nothing more can arrive: let
                           ;; go of the descriptor now (released when this read leaves)
                           ((= got 0) (proc-fd-shut! l) 0)
-                          ((= (proc-errno) proc-EINTR) (retry))
-                          ((= (proc-errno) proc-EAGAIN)
+                          ((= err proc-EINTR) (retry))
+                          ((= err proc-EAGAIN)
                            (if (proc-poller-wait-ready fd (jolt-keyword "read"))
                                (retry)
                                (begin
                                  (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
                                    (proc-fcntl-set fd proc-F-SETFL (fxand flags (fxnot proc-O-NONBLOCK))))
                                  (retry))))
-                          (else 0)))))))))
+                          ;; a read that failed is never the end of the output: the
+                          ;; caller is told why, as the JVM's FileInputStream.read is
+                          (else (throw-jvm (quote java.io.IOException)
+                                  (string-append "read of child pipe fd " (number->string fd)
+                                                 " failed: errno " (number->string err))))))))))))
         #f #f
         (lambda () (proc-fd-shut! l)))
       l)))
@@ -866,18 +872,18 @@
                   ;; lands on
                   (if (proc-fd-shut-now? l)
                       (shut-write)
-                      (let ((wrote (proc-c-write fd buf want)))
+                      (let-values (((wrote err) (proc-c-write-errno fd buf want)))
                         (cond
                           ((>= wrote 0) wrote)
-                          ((= (proc-errno) proc-EINTR) (retry))
-                          ((= (proc-errno) proc-EAGAIN)
+                          ((= err proc-EINTR) (retry))
+                          ((= err proc-EAGAIN)
                            (if (proc-poller-wait-ready fd (jolt-keyword "write"))
                                (retry)
                                (begin
                                  (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
                                    (proc-fcntl-set fd proc-F-SETFL (fxand flags (fxnot proc-O-NONBLOCK))))
                                  (retry))))
-                          (else (error 'process "write to child failed" fd))))))))))
+                          (else (error 'process "write to child failed: fd, errno" fd err))))))))))
         #f #f
         (lambda () (proc-fd-shut! l)))
       l)))
@@ -1082,9 +1088,9 @@
 (define (proc-await-exec fd)
   (let ((buf (sa-foreign-alloc 1)))
     (let retry ()
-      (let ((got (proc-c-read fd buf 1)))
+      (let-values (((got err) (proc-c-read fd buf 1)))
         (cond ((> got 0) (retry))
-              ((and (< got 0) (= (proc-errno) proc-EINTR)) (retry))
+              ((and (< got 0) (= err proc-EINTR)) (retry))
               (else #f))))
     (sa-foreign-free buf)
     (proc-c-close fd)))

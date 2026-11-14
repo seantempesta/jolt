@@ -140,6 +140,28 @@
                         (sa-foreign-procedure-blocking name args res)))))
          #'(if (eq? (sa-os-family) 'windows) win unx))))))
 
+;; Same, answering (values result errno), errno captured at the call's own boundary (Chez's __errno
+;; convention, saved before the thread reactivates). A read of errno in a later call is not the call's:
+;; between the two this thread may collect or, on a fiber, be preempted for another fiber, and an EAGAIN
+;; read as another errno ended a child's output as if it were complete (seon.lib/sh, `git status` exit 0
+;; with no output, 2026-11-12). Windows (no literal convention at boot, see io-errno-loc) reads the
+;; location right after the call.
+(define-syntax jolt-foreign-proc-blocking-errno
+  (lambda (x)
+    (syntax-case x (quote)
+      ((_ name (quote args) (quote res))
+       (with-syntax
+           ((win #'(let ((p (jolt-foreign-proc-blocking name (quote args) (quote res))))
+                     (and p (lambda xs
+                              (let ((loc (and io-errno-loc (io-errno-loc))))
+                                (let ((r (apply p xs)))
+                                  (values r (if loc (sa-foreign-ref 'int loc 0) 0))))))))
+            (unx #'(guard (e (#t #f))
+                   (sa-load-shared-object #f)
+                   (and (sa-foreign-entry? name)
+                        (sa-foreign-procedure-native-error __errno (__collect_safe) name args res)))))
+         #'(if (eq? (sa-os-family) 'windows) win unx))))))
+
 ;; --- the process's output streams ---------------------------------------------
 ;; On the JVM, System.out and System.err are PrintStreams, and a PrintStream never
 ;; throws: when the descriptor stops taking output (the reader of the pipe went

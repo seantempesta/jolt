@@ -123,7 +123,7 @@ endif
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotframetable aotfingerprint asynctimer buildlibsmoke buildsmoke reprobuildsmoke profilebuildsmoke embeddedresources \
   aotcachebudget providerfirstuse fibersecondmutator fiberuncaught fiberunread atomwatchorder varwatchorder buildemptycacheentry aotcachepathsmoke aotcachesourcepathsmoke aotcachestarfilesmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
-  readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling recordctoralloc rootchange forkafterwake forkbesidenative zipmemory lazyscaling \
+  readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling recordctoralloc rootchange forkafterwake forkbesidenative pipereadfailure zipmemory lazyscaling \
   devbootsmoke devirt directlink mintgate ffi fibers fiberspoll fieldjoin fieldnum fieldread flarr fnform poolshape coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inferscaling inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance libperf mandelbrot-num mathfl mvnhttp defmetacells staticsite gcpolicy stacklimit lazyretain \
@@ -185,7 +185,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values recordinline corpus nsaudit unit documented grenadine clishim mvnhttp readscaling gcpolicy stacklimit footprint lazyretain compilescaling applyscaling recordctoralloc rootchange forkafterwake forkbesidenative lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio stdlibratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
+CI-GATES := submodules values recordinline corpus nsaudit unit documented grenadine clishim mvnhttp readscaling gcpolicy stacklimit footprint lazyretain compilescaling applyscaling recordctoralloc rootchange forkafterwake forkbesidenative pipereadfailure lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio stdlibratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
   smoke tracesmoke errorreport errorkinds buildsmoke embeddedresources reprobuildsmoke profilebuildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym ffiloadfail continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke systemexitsmoke ziparchiveerrors zipreadscopepark zipindexpreempt \
   transient sortedcoll rrbprop rrbscaling stateimage infer inferscaling wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
@@ -840,6 +840,10 @@ forkafterwake: testbin
 # A fork beside threads on their way into a collect-safe read is made: entering C wakes a waiting fork (Chez Sdeactivate_thread)
 forkbesidenative: testbin
 	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/fork_beside_native_entry_test.clj
+
+# A child pipe's failed read raises naming its errno, captured at the call (rt.ss jolt-foreign-proc-blocking-errno)
+pipereadfailure: testbin
+	@JOLT_NO_USER_DEPS=1 target/release/jolt run test/pipe_read_failure_test.clj
 
 # Peak memory of the java.util.zip streams: 100 MB through GZIPOutputStream or
 # GZIPInputStream peaks within 2 MB of 1 MB. It reads the live heap, not the
