@@ -1966,13 +1966,16 @@
                           (make-who-condition 'open)
                           (make-message-condition (string-append "open failed: errno " (number->string err))))))
       fd)))
+;; The child-pipe ports are process.ss's, which loads lazily (on a first ProcessBuilder): asked for here, so a
+;; program that has started no process can open a FIFO (it was "variable ... is not bound" under jolt -e).
+(define (io-pipe-ports!) (lazy-shim-load! "host/chez/java/process.ss" "a FIFO's port"))
 (define (jolt-open-file-input-port p . rest)
   (if (io-path-may-wait? p)
-      (proc-fd-input-port (io-open-elsewhere p 0) io-elsewhere)
+      (begin (io-pipe-ports!) (proc-fd-input-port (io-open-elsewhere p 0) io-elsewhere))
       (apply open-file-input-port p rest)))
 (define (jolt-open-file-output-port p . rest)
   (if (io-path-may-wait? p)
-      (proc-fd-output-port (io-open-elsewhere p io-O-WRONLY) io-elsewhere)
+      (begin (io-pipe-ports!) (proc-fd-output-port (io-open-elsewhere p io-O-WRONLY) io-elsewhere))
       (apply open-file-output-port p rest)))
 
 ;; Sleeps until fd has something to read, hangs up or errors, or the thread is
