@@ -221,6 +221,7 @@ namespace-for
 ns-shaped-name?
 ns-source
 on-quiescent!
+on-root-change
 park-until-interrupt
 pop
 process-footprint-bytes
