@@ -1146,8 +1146,10 @@
 ;; (compile-eval.ss jolt-ce-run-emitted), as the thunk that runs it: read from
 ;; <generation>/v1/forms/KEY.so when a process published it, else made from
 ;; COMPILE's bytes (compile-to-port's fasl) and published there by temp and rename
-;; for every later process. Same generation, byte budget and pruning as a
-;; namespace's artifacts (aot-cache-artifacts walks forms/). An entry that is not
+;; for every later process. Same generation and byte budget as a namespace's
+;; artifacts (aot-cache-artifacts walks forms/), pruned when a namespace publishes, never
+;; here: the walk is over the whole cache (~320 MB allocated at 36k entries), and a forked
+;; agent's first new form would pay it every start. An entry that is not
 ;; such a fasl (truncated, overwritten) is a miss, compiled and published anew, as
 ;; a namespace's corrupt .so is; a cache this process cannot write still answers
 ;; the compiled code. Reading is apart from running: what the code raises when it
@@ -1166,8 +1168,7 @@
                      (out (open-file-output-port tmp (file-options no-fail))))
                 (put-bytevector out bv)
                 (close-port out)
-                (rename-replace! tmp so)))
-            (aot-prune-to-budget-once!))
+                (rename-replace! tmp so))))
           (or (aot-code-thunk bv)
               (error 'aot-form-code "compile-to-port wrote no code" key))))))
 ;; The thunk that runs the code BV holds as load-compiled-from-port runs it (Chez
