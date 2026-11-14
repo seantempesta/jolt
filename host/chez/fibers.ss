@@ -870,10 +870,16 @@
 ;; The registry then lists only the child's own fibers: a 'forked one is no work of this process,
 ;; so its quiescence, its deadlock check and its dump never count it (a child whose own work waited
 ;; was never quiescent while it held its parent's go loops: fiber-quiescent-test's fork case).
+;; What a parked fiber waits on, retired in a forked child (async.ss sets it: a channel's alt-handler is made
+;; inactive). The fiber is the parent's and never runs here, but its take or put stood on the channel, so a put
+;; in the child was taken by it and lost (gate forkparkedfiber, 2026-11-14). #f until async.ss loads.
+(define jolt-fiber-retire-wait! #f)
 (define (jolt-fibers-forget-the-parents!)
   (let ((self (jolt-current-fiber)))
     (for-each (lambda (f)
                 (unless (or (eq? f self) (memq (jolt-fiber-state f) '(done dead)))
+                  (let ((h (jolt-fiber-parked-on f)))
+                    (when (and h jolt-fiber-retire-wait!) (jolt-fiber-retire-wait! h)))
                   (jolt-fiber-state-set! f 'forked)
                   (jolt-fiber-next-set! f #f)))
               (jolt-fiber-registry-live))
