@@ -123,7 +123,7 @@ endif
 JOLT-TARGETS-NEEDING-DEPS := \
   aotcacheperf aotcachesmoke aotframetable aotfingerprint asynctimer buildlibsmoke buildsmoke reprobuildsmoke profilebuildsmoke embeddedresources \
   aotcachebudget providerfirstuse fibersecondmutator fiberuncaught fiberunread atomwatchorder varwatchorder buildemptycacheentry aotcachepathsmoke aotcachesourcepathsmoke aotcachestarfilesmoke compilepathsmoke contagion corpus cts dcerefs depssmoke depsunit devboot \
-  readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling recordctoralloc rootchange forkafterwake forkbesidenative pipereadfailure forkbound zipmemory lazyscaling \
+  readscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling applyscaling recordctoralloc rootchange forkafterwake forkbesidenative pipereadfailure forkbound flowstuckcontrol zipmemory lazyscaling \
   devbootsmoke devirt directlink mintgate ffi fibers fiberspoll fieldjoin fieldnum fieldread flarr fnform poolshape coreproc grenadine \
   gateboot gatebootsmoke gosm hasheq httpsfetch infer inferscaling inline inline-body irvalidate statlayout \
   jolt jolt-debug jolt-release joltsmoke libconformance libperf mandelbrot-num mathfl mvnhttp defmetacells staticsite gcpolicy stacklimit lazyretain \
@@ -185,7 +185,7 @@ install: build
 # naming the covered tree is written ONLY on a complete pass. `make gate-status`
 # answers "is this working tree gated?" — which is not something to remember.
 
-CI-GATES := submodules values recordinline corpus nsaudit unit documented grenadine clishim mvnhttp readscaling gcpolicy stacklimit footprint lazyretain compilescaling applyscaling recordctoralloc rootchange forkafterwake forkbesidenative pipereadfailure forkbound lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio stdlibratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
+CI-GATES := submodules values recordinline corpus nsaudit unit documented grenadine clishim mvnhttp readscaling gcpolicy stacklimit footprint lazyretain compilescaling applyscaling recordctoralloc rootchange forkafterwake forkbesidenative pipereadfailure forkbound flowstuckcontrol lazyscaling vecscaling pipescaling chunkscaling printscaling complexity ioscaling hotscaling fastpathratio stdlibratio depssmoke taskssmoke scriptsmoke exitwait completionssmoke depscpcache depsunit \
   smoke tracesmoke errorreport errorkinds buildsmoke embeddedresources reprobuildsmoke profilebuildsmoke buildlibsmoke staticnativesmoke zlibregistersmoke sci scifunctional cts loaderconf ffi ffidupsym ffiloadfail continuations stdlibfasl zlibunit depsnounzip zlibnativesmoke zipmemory noexecsmoke systemexitsmoke ziparchiveerrors zipreadscopepark zipindexpreempt \
   transient sortedcoll rrbprop rrbscaling stateimage infer inferscaling wp devirt fieldread numwp fieldnum fieldjoin contagion \
   hasheq narrowhash \
@@ -1127,6 +1127,10 @@ flow:
 # flow/update! changes a running flow in place; a change rewires only the out coords it touches.
 flowupdate:
 	@bin/jolt run test/chez/flow-update-test.clj
+
+# A stuck step never wedges the graph's control: pause, ping and stop answer, stop ends at its bound, the proc exits once released.
+flowstuckcontrol:
+	@bin/jolt run test/chez/flow-stuck-control-test.clj
 
 # ::flow/report may drop, never silently: ping's answer carries the count (::flow/report-dropped).
 flowreportdropped:
