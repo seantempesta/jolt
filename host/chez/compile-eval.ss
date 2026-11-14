@@ -598,12 +598,13 @@
   (format "~a ~s ~s ~s ~s\n" (if traced "traced" "plain") (optimize-level) (debug-level)
           (generate-inspector-information) (generate-procedure-source-information)))
 
-;; Is a form's compiled code reused? Not under JOLT_AOT_CACHE=0, nor while
-;; jolt.profile instruments (its counters are this process's), nor for a runtime
-;; with no fingerprint.
+;; A form's compiled code reused by digest: #f here, so an image without loader.ss (a state image, the
+;; fn-form mint) compiles every form; loader.ss sets it to the procedure that answers the code for a key's text
+;; (aot-form-code) when the cache may hold it for this form, else #f. Not while jolt.profile instruments (its
+;; counters are this process's).
+(define jolt-ce-form-cache #f)
 (define (jolt-ce-reuse?)
-  (and (aot-cache-enabled?) (not (sa-profile-instrumenting?)) (not (compile-profile))
-       (aot-runtime-fingerprint) #t))
+  (and jolt-ce-form-cache (not (sa-profile-instrumenting?)) (not (compile-profile)) (jolt-ce-form-cache 'ok?)))
 
 ;; Compile and run SCM, FORM's emitted Scheme whose labels were numbered in
 ;; (LO, HI]: its code from the cache when a process compiled the same renumbered
@@ -613,12 +614,12 @@
         (text (and (jolt-ce-reuse?) (jolt-ce-renumber scm lo hi))))
     (cond
       (text
-       (let* ((key (aot-text-key (string-append (jolt-ce-compile-tag traced) text)))
+       (let* ((keytext (string-append (jolt-ce-compile-tag traced) text))
               (name (and traced
                          (jolt-register-eval-marker-table-as!
-                          (string-append "jolt-eval-src-" key) text (hc-form-position form) written ns)))
+                          (string-append "jolt-eval-src-" (jolt-ce-form-cache 'key keytext)) text (hc-form-position form) written ns)))
               (compiled #f)
-              (run (aot-form-code key
+              (run (jolt-ce-form-cache 'code keytext
                       (lambda ()
                         (set! compiled #t)
                         (let-values (((port get) (open-bytevector-output-port)))

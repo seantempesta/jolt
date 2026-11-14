@@ -1136,6 +1136,9 @@
                   (fxlogand (fx* (fxlogxor h1 c) 16777619) #xFFFFFFFF)
                   (fxlogand (fx+ (fx* (fxlogxor h2 (fxsrl h2 15)) #x5bd1e9) c) #xFFFFFFFF)))))))
 
+;; Off while an install-owned file loads from source: its forms are the runtime's, covered by its fingerprint,
+;; and cache nothing (aot-cache-smoke (i)).
+(define aot-form-cache-off (make-parameter #f))
 ;; One top-level form's compiled code by KEY, the digest of its renumbered text
 ;; (compile-eval.ss jolt-ce-run-emitted), as the thunk that runs it: read from
 ;; <generation>/v1/forms/KEY.so when a process published it, else made from
@@ -1185,6 +1188,15 @@
 (define (aot-info msg)
   (when (getenv "JOLT_DEBUG")
     (display (string-append "[jolt.aot] " msg "\n") (current-error-port))))
+
+;; compile-eval.ss's form cache: whether this form may use it now, a text's key, and the code for a text.
+(set! jolt-ce-form-cache
+  (lambda (op . args)
+    (case op
+      ((ok?) (and (aot-cache-enabled?) (not (aot-form-cache-off)) (aot-runtime-fingerprint) #t))
+      ((key) (aot-text-key (car args)))
+      ((code) (aot-form-code (aot-text-key (car args)) (cadr args))))))
+
 
 ;; --- compile-time relevance (AOT key narrowing) -------------------------------
 ;; A namespace's fasl bakes in what its DEPENDENCIES contributed at COMPILE
@@ -2426,7 +2438,7 @@
      (parameterize ((aot-dep-sink #f) (io-file-read-sink #f))
        (unless (jolt-load-embedded-fasl! name file)
          ;; embedded fasl registered but failed to load: fall back to source.
-         (ldr-wrapping (lambda () (load-jolt-file file))))))
+         (parameterize ((aot-form-cache-off #t)) (ldr-wrapping (lambda () (load-jolt-file file)))))))
     ((and (aot-cache-enabled?) (not force?) (not (ldr-reload-all?))
           ;; jolt.profile counts code it compiled itself: a cached fasl carries no
           ;; counters, and what an instrumented compile would write to the cache
@@ -2471,7 +2483,7 @@
      ;; a reload bypasses the cache, and whatever key this process read for the
      ;; namespace before may no longer describe its source
      (when force? (aot-forget-own-key! name))
-     (parameterize ((aot-dep-sink #f) (io-file-read-sink #f))
+     (parameterize ((aot-dep-sink #f) (io-file-read-sink #f) (aot-form-cache-off (ldr-install-file? file)))
        (ldr-wrapping (lambda () (load-jolt-file file)))))))
 
 ;; Mark a namespace as loaded in both the host hashtable and the *loaded-libs* ref.
