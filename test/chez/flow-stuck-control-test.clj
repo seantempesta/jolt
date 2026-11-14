@@ -35,5 +35,18 @@
   ;; released, the proc sees its control closed and runs its stop transition, then exits
   (deliver gate true)
   (when (= ::late (deref stopped 3000 ::late)) (fail! "the released proc never ran its stop transition"))
+  ;; update! removing three stuck procs stops them under one deadline, not one bound each (E3b: 913 ms against 300)
+  (let [gate3 (promise)
+        stuck3 (fn ([] {:ins {:in "x"} :outs {} :workload :io}) ([_] {}) ([s _] s) ([s _ m] @gate3 [s {}]))
+        cfg {:procs (into {} (for [k [:a :b :c]] [k {:proc (flow/process stuck3)}])) :conns []}
+        g3 (flow/create-flow (assoc cfg :stop-timeout-ms 300))]
+    (flow/start g3)
+    (flow/resume g3)
+    (doseq [k [:a :b :c]] @(flow/inject g3 [k :in] [1]))
+    (Thread/sleep 50)
+    (let [t0 (System/nanoTime) _ (within 5000 #(flow/update! g3 {:procs {} :conns []})) ms (/ (- (System/nanoTime) t0) 1e6)]
+      (when (> ms 700) (fail! "update! removing 3 stuck procs took " ms " ms against one 300 ms bound")))
+    (deliver gate3 true)
+    (within 5000 #(flow/stop g3)))
   (println "FLOW-STUCK-CONTROL-TEST OK")
   (System/exit 0))
