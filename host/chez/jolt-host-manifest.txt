@@ -100,6 +100,7 @@ file-mtime
 find-var
 fn-form-parse
 fork-alone
+fork-alone-cancel!
 form-bigdec-source
 form-bigdec-value-source
 form-bigdec-value?

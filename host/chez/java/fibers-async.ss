@@ -683,28 +683,32 @@
     ;; closes the ends it inherited), oldest first
     (for-each (lambda (h) (h)) (reverse jolt-after-fork-hooks))))
 (def-var! "jolt.host" "after-fork-child!" (lambda () (jolt-after-fork-child!) jolt-nil))
-;; (jolt.host/fork-alone) -> the child's pid in the parent, 0 in the child, -2 when the fork is
-;; refused because another thread is running Scheme at that instant (a fork beside one breaks the
-;; child). The one way to fork a jolt process: the count and the fork are made under Chez's
-;; $tc-mutex with interrupts disabled, and the child resets itself (jolt-after-fork-child!)
-;; BEFORE interrupts return. A caller that enabled them first let a preemption switch the child
-;; to the scheduler over the parent's run queue, which ran the parent's ready fibers in the child
-;; (a Seon root's agents, 2026-11-10). The foreign entry is made at the first call, so loading
-;; this file asks nothing of a platform without fork(2).
+;; (jolt.host/fork-alone) -> the child's pid in the parent, 0 in the child, -2 when
+;; jolt.host/fork-alone-cancel! ended its wait. The one way to fork a jolt process. A fork beside a
+;; thread running Scheme gives the child that thread's half-done work, so Chez's fork_alone waits,
+;; under the tc mutex, for every other thread to park (in a wait or a collect-safe call), woken by
+;; each one that does and never by a clock, and forks then: a thread that had just woken this one
+;; (the timer delivering, a carrier) is still finishing its turn for a moment, and the fork used to
+;; refuse beside it (3 in 100 right after a timeout; an agent clone's "cannot fork"). A thread that
+;; never parks is one no fork is safe beside: the caller's bound ends that wait with the cancel.
+;; Interrupts stay disabled across it, and the child resets itself (jolt-after-fork-child!) BEFORE
+;; they return: a caller that enabled them first let a preemption switch the child to the scheduler
+;; over the parent's run queue, which ran the parent's ready fibers in the child (a Seon root's
+;; agents, 2026-11-10). The foreign entries are made at the first call, so loading this file asks
+;; nothing of a platform without fork(2).
 (define jolt-fork-alone
-  (let ((fork #f))
+  (let ((fork-alone #f))
     (lambda ()
-      (unless fork (set! fork (foreign-procedure "fork" () int)))
+      (unless fork-alone (set! fork-alone (foreign-procedure "(cs)fork_alone" () int)))
       (disable-interrupts)
-      ;; through the counting wrapper, as the collector's rendezvous takes this mutex
-      ;; (scheme-adapter-runtime.ss): every lock the runtime takes is one it can tell it holds
-      (jolt-lock! #%$tc-mutex)
-      (let ((pid (if (= (jolt-active-threads) 1) (fork) -2)))
-        (jolt-unlock! #%$tc-mutex)
+      (let ((pid (fork-alone)))
         (when (= pid 0) (jolt-after-fork-child!))
         (enable-interrupts)
         pid))))
 (def-var! "jolt.host" "fork-alone" (lambda () (jolt-fork-alone)))
+(def-var! "jolt.host" "fork-alone-cancel!"
+  (let ((cancel #f))
+    (lambda () (unless cancel (set! cancel (foreign-procedure "(cs)fork_alone_cancel" () void))) (cancel) jolt-nil)))
 ;; (jolt.host/fiber-pump!): this fiber is a remote end's pump: never told a deadlock, not counted by a
 ;; quiescence check (its record's pump field). (jolt.host/on-quiescent! f): f, or nil, hears a main
 ;; carrier's quiescence with the dump (fibers.ss jolt-quiescent?).
