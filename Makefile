@@ -1143,10 +1143,11 @@ forkquiescenthandler:
 
 # A FIFO's open and reads park their fiber on the poller, both directions, so the main carrier runs on (task
 # jolt.host/a-blocking-call-on-a-main-carrier-parks); a thread waiting in an open or a read leaves the collector running.
-fifoopenparks:
-	@perl -e 'alarm 60; exec @ARGV' bin/jolt run test/chez/fifo-open-parks-test.clj
-blockingopencollects:
-	@perl -e 'alarm 60; exec @ARGV' bin/jolt run test/chez/blocking-open-collects-test.clj
+fifoopenparks: testbin
+	@perl -e 'alarm 60; exec @ARGV' target/release/jolt run test/chez/fifo-open-parks-test.clj
+	@perl -e 'alarm 60; exec @ARGV' target/release/jolt run test/chez/fifo-open-bare-test.clj
+blockingopencollects: testbin
+	@perl -e 'alarm 60; exec @ARGV' target/release/jolt run test/chez/blocking-open-collects-test.clj
 
 # ::flow/report may drop, never silently: ping's answer carries the count (::flow/report-dropped).
 flowreportdropped:
