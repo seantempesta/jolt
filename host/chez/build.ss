@@ -1424,7 +1424,7 @@
   (let ((clean (list->string
                  (map (lambda (c) (if (or (char-alphabetic? c) (char-numeric? c) (memv c '(#\. #\- #\_))) c #\_))
                       (string->list ns)))))
-    (if (string=? clean ns) ns (string-append clean "$" (bld-text-key ns)))))
+    (if (string=? clean ns) ns (string-append clean "$" (aot-text-key ns)))))
 
 ;; (define (jolt-app-init!) …) calling NAMES in order, after PRE (forms to run first).
 (define (bld-emit-app-init-main out names pre)
@@ -3452,7 +3452,7 @@
         ((bld-profile-use) => (lambda (p) (string-append "profile-use " (cdr p))))
         (else "")))
 
-;; FNV-1a over bytes, as hex: bld-text-key's first half, for a binary file.
+;; FNV-1a over bytes, as hex: aot-text-key's first half, for a binary file.
 (define (bld-bytes-key bv)
   (let ((n (bytevector-length bv)))
     (let loop ((i 0) (h 2166136261))
@@ -4004,21 +4004,8 @@
   ;; without a runtime fingerprint a key cannot tell two jolts apart
   (and (not (bld-env-off? "JOLT_BUILD_CACHE")) (aot-runtime-fingerprint) #t))
 
-;; FNV-1a and a multiplicative hash with a different basis and multiplier, in one
-;; pass; answered as hex text. Both multipliers stay under 2^24 so a product of a
-;; 32-bit state is a fixnum on every 64-bit target.
-(define (bld-text-key s)
-  (let ((n (string-length s)))
-    (let loop ((i 0) (h1 2166136261) (h2 1540483477))
-      (if (fx=? i n)
-          (string-append (number->string n 16) "-" (number->string h1 16) "-" (number->string h2 16))
-          (let ((c (char->integer (string-ref s i))))
-            (loop (fx+ i 1)
-                  (fxlogand (fx* (fxlogxor h1 c) 16777619) #xFFFFFFFF)
-                  (fxlogand (fx+ (fx* (fxlogxor h2 (fxsrl h2 15)) #x5bd1e9) c) #xFFFFFFFF)))))))
-
 (define (bld-unit-key mode text)
-  (bld-text-key
+  (aot-text-key
     (string-append (scheme-version) " " (sa-host-tag) " " (or (aot-runtime-fingerprint) "") "\n"
                    (bld-params-bindings (or (bld-mode-params mode) '()) "\n") "\n"
                    (if (bld-app-drops-expressions? mode) "inspector-expressions inspector-variables\n" "")
