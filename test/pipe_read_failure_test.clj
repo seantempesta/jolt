@@ -19,11 +19,11 @@
                 [p (proc-fd-input-port rd)])
            (close rd)
            (close wr)
-           (guard (e (#t e)) (get-u8 p)))))"))
-(let [v (read-closed)
-      msg (when (instance? Throwable v) (ex-message v))]
-  (println "pipe-read-failure:" (or msg (str "no error, read answered " (pr-str v))))
-  (when-not (and (string? msg) (.contains ^String msg "errno 9"))
+           (guard (e (#t (if (condition? e) (call-with-string-output-port (lambda (o) (display-condition e o))) (format \"raised ~s\" e))))
+             (format \"no error, read answered ~s\" (get-u8 p))))))"))
+(let [said (read-closed)]
+  (println "pipe-read-failure:" said)
+  (when-not (.contains ^String said "errno 9")
     (println "FAIL pipe-read-failure: a read that failed with EBADF did not raise an error naming errno 9")
     (System/exit 1))
   (println "pipe-read-failure OK")
