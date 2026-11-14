@@ -79,8 +79,14 @@ a_after="$(perl -e 'print +(stat shift)[9]' "$(art a so)")"
 [ "$out" = "a45" ] && [ "$a_after" = "$a_before" ] && pass "a hit writes nothing to its artifact" \
   || fail "the hit answered '$out', its .so mtime moved $a_before -> $a_after"
 
-# the fourth publishes under a budget of three and a half artifacts
-budget="$(perl -e 'printf "%.6f", ($ARGV[0] + $ARGV[1] / 2) / 1048576' "$three" "$one")"
+# the fourth publishes under a budget of three and a half artifacts and its own -e forms: those are published before
+# its namespace's publish prunes, young, so they count first; the hit run's forms are their measure (the same shape,
+# one namespace). Every form written so far is aged oldest.
+young="$(find "$cache" -path '*/forms/*' -type f -mmin -30)"
+runforms="$(bytes $young)"
+forms="$(find "$cache" -path '*/forms/*' -type f)"
+[ -z "$forms" ] || age 7200 $forms
+budget="$(perl -e 'printf "%.6f", ($ARGV[0] + $ARGV[1] / 2 + $ARGV[2]) / 1048576' "$three" "$one" "$runforms")"
 out="$(run "$budget" d)"
 [ "$out" = "d45" ] || fail "the fourth answered '$out'"
 if [ -z "$(art a so)" ] && [ -z "$(art a scm)" ]; then pass "the oldest written (a) was evicted, .so and .scm, its hit notwithstanding"
