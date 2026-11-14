@@ -17,11 +17,14 @@
             parked (a/go (a/<! ch) (reset! ran true))]
         (Thread/sleep 50)   ; the go block is parked on ch
         (let [pid (jolt.host/fork-alone 5000)]
-          (cond (zero? pid) (do (a/offer! ch :in-the-child)   ; a put in the child: whoever takes it runs here
-                                (Thread/sleep 100)
-                                (exit-now (if @ran 3 0)))
+          (cond (zero? pid) (let [taken (a/offer! ch :in-the-child)]   ; a put in the child: whoever takes it runs here
+                              (Thread/sleep 100)
+                              ;; 3: the parent's fiber ran; 4: its take was still registered and took the value
+                              ;; (resumed onto a carrier that will not run it); 0: the child's channel had no taker
+                              (exit-now (cond @ran 3 taken 4 :else 0)))
                 (neg? pid) [:refused pid]
                 :else (let [st (wait-status pid)] (a/close! ch) [:child-exit st])))))))
 (cond (= r [:child-exit 0]) (do (println "FORK-PARKED-FIBER-TEST OK") (System/exit 0))
       (= r [:child-exit 3]) (fail! "the child ran a fiber its parent had parked")
+      (= r [:child-exit 4]) (fail! "the child's put was taken by a fiber its parent had parked (not run, but its take stood)")
       :else (fail! "unexpected: " (pr-str r)))
