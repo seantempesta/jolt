@@ -239,7 +239,8 @@ if [ -n "$chez_bin" ]; then
   cache_i="$(mktemp -d)"
   JOLT_AOT_CACHE=1 JOLT_CACHE_DIR="$cache_i" JOLT_VERSION=dev "$chez_bin" --script host/chez/cli.ss \
     -e "(require 'clojure.set) (println (clojure.set/union #{1 2} #{2 3}))" >/dev/null 2>&1
-  n_i="$(find "$cache_i" -name '*.so' 2>/dev/null | wc -l | tr -d ' ')"
+  # namespace artifacts only: the -e forms themselves are a user's forms, which the form cache keeps (v1/forms)
+  n_i="$(find "$cache_i" -name '*.so' -not -path '*/forms/*' 2>/dev/null | wc -l | tr -d ' ')"
   rm -rf "$cache_i"
 fi
 if [ "$n_i" = "0" ]; then
