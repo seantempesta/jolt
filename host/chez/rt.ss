@@ -159,7 +159,7 @@
             (unx #'(guard (e (#t #f))
                    (sa-load-shared-object #f)
                    (and (sa-foreign-entry? name)
-                        (sa-foreign-procedure-native-error __errno (__collect_safe) name args res)))))
+                        (jolt-ffi-native-error-procedure (__collect_safe) name args res)))))
          #'(if (eq? (sa-os-family) 'windows) win unx))))))
 
 ;; --- the process's output streams ---------------------------------------------

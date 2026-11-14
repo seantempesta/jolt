@@ -683,14 +683,14 @@
     ;; closes the ends it inherited), oldest first
     (for-each (lambda (h) (h)) (reverse jolt-after-fork-hooks))))
 (def-var! "jolt.host" "after-fork-child!" (lambda () (jolt-after-fork-child!) jolt-nil))
-;; (jolt.host/fork-alone) -> the child's pid in the parent, 0 in the child, -2 when
-;; jolt.host/fork-alone-cancel! ended its wait. The one way to fork a jolt process. A fork beside a
+;; (jolt.host/fork-alone [ms]) -> the child's pid in the parent, 0 in the child, -3 when no other
+;; thread parked within ms. The one way to fork a jolt process. A fork beside a
 ;; thread running Scheme gives the child that thread's half-done work, so Chez's fork_alone waits,
 ;; under the tc mutex, for every other thread to park (in a wait or a collect-safe call), woken by
-;; each one that does and never by a clock, and forks then: a thread that had just woken this one
+;; each one that does, its one clock the caller's bound, and forks then: a thread that had just woken this one
 ;; (the timer delivering, a carrier) is still finishing its turn for a moment, and the fork used to
 ;; refuse beside it (3 in 100 right after a timeout; an agent clone's "cannot fork"). A thread that
-;; never parks is one no fork is safe beside: the caller's bound ends that wait with the cancel.
+;; never parks is one no fork is safe beside: the bound ends that wait, and fork-holders names it.
 ;; Interrupts stay disabled across it, and the child resets itself (jolt-after-fork-child!) BEFORE
 ;; they return: a caller that enabled them first let a preemption switch the child to the scheduler
 ;; over the parent's run queue, which ran the parent's ready fibers in the child (a Seon root's
@@ -727,9 +727,6 @@
                     (loop (cdr ts) (cons (jolt-hash-map k-id id k-name (jolt-thread-name id)) acc))
                     (loop (cdr ts) acc)))))))))
 (def-var! "jolt.host" "fork-holders" (lambda () (jolt-fork-holders)))
-(def-var! "jolt.host" "fork-alone-cancel!"
-  (let ((cancel #f))
-    (lambda () (unless cancel (set! cancel (foreign-procedure "(cs)fork_alone_cancel" () void))) (cancel) jolt-nil)))
 ;; (jolt.host/fiber-pump!): this fiber is a remote end's pump: never told a deadlock, not counted by a
 ;; quiescence check (its record's pump field). (jolt.host/on-quiescent! f): f, or nil, hears a main
 ;; carrier's quiescence with the dump (fibers.ss jolt-quiescent?).
