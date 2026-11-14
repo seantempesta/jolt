@@ -1121,6 +1121,9 @@
   (aot-cache-key-of (bytevector-length bv) (aot-bytes-hash bv)))
 (define (aot-cache-key-of len hash)
   (string-append (number->string len 16) "-" (number->string hash 16)))
+;; Not cryptographic: about 64 bits beside the length, so two different texts of one length share a key with
+;; probability ~2^-64 a pair; at 10^5 cached forms that is ~10^-9 (accepted by root, 2026-11-14, as the build cache
+;; accepts it); a collision would run the other text's code.
 ;; FNV-1a and a multiplicative hash with a different basis and multiplier, in one
 ;; pass, beside the length; answered as hex text. Both multipliers stay under 2^24
 ;; so a product of a 32-bit state is a fixnum on every 64-bit target. The key of a
