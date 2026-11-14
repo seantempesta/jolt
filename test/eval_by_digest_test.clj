@@ -7,7 +7,8 @@
 ;;   shifted  the same forms after other forms used labels first, so each form's labels carry other numbers: at least
 ;;            half load (renumbering is what makes them the same text; a form whose text keeps another process-wide
 ;;            number, a destructuring gensym, compiles);
-;; and all three compute the same values and resolve the throw's frame to its line.
+;;   corrupt  every entry overwritten with garbage: every form compiled again, none run from it;
+;; and all four compute the same values and resolve the throw's frame to its line.
 ;; Estimate (2026-11-14, this corpus, measured warm): a compile is about half a form's eval, so the second process's
 ;; eval ticks are at most 3/4 of the first's.
 ;; Run: target/release/jolt run test/eval_by_digest_test.clj
@@ -53,9 +54,12 @@
         first-run (run-child cache false)
         second-run (run-child cache false)
         shifted (run-child cache true)
+        ;; an entry that is not a fasl (truncated, overwritten) is a miss, compiled anew, never run
+        _ (sh/sh "sh" "-c" (str "for f in " cache "/*/v1/forms/*.so; do printf GARBAGE > \"$f\"; done"))
+        corrupt (run-child cache false)
         n (:compiles first-run)               ; units: an ns form's expansion is several
         fail (fn [why] (println "FAIL eval-by-digest:" why) (System/exit 1))]
-    (doseq [[k r] [[:first first-run] [:second second-run] [:shifted shifted]]] (println "eval-by-digest" k r))
+    (doseq [[k r] [[:first first-run] [:second second-run] [:shifted shifted] [:corrupt corrupt]]] (println "eval-by-digest" k r))
     (sh/sh "rm" "-rf" cache)
     (when-not (and (>= n (:forms first-run)) (zero? (:hits first-run)))
       (fail (str "the first process, on an empty cache, compiled " n " and loaded " (:hits first-run))))
@@ -63,8 +67,10 @@
       (fail (str "the second process compiled " (:compiles second-run) " of " n " forms the first had compiled")))
     (when-not (>= (* 2 (:hits shifted)) n)
       (fail (str "after other forms, " (:hits shifted) " of " n " forms loaded: their labels were not renumbered")))
-    (when-not (apply = (map :values [first-run second-run shifted])) (fail "the processes computed different values"))
-    (when-not (every? #(= 3 (:boom-line %)) [first-run second-run shifted])
+    (when-not (and (= n (:compiles corrupt)) (zero? (:hits corrupt)))
+      (fail (str "over corrupt entries the process compiled " (:compiles corrupt) " and loaded " (:hits corrupt))))
+    (when-not (apply = (map :values [first-run second-run shifted corrupt])) (fail "the processes computed different values"))
+    (when-not (every? #(= 3 (:boom-line %)) [first-run second-run shifted corrupt])
       (fail (str "the throw's frame did not resolve to line 3: " (mapv :boom-line [first-run second-run shifted]))))
     (when-not (<= (* 4 (:ticks-per-form second-run)) (* 3 (:ticks-per-form first-run)))
       (fail (str "a loaded form cost " (:ticks-per-form second-run) " ticks, a compiled one " (:ticks-per-form first-run))))

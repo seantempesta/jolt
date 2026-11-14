@@ -1136,30 +1136,52 @@
                   (fxlogand (fx* (fxlogxor h1 c) 16777619) #xFFFFFFFF)
                   (fxlogand (fx+ (fx* (fxlogxor h2 (fxsrl h2 15)) #x5bd1e9) c) #xFFFFFFFF)))))))
 
-;; One top-level form's compiled code (a fasl, as compile-to-port writes it) by
-;; KEY, the digest of its renumbered text (compile-eval.ss jolt-ce-run-emitted):
-;; <generation>/v1/forms/KEY.so when a process published it, else COMPILE's bytes,
-;; published there by temp and rename for every later process. Same generation,
-;; byte budget and pruning as a namespace's artifacts (aot-cache-artifacts walks
-;; forms/). A cache this process cannot write still answers COMPILE's bytes.
-(define aot-forms-dir-made? #f)
+;; One top-level form's compiled code by KEY, the digest of its renumbered text
+;; (compile-eval.ss jolt-ce-run-emitted), as the thunk that runs it: read from
+;; <generation>/v1/forms/KEY.so when a process published it, else made from
+;; COMPILE's bytes (compile-to-port's fasl) and published there by temp and rename
+;; for every later process. Same generation, byte budget and pruning as a
+;; namespace's artifacts (aot-cache-artifacts walks forms/). An entry that is not
+;; such a fasl (truncated, overwritten) is a miss, compiled and published anew, as
+;; a namespace's corrupt .so is; a cache this process cannot write still answers
+;; the compiled code. Reading is apart from running: what the code raises when it
+;; runs is the form's, never a miss.
 (define (aot-form-code key compile)
   (let* ((dir (and (aot-cache-usable?) (string-append (aot-cache-subdir) "/forms")))
          (so (and dir (string-append dir "/" key ".so")))
          ;; an entry pruned between the test and the read is a miss
-         (hit (and so (file-regular? so) (guard (e (#t #f)) (read-file-bytes so)))))
+         (hit (and so (file-regular? so) (aot-code-thunk (guard (e (#t #f)) (read-file-bytes so))))))
     (or hit
         (let ((bv (compile)))
           (when so
             (guard (e (#t (aot-info (string-append "could not cache form " key (ldr-condition-suffix e)))))
-              (unless aot-forms-dir-made? (aot-mkdir-p dir) (set! aot-forms-dir-made? #t))
+              (aot-mkdir-p dir)
               (let* ((tmp (string-append dir "/" key ".tmp" (number->string (get-process-id))))
                      (out (open-file-output-port tmp (file-options no-fail))))
                 (put-bytevector out bv)
                 (close-port out)
                 (rename-replace! tmp so)))
             (aot-prune-to-budget-once!))
-          bv))))
+          (or (aot-code-thunk bv)
+              (error 'aot-form-code "compile-to-port wrote no code" key))))))
+;; The thunk that runs the code BV holds as load-compiled-from-port runs it (Chez
+;; s/7.ss make-load-binary: each procedure in order, answering the last one's
+;; values; the recompile-info record and the #t after the header are not code), or
+;; #f when BV is not such a fasl.
+(define (aot-code-thunk bv)
+  (and (bytevector? bv)
+       (let ((procs (guard (e (#t #f))
+                      (let ((ip (open-bytevector-input-port bv)))
+                        (let loop ((ps '()))
+                          (let ((x (fasl-read ip)))
+                            (cond ((eof-object? x) (reverse ps))
+                                  ((procedure? x) (loop (cons x ps)))
+                                  ((or (eq? x #t) (record? x)) (loop ps))
+                                  (else #f))))))))
+         (and (pair? procs)
+              (lambda ()
+                (let run ((ps procs))
+                  (if (null? (cdr ps)) ((car ps)) (begin ((car ps)) (run (cdr ps))))))))))
 (define (aot-info msg)
   (when (getenv "JOLT_DEBUG")
     (display (string-append "[jolt.aot] " msg "\n") (current-error-port))))

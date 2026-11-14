@@ -618,7 +618,7 @@
                          (jolt-register-eval-marker-table-as!
                           (string-append "jolt-eval-src-" key) text (hc-form-position form) written ns)))
               (compiled #f)
-              (code (aot-form-code key
+              (run (aot-form-code key
                       (lambda ()
                         (set! compiled #t)
                         (let-values (((port get) (open-bytevector-output-port)))
@@ -626,7 +626,7 @@
                                            port)
                           (get))))))
          (jolt-ce-count! (if compiled 0 1))
-         (load-compiled-from-port (open-bytevector-input-port code))))
+         (run)))
       (else
        (jolt-ce-count! 0)
        (if traced
