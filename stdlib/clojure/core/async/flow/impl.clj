@@ -533,6 +533,18 @@
                           #(let [^Future f ((futurize step {:exec (spi/get-exec resolver :compute)}) %1 %2 %3)]
                              (if compute-timeout-ms (.get f compute-timeout-ms TimeUnit/MILLISECONDS) (.get f)))
                           step)
+              ;; jolt: a step's tick budget. A describe's :step-ticks (a number, or a fn of the state) runs each step
+              ;; under jolt.host/run-interruptible with that budget; past it the step throws {:jolt/interrupted
+              ;; :jolt/ticks-spent :jolt/ticks-budget} and takes the step-error path: the state kept, the outputs
+              ;; dropped, {::flow/pid ::flow/msg ::flow/ex} on the error chan, and the loop goes on to its next
+              ;; message. Ticks are work done, never wall time; unset, nothing changes.
+              transform (if-let [st (:step-ticks desc)]
+                          (let [t transform]
+                            (fn [s c m]
+                              (if-let [n (if (fn? st) (st s) st)]
+                                (jolt.host/run-interruptible (jolt.host/make-interrupt) #(t s c m) n)
+                                (t s c m))))
+                          transform)
               exs (spi/get-exec resolver (if (= workload :mixed) :mixed :io))
               state (step args)
               ins (into (or ins {}) (::flow/in-ports state))
