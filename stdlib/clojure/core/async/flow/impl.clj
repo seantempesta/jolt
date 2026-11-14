@@ -411,11 +411,12 @@
                              (let [ins (get cmap [pid out])]
                                (assoc site :writing (cond (empty? ins) nil (= 1 (count ins)) (first ins) :else ins)))
                              site))
+                ;; in-chans grouped by pid once: O(ports), never a scan of every port per proc (that was O(procs x
+                ;; ports), 10 KB a proc at 50 procs [M] against ~1 KB estimated)
+                fills (reduce-kv (fn [m [p cid] ch] (assoc-in m [p cid] (jolt.host/chan-fill ch))) {} in-chans)
                 ret (reduce (fn [ret pid]
-                              (let [fills (into {} (keep (fn [[[p cid] ch]] (when (= p pid) [cid (jolt.host/chan-fill ch)])))
-                                                in-chans)]
-                                (update ret pid merge {::flow/site (some->> (get-in running [pid :site]) deref (coord-of pid))
-                                                       ::flow/in-fill fills})))
+                              (update ret pid merge {::flow/site (some->> (get-in running [pid :site]) deref (coord-of pid))
+                                                     ::flow/in-fill (get fills pid {})}))
                             ret pids)]
           ;; jolt: how many reports the sliding ::flow/report chan dropped, and the pids that did not answer, as the
           ;; answer's metadata (its keys stay pids); an answer with no pong is {}, so the metadata survives
