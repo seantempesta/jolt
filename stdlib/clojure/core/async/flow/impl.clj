@@ -233,7 +233,8 @@
 (defn- start-proc! [rt execs {:keys [pid proc args ins]}]
   (let [{:keys [in-chans error report castees cast status]} @rt
         control (async/chan 10)
-        ;; jolt: where the proc's loop waits ({:reading #{cid}}, {:writing coord}) or what it steps ({:stepping cid}),
+        ;; jolt: where the proc's loop waits ({:reading #{cid}}, {:writing out-cid}, ping names its coord) or what it steps
+        ;; ({:stepping cid :since-ns :msg}),
         ;; kept by the loop as it goes and read by ping without asking the proc (a proc stuck in a step cannot answer)
         site (volatile! nil)
         fut (spi/start proc {:pid pid :args (assoc args ::flow/pid pid)
@@ -402,11 +403,18 @@
           ;; jolt: the queues, read without asking any proc, so a proc stuck in a step is seen too: each running
           ;; proc's ::flow/site (where its loop waits or what it steps) and ::flow/in-fill, each in-port's
           ;; jolt.host/chan-fill (task clojure.core.async.flow/ping-says-where-a-proc-is-parked). Reads only.
-          (let [{:keys [running in-chans]} @rt
+          (let [{:keys [running in-chans cmap]} @rt
+                ;; a write's site names the coords it writes to (cmap: [pid out] -> #{[pid in]}), one coord or a set
+                ;; (a fan-out), nil when the out is unconnected, so a wait-for graph is the answer read directly
+                coord-of (fn [pid site]
+                           (if-let [out (:writing site)]
+                             (let [ins (get cmap [pid out])]
+                               (assoc site :writing (cond (empty? ins) nil (= 1 (count ins)) (first ins) :else ins)))
+                             site))
                 ret (reduce (fn [ret pid]
                               (let [fills (into {} (keep (fn [[[p cid] ch]] (when (= p pid) [cid (jolt.host/chan-fill ch)])))
                                                 in-chans)]
-                                (update ret pid merge {::flow/site (some-> (get-in running [pid :site]) deref)
+                                (update ret pid merge {::flow/site (some->> (get-in running [pid :site]) deref (coord-of pid))
                                                        ::flow/in-fill fills})))
                             ret pids)]
           ;; jolt: how many reports the sliding ::flow/report chan dropped, and the pids that did not answer, as the
@@ -570,7 +578,8 @@
                                  _ (when site (vreset! site {:reading (set (keep io-id (drop 2 read-chans)))}))
                                  [msg c] (async/alts!! read-chans :priority true)
                                  cid (io-id c)
-                                 _ (when site (vreset! site (when-not (= c control) {:stepping cid})))]
+                                 _ (when site (vreset! site (when-not (= c control)
+                                                              {:stepping cid :since-ns (System/nanoTime) :msg msg})))]
                              (if (= c control)
                                (let [nstatus (handle-command status msg)
                                      nstate (transit status nstatus state)]
