@@ -1145,7 +1145,8 @@ forkquiescenthandler:
 # jolt.host/a-blocking-call-on-a-main-carrier-parks); a thread waiting in an open or a read leaves the collector running.
 fifoopenparks: testbin
 	@perl -e 'alarm 60; exec @ARGV' target/release/jolt run test/chez/fifo-open-parks-test.clj
-	@perl -e 'alarm 60; exec @ARGV' target/release/jolt run test/chez/fifo-open-bare-test.clj
+	@f=$$(mktemp -u "$${TMPDIR:-/tmp}/fifo-bare.XXXXXX") && mkfifo "$$f" && \
+	  FIFO="$$f" perl -e 'alarm 60; exec @ARGV' target/release/jolt run test/chez/fifo-open-bare-test.clj
 blockingopencollects: testbin
 	@perl -e 'alarm 60; exec @ARGV' target/release/jolt run test/chez/blocking-open-collects-test.clj
 
