@@ -620,6 +620,13 @@
   (set! jolt-asleep-det-pending #f)
   (set-box! jolt-asleep-det-started #f)
   (set! jolt-asleep-said #f)
+  ;; the quiescence handler is the parent's (it closes over the parent's socket and state): a child starts with none
+  ;; and sets its own (fibers.ss jolt-on-quiescent!)
+  (set! jolt-quiescent-handler #f)
+  (set! jolt-quiescent-told #f)
+  (set! jolt-quiescent-notices 0)
+  (set! jolt-quiescent-last-answer #f)
+  (set! jolt-quiescent-last-error #f)
   (let ((self (get-thread-id)))
     (if jolt-main-thread
         ;; a main-carrier program forked from inside its own fiber: the child keeps carrier 0
