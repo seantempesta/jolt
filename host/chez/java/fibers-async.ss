@@ -38,6 +38,9 @@
 
 ;; A waiter handler whose wake is fiber f — the fiber-wake strategy.
 (define (jolt-fiber-waiter f) (alt-handler-alloc f))
+;; a forked child's parent fibers' waits (fibers.ss jolt-fibers-forget-the-parents!): their handlers taken off.
+;; Set here, not in async.ss: fibers.ss loads after async.ss and its define would reset it.
+(set! jolt-fiber-retire-wait! (lambda (h) (when (alt-handler? h) (alt-handler-active?-set! h #f))))
 
 ;; ac-try-give!/locked can THROW — a nil value, or a transducer step raising — and
 ;; this path holds the channel mutex BY HAND, because it has to be able to release

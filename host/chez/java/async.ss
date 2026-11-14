@@ -230,8 +230,6 @@
 ;; suspends — a fiber that parks holding the mutex deadlocks its carrier and
 ;; every other fiber on it (the R3 invariant; the fiber-side registration in
 ;; fibers-async.ss releases before parking).
-;; a forked child's parent fibers' waits (fibers.ss jolt-fibers-forget-the-parents!): their handlers taken off
-(set! jolt-fiber-retire-wait! (lambda (h) (when (alt-handler? h) (alt-handler-active?-set! h #f))))
 (define (alt-claim! h)
   (jolt-with-mutex (alt-handler-fmu h)
     (and (alt-handler-active? h)
