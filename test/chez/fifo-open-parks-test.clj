@@ -53,6 +53,7 @@
 (check "a regular file opens and reads as ever" (= (:regular on-carrier) "plain") (:regular on-carrier))
 
 (shell/sh "rm" "-rf" dir)
+(shutdown-agents)   ; that sh, off the carrier, copied on futures
 (if (seq @failures)
   (do (doseq [f @failures] (println "FAIL:" f)) (System/exit 1))
   (println "fifo-open-parks: OK"))
