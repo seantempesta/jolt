@@ -222,7 +222,13 @@
 ;;                      small vector's print (measured 1.24-1.40, 2026-10; then
 ;;                      1.53-1.60 once every #object carried its identity hash and
 ;;                      the vector print got ~12% faster, the File side itself
-;;                      within 1.1x of before).
+;;                      within 1.1x of before). On the pin where a call of 5-8
+;;                      arguments and a 4-8 parameter protocol method stopped
+;;                      consing (Jolt 2ae4ea90 on), it read 1.73-1.98 in seven
+;;                      runs at load 17-19, the old 1.9 ceiling inside its own
+;;                      band: the ceiling is that band's top with the 1.25x a cost
+;;                      proof allows, 2.5. A lost fast path (a per-call class
+;;                      lookup, an #object without the registry) reads well above it.
 ;;
 (ns fastpath-ratio-test
   (:require [clojure.string :as str]))
@@ -709,7 +715,7 @@
   (judge! "host-object-pr"
           #(dotimes [_ 20000] (pr-str [1 "a"]))
           #(dotimes [_ 20000] (pr-str (java.io.File. "/tmp")))
-          1.9)
+          2.5)
 
   (.delete (java.io.File. src-path))
   (.delete (java.io.File. data-path))
