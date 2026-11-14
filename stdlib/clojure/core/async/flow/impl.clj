@@ -192,11 +192,15 @@
     {:cmap cmap :conn-set new-set :pid-outs pid-outs :routes routes :mults mults}))
 
 (defn- send-control!
-  "Put cmd on each pid's own control chan, in order (called under the graph lock)."
+  "Put cmd on each pid's own control chan, in order, never blocking (called under the graph lock): a lifecycle
+  command is put! (queued behind a stuck step, delivered in order, ended by stop's close); a ping is offer!ed (a
+  proc whose control is full is named unanswered). jolt: a blocking put here let one stuck step wedge ping, pause,
+  stop and update! for the whole graph (flow-audit-and-plan-2026-11-14, E4)."
   [rt pids cmd]
   (doseq [pid pids]
     (when-let [c (get-in @rt [:running pid :control])]
-      (async/>!! c (assoc cmd ::flow/to pid)))))
+      (let [m (assoc cmd ::flow/to pid)]
+        (if (= ::flow/ping (::flow/command cmd)) (async/offer! c m) (async/put! c m))))))
 
 (defn- proc-resolver [rt pid execs]
   (reify spi/Resolver
@@ -237,7 +241,7 @@
                              :outs {::flow/error error ::flow/report report}})]
     (swap! rt assoc-in [:running pid] {:future fut :control control})
     (when (= :running status)
-      (async/>!! control #::flow{:command ::flow/resume :to pid}))))
+      (async/put! control #::flow{:command ::flow/resume :to pid}))))
 
 (defn- await-exits
   "Await each future up to the deadline; answers the pids still running."
@@ -249,14 +253,18 @@
                         pid)))
           running)))
 
-(defn- stop-proc!
-  "Stop one proc and await its exit. Answers nil, or the pid when it missed the bound."
-  [rt pid stop-timeout-ms]
-  (when-let [{:keys [control] :as r} (get-in @rt [:running pid])]
-    (async/>!! control #::flow{:command ::flow/stop :to pid})
-    (if (seq (await-exits {pid r} stop-timeout-ms))
-      pid
-      (do (async/close! control) (swap! rt update :running dissoc pid) nil))))
+(defn- stop-procs!
+  "Stop pids: every stop is sent first, then their exits are awaited under one deadline, and each one's control is
+  closed (a proc still stuck exits at its next take, as a nil command is :exit). Answers the pids that missed the
+  bound. jolt: each was stopped and awaited in turn, every one with the full bound (3 stuck procs, 913 ms against 300)."
+  [rt pids stop-timeout-ms]
+  (let [running (select-keys (:running @rt) pids)]
+    (send-control! rt (keys running) #::flow{:command ::flow/stop})
+    (let [missed (await-exits running stop-timeout-ms)]
+      (doseq [[pid {:keys [control]}] running]
+        (async/close! control)
+        (when-not (missed pid) (swap! rt update :running dissoc pid)))
+      missed)))
 
 (defn create-flow
   "see lib ns for docs (jolt: update! changes a running flow in place, above)"
@@ -321,7 +329,7 @@
                    ;; 3. stop removed and changed procs, awaiting each exit; one that missed
                    ;; its bound is never started twice (every later update retries it)
                    (let [pending (:pending-exit old #{})
-                         missed (into #{} (keep #(stop-proc! rt % stop-timeout-ms)) (into pending stop))
+                         missed (stop-procs! rt (into pending stop) stop-timeout-ms)
                          start (-> start (into (filter #(contains? plans %)) (remove missed pending)) (set-diff missed))
                          _ (swap! rt assoc :pending-exit missed)
                          ;; 4. a removed output's mult closes (its taps are close? false)
@@ -378,18 +386,20 @@
                                (send-control! rt (keys (:running @rt)) #::flow{:command ::flow/resume}))))
       (ping [_ timeout-ms]
         (let [timeout (async/timeout timeout-ms)
-              [n reply] (locked #(let [pids (keys (:running @rt))
-                                       reply (async/chan (max 1 (count pids)))]
-                                   (send-control! rt pids #::flow{:command ::flow/ping :reply-chan reply})
-                                   [(count pids) reply]))
+              [n reply pids] (locked #(let [pids (keys (:running @rt))
+                                            reply (async/chan (max 1 (count pids)))]
+                                        (send-control! rt pids #::flow{:command ::flow/ping :reply-chan reply})
+                                        [(count pids) reply pids]))
               ret-chan (fiber-go (async/take n reply))
               ret (loop [ret nil]
                     (let [[m _] (async/alts!! [ret-chan timeout])]
                       (if (some? m) (recur (assoc ret (::flow/pid m) m)) ret)))]
           ;; jolt: take's go-loop ends only when reply closes (a late pong is dropped)
           (async/close! reply)
-          ;; jolt: how many reports the sliding ::flow/report chan dropped, as the answer's metadata (its keys stay pids)
-          (some-> ret (with-meta {::flow/report-dropped (jolt.host/chan-dropped (:report @rt))}))))
+          ;; jolt: how many reports the sliding ::flow/report chan dropped, and the pids that did not answer, as the
+          ;; answer's metadata (its keys stay pids); an answer with no pong is {}, so the metadata survives
+          (with-meta (or ret {}) {::flow/report-dropped (jolt.host/chan-dropped (:report @rt))
+                                  ::flow/unanswered (vec (remove (set (keys ret)) pids))})))
       (pause-proc [_ pid] (locked #(send-control! rt [pid] #::flow{:command ::flow/pause})))
       (resume-proc [_ pid] (locked #(send-control! rt [pid] #::flow{:command ::flow/resume})))
       (ping-proc [_ pid timeout-ms]
@@ -416,27 +426,29 @@
                     (if @rt (apply! d) {:running false}))))))))
 
 (defn- finish-outputs!
-  "jolt (V1's one change to the proc loop): a stop that arrives while a step's outputs are
-  being sent delivers the rest of them, each put bounded by stop-output-ms, instead of
-  dropping them; one that misses its bound is reported."
-  [outputs outs resolver cast stop-output-ms report]
+  "jolt (V1's one change to the proc loop): a stop that arrives while a step's outputs are being sent delivers the
+  rest of them, put! in order (never blocking the stopping proc, never timed), and one a closed channel refuses is
+  reported. A clock here lost the last outputs of a stopping proc whose reader was itself waiting on the stop."
+  [outputs outs resolver cast report]
   (doseq [[output msgs] outputs]
     (if (and (vector? output) (= (first output) ::flow/cast))
       (cast (second output) msgs)
       (when-let [outc (or (outs output) (spi/get-write-chan resolver output))]
         (doseq [m msgs]
-          (let [[v _] (async/alts!! [[outc m] (async/timeout stop-output-ms)])]
-            (when-not v (async/put! report {::flow/dropped-on-stop output}))))))))
+          (async/put! outc m (fn [ok] (when-not ok (async/put! report {::flow/dropped-on-stop output})))))))))
 
 (defn handle-command
   [pid pong status cmd]
   (let [transition #::flow{:stop :exit, :resume :running, :pause :paused}
         {::flow/keys [to command reply-chan]} cmd]
-    (if (#{::flow/all pid} to)
+    (cond
+      ;; jolt: a closed control (stop closed it) is :exit, never a status kept while the loop spins on nil
+      (nil? cmd) :exit
+      (#{::flow/all pid} to)
       (do
         (when (= command ::flow/ping) (pong reply-chan))
         (or (transition command) status))
-      status)))
+      :else status)))
 
 (defn handle-transition
   "when transition, returns maybe new state"
@@ -452,7 +464,7 @@
   (loop [nstatus status, nstate state, outputs (seq outputs)]
     (if (or (nil? outputs) (= nstatus :exit))
       (do (when (and outputs (= nstatus :exit))
-            (finish-outputs! outputs outs resolver cast 1000 (outs ::flow/report)))
+            (finish-outputs! outputs outs resolver cast (outs ::flow/report)))
           [nstatus nstate])
       (let [[output msgs] (first outputs)]
         (if (and (vector? output) (= (first output) ::flow/cast))
@@ -463,7 +475,7 @@
                   (loop [nstatus nstatus, nstate nstate, msgs (seq msgs)]
                     (if (or (nil? msgs) (= nstatus :exit))
                       (do (when (and msgs (= nstatus :exit))
-                            (finish-outputs! [[output msgs]] outs resolver cast 1000 (outs ::flow/report)))
+                            (finish-outputs! [[output msgs]] outs resolver cast (outs ::flow/report)))
                           [nstatus nstate])
                       (let [[v c] (async/alts!!
                                    [control [outc (first msgs)]]
@@ -478,7 +490,7 @@
 
 (defn proc
   "see lib ns for docs"
-  [step {:keys [workload compute-timeout-ms] :or {compute-timeout-ms 5000}}]
+  [step {:keys [workload compute-timeout-ms]}]
   (let [{:keys [params ins ping-map-fn] :or {ping-map-fn identity} :as desc} (step)
         workload (or workload (:workload desc) :mixed)]
     ;;(assert (or (not params) init) "must have :init if :params")
@@ -494,8 +506,10 @@
       (start [_ {:keys [pid args ins outs resolver cast]}]
         (assert (or (not params) args) "must provide :args if :params")
         (let [transform (if (= workload :compute)
-                          #(.get ^Future ((futurize step {:exec (spi/get-exec resolver :compute)}) %1 %2 %3)
-                                 compute-timeout-ms TimeUnit/MILLISECONDS)
+                          ;; jolt: no clock unless compute-timeout-ms is given; given, a step past it is abandoned
+                          ;; while its future keeps running
+                          #(let [^Future f ((futurize step {:exec (spi/get-exec resolver :compute)}) %1 %2 %3)]
+                             (if compute-timeout-ms (.get f compute-timeout-ms TimeUnit/MILLISECONDS) (.get f)))
                           step)
               exs (spi/get-exec resolver (if (= workload :mixed) :mixed :io))
               state (step args)
@@ -516,11 +530,19 @@
                                                              :ins pins :outs pouts})
                                                     ::flow/state (ping-map-fn state)))))
                        handle-command (partial handle-command pid pong)
+                       ;; jolt: a transition that throws is reported and its status still taken (a stop whose
+                       ;; transition threw left the proc running and reading its input)
+                       transit (fn [status nstatus state]
+                                 (try (handle-transition step status nstatus state)
+                                      (catch Throwable ex
+                                        (async/put! (outs ::flow/error)
+                                                    #::flow{:pid pid, :status nstatus, :state state, :op :transition, :ex ex})
+                                        state)))
                        [nstatus nstate count read-ins]
                        (try
                          (if (= status :paused)
                            (let [nstatus (handle-command status (async/<!! control))
-                                 nstate (handle-transition step status nstatus state)]
+                                 nstate (transit status nstatus state)]
                              [nstatus nstate count read-ins])
                            ;;:running
                            (let [ ;;TODO rotate/randomize after control per normal alts?
@@ -534,7 +556,7 @@
                                  cid (io-id c)]
                              (if (= c control)
                                (let [nstatus (handle-command status msg)
-                                     nstate (handle-transition step status nstatus state)]
+                                     nstate (transit status nstatus state)]
                                  [nstatus nstate count read-ins])
                                (try
                                  (let [[nstate outputs]
@@ -548,12 +570,12 @@
                                                                  read-ins
                                                                  (dissoc read-ins cid))])
                                  (catch Throwable ex
-                                   (async/>!! (outs ::flow/error)
+                                   (async/put! (outs ::flow/error)
                                               #::flow{:pid pid, :status status, :state state,
                                                       :count (inc count), :cid cid, :msg msg :op :step, :ex ex})
                                    [status state count read-ins])))))
                          (catch Throwable ex
-                           (async/>!! (outs ::flow/error)
+                           (async/put! (outs ::flow/error)
                                       #::flow{:pid pid, :status status, :state state, :count (inc count), :ex ex})
                            [status state count read-ins]))]
                    (when-not (= nstatus :exit) ;;fall out
