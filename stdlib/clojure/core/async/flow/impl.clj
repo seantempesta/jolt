@@ -233,13 +233,16 @@
 (defn- start-proc! [rt execs {:keys [pid proc args ins]}]
   (let [{:keys [in-chans error report castees cast status]} @rt
         control (async/chan 10)
+        ;; jolt: where the proc's loop waits ({:reading #{cid}}, {:writing coord}) or what it steps ({:stepping cid}),
+        ;; kept by the loop as it goes and read by ping without asking the proc (a proc stuck in a step cannot answer)
+        site (volatile! nil)
         fut (spi/start proc {:pid pid :args (assoc args ::flow/pid pid)
-                             :resolver (proc-resolver rt pid execs) :cast cast
+                             :resolver (proc-resolver rt pid execs) :cast cast ::flow/site site
                              :ins (assoc (into {} (map (fn [[[_ cid :as k] _]] [cid (in-chans k)])) ins)
                                          ::flow/control control
                                          ::flow/casts (get-in castees [pid :chan]))
                              :outs {::flow/error error ::flow/report report}})]
-    (swap! rt assoc-in [:running pid] {:future fut :control control})
+    (swap! rt assoc-in [:running pid] {:future fut :control control :site site})
     (when (= :running status)
       (async/put! control #::flow{:command ::flow/resume :to pid}))))
 
@@ -396,10 +399,20 @@
                       (if (some? m) (recur (assoc ret (::flow/pid m) m)) ret)))]
           ;; jolt: take's go-loop ends only when reply closes (a late pong is dropped)
           (async/close! reply)
+          ;; jolt: the queues, read without asking any proc, so a proc stuck in a step is seen too: each running
+          ;; proc's ::flow/site (where its loop waits or what it steps) and ::flow/in-fill, each in-port's
+          ;; jolt.host/chan-fill (task clojure.core.async.flow/ping-says-where-a-proc-is-parked). Reads only.
+          (let [{:keys [running in-chans]} @rt
+                ret (reduce (fn [ret pid]
+                              (let [fills (into {} (keep (fn [[[p cid] ch]] (when (= p pid) [cid (jolt.host/chan-fill ch)])))
+                                                in-chans)]
+                                (update ret pid merge {::flow/site (some-> (get-in running [pid :site]) deref)
+                                                       ::flow/in-fill fills})))
+                            ret pids)]
           ;; jolt: how many reports the sliding ::flow/report chan dropped, and the pids that did not answer, as the
           ;; answer's metadata (its keys stay pids); an answer with no pong is {}, so the metadata survives
           (with-meta (or ret {}) {::flow/report-dropped (jolt.host/chan-dropped (:report @rt))
-                                  ::flow/unanswered (vec (remove (set (keys ret)) pids))})))
+                                  ::flow/unanswered (vec (remove #(::flow/pid (get ret %)) pids))}))))
       (pause-proc [_ pid] (locked #(send-control! rt [pid] #::flow{:command ::flow/pause})))
       (resume-proc [_ pid] (locked #(send-control! rt [pid] #::flow{:command ::flow/resume})))
       (ping-proc [_ pid timeout-ms]
@@ -460,7 +473,7 @@
                             :paused ::flow/pause))
     state))
 
-(defn send-outputs [status state outputs outs resolver control handle-command transition cast]
+(defn send-outputs [status state outputs outs resolver control handle-command transition cast & [site]]
   (loop [nstatus status, nstate state, outputs (seq outputs)]
     (if (or (nil? outputs) (= nstatus :exit))
       (do (when (and outputs (= nstatus :exit))
@@ -477,7 +490,8 @@
                       (do (when (and msgs (= nstatus :exit))
                             (finish-outputs! [[output msgs]] outs resolver cast (outs ::flow/report)))
                           [nstatus nstate])
-                      (let [[v c] (async/alts!!
+                      (let [_ (when site (vreset! site {:writing output}))
+                            [v c] (async/alts!!
                                    [control [outc (first msgs)]]
                                    :priority true)]
                         (if (= c control)
@@ -503,7 +517,7 @@
           (walk/postwalk datafy {:step step :desc desc})))
       spi/ProcLauncher
       (describe [_] desc)
-      (start [_ {:keys [pid args ins outs resolver cast]}]
+      (start [_ {:keys [pid args ins outs resolver cast] site ::flow/site}]
         (assert (or (not params) args) "must provide :args if :params")
         (let [transform (if (= workload :compute)
                           ;; jolt: no clock unless compute-timeout-ms is given; given, a step past it is abandoned
@@ -541,7 +555,8 @@
                        [nstatus nstate count read-ins]
                        (try
                          (if (= status :paused)
-                           (let [nstatus (handle-command status (async/<!! control))
+                           (let [_ (when site (vreset! site {:paused true}))
+                                 nstatus (handle-command status (async/<!! control))
                                  nstate (transit status nstatus state)]
                              [nstatus nstate count read-ins])
                            ;;:running
@@ -552,8 +567,10 @@
                                                              (conj ret chan)
                                                              ret))
                                                          [control casts] read-ins))
+                                 _ (when site (vreset! site {:reading (set (keep io-id (drop 2 read-chans)))}))
                                  [msg c] (async/alts!! read-chans :priority true)
-                                 cid (io-id c)]
+                                 cid (io-id c)
+                                 _ (when site (vreset! site (when-not (= c control) {:stepping cid})))]
                              (if (= c control)
                                (let [nstatus (handle-command status msg)
                                      nstate (transit status nstatus state)]
@@ -565,7 +582,7 @@
                                          (transform state cid msg))
                                        [nstatus nstate]
                                        (send-outputs status nstate outputs outs
-                                                     resolver control handle-command step cast)]
+                                                     resolver control handle-command step cast site)]
                                    [nstatus nstate (inc count) (if (some? msg)
                                                                  read-ins
                                                                  (dissoc read-ins cid))])

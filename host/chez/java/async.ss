@@ -1457,6 +1457,20 @@
 ;; that only grows (a flow's ::flow/report slides; its ping shows the count: never a silent loss)
 (def-var! "jolt.host" "chan-dropped"
   (lambda (ch) (if (async-chan? ch) (vector-ref (async-chan-items ch) 3) 0)))
+;; (jolt.host/chan-fill ch): {:count n :capacity c :parked-puts p} — the values ch's buffer holds, its size (0
+;; for an unbuffered channel), and the puts parked waiting for room; nil for a port that is not a channel. Read
+;; under ch's lock, O(1): no wait (task jolt.async/a-channel-shows-its-fill; a flow's ping shows each in-port's)
+(def-var! "jolt.host" "chan-fill"
+  (lambda (ch)
+    (if (async-chan? ch)
+        (begin
+          (jolt-lock! (async-chan-mu ch))
+          (let ((n (ac-qlen ch)) (cap (async-chan-cap ch)) (p (length (async-chan-alt-putters ch))))
+            (jolt-unlock! (async-chan-mu ch))
+            (jolt-hash-map (jolt-keyword "count") n
+                           (jolt-keyword "capacity") (if (fixnum? cap) cap 0)
+                           (jolt-keyword "parked-puts") p)))
+        jolt-nil)))
 (cca-def! "__set-port-reader!" (lambda (f) (set! jolt-async-port-reader f) jolt-nil))
 (cca-def! "__port" jolt-async-port)
 ;; alts!'s ports with each take port that is not a channel read as the promise-chan reading it
