@@ -112,8 +112,10 @@
     (let [c (a/chan) ran (atom nil)]
       (a/go (reset! ran [:the-parents-fiber-ran (a/<! c)]))
       (a/<!! (a/timeout 5))
-      (check-eq "a fiber parked in the parent is not run in the child when the child wakes it"
-                (in-child-now #(do (a/>!! c :from-the-child) (a/<!! (a/timeout 50)) (nil? @ran))) 0)
+      ;; nor does its take stand there: a put in the child finds no taker (it was taken, and lost, by the parent's
+      ;; fiber, which never runs here: the blocking put this check made returned only because of that, 2026-11-14)
+      (check-eq "a fiber parked in the parent is not run in the child, and its take does not stand there"
+                (in-child-now #(let [taken (a/offer! c :from-the-child)] (a/<!! (a/timeout 50)) (and (not taken) (nil? @ran)))) 0)
       (a/close! c))
     ;; the parent's shutdown hooks are the parent's: a child that exits through System/exit runs
     ;; none of them (a Seon root's hook stops root; every fork of root ran it on a copy of root's

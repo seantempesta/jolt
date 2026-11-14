@@ -890,6 +890,8 @@
         #f #f
         (lambda () (proc-fd-shut! l)))
       l)))
+;; io-streams.ss's FIFO ports reach these two through this pair (it names nothing of this lazy file)
+(set! jolt-fd-ports (cons proc-fd-input-port proc-fd-output-port))
 ;; A child's stdout or stderr at its exit: let go of now when nobody is reading
 ;; it and the kernel holds nothing for it, so a child whose output was never
 ;; read does not keep its pipes until a collection -- the JDK closes them at

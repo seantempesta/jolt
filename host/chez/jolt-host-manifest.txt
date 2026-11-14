@@ -32,6 +32,7 @@ call-on-main-thread-async
 callable-host?
 catvec
 chan-dropped
+chan-fill
 chez-number-literal
 class-ancestors
 class-bases
