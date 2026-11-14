@@ -813,7 +813,9 @@
         (bytevector-copy! bv start tmp 0 n)
         (sa-foreign-bytes-set! buf tmp n))))
 
-(define (proc-fd-input-port fd)
+;; RUN, when given, runs each read's C call: io-streams.ss jolt-open-file-input-port's, for a FIFO
+;; (whose reads must run off the main carrier: see there). Default: the call itself.
+(define (proc-fd-input-port fd . run)
   (proc-fd-collect-released!)
   (let* ((l (proc-fd-life-new fd))
          (buf (proc-fd-life-buf l))
@@ -829,7 +831,7 @@
                   ;; top of every iteration: a fiber woken by a shut resumes here
                   (if (proc-fd-shut-now? l)
                       0
-                      (let-values (((got err) (proc-c-read fd buf want)))
+                      (let-values (((got err) (if (pair? run) ((car run) (lambda () (proc-c-read fd buf want))) (proc-c-read fd buf want))))
                         (cond
                           ((> got 0)
                            (proc-buf->bv! buf bv start got scratch)
@@ -853,7 +855,8 @@
         #f #f
         (lambda () (proc-fd-shut! l)))
       l)))
-(define (proc-fd-output-port fd)
+;; RUN as proc-fd-input-port's, for each write's C call.
+(define (proc-fd-output-port fd . run)
   (proc-fd-collect-released!)
   (let* ((l (proc-fd-life-new fd))
          (buf (proc-fd-life-buf l))
@@ -872,7 +875,7 @@
                   ;; lands on
                   (if (proc-fd-shut-now? l)
                       (shut-write)
-                      (let-values (((wrote err) (proc-c-write-errno fd buf want)))
+                      (let-values (((wrote err) (if (pair? run) ((car run) (lambda () (proc-c-write-errno fd buf want))) (proc-c-write-errno fd buf want))))
                         (cond
                           ((>= wrote 0) wrote)
                           ((= err proc-EINTR) (retry))

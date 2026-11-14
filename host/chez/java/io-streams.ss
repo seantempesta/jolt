@@ -1912,71 +1912,54 @@
 
 (define jolt-poll-fn (jolt-foreign-proc-blocking "poll" '(void* unsigned-long int) 'int))
 (define jolt-poll-eintr 4)
-;; --- opening a path whose open or read may wait: a FIFO, a device -----------------
+;; --- opening a path whose open or reads may wait: a FIFO, a device -----------------
 ;; Task jolt.host/a-blocking-call-on-a-main-carrier-parks. A FIFO's open waits for
-;; its other end, and its reads for a writer; run in C on a main carrier, either
-;; holds the carrier, so no other fiber runs and the wait is invisible (an open of
-;; a FIFO nobody wrote held one 80 minutes, 2026-11-13). Every path-opening ctor
-;; opens through these two, which answer what open-file-input-port and
-;; open-file-output-port answer: a regular file (or a missing path, or a directory)
-;; takes that ordinary path unchanged, one stat more; anything else is opened
-;; non-blocking and read or written through the child-pipe ports
-;; (proc-fd-input-port, proc-fd-output-port), whose EAGAIN parks the fiber on
-;; jolt.io-poller.
-;;
-;; The read side: a FIFO opened O_NONBLOCK with no writer reports nothing to read
-;; until a writer writes (measured, macOS 27), so the open waits on the poller for
-;; readability before the port's first read, which would otherwise answer EOF. The
-;; write side: with no reader the non-blocking open fails ENXIO at once, and no
-;; event says a reader came, so that open waits on an OS thread in a collect-safe
-;; open while the fiber parks on its answer (off a fiber, this thread waits there
-;; itself). The path is handed to C in foreign memory: a collect-safe call may see
+;; its other end, and its reads and writes for the other side; run in C on a main
+;; carrier, any of them holds the carrier, so no other fiber runs and the wait is
+;; invisible (an open of a FIFO nobody wrote held one 80 minutes, 2026-11-13). Every
+;; path-opening ctor opens through these two, which answer what open-file-input-port
+;; and open-file-output-port answer. A regular file, a missing path or a directory,
+;; and any open off a fiber, take that ordinary path unchanged (Chez's own open and
+;; reads are collect-safe, so a thread waiting there stops no collection:
+;; blockingopencollects). On a fiber, any other path's open, and each of its port's
+;; reads and writes, runs as a collect-safe call on an OS thread while the fiber parks
+;; on its answer (io-elsewhere). Not the poller: on macOS (27, measured) neither
+;; kqueue nor poll reports a FIFO's writer leaving, nor a writer that opens and closes
+;; having written nothing, where read answers EOF, so a read parked there would wait
+;; for good. The path is handed to C in foreign memory: a collect-safe call may see
 ;; the collector move a Scheme string.
 (define io-O-WRONLY 1)
 (define io-O-CLOEXEC (if (eq? (sa-os-family) 'macos) #x1000000 #x80000))
-(define io-ENXIO 6)
-(define io-c-open2 (jolt-foreign-proc-safe "open" '(void* int) 'int))
-(define io-c-open2-waits (jolt-foreign-proc-blocking "open" '(void* int) 'int))
+(define io-c-open-waits (jolt-foreign-proc-blocking-errno "open" '(void* int) 'int))
 (define (io-path-may-wait? p)
-  (and (string? p) io-c-open2 io-c-open2-waits
+  (and (string? p) io-c-open-waits (jolt-current-fiber)
        (not (file-regular? p)) (file-exists? p) (not (file-directory? p))))
+;; THUNK's values, the C call it makes run on an OS thread while this fiber parks; off a fiber, here.
+(define (io-elsewhere thunk)
+  (if (jolt-current-fiber)
+      (apply values (jolt-fiber-<! (async-go-spawn-thread (lambda () (call-with-values thunk list)))))
+      (thunk)))
 (define (io-c-path p)
   (let* ((bv (string->utf8 p)) (n (bytevector-length bv)) (m (sa-foreign-alloc (fx+ n 1))))
     (do ((i 0 (fx+ i 1))) ((fx=? i n)) (sa-foreign-set! 'unsigned-8 m i (bytevector-u8-ref bv i)))
     (sa-foreign-set! 'unsigned-8 m n 0)
     m))
-(define (io-open-refused p err)
-  (raise (condition (if (= err 13) (make-i/o-file-protection-error p) (make-i/o-filename-error p))
-                    (make-who-condition 'open)
-                    (make-message-condition (string-append "open failed: errno " (number->string err))))))
+(define (io-open-elsewhere p flags)
+  (let ((cp (io-c-path p)))
+    (let-values (((fd err) (io-elsewhere (lambda () (io-c-open-waits cp (fxior flags io-O-CLOEXEC))))))
+      (sa-foreign-free cp)
+      (when (< fd 0)
+        (raise (condition (if (= err 13) (make-i/o-file-protection-error p) (make-i/o-filename-error p))
+                          (make-who-condition 'open)
+                          (make-message-condition (string-append "open failed: errno " (number->string err))))))
+      fd)))
 (define (jolt-open-file-input-port p . rest)
   (if (io-path-may-wait? p)
-      (let ((cp (io-c-path p)))
-        (let-values (((fd err) (io-call+errno (io-c-open2 cp (fxior proc-O-NONBLOCK io-O-CLOEXEC)))))
-          (sa-foreign-free cp)
-          (when (< fd 0) (io-open-refused p err))
-          ;; nothing to read yet: park until a writer writes (or blocks this thread when no poller is loaded,
-          ;; then the fd blocks, and its first read waits in a collect-safe read)
-          (unless (proc-poller-wait-ready fd (jolt-keyword "read"))
-            (let ((flags (proc-fcntl-get fd proc-F-GETFL)))
-              (proc-fcntl-set fd proc-F-SETFL (fxand flags (fxnot proc-O-NONBLOCK)))))
-          (proc-fd-input-port fd)))
+      (proc-fd-input-port (io-open-elsewhere p 0) io-elsewhere)
       (apply open-file-input-port p rest)))
 (define (jolt-open-file-output-port p . rest)
   (if (io-path-may-wait? p)
-      (let ((cp (io-c-path p)))
-        (let-values (((fd err) (io-call+errno (io-c-open2 cp (fxior io-O-WRONLY proc-O-NONBLOCK io-O-CLOEXEC)))))
-          (let ((fd (cond ((>= fd 0) fd)
-                          ((= err io-ENXIO)
-                           (let ((open (lambda () (io-c-open2-waits cp (fxior io-O-WRONLY io-O-CLOEXEC)))))
-                             (if (jolt-current-fiber)
-                                 (jolt-fiber-<! (async-go-spawn-thread open))
-                                 (open))))
-                          (else -1))))
-            (sa-foreign-free cp)
-            (when (< fd 0) (io-open-refused p (if (= err io-ENXIO) 0 err)))
-            (proc-set-nonblocking! fd)
-            (proc-fd-output-port fd))))
+      (proc-fd-output-port (io-open-elsewhere p io-O-WRONLY) io-elsewhere)
       (apply open-file-output-port p rest)))
 
 ;; Sleeps until fd has something to read, hangs up or errors, or the thread is
