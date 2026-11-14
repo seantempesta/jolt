@@ -2596,6 +2596,11 @@
 (define jolt-on-root-change-cell #f)
 (define (var-root-set! c v)
   (when var-root-write-hook (var-root-write-hook c))
+  ;; the root this write replaces, read only while *on-root-change* is bound (its hook gets (f var old))
+  (let* ((cell jolt-on-root-change-cell)
+         (h (and cell (var-cell-dyn-bound? cell)
+                 (let ((h (dyn-binding-value cell))) (and (not (eq? h dyn-no-binding)) (not (jolt-nil? h)) h))))
+         (old (and h (var-cell-root c))))
   (let ((l (hashtable-ref var-linked-tbl c #f)))
     (if l
         ;; The cell and the binding are ONE value, so the two writes are one
@@ -2607,13 +2612,10 @@
           (var-cell-root-set! c v)
           ((cdr l) v))
         (var-cell-root-set! c v)))
-  ;; after the write and outside the mutex; bound to nil while it runs, so a root it
+  ;; after the write and outside the mutex, with the root it replaced; bound to nil while it runs, so a root it
   ;; writes itself is not noted again
-  (let ((cell jolt-on-root-change-cell))
-    (when (and cell (var-cell-dyn-bound? cell))
-      (let ((h (dyn-binding-value cell)))
-        (unless (or (eq? h dyn-no-binding) (jolt-nil? h))
-          (dyn-with-frame (list (cons cell jolt-nil)) (lambda () (jolt-invoke1 h c))))))))
+  (when h
+    (dyn-with-frame (list (cons cell jolt-nil)) (lambda () (jolt-invoke2 h c old))))))
 ;; The jv$ symbol a linked var is bound under, or #f. jolt.host/seed-callable?
 ;; answers it so an app's direct call site applies the binding itself (backend
 ;; emit-invoke) rather than a root hoisted once at load.

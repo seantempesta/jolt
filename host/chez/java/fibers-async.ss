@@ -698,14 +698,35 @@
 ;; nothing of a platform without fork(2).
 (define jolt-fork-alone
   (let ((fork-alone #f))
+    (case-lambda
+      (() (jolt-fork-alone -1))
+      ((bound-ms)
+       (unless fork-alone (set! fork-alone (foreign-procedure "(cs)fork_alone" (iptr) int)))
+       (disable-interrupts)
+       (let ((pid (fork-alone bound-ms)))
+         (when (= pid 0) (jolt-after-fork-child!))
+         (enable-interrupts)
+         pid)))))
+;; (jolt.host/fork-alone) waits with no bound; (jolt.host/fork-alone ms) answers -3 when no other thread
+;; has parked within ms, and (jolt.host/fork-holders) then names who held it.
+(def-var! "jolt.host" "fork-alone"
+  (case-lambda (() (jolt-fork-alone)) ((ms) (jolt-fork-alone (jnum->exact ms)))))
+;; (jolt.host/fork-holders) -> [{:id n :name s} ...]: the threads other than this one that hold a fork now (Chez
+;; fork_hold_state: active, running Scheme or in a C call that is not collect-safe), what a fork's bound names
+(define jolt-fork-holders
+  (let ((hold-state #f))
     (lambda ()
-      (unless fork-alone (set! fork-alone (foreign-procedure "(cs)fork_alone" () int)))
-      (disable-interrupts)
-      (let ((pid (fork-alone)))
-        (when (= pid 0) (jolt-after-fork-child!))
-        (enable-interrupts)
-        pid))))
-(def-var! "jolt.host" "fork-alone" (lambda () (jolt-fork-alone)))
+      (unless hold-state (set! hold-state (foreign-procedure "(cs)fork_hold_state" (scheme-object) int)))
+      (let ((me (get-thread-id)) (k-id (keyword #f "id")) (k-name (keyword #f "name")))
+        (let loop ((ts ($thread-list)) (acc '()))
+          (if (null? ts)
+              (apply jolt-vector (reverse acc))
+              (let* ((t (car ts)) (tc ($thread-tc t))
+                     (id (and (not (eq? tc 0)) ($tc-field 'threadno tc))))
+                (if (and id (not (eqv? id me)) (= 1 (hold-state t)))
+                    (loop (cdr ts) (cons (jolt-hash-map k-id id k-name (jolt-thread-name id)) acc))
+                    (loop (cdr ts) acc)))))))))
+(def-var! "jolt.host" "fork-holders" (lambda () (jolt-fork-holders)))
 (def-var! "jolt.host" "fork-alone-cancel!"
   (let ((cancel #f))
     (lambda () (unless cancel (set! cancel (foreign-procedure "(cs)fork_alone_cancel" () void))) (cancel) jolt-nil)))

@@ -62,12 +62,13 @@
   the child becomes proc pid of g (proc over the parent's end: in-port (:in opts, default :in)
   carries what the flow sends it, out-port (:out opts, default :out) what the child puts, its
   end delivered last), with (:conns opts) added, by one update! of the config last applied.
-  Answers {:pid child-os-pid}, or {:refused n} when fork-alone refuses (another thread was
-  active: n is -2) and nothing is added. The caller reaps the child (waitpid)."
-  [g pid child {:keys [in out conns keep] :or {in :in out :out} :as opts}]
-  (let [ropts (dissoc opts :in :out :conns :keep)
+  Answers {:pid child-os-pid}, or {:refused n :holders [...]} when fork-alone gives up (n is -2 when
+  cancelled, -3 when no other thread parked within (:fork-wait-ms opts); :holders, jolt.host/fork-holders,
+  the threads that held it) and nothing is added. The caller reaps the child (waitpid)."
+  [g pid child {:keys [in out conns keep fork-wait-ms] :or {in :in out :out} :as opts}]
+  (let [ropts (dissoc opts :in :out :conns :keep :fork-wait-ms)
         [end fd] (r/remote-pair ropts)
-        os-pid (jolt.host/fork-alone)]
+        os-pid (if fork-wait-ms (jolt.host/fork-alone fork-wait-ms) (jolt.host/fork-alone))]
     (cond
       (zero? os-pid)
       (let [_ (r/close-streams-but! (conj (set keep) fd))
@@ -82,7 +83,7 @@
         (System/exit (if ok 0 1)))
 
       (neg? os-pid)
-      (do (r/close! end) (r/close-fd! fd) {:refused os-pid})
+      (let [holders (jolt.host/fork-holders)] (r/close! end) (r/close-fd! fd) {:refused os-pid :holders holders})
 
       :else
       (do (r/close-fd! fd)

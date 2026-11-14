@@ -479,7 +479,8 @@
 (def-var! "clojure.core" "var-get" jolt-var-get)
 (def-var! "clojure.core" "deref" jolt-deref)
 
-;; jolt.host/*on-root-change* (rt.ss var-root-set!): a fn called with each var whose root is written while it
+;; jolt.host/*on-root-change* (rt.ss var-root-set!): a fn called with each var whose root is written while it,
+;; and the root that write replaced, (f var old),
 ;; is bound; jolt.host/on-root-change binds it around a thunk. Defined here, after the binding machinery, so
 ;; var-root-set! reads it only once a binding can exist.
 (def-dynvar! "jolt.host" "*on-root-change*" jolt-nil)

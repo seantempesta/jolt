@@ -1,4 +1,5 @@
-;; Every change of a var's root inside (jolt.host/on-root-change f thunk) calls f with the var once the root is written,
+;; Every change of a var's root inside (jolt.host/on-root-change f thunk) calls f with the var and the root it replaced
+;; once the root is written,
 ;; on any thread or fiber the thunk started (the binding conveys, as every binding does: a pooled future's, a go block's,
 ;; an a/thread's): a def, a def through load-string from a computed string, an intern, an alter-var-root. Seon's
 ;; REPL binds it around an eval to note what the eval redefined, wherever the definition came from (an agent's computed
@@ -15,7 +16,8 @@
 ;; pool's does not, and missed the root writes a thread parameter carried)
 (dotimes [_ 8] @(future 1) (a/<!! (a/thread 1)) (a/<!! (a/go 1)))
 (let [seen (atom [])
-      note (fn [v] (swap! seen conj (str (.-ns v) "/" (.sym v))))]
+      olds (atom {})
+      note (fn [v old] (swap! olds assoc (str (.-ns v) "/" (.sym v)) old) (swap! seen conj (str (.-ns v) "/" (.sym v))))]
   (jolt.host/on-root-change note
     (fn []
       (load-string (str "(def " "computed-" "name" " 1)"))
@@ -26,6 +28,7 @@
       (a/<!! (a/go (intern *ns* 'from-go 3)))))
   (doseq [n ["user/computed-name" "user/interned" "user/before" "user/from-future" "user/from-thread" "user/from-go"]]
     (when-not (some #{n} @seen) (fail! n " was not reported: " (pr-str @seen))))
+  (when-not (= 0 (@olds "user/before")) (fail! "alter-var-root's hook did not get the root it replaced: " (pr-str (@olds "user/before"))))
   (reset! seen [])
   (def after-the-hook 3)
   (dotimes [_ 8] @(future (intern *ns* 'after-future 1)) (a/<!! (a/go (intern *ns* 'after-go 2))))
