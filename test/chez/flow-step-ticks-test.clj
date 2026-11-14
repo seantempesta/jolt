@@ -16,9 +16,10 @@
     ([] {:ins {:in "values"} :outs {} :workload workload :step-ticks 50000000})
     ([_] {:n 0})
     ([s _] s)
-    ([s _ m] (if (= m :spin)
+    ([s cid m] (cond (= cid ::flow/step-ended) [s {}]   ; a proc that ignores the ended step is unchanged
+                     (= m :spin)
                (loop [] (recur))
-               (do (swap! done conj [workload m (:n s)]) [(update s :n inc) {}])))))
+                     :else (do (swap! done conj [workload m (:n s)]) [(update s :n inc) {}])))))
 
 (doseq [w [:mixed :io]]
   (let [g (flow/create-flow {:procs {:s {:proc (flow/process (spinner w))}} :stop-timeout-ms 300})
