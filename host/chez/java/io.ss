@@ -3186,14 +3186,15 @@
         ;; though. Truncating a file with data costs the kernel a free and a
         ;; reallocation of its blocks (about 70us on Linux on disk, against 6us
         ;; to overwrite them), so the old tail goes after the write, when there
-        ;; is one. A device or fifo reports length 0 and has no tail.
+        ;; is one. A device or fifo reports length 0 and has no tail; one opened on a
+        ;; fiber is a port with no length at all (jolt-open-file-output-port).
         (with-port (open-path-guarded given p
                      (lambda (rp) (jolt-open-file-output-port rp (file-options no-fail no-truncate)
                                                          (buffer-mode block))))
           (lambda (port)
             (put-bytevector port bytes)
             (flush-output-port port)
-            (when (> (port-length port) (bytevector-length bytes))
+            (when (and (port-has-port-length? port) (> (port-length port) (bytevector-length bytes)))
               (set-port-length! port (bytevector-length bytes))))))
     jolt-nil))
 
