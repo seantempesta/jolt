@@ -612,7 +612,25 @@
                                    (async/put! (outs ::flow/error)
                                               #::flow{:pid pid, :status status, :state state,
                                                       :count (inc count), :cid cid, :msg msg :op :step, :ex ex})
-                                   [status state count read-ins])))))
+                                   ;; jolt: a step ended at its :step-ticks budget is handed back to its proc, cid
+                                   ;; ::flow/step-ended, so it can answer its asker typed (a dropped ask was a hang); its
+                                   ;; state is kept. Only a budget's end: any other throw is the step's own error.
+                                   (let [d (ex-data ex)]
+                                     (if (and (:step-ticks desc) (:jolt/ticks-budget d))
+                                       (try
+                                         (let [[nstate outputs] (transform state ::flow/step-ended
+                                                                           {:msg msg :cid cid
+                                                                            :ticks-spent (:jolt/ticks-spent d)
+                                                                            :ticks-budget (:jolt/ticks-budget d)})
+                                               [nstatus nstate] (send-outputs status nstate outputs outs
+                                                                              resolver control handle-command step cast site)]
+                                           [nstatus nstate count read-ins])
+                                         (catch Throwable ex2
+                                           (async/put! (outs ::flow/error)
+                                                       #::flow{:pid pid, :status status, :state state, :cid ::flow/step-ended,
+                                                               :msg msg :op :step-ended, :ex ex2})
+                                           [status state count read-ins]))
+                                       [status state count read-ins])))))))
                          (catch Throwable ex
                            (async/put! (outs ::flow/error)
                                       #::flow{:pid pid, :status status, :state state, :count (inc count), :ex ex})
