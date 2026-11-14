@@ -1021,10 +1021,7 @@
 ;; not counted.
 (define (aot-cache-artifacts root)
   (let ((t (make-hashtable string-hash string=?)))
-    (for-each
-      (lambda (g)
-        (let ((v1 (string-append root "/" g "/v1")))
-          (when (and (aot-real-dir? (string-append root "/" g)) (aot-real-dir? v1))
+    (define (dir-artifacts! v1)
             (for-each
               (lambda (f)
                 (let ((ext (aot-ext f)) (p (string-append v1 "/" f)))
@@ -1038,7 +1035,14 @@
                           (vector-set! a 0 (max ms (vector-ref a 0)))
                           (vector-set! a 1 (+ n (vector-ref a 1)))
                           (vector-set! a (if (string=? ext ".so") 2 3) p)))))))
-              (directory-list v1)))))
+              (directory-list v1)))
+    (for-each
+      (lambda (g)
+        (let ((v1 (string-append root "/" g "/v1")))
+          (when (and (aot-real-dir? (string-append root "/" g)) (aot-real-dir? v1))
+            (dir-artifacts! v1)
+            (let ((forms (string-append v1 "/forms")))   ; aot-form-code's
+              (when (aot-real-dir? forms) (dir-artifacts! forms))))))
       (if (aot-real-dir? root) (directory-list root) '()))
     (vector->list (hashtable-values t))))
 (define (aot-prune-to-budget! root limit)
@@ -1117,6 +1121,45 @@
   (aot-cache-key-of (bytevector-length bv) (aot-bytes-hash bv)))
 (define (aot-cache-key-of len hash)
   (string-append (number->string len 16) "-" (number->string hash 16)))
+;; FNV-1a and a multiplicative hash with a different basis and multiplier, in one
+;; pass, beside the length; answered as hex text. Both multipliers stay under 2^24
+;; so a product of a 32-bit state is a fixnum on every 64-bit target. The key of a
+;; compiled unit by its text: a build's (build.ss bld-unit-key) and a form's
+;; (aot-form-code).
+(define (aot-text-key s)
+  (let ((n (string-length s)))
+    (let loop ((i 0) (h1 2166136261) (h2 1540483477))
+      (if (fx=? i n)
+          (string-append (number->string n 16) "-" (number->string h1 16) "-" (number->string h2 16))
+          (let ((c (char->integer (string-ref s i))))
+            (loop (fx+ i 1)
+                  (fxlogand (fx* (fxlogxor h1 c) 16777619) #xFFFFFFFF)
+                  (fxlogand (fx+ (fx* (fxlogxor h2 (fxsrl h2 15)) #x5bd1e9) c) #xFFFFFFFF)))))))
+
+;; One top-level form's compiled code (a fasl, as compile-to-port writes it) by
+;; KEY, the digest of its renumbered text (compile-eval.ss jolt-ce-run-emitted):
+;; <generation>/v1/forms/KEY.so when a process published it, else COMPILE's bytes,
+;; published there by temp and rename for every later process. Same generation,
+;; byte budget and pruning as a namespace's artifacts (aot-cache-artifacts walks
+;; forms/). A cache this process cannot write still answers COMPILE's bytes.
+(define aot-forms-dir-made? #f)
+(define (aot-form-code key compile)
+  (let* ((dir (and (aot-cache-usable?) (string-append (aot-cache-subdir) "/forms")))
+         (so (and dir (string-append dir "/" key ".so")))
+         ;; an entry pruned between the test and the read is a miss
+         (hit (and so (file-regular? so) (guard (e (#t #f)) (read-file-bytes so)))))
+    (or hit
+        (let ((bv (compile)))
+          (when so
+            (guard (e (#t (aot-info (string-append "could not cache form " key (ldr-condition-suffix e)))))
+              (unless aot-forms-dir-made? (aot-mkdir-p dir) (set! aot-forms-dir-made? #t))
+              (let* ((tmp (string-append dir "/" key ".tmp" (number->string (get-process-id))))
+                     (out (open-file-output-port tmp (file-options no-fail))))
+                (put-bytevector out bv)
+                (close-port out)
+                (rename-replace! tmp so)))
+            (aot-prune-to-budget-once!))
+          bv))))
 (define (aot-info msg)
   (when (getenv "JOLT_DEBUG")
     (display (string-append "[jolt.aot] " msg "\n") (current-error-port))))

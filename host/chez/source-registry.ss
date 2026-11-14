@@ -763,23 +763,31 @@
                 (if (string? v) v #f))))
     (and (string? ns)
          (vector file ns (car (jolt-profile-form-labels written ns))))))
+;; NAME #f mints the next jolt-eval-src-<n>. A form whose compiled code is reused
+;; (compile-eval.ss jolt-ce-run-emitted) carries the name its text's digest gives,
+;; jolt-eval-src-<key>, in every process that loads it; registering a name already
+;; registered replaces its table and keeps its place in the eviction order.
 (define (jolt-register-eval-marker-table! scm . info)
+  (apply jolt-register-eval-marker-table-as! #f scm info))
+(define (jolt-register-eval-marker-table-as! given scm . info)
   (define prof (and (sa-profile-instrumenting?) (= (length info) 3)
                     (apply jolt-profile-source-entry scm info)))
   (define dbg (and (jolt-debug-locals-instrumenting?) (= (length info) 3)
                    (apply jolt-debug-source-entry info)))
   (jolt-lock! jolt-eval-source-mutex)
-  (let ((name (string-append "jolt-eval-src-"
-                             (number->string jolt-eval-source-counter)))
+  (let ((name (or given
+                  (let ((n (string-append "jolt-eval-src-" (number->string jolt-eval-source-counter))))
+                    (set! jolt-eval-source-counter (+ jolt-eval-source-counter 1))
+                    n)))
         (table (jolt-marker-table scm)))
-    (set! jolt-eval-source-counter (+ jolt-eval-source-counter 1))
-    (when (fx>=? (hashtable-size jolt-eval-marker-registry) jolt-eval-source-max)
-      (let ((old (jolt-eval-queue-pop!)))
-        (when old
-          (hashtable-delete! jolt-eval-marker-registry old)
-          (hashtable-delete! jolt-debug-sources old))))
+    (unless (hashtable-contains? jolt-eval-marker-registry name)
+      (when (fx>=? (hashtable-size jolt-eval-marker-registry) jolt-eval-source-max)
+        (let ((old (jolt-eval-queue-pop!)))
+          (when old
+            (hashtable-delete! jolt-eval-marker-registry old)
+            (hashtable-delete! jolt-debug-sources old))))
+      (jolt-eval-queue-push! name))
     (hashtable-set! jolt-eval-marker-registry name table)
-    (jolt-eval-queue-push! name)
     (when prof (jolt-profile-note-source! name prof))
     (when dbg (hashtable-set! jolt-debug-sources name dbg))
     (jolt-unlock! jolt-eval-source-mutex)
@@ -793,8 +801,9 @@
   (jolt-marker-entry-line (jolt-eval-source-entry name offset)))
 ;; Is this source name a registry key rather than a real file? The distinguisher
 ;; between "consult the eval registry" and "read a .scm off disk": every name
-;; this registry mints is "jolt-eval-src-" followed by decimal digits, and no
-;; generated artifact on disk is ever named that.
+;; this registry mints is "jolt-eval-src-" followed by a counter (decimal) or a
+;; text key (hex digits and dashes, loader.ss aot-text-key), and no generated
+;; artifact on disk is ever named that.
 (define (jolt-eval-source-name? name)
   (and (string? name)
        (let ((n (string-length name)))
@@ -802,8 +811,9 @@
               (string=? (substring name 0 14) "jolt-eval-src-")
               (let loop ((i 14))
                 (or (fx>=? i n)
-                    (and (char<=? #\0 (string-ref name i) #\9)
-                         (loop (fx+ i 1)))))))))
+                    (let ((c (string-ref name i)))
+                      (and (or (char<=? #\0 c #\9) (char<=? #\A c #\F) (char=? c #\-))
+                           (loop (fx+ i 1))))))))))
 
 ;; --- jolt.profile: execution counts by clj line --------------------------------
 ;; Code compiled while instrumentation is on (sa-profile-instrument!) carries a
