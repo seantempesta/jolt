@@ -859,7 +859,14 @@
                                         (if (fx=? i n)
                                             (reverse acc)
                                             (loop (fx+ i 1) (cons (list 'jolt-fnsrc-probe i) acc)))))
-                                (slots (image-flat-free-values (apply mk sent))))
+                                (slots (image-flat-free-values (apply mk sent)))
+                                ;; a spliced copy's constant entries (a one-element vector in its
+                                ;; live names) capture nothing: their value travels in the
+                                ;; registration, so their sentinel is not looked for
+                                (consts (let loop ((l (jolt-seq (vector-ref reg 3))) (acc '()))
+                                          (if (jolt-nil? l)
+                                              (reverse acc)
+                                              (loop (jolt-next l) (cons (not (string? (jolt-first l))) acc))))))
                            (if (not slots)
                                'none
                                (let ((perm (map (lambda (s)
@@ -868,7 +875,12 @@
                                                           ((eq? (car l) s) i)
                                                           (else (loop (cdr l) (fx+ i 1))))))
                                                 sent)))
-                                 (if (memq #f perm) 'none perm))))))))
+                                 (if (let miss ((p perm) (c consts))
+                                       (and (pair? p)
+                                            (or (and (not (car p)) (not (and (pair? c) (car c))))
+                                                (miss (cdr p) (if (pair? c) (cdr c) c)))))
+                                     'none
+                                     perm))))))))
             (image-fn-form-layout-set! reg v)
             v)))))
 

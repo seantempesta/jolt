@@ -2784,11 +2784,20 @@
 ;; gensym a `letfn*` binds around a loop. Hoisted, those are unbound at runtime.
 ;; Only the FIRST maker is registered (the cell guards it), because all it is used
 ;; for is the layout, and every instance shares the code object that decides it.
-(defn- fnsrc-maker-site [nm frees inner]
+;; A spliced copy's maker, [params args] from its :live-names: a captured name is both, a constant is a
+;; placeholder parameter passed #f. nil when two entries name one local (a parameter list cannot repeat).
+(defn- fnsrc-spliced-maker [lives]
+  (let [names (filter string? lives)]
+    (when (= (count names) (count (distinct names)))
+      [(mapv #(if (string? %) (munge-name %) (fresh-label "_mkx$")) lives)
+       (mapv #(if (string? %) (munge-name %) "#f") lives)])))
+
+;; PS the maker's parameters and ARGS what the site passes them, both emitted names: a literal's free
+;; names for each, or for a SPLICED copy the names its captures became (fnsrc-spliced-maker).
+(defn- fnsrc-maker-site [nm ps args inner]
   (let [c (fresh-label "_mkc$")
         v (fresh-label "_mk$")
-        ps (map munge-name frees)
-        args (apply str (map #(str " " %) ps))]
+        args (apply str (map #(str " " %) args))]
     (swap! *cache-cells* conj c)
     (str "(let ((" v " (lambda (" (str/join " " ps) ") " inner "))) "
          "(if (not " c ") (begin (set! " c " #t) "
@@ -3325,19 +3334,20 @@
               ;; the same maker treatment as an anonymous literal below, and for
               ;; the same reason — a letfn-bound fn that a lazy-seq thunk closes
               ;; over is exactly what map-indexed, distinct and tree-seq capture
-              (if (or (nil? *fnsrc-regs*) (:live-names node) (nil? *cache-cells*)
-                    ;; nothing captured, nothing to recover: the restore wrapper
-                    ;; binds no free names, so this closure never needs a layout
-                    (empty? (:free-names node))
-                    (some *letrec-binders* (:free-names node)))
-                (do (when *fnsrc-regs*
-                      (swap! *fnsrc-regs* conj
-                             [fnsrc-nm (:src-form node) fnsrc-src-ns (:free-names node)
-                              (:live-names node)]))
-                    inner)
-                (do (swap! *fnsrc-regs* conj
-                           [fnsrc-nm (:src-form node) fnsrc-src-ns (:free-names node) nil])
-                    (fnsrc-maker-site fnsrc-nm (:free-names node) inner))))
+              (let [lives (:live-names node)
+                    maker (if lives (fnsrc-spliced-maker lives) (let [ps (map munge-name (:free-names node))] [ps ps]))]
+                (if (or (nil? *fnsrc-regs*) (nil? maker) (nil? *cache-cells*)
+                      ;; nothing captured, nothing to recover: the restore wrapper
+                      ;; binds no free names, so this closure never needs a layout
+                      (empty? (:free-names node))
+                      (some *letrec-binders* (or (seq (filter string? lives)) (:free-names node))))
+                  (do (when *fnsrc-regs*
+                        (swap! *fnsrc-regs* conj
+                               [fnsrc-nm (:src-form node) fnsrc-src-ns (:free-names node) lives]))
+                      inner)
+                  (do (swap! *fnsrc-regs* conj
+                             [fnsrc-nm (:src-form node) fnsrc-src-ns (:free-names node) lives])
+                      (fnsrc-maker-site fnsrc-nm (nth maker 0) (nth maker 1) inner)))))
             :else
             (str "(letrec ((" m " " lambda ")) " ret ")"))))
       (if (not fnsrc-nm)
@@ -3392,22 +3402,25 @@
           ;; reads every later instance through that permutation. The cost is one
           ;; closure per site at first dump and one call per closure creation.
           ;;
-          ;; A SPLICED copy keeps the old emission: its captures no longer stand
-          ;; in one-to-one correspondence with the source's free names (a binder
-          ;; was renamed, an argument was folded to a constant), which is what
-          ;; :live-names records, so there is no honest parameter list to give a
-          ;; maker. Those still need inspector information, which the builds that
-          ;; splice (an app build, not the seed) generate by default.
-          (if (or (nil? *fnsrc-regs*) lives (nil? *cache-cells*)
-                  (empty? frees)
-                  (some *letrec-binders* frees))
-            ;; no maker: a spliced copy (see above), or a literal emitted outside
-            ;; any cache-cell scope — there would be nowhere to bind one, and a
-            ;; site calling an unbound maker is worse than a closure that refuses.
-            (do (when *fnsrc-regs* (swap! *fnsrc-regs* conj [nm form fnsrc-src-ns frees lives]))
-                inner)
-            (do (swap! *fnsrc-regs* conj [nm form fnsrc-src-ns frees nil])
-                (fnsrc-maker-site nm frees inner))))))))
+          ;; A SPLICED copy's captures are not its source's free names (a binder
+          ;; was renamed, an argument was folded to a constant): :live-names says
+          ;; what each became. Its maker takes one parameter a free name, the
+          ;; renamed local where one is captured, a placeholder where a constant
+          ;; left nothing to capture (its value travels in the registration), so
+          ;; the layout probe reads it as any other site's, with no inspector
+          ;; information: a release build strips that, and a spliced closure
+          ;; could not be written to an image from one (buildsmoke).
+          (let [maker (if lives (fnsrc-spliced-maker lives) (let [ps (map munge-name frees)] [ps ps]))]
+            (if (or (nil? *fnsrc-regs*) (nil? maker) (nil? *cache-cells*)
+                    (empty? frees)
+                    (some *letrec-binders* (or (seq (filter string? lives)) frees)))
+              ;; no maker: a spliced copy whose captures repeat a name, or a literal
+              ;; emitted outside any cache-cell scope — there would be nowhere to bind
+              ;; one, and a site calling an unbound maker is worse than a closure that refuses.
+              (do (when *fnsrc-regs* (swap! *fnsrc-regs* conj [nm form fnsrc-src-ns frees lives]))
+                  inner)
+              (do (swap! *fnsrc-regs* conj [nm form fnsrc-src-ns frees lives])
+                  (fnsrc-maker-site nm (nth maker 0) (nth maker 1) inner)))))))))
 
 ;; If fnode is a clojure.core (or host) ref to a native-op primitive, return the
 ;; Scheme op string — only at an arity where the Scheme op and the jolt fn agree.
