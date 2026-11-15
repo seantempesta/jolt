@@ -2463,10 +2463,17 @@
             ;; (seon.sqlite's with-row-calls, six bindings a call, 2026-11-12). At top
             ;; level, with no def scope, the closure keeps it, as before.
             cells *cache-cells*
-            p (if cells
-                (let [c (fresh-label "_cfn$")] (swap! cells conj c) c)
-                "p")
-            proc (str "(or " p " (begin (set! " p " (or " scoped " " fp ")) " p "))")
+            ;; Outside a def (a deftype or defrecord method, an extend-type impl, a reify in a bare top-level form) there are
+            ;; no cells but the form's constant pool: the site takes a box of its own from the pool (hoist-const-per-site),
+            ;; made once when the form loads, so it resolves once a process; a fresh closure per evaluation dlsym'd each
+            ;; call (15 us a call at Seon's root, task jolt.backend/a-cfn-outside-a-def-resolves-once)
+            box (when (and (not cells) *const-pool*) (hoist-const-per-site "(box #f)"))
+            p (cond cells (let [c (fresh-label "_cfn$")] (swap! cells conj c) c)
+                    box nil
+                    :else "p")
+            proc (if box
+                   (str "(or (unbox " box ") (let ((_r (or " scoped " " fp "))) (set-box! " box " _r) _r))")
+                   (str "(or " p " (begin (set! " p " (or " scoped " " fp ")) " p "))"))
             call-args (if ret-aggregate? (into [native-destination] native-args) native-args)
             call (str "(" proc
                       (when (seq call-args) (str " " (str/join " " call-args))) ")")
@@ -2494,7 +2501,7 @@
                    (= "float" (:rettype node)) (str "(make-jfloat " call ")")
                    :else call)
             lam (str "(lambda (" (str/join " " wrapper-params) ") " body ")")
-            binding (if cells lam (str "(let ((p #f)) " lam ")"))]
+            binding (if (or cells box) lam (str "(let ((p #f)) " lam ")"))]
         (if (or (seq aggregates) ret-aggregate?)
           (str "(let () "
                (str/join " "
