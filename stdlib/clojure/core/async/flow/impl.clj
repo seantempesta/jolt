@@ -597,12 +597,11 @@
                            ;;:running
                            (let [ ;;TODO rotate/randomize after control per normal alts?
                                  read-chans (let [ipred (or (::flow/input-filter state) identity)]
-                                              (cond-> (reduce-kv (fn [ret cid chan]
-                                                                   (if (ipred cid)
-                                                                     (conj ret chan)
-                                                                     ret))
-                                                                 [control casts] read-ins)
-                                                ended (conj ended)))
+                                              (reduce-kv (fn [ret cid chan]
+                                                           (if (ipred cid)
+                                                             (conj ret chan)
+                                                             ret))
+                                                         (cond-> [control] ended (conj ended) true (conj casts)) read-ins))
                                  _ (when site (vreset! site {:reading (disj (set (keep io-id read-chans)) ::flow/step-ended)}))
                                  [msg c] (async/alts!! read-chans :priority true)
                                  cid (io-id c)
