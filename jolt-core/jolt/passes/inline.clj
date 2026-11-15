@@ -460,6 +460,14 @@
                          (conj seen e))))
         false))))
 
+(defn- no-inline-ns?
+  "Is a callee in namespace nsn one the compile options say never to splice: its name starts with a prefix of
+  *compiler-options*' :no-inline-ns-prefixes (a program whose own vars are redefined in place, by a REPL or a load of a
+  changed form, must call them through their vars, never a copy of an old body)."
+  [nsn]
+  (let [ps (get *compiler-options* :no-inline-ns-prefixes) s (str nsn)]
+    (boolean (and ps nsn (some (fn [p] (and (<= (count p) (count s)) (= p (subs s 0 (count p))))) ps)))))
+
 (defn- try-inline
   "node is an :invoke whose children are already inlined. If its :fn is a var
   with a stashed, in-budget, arity-matching inline body, return the spliced
@@ -467,7 +475,7 @@
   [node ctx]
   (let [f (get node :fn)]
     (if (= :var (get f :op))
-      (let [stash (inline-ir ctx (get f :ns) (get f :name))]
+      (let [stash (when-not (no-inline-ns? (get f :ns)) (inline-ir ctx (get f :ns) (get f :name)))]
         (if stash
           (let [params (get stash :params)
                 body (get stash :body)

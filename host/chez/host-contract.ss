@@ -1340,7 +1340,10 @@
   (def-var! "jolt.host" "stash-inline!" hc-stash-inline!)
   (def-var! "jolt.host" "var-redefined?" hc-var-redefined?)
   (def-var! "jolt.host" "seed-callable?" hc-seed-callable?)
-  (def-var! "jolt.host" "mark-spliced!" hc-mark-spliced!))
+  (def-var! "jolt.host" "mark-spliced!" hc-mark-spliced!)
+  ;; (jolt.host/spliced-fqns) -> ["ns/name" ...]: every callee whose body this process's inline pass copied into a caller
+  ;; (mark-spliced!), so a build can show which vars a redefinition would not reach
+  (def-var! "jolt.host" "spliced-fqns" (lambda () (apply jolt-vector (inline-spliced-fqns)))))
 
 (hc-install!)
 
