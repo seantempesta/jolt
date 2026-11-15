@@ -192,7 +192,7 @@ CI-GATES := submodules values recordinline corpus nsaudit unit documented grenad
   protoret accfix pic narrow directlink mintgate directcall defmetacells staticsite arraymap recfast recfold arraybacking largebytesgc largefxgc unitcontext numeric oparity mathfl flonumdisp flarr \
   fnform poolshape coreproc traceemit traceeval degradedbacktrace \
   inline inline-body dcerefs shakelocal manifestcheck readmecheck portcheck mirrordrift regexdfacheck regexdfa regexanchor regexanchorprims regexanchorcheck regexreplace regexsyntax regexbacktrack deadhost foreignlookuponce recordshadow emittedheads adaptercheck hostprops normalizecheck hostregistry hostarity enummodel imagecoverage lazyshims foreignhandles dispatchalloc hostsite regexmatcher winpath winplatform winparity statlayout lockcheck parkcheck shelloutcheck errnocheck irvalidate seeddefs devbootsmoke numequivalloc analyzealloc emitalloc treeseqcost hashsetbulkcost imagefnforms imagelegacyclaim \
-  gatebootsmoke aotcachesmoke aotframetable aotcachebudget providerfirstuse fibersecondmutator fiberuncaught fiberunread atomwatchorder varwatchorder buildemptycacheentry aotcachepathsmoke aotcachesourcepathsmoke aotcachestarfilesmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck buildunitwrite threadeddeadlock forkheldlocks oomafterrendezvous heaphistogram siginfodump siginfodumpdisabled siginfodumpchild fibercost stepmeasure \
+  gatebootsmoke aotcachesmoke aotframetable aotcachebudget providerfirstuse fibersecondmutator fiberuncaught fiberunread atomwatchorder varwatchorder buildemptycacheentry aotcachepathsmoke aotcachesourcepathsmoke aotcachestarfilesmoke aotfingerprint vfaslceiling vfaslstrings buildscaling buildnatives buildsegments compilepathsmoke makefilesmoke versionsmoke attributioncheck noticecheck buildunitwrite threadeddeadlock forkheldlocks oomafterrendezvous heaphistogram siginfodump siginfodumpdisabled siginfodumpchild fibercost stepmeasure foreignlookups \
   systemstreams closedstdout stderrsplit userdirpaths mimetypes utf8decode \
   certify gambitcheck gambitkernel gambitgencheck gambitseedcheck gambitboot gambiteval gambitunbound gambitvars gambitstatics gambittwins gambitprofile grenadinecheck fibers fiberspoll gosm asynctimer ticks interruptnest monitorescape windescape threadsafety maskedacquire ioerrno cas flow tickbudget remotechan remotedefaultpump remotefork flowerrorkept flowupdate flowreportdropped fiberquiescent
 TEST-GATES := submodules selfhost ci
@@ -1898,6 +1898,10 @@ fibercost:
 # names the step a fiber is in and the ticks it has run since that step began.
 stepmeasure:
 	@JOLT_NO_USER_DEPS=1 perl -e 'alarm 60; exec @ARGV' bin/jolt run test/chez/step-measure-test.clj
+# Each foreign-procedure evaluation's lookup is counted by name (our Chez's (cs)foreign_lookups,
+# jolt.host/foreign-lookups): a cfn resolved per call is named, in the dump too.
+foreignlookups:
+	@JOLT_NO_USER_DEPS=1 perl -e 'alarm 60; exec @ARGV' bin/jolt run test/chez/foreign-lookups-test.clj
 # On the built jolt: from source (bin/jolt) no collector policy is installed, so no ceiling holds.
 oomafterrendezvous: testbin
 	@JOLT_NO_USER_DEPS=1 JOLT_MAX_HEAP=96m perl -e 'alarm 120; exec @ARGV' target/release/jolt run test/chez/oom-after-rendezvous-test.clj

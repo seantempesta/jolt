@@ -1096,6 +1096,13 @@
                                                                      (call-with-string-output-port (lambda (s) (display-condition jolt-quiescent-last-error s)))
                                                                      (jolt-pr-str (jolt-unwrap-throw jolt-quiescent-last-error)))))
                     ""))
+       ;; the names a foreign-procedure was resolved for most often: one whose count grows with its calls is
+       ;; resolved per call (a dlsym walk over every loaded object each time)
+       (when jolt-foreign-lookups-proc
+         (let ((top (jolt-first-n (list-sort (lambda (a b) (> (cdr a) (cdr b))) (jolt-foreign-lookups-proc)) 5)))
+           (unless (null? top)
+             (fprintf port "foreign lookups (most first): ~{~a ~a~^, ~}~%"
+                      (apply append (map (lambda (e) (list (car e) (cdr e))) top))))))
        (for-each
          (lambda (e)
            (let ((f (car e)) (n (cdr e)))
@@ -2072,6 +2079,12 @@
   (if (foreign-entry? "(cs)thread_bytes_allocated")
       (foreign-procedure "(cs)thread_bytes_allocated" () uptr)
       (lambda () (bytes-allocated))))
+;; the first n of l, or all of l when it has fewer
+(define (jolt-first-n l n) (if (or (null? l) (fx=? n 0)) '() (cons (car l) (jolt-first-n (cdr l) (fx- n 1)))))
+;; Our Chez's count of each foreign-procedure evaluation's lookup by name (c/foreign.c S_foreign_lookups):
+;; ((name . count) ...), or #f on a Chez without it. jolt.host/foreign-lookups and the dump read it.
+(define jolt-foreign-lookups-proc
+  (and (foreign-entry? "(cs)foreign_lookups") (foreign-procedure "(cs)foreign_lookups" () scheme-object)))
 ;; The calling thread's CPU time in nanoseconds (macOS clock_gettime_nsec_np, CLOCK_THREAD_CPUTIME_ID
 ;; 16), made once at load; 0 where it does not resolve (Linux: clock_gettime's struct form, later).
 (define jolt-thread-cpu-ns

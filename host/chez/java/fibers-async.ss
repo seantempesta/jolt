@@ -533,6 +533,14 @@
 ;; (jolt.host/fiber-cost f) -> [ticks bytes cpu-ns]: what fiber f's dispatches have run so far, summed
 ;; by the drain loop (fibers.ss jolt-fiber-drain!): its engine ticks, the bytes it allocated and the CPU
 ;; time it took. CPU time counts C (foreign calls, the collector's copying) that ticks never do.
+;; (jolt.host/foreign-lookups) -> {name count}: each foreign-procedure evaluation's lookup by name since the
+;; process started (our Chez, c/foreign.c S_foreign_lookups), or nil on a Chez without the counter. A name
+;; whose count grows with its calls is resolved per call: a dlsym walk over every loaded object each time.
+(def-var! "jolt.host" "foreign-lookups"
+  (lambda ()
+    (if jolt-foreign-lookups-proc
+        (fold-left (lambda (m e) (jolt-assoc m (car e) (cdr e))) (jolt-hash-map) (jolt-foreign-lookups-proc))
+        jolt-nil)))
 (def-var! "jolt.host" "fiber-cost"
   (lambda (f) (jolt-vector (jolt-fiber-ticks f) (jolt-fiber-bytes f) (jolt-fiber-cpu-ns f))))
 (def-var! "jolt.host" "fiber-state"

@@ -101,6 +101,7 @@ file-exists?
 file-mtime
 find-var
 fn-form-parse
+foreign-lookups
 fork-alone
 fork-holders
 form-bigdec-source
