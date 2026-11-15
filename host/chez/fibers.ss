@@ -1104,6 +1104,15 @@
                       (jolt-fiber-describe-wait (jolt-fiber-parked-on f))
                       (or (jolt-fiber-wstate f) "none") (jolt-fiber-ticks f) (jolt-fiber-bytes f) (jolt-fiber-cpu-ns f)
                       (jolt-fiber-site-text f))
+             ;; the labelled measures open in it, innermost first: a step's scope and its ticks since it began
+             ;; (as of the fiber's last dispatch for a running one)
+             (let loop ((m (jolt-fiber-measure f)))
+               (when (and (vector? m) (fx>=? (vector-length m) 5) (eq? (vector-ref m 2) f))
+                 (when (vector-ref m 4)
+                   (fprintf port "  in ~a, ~a ticks since it began~%"
+                            (guard (_ (#t "?")) (jolt-pr-str (vector-ref m 4)))
+                            (max 0 (- (jolt-fiber-ticks f) (or (vector-ref m 3) 0)))))
+                 (loop (vector-ref m 0))))
              (cond
                ;; a running fiber's k is the one it last parked with, stale: only a parked one's is shown
                ((and (eq? 'parked (jolt-fiber-state f)) (jolt-fiber-k f))
@@ -1354,6 +1363,15 @@
         (let ((s (vector id 0 0 0 0 #f))) (jolt-ticks-state s) s))))
 
 ;; A measure's node: #(parent ticks-box owner). The measure open in this context: the running fiber's, else this thread's.
+;; A fiber's own ticks now: its dispatches' sum and, when it is the running one, the running dispatch's
+;; (jolt-ticks less the lineage of its open measure). Interrupts held across the two reads, as jolt-ticks.
+(define (jolt-fiber-own-ticks f)
+  (disable-interrupts)
+  (let ((n (if (eq? f (jolt-current-fiber))
+               (+ (jolt-fiber-ticks f) (- (jolt-thread-ticks*) (vector-ref (jolt-ticks-cell) 3)))
+               (jolt-fiber-ticks f))))
+    (enable-interrupts)
+    n))
 (define (jolt-current-measure)
   (let ((f (jolt-current-fiber)))
     (if f (jolt-fiber-measure f) (vector-ref (jolt-ticks-cell) 5))))

@@ -556,6 +556,10 @@
                                 (jolt.host/run-interruptible (jolt.host/make-interrupt) #(t s c m) n)
                                 (t s c m))))
                           transform)
+              ;; jolt: every step runs in a measure labelled [pid in-port] (jolt.host/measured), so a fiber's
+              ;; dump names the step it is in and the ticks it has run since that step began
+              transform (let [t transform]
+                          (fn [s c m] (jolt.host/measured [pid c] #(t s c m))))
               exs (spi/get-exec resolver (if (= workload :mixed) :mixed :io))
               state (step args)
               ins (into (or ins {}) (::flow/in-ports state))

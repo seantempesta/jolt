@@ -807,31 +807,41 @@
 ;; (jolt-tick-go-multi! keeps the remaining arm as the preempt demand) and back. A measure
 ;; opened while another demand is armed (idle? false) stops counting if that demand ends
 ;; inside it, as before. Gate: nested-budget-test's ticks-of cases.
+;; (jolt-measure thunk label) -> (values v ticks): thunk run in a measure, its value and the ticks it ran.
+;; The measure is a node #(parent ticks-box owner start label): the fibers its body spawns charge it
+;; (fibers.ss jolt-charge-lineage!), this context's own count adds it while it is open
+;; (jolt-own-lineage-ticks), and a fiber's dump names it, label and the ticks its owner has run since start
+;; (its own count at the open, jolt-fiber-own-ticks). A Flow step runs in one labelled [pid in-port]
+;; (flow impl), so a hung step's dump says which step and how long it has run.
+(define (jolt-measure thunk label)
+  (let* ((s (jolt-ticks-cell))
+         (off? (not (jolt-current-fiber)))
+         (idle? (and off? (fx=? 0 (vector-ref s 2))))
+         (f (jolt-current-fiber))
+         (node (vector (jolt-current-measure) (box 0) (or f (get-thread-id)) (and f (jolt-fiber-own-ticks f)) label))
+         (t0 #f)
+         (t1 #f))
+    (let ((v (dynamic-wind
+               (lambda ()
+                 (jolt-set-current-measure! node)
+                 ;; open on the thread whether or not it arms: the watch counts while a measure is open
+                 ;; (ticks.ss jolt-tick-watch-arm!), so a body outlasting an older arm is counted whole
+                 (when off? (vector-set! s 4 (fx+ (vector-ref s 4) 1)))
+                 (when idle? (jolt-tick-preempt! (most-positive-fixnum)))
+                 (unless t0 (set! t0 (jolt-ticks))))
+               thunk
+               (lambda ()
+                 ;; read before the node closes, so the count holds what its fibers ran
+                 (set! t1 (jolt-ticks))
+                 (jolt-set-current-measure! (vector-ref node 0))
+                 (when off?
+                   (vector-set! s 4 (fx- (vector-ref s 4) 1))
+                   ;; the last measure out disarms the arm it made and puts the thread's watch back
+                   (when (and idle? (fx=? 0 (vector-ref s 4))) (jolt-tick-preempt! 0) (jolt-tick-watch!)))))))
+      (values v (- t1 t0)))))
 (def-var! "jolt.host" "ticks-of"
-  (lambda (thunk)
-    (let* ((s (jolt-ticks-cell))
-           (off? (not (jolt-current-fiber)))
-           (idle? (and off? (fx=? 0 (vector-ref s 2))))
-           ;; this measure's node: the fibers its body spawns charge it (fibers.ss jolt-charge-lineage!), and this
-           ;; context's own count adds it while it is open (jolt-own-lineage-ticks)
-           (node (vector (jolt-current-measure) (box 0) (or (jolt-current-fiber) (get-thread-id))))
-           (t0 #f)
-           (t1 #f))
-      (dynamic-wind
-        (lambda ()
-          (jolt-set-current-measure! node)
-          ;; open on the thread whether or not it arms: the watch counts while a measure is open
-          ;; (ticks.ss jolt-tick-watch-arm!), so a body outlasting an older arm is counted whole
-          (when off? (vector-set! s 4 (fx+ (vector-ref s 4) 1)))
-          (when idle? (jolt-tick-preempt! (most-positive-fixnum)))
-          (unless t0 (set! t0 (jolt-ticks))))
-        thunk
-        (lambda ()
-          ;; read before the node closes, so the count holds what its fibers ran
-          (set! t1 (jolt-ticks))
-          (jolt-set-current-measure! (vector-ref node 0))
-          (when off?
-            (vector-set! s 4 (fx- (vector-ref s 4) 1))
-            ;; the last measure out disarms the arm it made and puts the thread's watch back
-            (when (and idle? (fx=? 0 (vector-ref s 4))) (jolt-tick-preempt! 0) (jolt-tick-watch!)))))
-      (- t1 t0))))
+  (lambda (thunk) (let-values (((v n) (jolt-measure thunk #f))) n)))
+;; (jolt.host/measured label thunk) -> thunk's value, run in a measure labelled label (any value; the dump
+;; prints it): a step's scope, what the dump names while the step runs.
+(def-var! "jolt.host" "measured"
+  (lambda (label thunk) (let-values (((v n) (jolt-measure thunk label))) v)))
