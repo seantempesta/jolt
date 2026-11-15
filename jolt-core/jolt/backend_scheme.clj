@@ -1283,6 +1283,8 @@
 (def ^:private rt-emitted-names
   (let [from-registry registry-emitted-names
         helpers #{"jolt-nil" "jolt-invoke" "jolt-invoke0" "jolt-invoke1"
+                  ;; a cfn outside a def keeps its procedure in a box of its form's constant pool (emit of :ffi-fn)
+                  "box" "set-box!" "unbox" "_r"
                   "jolt-invoke2" "jolt-invoke3" "jolt-invoke4" "jolt-invoke5" "jolt-invoke6"
                   "jolt-invoke7" "jolt-invoke8"
                   "jolt-invoke-t0" "jolt-invoke-t1" "jolt-invoke-t2" "jolt-invoke-t3" "jolt-invoke-t4"

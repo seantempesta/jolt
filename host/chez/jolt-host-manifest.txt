@@ -309,6 +309,7 @@ sorted-seq-from
 sorted-tree
 sorted-with
 source-roots
+spliced-fqns
 stack-check-failure
 stack-limit
 stash-inline!
