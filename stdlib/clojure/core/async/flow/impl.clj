@@ -389,16 +389,26 @@
       (resume [_] (locked #(do (swap! rt assoc :status :running)
                                (send-control! rt (keys (:running @rt)) #::flow{:command ::flow/resume}))))
       (ping [_ timeout-ms]
+        ;; jolt: a proc mid-step reads control only between steps, so a ping waits only for the procs not :stepping
+        ;; when it is sent (their ::flow/site, read without asking): waiting for every pid held each ping to its whole
+        ;; timeout while any proc stepped, the asker's own worker among them at root. A stepping proc's pong that
+        ;; arrives before the rest is merged, never counted; one idle at the read that takes a message before the ping
+        ;; answers when that step ends. Gate flowpingstepping.
         (let [timeout (async/timeout timeout-ms)
-              [n reply pids] (locked #(let [pids (keys (:running @rt))
-                                            reply (async/chan (max 1 (count pids)))]
-                                        (send-control! rt pids #::flow{:command ::flow/ping :reply-chan reply})
-                                        [(count pids) reply pids]))
-              ret-chan (fiber-go (async/take n reply))
-              ret (loop [ret nil]
-                    (let [[m _] (async/alts!! [ret-chan timeout])]
-                      (if (some? m) (recur (assoc ret (::flow/pid m) m)) ret)))]
-          ;; jolt: take's go-loop ends only when reply closes (a late pong is dropped)
+              [waiting reply pids] (locked #(let [running (:running @rt)
+                                                  pids (keys running)
+                                                  stepping? (fn [pid] (:stepping (some-> (get-in running [pid :site]) deref)))
+                                                  reply (async/chan (max 1 (count pids)))]
+                                              (send-control! rt pids #::flow{:command ::flow/ping :reply-chan reply})
+                                              [(set (remove stepping? pids)) reply pids]))
+              ret (loop [ret nil left waiting]
+                    (if (empty? left)
+                      ret
+                      (let [[m c] (async/alts!! [reply timeout])]
+                        (if (and (= c reply) (some? m))
+                          (recur (assoc ret (::flow/pid m) m) (disj left (::flow/pid m)))
+                          ret))))]
+          ;; jolt: a pong after the answer finds reply closed and is dropped
           (async/close! reply)
           ;; jolt: the queues, read without asking any proc, so a proc stuck in a step is seen too: each running
           ;; proc's ::flow/site (where its loop waits or what it steps) and ::flow/in-fill, each in-port's
