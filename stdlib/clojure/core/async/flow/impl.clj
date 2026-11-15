@@ -560,7 +560,11 @@
               state (step args)
               ins (into (or ins {}) (::flow/in-ports state))
               outs (into (or outs {}) (::flow/out-ports state))
-              io-id (zipmap (concat (vals ins) (vals outs)) (concat (keys ins) (keys outs)))
+              ;; jolt: a proc with a :step-ticks budget reads its ended steps as messages, cid ::flow/step-ended, on a
+              ;; chan of its own read right after control, so it takes one before it steps again: one is ever waiting
+              ended (when (:step-ticks desc) (async/chan 1))
+              io-id (cond-> (zipmap (concat (vals ins) (vals outs)) (concat (keys ins) (keys outs)))
+                      ended (assoc ended ::flow/step-ended))
               control (::flow/control ins)
               casts (::flow/casts ins)
               read-ins (dissoc ins ::flow/control ::flow/casts)
@@ -593,12 +597,13 @@
                            ;;:running
                            (let [ ;;TODO rotate/randomize after control per normal alts?
                                  read-chans (let [ipred (or (::flow/input-filter state) identity)]
-                                              (reduce-kv (fn [ret cid chan]
-                                                           (if (ipred cid)
-                                                             (conj ret chan)
-                                                             ret))
-                                                         [control casts] read-ins))
-                                 _ (when site (vreset! site {:reading (set (keep io-id (drop 2 read-chans)))}))
+                                              (cond-> (reduce-kv (fn [ret cid chan]
+                                                                   (if (ipred cid)
+                                                                     (conj ret chan)
+                                                                     ret))
+                                                                 [control casts] read-ins)
+                                                ended (conj ended)))
+                                 _ (when site (vreset! site {:reading (disj (set (keep io-id read-chans)) ::flow/step-ended)}))
                                  [msg c] (async/alts!! read-chans :priority true)
                                  cid (io-id c)
                                  _ (when site (vreset! site (when-not (= c control)
@@ -622,25 +627,16 @@
                                    (async/put! (outs ::flow/error)
                                               #::flow{:pid pid, :status status, :state state,
                                                       :count (inc count), :cid cid, :msg msg :op :step, :ex ex})
-                                   ;; jolt: a step ended at its :step-ticks budget is handed back to its proc, cid
-                                   ;; ::flow/step-ended, so it can answer its asker typed (a dropped ask was a hang); its
-                                   ;; state is kept. Only a budget's end: any other throw is the step's own error.
+                                   ;; jolt: a step ended at its :step-ticks budget also reaches its proc as a message,
+                                   ;; cid ::flow/step-ended, taken by its next read like any other, so it can answer its
+                                   ;; asker typed (a dropped ask was a hang); its state is kept. Only a budget's end: any
+                                   ;; other throw is the step's own error. One path: no handler beside ::flow/error
                                    (let [d (ex-data ex)]
-                                     (if (and (:step-ticks desc) (:jolt/ticks-budget d))
-                                       (try
-                                         (let [[nstate outputs] (transform state ::flow/step-ended
-                                                                           {:msg msg :cid cid
-                                                                            :ticks-spent (:jolt/ticks-spent d)
-                                                                            :ticks-budget (:jolt/ticks-budget d)})
-                                               [nstatus nstate] (send-outputs status nstate outputs outs
-                                                                              resolver control handle-command step cast site)]
-                                           [nstatus nstate count read-ins])
-                                         (catch Throwable ex2
-                                           (async/put! (outs ::flow/error)
-                                                       #::flow{:pid pid, :status status, :state state, :cid ::flow/step-ended,
-                                                               :msg msg :op :step-ended, :ex ex2})
-                                           [status state count read-ins]))
-                                       [status state count read-ins])))))))
+                                     (when (and ended (:jolt/ticks-budget d))
+                                       (async/offer! ended {:msg msg :cid cid
+                                                            :ticks-spent (:jolt/ticks-spent d)
+                                                            :ticks-budget (:jolt/ticks-budget d)})))
+                                   [status state count read-ins])))))
                          (catch Throwable ex
                            (async/put! (outs ::flow/error)
                                       #::flow{:pid pid, :status status, :state state, :count (inc count), :ex ex})
