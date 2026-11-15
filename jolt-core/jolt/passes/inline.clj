@@ -461,12 +461,15 @@
         false))))
 
 (defn- no-inline-ns?
-  "Is a callee in namespace nsn one the compile options say never to splice: its name starts with a prefix of
-  *compiler-options*' :no-inline-ns-prefixes (a program whose own vars are redefined in place, by a REPL or a load of a
-  changed form, must call them through their vars, never a copy of an old body)."
+  "Is a callee in namespace nsn one the compile options say never to splice: nsn is a root of *compiler-options*'
+  :no-inline-ns-prefixes (symbols or strings, e.g. [seon my]) or under one (root.) (a program whose own vars are
+  redefined in place, by a REPL or a load of a changed form, must call them through their vars, never a copy of an old
+  body)."
   [nsn]
   (let [ps (get *compiler-options* :no-inline-ns-prefixes) s (str nsn)]
-    (boolean (and ps nsn (some (fn [p] (and (<= (count p) (count s)) (= p (subs s 0 (count p))))) ps)))))
+    (boolean (and ps nsn (some (fn [p] (let [r (str p) d (str r ".")]
+                                         (or (= s r) (and (<= (count d) (count s)) (= d (subs s 0 (count d)))))))
+                               ps)))))
 
 (defn- try-inline
   "node is an :invoke whose children are already inlined. If its :fn is a var
