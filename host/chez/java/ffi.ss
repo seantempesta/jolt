@@ -602,6 +602,8 @@
 ;; — the emitter then falls back to global name resolution. #f on Windows (no
 ;; registered handles).
 (define (jolt-ffi-dlsym-native sym)
+  ;; counted by name (fibers.ss jolt-count-foreign-lookup): a cfn resolved on every call shows here
+  (when jolt-count-foreign-lookup (jolt-count-foreign-lookup sym))
   (let ((rs (jolt-ffi-native-resolvers sym)))
     (cond
       ((null? rs) #f)

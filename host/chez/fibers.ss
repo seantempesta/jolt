@@ -2085,6 +2085,10 @@
 ;; ((name . count) ...), or #f on a Chez without it. jolt.host/foreign-lookups and the dump read it.
 (define jolt-foreign-lookups-proc
   (and (foreign-entry? "(cs)foreign_lookups") (foreign-procedure "(cs)foreign_lookups" () scheme-object)))
+;; One lookup made here counted into that table: Jolt's own dlsym walk over its declared natives
+;; (ffi.ss jolt-ffi-dlsym-native), where a cfn resolves; #f on a Chez without it.
+(define jolt-count-foreign-lookup
+  (and (foreign-entry? "(cs)count_foreign_lookup") (foreign-procedure "(cs)count_foreign_lookup" (string) void)))
 ;; The calling thread's CPU time in nanoseconds (macOS clock_gettime_nsec_np, CLOCK_THREAD_CPUTIME_ID
 ;; 16), made once at load; 0 where it does not resolve (Linux: clock_gettime's struct form, later).
 (define jolt-thread-cpu-ns
