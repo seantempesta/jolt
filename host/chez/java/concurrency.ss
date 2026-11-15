@@ -5641,11 +5641,6 @@
   (jolt-with-sigmask jolt-sig-block-how jolt-shutdown-sigset fork))
 (set! jolt-fork-sigmask-guard jolt-fork-with-shutdown-blocked)
 (define c-sigwait (jolt-foreign-proc-blocking "sigwait" '(void* void*) 'int))
-;; our Chez's (cs)sigsender_install fd sig (c/schsig.c): SIG's handler writes {sig pid uid} to fd; #f on another Chez
-(define jolt-sigsender-install
-  (and (foreign-entry? "(cs)sigsender_install") (foreign-procedure "(cs)sigsender_install" (int int) int)))
-(define c-pipe (and (foreign-entry? "pipe") (jolt-foreign-proc-safe "pipe" '(void*) 'int)))
-(define c-read-blocking (jolt-foreign-proc-blocking "read" '(int void* size_t) 'ssize_t))
 ;; What a sigwait answered: its signal when it is one of ours, else #f and the
 ;; watcher asks again. The answer is checked, not taken on a zero return: on
 ;; macOS, libsystem_pthread's sigwait turns the kernel's EINTR into a return of
@@ -5742,67 +5737,43 @@
         ;; named by its creator: the watcher itself runs no jolt code until a signal comes
         (jolt-thread-name-set! (sa-thread-id-of (fork-thread-dormant
           (lambda ()
-            ;; one signal of ours, its sender when known: SIGINT's trip, SIGINFO's dump, else the shutdown
-            (define (dispatch! sig sender)
-              (let ((target (unbox jolt-sigint-target)))
-                (cond
-                  ((and (= sig 2) target (jolt-sigint-trip! target)) #t)
-                  ;; SIGINFO: the dump, written here, and the watcher waits again. jolt-mark-mt! here is set mid-run,
-                  ;; not by the context that makes a second mutator: one single-threaded fast-path operation already
-                  ;; in flight on the main thread can race the dump's reads; for a hang's evidence that is taken, and a
-                  ;; dump that fails says so on stderr (jolt-siginfo-dump!'s guard). flow, 2026-11-15.
-                  ((eqv? sig jolt-dump-signal)
-                   (jolt-mark-mt!)
-                   (guard (_ (#t #f)) (jolt-siginfo-dump!))
-                   #t)
-                  (else
-                    ;; this thread now runs jolt code alongside the program's (jolt-add-runtime-shutdown-hook)
-                    (jolt-mark-mt!)
-                    ;; who ended this process, first (an agent died of a HUP nobody named: deps, 2026-11-15)
-                    (when sender
-                      (guard (_ (#t #f))
-                        (let ((e (current-error-port)))
-                          (display (string-append "jolt: signal " (number->string sig) " from pid " (number->string (car sender))
-                                                  " uid " (number->string (cdr sender)))
-                                   e)
-                          (newline e)
-                          (flush-output-port e))))
-                    (guard (_ (#t #f)) (jolt-run-shutdown-hooks!))
-                    (guard (_ (#t #f)) (flush-output-port (current-output-port)))
-                    (guard (_ (#t #f)) (flush-output-port (current-error-port)))
-                    ;; 128+signal is the status a shell reports for a process killed by that signal, and the JVM's
-                    (c-underscore-exit (+ 128 sig))))))
-            (let ((fds (and jolt-sigsender-install c-pipe (sa-foreign-alloc 8))))
-              (if (and fds (eqv? 0 (c-pipe fds)))
-                  ;; our Chez: each signal's SA_SIGINFO handler (c/schsig.c) writes {sig pid uid} to a pipe this thread
-                  ;; reads, and this thread alone unmasks the set, so the kernel delivers here and the sender is known
-                  ;; (sigwait answers the number only; macOS has no sigwaitinfo)
-                  (let ((rfd (sa-foreign-ref 'int fds 0)) (wfd (sa-foreign-ref 'int fds 4)) (buf (sa-foreign-alloc 12)))
-                    (for-each (lambda (sig) (jolt-sigsender-install wfd sig)) jolt-watched-signals)
-                    (let ((old (sa-foreign-alloc 128)))
-                      (c-pthread-sigmask jolt-sig-unblock-how jolt-shutdown-sigset old)
-                      (sa-foreign-free old))
-                    (let loop ()
-                      ;; recorded as waiting, as the sigwait below is (fibers.ss's main carrier never takes it for running)
-                      (let ((n (call-with-thread-state 'WAITING
-                                 (lambda () (jolt-asleep-while #f #f (lambda () (c-read-blocking rfd buf 12)))))))
-                        (when (eqv? n 12)
-                          (let ((sig (sa-foreign-ref 'int buf 0)))
-                            (when (memv sig jolt-watched-signals)
-                              (dispatch! sig (cons (sa-foreign-ref 'int buf 4) (sa-foreign-ref 'int buf 8))))))
-                        (loop))))
-                  (let ((sigbuf (sa-foreign-alloc 8)))
-                    (let loop ()
-                      ;; recorded as waiting: a main carrier that reads every other thread asleep before it tells its
-                      ;; waiters nothing can wake them (fibers.ss) never takes this one for running
-                      (sa-foreign-set! 'int sigbuf 0 0)
-                      (let ((sig (jolt-sigwait-signal
-                                   (call-with-thread-state 'WAITING
-                                     (lambda () (jolt-asleep-while #f #f (lambda () (c-sigwait jolt-shutdown-sigset sigbuf)))))
-                                   sigbuf)))
-                        ;; an error number, or 0 with no signal of ours: ask again
-                        (when sig (dispatch! sig #f))
-                        (loop)))))))))
+            (let ((sigbuf (sa-foreign-alloc 8)))
+              (let loop ()
+                ;; recorded as waiting: a main carrier that reads every other thread asleep before it
+                ;; tells its waiters nothing can wake them (fibers.ss) never takes this one for running
+                ;; merge: upstream's jolt-sigwait-signal (an error number, or 0 with no signal of ours,
+                ;; asks again) around our asleep/WAITING wrapper
+                (sa-foreign-set! 'int sigbuf 0 0)
+                (if (jolt-sigwait-signal
+                      (call-with-thread-state 'WAITING
+                        (lambda () (jolt-asleep-while #f #f (lambda () (c-sigwait jolt-shutdown-sigset sigbuf)))))
+                      sigbuf)
+                    (let ((sig (sa-foreign-ref 'int sigbuf 0))
+                          (target (unbox jolt-sigint-target)))
+                      (cond
+                        ((and (= sig 2) target (jolt-sigint-trip! target)) (loop))
+                        ;; SIGINFO: the dump, written here, and the watcher waits again
+                        ;; jolt-mark-mt! here is set mid-run, not by the context that makes a second
+                        ;; mutator (locks.ss's race-free argument does not hold): one single-threaded
+                        ;; fast-path operation already in flight on the main thread can race the dump's
+                        ;; reads. For a hang's evidence that is taken (its mutator is usually stuck), and
+                        ;; a dump that fails says so on stderr (jolt-siginfo-dump!'s guard). flow, 2026-11-15.
+                        ((eqv? sig jolt-dump-signal)
+                         (jolt-mark-mt!)
+                         (guard (_ (#t #f)) (jolt-siginfo-dump!))
+                         (loop))
+                        (else
+                          (begin
+                            ;; this thread now runs jolt code alongside the
+                            ;; program's (jolt-add-runtime-shutdown-hook)
+                            (jolt-mark-mt!)
+                            (guard (_ (#t #f)) (jolt-run-shutdown-hooks!))
+                            (guard (_ (#t #f)) (flush-output-port (current-output-port)))
+                            (guard (_ (#t #f)) (flush-output-port (current-error-port)))
+                            ;; 128+signal is the status a shell reports for a process
+                            ;; killed by that signal, and what the JVM exits with here.
+                            (c-underscore-exit (+ 128 sig))))))
+                    (loop))))))) ; an error number, or 0 with no signal of ours — ask again
           "jolt-shutdown"))))
   jolt-nil)
 
