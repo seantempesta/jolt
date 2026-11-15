@@ -5645,9 +5645,6 @@
 (define jolt-sigsender-install
   (and (foreign-entry? "(cs)sigsender_install") (foreign-procedure "(cs)sigsender_install" (int int) int)))
 (define c-pipe (and (foreign-entry? "pipe") (jolt-foreign-proc-safe "pipe" '(void*) 'int)))
-(define jolt-sigsender-reset
-  (and (foreign-entry? "(cs)sigsender_reset") (foreign-procedure "(cs)sigsender_reset" (int) int)))
-(define c-close-fd (jolt-foreign-proc-safe "close" '(int) 'int))
 (define c-read-blocking (jolt-foreign-proc-blocking "read" '(int void* size_t) 'ssize_t))
 ;; What a sigwait answered: its signal when it is one of ours, else #f and the
 ;; watcher asks again. The answer is checked, not taken on a zero return: on
@@ -5782,13 +5779,6 @@
                   ;; (sigwait answers the number only; macOS has no sigwaitinfo)
                   (let ((rfd (sa-foreign-ref 'int fds 0)) (wfd (sa-foreign-ref 'int fds 4)) (buf (sa-foreign-alloc 12)))
                     (for-each (lambda (sig) (jolt-sigsender-install wfd sig)) jolt-watched-signals)
-                    ;; a forked child is not the process this watcher reads for: it closes the pipe and has each signal's
-                    ;; action back as it was, so it is exactly what it was before the sender existed
-                    (set! jolt-after-fork-hooks
-                      (cons (lambda ()
-                              (when jolt-sigsender-reset (for-each jolt-sigsender-reset jolt-watched-signals))
-                              (c-close-fd rfd) (c-close-fd wfd))
-                            jolt-after-fork-hooks))
                     (let ((old (sa-foreign-alloc 128)))
                       (c-pthread-sigmask jolt-sig-unblock-how jolt-shutdown-sigset old)
                       (sa-foreign-free old))
