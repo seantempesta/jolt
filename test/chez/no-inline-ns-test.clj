@@ -10,12 +10,12 @@
 
 (defn- spliced? [fqn] (some #{fqn} (jolt.host/spliced-fqns)))
 
-(binding [*compiler-options* {:direct-linking true}]
+(binding [*ns* *ns* *compiler-options* {:direct-linking true}]
   (eval '(do (ns nin.lib) (defn sq [x] (* x x))))
   (eval '(do (ns nin.app) (defn f [y] (nin.lib/sq y)))))
 (when-not (spliced? "nin.lib/sq") (fail! "direct-linked, a small library fn is spliced (else this test shows nothing): " (jolt.host/spliced-fqns)))
 
-(binding [*compiler-options* {:direct-linking true :no-inline-ns-prefixes ["prog."]}]
+(binding [*ns* *ns* *compiler-options* {:direct-linking true :no-inline-ns-prefixes ["prog."]}]
   (eval '(do (ns prog.lib) (defn sq [x] (* x x))))
   (eval '(do (ns prog.app) (defn f [y] (prog.lib/sq y)))))
 (when (spliced? "prog.lib/sq") (fail! "a listed namespace's fn was spliced: " (jolt.host/spliced-fqns)))
