@@ -118,6 +118,11 @@
           ;; #t for a remote end's pump (jolt.host/fiber-pump!, set by the fiber itself): never told a
           ;; deadlock, not counted by a quiescence check
           (mutable pump)
+          ;; the measure open where it was spawned (a jolt.host/ticks-of node, #(parent ticks-box owner), or #f): its
+          ;; dispatches charge it and its enclosing ones (jolt-charge-lineage!), so a measure counts the fibers its body
+          ;; spawns. And the measure open in it now: that one, or one it opened (ticks-of), which what it spawns inherits
+          spawned-under
+          (mutable measure)
           ;; where it was spawned, for the dump (jolt-fiber-dump-site): the string
           ;; "ns:line" a go form's expansion passes, one constant every spawn from
           ;; that form shares, else the procedure the spawner handed over (its body:
@@ -801,12 +806,13 @@
 ;; the fiber can run.
 (define (jolt-fiber-spawn-on* c thunk ibox before-run site)
   (jolt-mark-mt!)
-  (let ((f (make-jolt-fiber
+  (let* ((under (jolt-current-measure))
+         (f (make-jolt-fiber
             'ready thunk #f #f #f #f
             (make-jolt-dslice (jolt-slice-stack-param)
                               (jolt-slice-ns-param)
                               #f)
-            c #f '() 0 #f #f 0 #f ibox #f #f #f #f 0 #f #f #f site)))
+            c #f '() 0 #f #f 0 #f ibox #f #f #f #f 0 #f #f #f under under site)))
     (jolt-fiber-register! f)
     (when ibox (jolt-fiber-own-ibox! f ibox))
     (when before-run (before-run f))
@@ -1334,12 +1340,34 @@
 ;; value, and the cell is made afresh for a thread that does not own it.
 (define jolt-ticks-state (make-thread-parameter #f))
 (define (jolt-ticks-cell)
-  ;; #(owner consumed armed dispatch-mark measures): measures, the ticks-of extents open
-  ;; off a fiber (each armed the timer to count, and a borrow's exit must leave it so)
+  ;; #(owner consumed armed dispatch-mark measures measure): measures, the ticks-of extents open
+  ;; off a fiber (each armed the timer to count, and a borrow's exit must leave it so); measure,
+  ;; the innermost ticks-of node open off a fiber on this thread (jolt-current-measure), or #f
   (let ((s (jolt-ticks-state)) (id (get-thread-id)))
     (if (and s (eqv? (vector-ref s 0) id))
         s
-        (let ((s (vector id 0 0 0 0))) (jolt-ticks-state s) s))))
+        (let ((s (vector id 0 0 0 0 #f))) (jolt-ticks-state s) s))))
+
+;; A measure's node: #(parent ticks-box owner). The measure open in this context: the running fiber's, else this thread's.
+(define (jolt-current-measure)
+  (let ((f (jolt-current-fiber)))
+    (if f (jolt-fiber-measure f) (vector-ref (jolt-ticks-cell) 5))))
+(define (jolt-set-current-measure! n)
+  (let ((f (jolt-current-fiber)))
+    (if f (jolt-fiber-measure-set! f n) (vector-set! (jolt-ticks-cell) 5 n))))
+;; d ticks a fiber spawned under node n ran: n's and every enclosing measure's, by a compare-and-set (a measure's
+;; fibers run on any carrier). O(the nesting depth).
+(define (jolt-charge-lineage! n d)
+  (let loop ((n n))
+    (when n
+      (let ((b (vector-ref n 1)))
+        (let retry () (let ((o (unbox b))) (unless (box-cas! b o (+ o d)) (retry)))))
+      (loop (vector-ref n 0)))))
+;; the lineage ticks this context adds to its own count: its own open measure's (a node it opened, never one it was
+;; spawned under, whose ticks hold its own dispatches)
+(define (jolt-own-lineage-ticks)
+  (let ((n (jolt-current-measure)))
+    (if (and n (eq? (vector-ref n 2) (or (jolt-current-fiber) (get-thread-id)))) (unbox (vector-ref n 1)) 0)))
 (define (jolt-set-timer! n)
   (let* ((s (jolt-ticks-cell)) (left (set-timer n)))
     (vector-set! s 1 (+ (vector-ref s 1) (fxmax 0 (fx- (vector-ref s 2) left))))
@@ -1385,9 +1413,10 @@
   ;; as jolt-thread-ticks)
   (disable-interrupts)
   (let* ((f (jolt-current-fiber))
-         (n (if f
-                (+ (jolt-fiber-ticks f) (- (jolt-thread-ticks*) (vector-ref (jolt-ticks-cell) 3)))
-                (jolt-thread-ticks*))))
+         (n (+ (if f
+                   (+ (jolt-fiber-ticks f) (- (jolt-thread-ticks*) (vector-ref (jolt-ticks-cell) 3)))
+                   (jolt-thread-ticks*))
+               (jolt-own-lineage-ticks))))
     (enable-interrupts)
     n))
 
@@ -2028,7 +2057,9 @@
         (let ((mark (jolt-thread-ticks)))
           (vector-set! (jolt-ticks-cell) 3 mark)
           (jolt-fiber-run f)
-          (jolt-fiber-ticks-set! f (+ (jolt-fiber-ticks f) (- (jolt-thread-ticks) mark))))
+          (let ((d (- (jolt-thread-ticks) mark)))
+            (jolt-fiber-ticks-set! f (+ (jolt-fiber-ticks f) d))
+            (let ((n (jolt-fiber-spawned-under f))) (when n (jolt-charge-lineage! n d)))))
         (loop)))))
 
 ;; (sa-fiber-run-all) -> void. Drain carrier 0's run queue on the calling

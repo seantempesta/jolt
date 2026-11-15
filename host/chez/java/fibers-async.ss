@@ -793,9 +793,14 @@
     (let* ((s (jolt-ticks-cell))
            (off? (not (jolt-current-fiber)))
            (idle? (and off? (fx=? 0 (vector-ref s 2))))
-           (t0 #f))
+           ;; this measure's node: the fibers its body spawns charge it (fibers.ss jolt-charge-lineage!), and this
+           ;; context's own count adds it while it is open (jolt-own-lineage-ticks)
+           (node (vector (jolt-current-measure) (box 0) (or (jolt-current-fiber) (get-thread-id))))
+           (t0 #f)
+           (t1 #f))
       (dynamic-wind
         (lambda ()
+          (jolt-set-current-measure! node)
           ;; open on the thread whether or not it arms: the watch counts while a measure is open
           ;; (ticks.ss jolt-tick-watch-arm!), so a body outlasting an older arm is counted whole
           (when off? (vector-set! s 4 (fx+ (vector-ref s 4) 1)))
@@ -803,8 +808,11 @@
           (unless t0 (set! t0 (jolt-ticks))))
         thunk
         (lambda ()
+          ;; read before the node closes, so the count holds what its fibers ran
+          (set! t1 (jolt-ticks))
+          (jolt-set-current-measure! (vector-ref node 0))
           (when off?
             (vector-set! s 4 (fx- (vector-ref s 4) 1))
             ;; the last measure out disarms the arm it made and puts the thread's watch back
             (when (and idle? (fx=? 0 (vector-ref s 4))) (jolt-tick-preempt! 0) (jolt-tick-watch!)))))
-      (- (jolt-ticks) t0))))
+      (- t1 t0))))
