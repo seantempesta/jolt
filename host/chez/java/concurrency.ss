@@ -5601,7 +5601,13 @@
 ;; A CHILD process inherits none of this mask (jolt-with-empty-sigmask, further
 ;; down), so ^C on the foreground process group still kills subprocesses outright.
 (define jolt-shutdown-signals '(15 1 2))
-(define jolt-shutdown-sigset (and jolt-sigmask-ok? (jolt-make-sigset jolt-shutdown-signals)))
+;; SIGINFO (29, macOS) is the watcher's too: it writes the fiber dump from its own thread
+;; (jolt-siginfo-dump!, fibers-async.ss), so a dump never waits for an event check of a thread
+;; that may never reach one (interrupts disabled, a hang: 5 of 5 overrun dumps were empty,
+;; 2026-11-15). Blocked in every thread jolt forks, as the shutdown signals are.
+(define jolt-dump-signal (and (eq? (sa-os-family) 'macos) 29))
+(define jolt-watched-signals (if jolt-dump-signal (cons jolt-dump-signal jolt-shutdown-signals) jolt-shutdown-signals))
+(define jolt-shutdown-sigset (and jolt-sigmask-ok? (jolt-make-sigset jolt-watched-signals)))
 ;; #t once the sigwait watcher owns the signals above — park-until-interrupt reads
 ;; it to decide whether SIGINT is still Chez's to deliver.
 (define jolt-shutdown-armed (box #f))
@@ -5649,7 +5655,7 @@
 (define (jolt-sigwait-signal r sigbuf)
   (and (eqv? r 0)
        (let ((sig (sa-foreign-ref 'int sigbuf 0)))
-         (and (memv sig jolt-shutdown-signals) sig))))
+         (and (memv sig jolt-watched-signals) sig))))
 ;; The watcher cannot leave through Chez's (exit): called off the main thread it
 ;; never returns. It has already run the hooks and flushed by then, so _exit is
 ;; the whole of what is left to do.
@@ -5746,8 +5752,14 @@
                       sigbuf)
                     (let ((sig (sa-foreign-ref 'int sigbuf 0))
                           (target (unbox jolt-sigint-target)))
-                      (if (and (= sig 2) target (jolt-sigint-trip! target))
-                          (loop)
+                      (cond
+                        ((and (= sig 2) target (jolt-sigint-trip! target)) (loop))
+                        ;; SIGINFO: the dump, written here, and the watcher waits again
+                        ((eqv? sig jolt-dump-signal)
+                         (jolt-mark-mt!)
+                         (guard (_ (#t #f)) (jolt-siginfo-dump!))
+                         (loop))
+                        (else
                           (begin
                             ;; this thread now runs jolt code alongside the
                             ;; program's (jolt-add-runtime-shutdown-hook)
@@ -5757,7 +5769,7 @@
                             (guard (_ (#t #f)) (flush-output-port (current-error-port)))
                             ;; 128+signal is the status a shell reports for a process
                             ;; killed by that signal, and what the JVM exits with here.
-                            (c-underscore-exit (+ 128 sig)))))
+                            (c-underscore-exit (+ 128 sig))))))
                     (loop))))))) ; an error number, or 0 with no signal of ours — ask again
           "jolt-shutdown"))))
   jolt-nil)

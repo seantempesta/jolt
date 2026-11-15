@@ -417,11 +417,11 @@
   (or jolt-dump-port
       (begin (set! jolt-dump-port (standard-error-port (buffer-mode none) (native-transcoder)))
              jolt-dump-port)))
-(when (eq? (sa-os-family) 'macos)
-  ;; the handler's edge: it runs inside whatever the thread was doing, so a dump that fails
-  ;; says so on stderr, with its condition, and the interrupted code goes on
-  (register-signal-handler 29
-    (lambda (sig)
+;; SIGINFO's dump: descriptor 2 and JOLT_DUMP_DIR. The shutdown watcher calls it from its own thread
+;; (concurrency.ss, the signal blocked in every thread jolt forks); Chez's handler below, at the main
+;; thread's next event check, only where no watcher took the signal (a forked child before it arms,
+;; an embedded runtime). The edge: a dump that fails says so on stderr, with its condition.
+(define (jolt-siginfo-dump!)
       (let ((p (jolt-dump-port!)))
         (guard (e (#t (fprintf p "jolt fiber dump failed: ~a~%"
                                (if (condition? e) (call-with-string-output-port (lambda (p) (display-condition e p))) e))))
@@ -435,7 +435,9 @@
                                                (file-options no-fail no-truncate append)
                                                (buffer-mode block) (native-transcoder))))
                 (jolt-fiber-dump fp #f)
-                (close-port fp)))))))))
+                (close-port fp)))))))
+(when (eq? (sa-os-family) 'macos)
+  (register-signal-handler 29 (lambda (sig) (jolt-siginfo-dump!))))
 ;; The interrupt's throwable is a jolt value, raised as a throw would raise it,
 ;; so the fiber's own try/catch sees exactly what the caller passed.
 (def-var! "jolt.host" "fiber-interrupt!"
