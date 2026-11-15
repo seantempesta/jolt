@@ -449,6 +449,9 @@
                         #(doseq [m msgs] (async/>!! c m))))]
           ((futurize do-io {:exec :io}))))
 
+      clojure.core.async.flow.impl.graph.Drain
+      (drain [_] (locked #(send-control! rt (keys (:running @rt)) #::flow{:command ::flow/drain})))
+      (drain-proc [_ pid] (locked #(send-control! rt [pid] #::flow{:command ::flow/drain})))
       clojure.core.async.flow.impl.graph.Update
       (update-flow [_ d]
         (locked (fn []
@@ -471,7 +474,8 @@
 
 (defn handle-command
   [pid pong status cmd]
-  (let [transition #::flow{:stop :exit, :resume :running, :pause :paused}
+  ;; jolt: ::flow/drain is :draining, read as :running is (the proc keeps reading); its transition arity runs with ::flow/drain
+  (let [transition #::flow{:stop :exit, :resume :running, :pause :paused, :drain :draining}
         {::flow/keys [to command reply-chan]} cmd]
     (cond
       ;; jolt: a closed control (stop closed it) is :exit, never a status kept while the loop spins on nil
@@ -489,7 +493,8 @@
     (transition state (case nstatus
                             :exit ::flow/stop
                             :running ::flow/resume
-                            :paused ::flow/pause))
+                            :paused ::flow/pause
+                            :draining ::flow/drain))
     state))
 
 (defn send-outputs [status state outputs outs resolver control handle-command transition cast & [site]]

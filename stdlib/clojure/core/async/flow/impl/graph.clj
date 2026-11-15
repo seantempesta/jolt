@@ -27,6 +27,12 @@
   (inject [g [pid io-id] msgs] "synchronously puts the messages on the channel 
                          corresponding to the input or output of the process"))
 
+;; jolt: let every process finish what is queued before a stop (see clojure.core.async.flow/drain): a process told to drain
+;; keeps reading its in-ports as when running; it ends only on stop, which the caller sends once every queue is empty
+(defprotocol Drain
+  (drain [g] "tells every process to drain: it keeps reading, its transition arity runs once with ::flow/drain")
+  (drain-proc [g pid] "tells one process to drain"))
+
 ;; jolt: change a running flow in place (see clojure.core.async.flow/update!)
 (defprotocol Update
   (update-flow [g new-config] "diff :procs and :conns against the running flow and apply the difference"))

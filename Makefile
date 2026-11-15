@@ -1902,6 +1902,9 @@ stepmeasure:
 # jolt.host/foreign-lookups): a cfn resolved per call is named, in the dump too.
 foreignlookups:
 	@JOLT_NO_USER_DEPS=1 perl -e 'alarm 60; exec @ARGV' bin/jolt run test/chez/foreign-lookups-test.clj
+# ::flow/drain beside pause, resume and stop: a drained process finishes its queue, then ends on stop.
+flowdrain:
+	@JOLT_NO_USER_DEPS=1 perl -e 'alarm 60; exec @ARGV' bin/jolt run test/chez/flow-drain-test.clj
 # On the built jolt: from source (bin/jolt) no collector policy is installed, so no ceiling holds.
 oomafterrendezvous: testbin
 	@JOLT_NO_USER_DEPS=1 JOLT_MAX_HEAP=96m perl -e 'alarm 120; exec @ARGV' target/release/jolt run test/chez/oom-after-rendezvous-test.clj

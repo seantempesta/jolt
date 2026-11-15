@@ -171,6 +171,16 @@
   "pauses a process"
   [g pid] (g/pause-proc g pid))
 
+(defn drain
+  "jolt: tells every process to drain: each keeps reading its in-ports as when running, so what is queued is finished; its
+  transition arity runs once with ::flow/drain, and ping shows :draining. A drained flow ends with stop, sent once every
+  queue is empty (the caller's to decide)."
+  [g] (g/drain g))
+
+(defn drain-proc
+  "jolt: tells one process to drain (see drain)"
+  [g pid] (g/drain-proc g pid))
+
 (defn resume-proc
   "resumes a process"
   [g pid] (g/resume-proc g pid))
