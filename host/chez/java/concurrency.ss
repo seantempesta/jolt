@@ -5784,11 +5784,16 @@
                     (for-each (lambda (sig) (jolt-sigsender-install wfd sig)) jolt-watched-signals)
                     ;; a forked child is not the process this watcher reads for: it closes the pipe and has each signal's
                     ;; action back as it was, so it is exactly what it was before the sender existed
-                    (set! jolt-after-fork-hooks
-                      (cons (lambda ()
-                              (when jolt-sigsender-reset (for-each jolt-sigsender-reset jolt-watched-signals))
-                              (c-close-fd rfd) (c-close-fd wfd))
-                            jolt-after-fork-hooks))
+                    ;; once: the hook list is inherited, and a child's own children (a fork server's agents) must not
+                    ;; close these numbers again, which by then may name the child's own files (a jar: ZipException)
+                    (let ((done (box #f)))
+                      (set! jolt-after-fork-hooks
+                        (cons (lambda ()
+                                (unless (unbox done)
+                                  (set-box! done #t)
+                                  (when jolt-sigsender-reset (for-each jolt-sigsender-reset jolt-watched-signals))
+                                  (c-close-fd rfd) (c-close-fd wfd)))
+                              jolt-after-fork-hooks)))
                     (let ((old (sa-foreign-alloc 128)))
                       (c-pthread-sigmask jolt-sig-unblock-how jolt-shutdown-sigset old)
                       (sa-foreign-free old))
