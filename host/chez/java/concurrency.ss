@@ -2214,10 +2214,8 @@
 (define bytes-sentinel (cons 'jolt 'bytes-spent))
 (define jolt-kw-bytes-spent (keyword "jolt" "bytes-spent"))
 (define jolt-kw-bytes-budget (keyword "jolt" "bytes-budget"))
-(define jolt-thread-bytes
-  (if (foreign-entry? "(cs)thread_bytes_allocated")
-      (foreign-procedure "(cs)thread_bytes_allocated" () uptr)
-      (lambda () (bytes-allocated))))
+;; jolt-thread-bytes, the calling thread's own allocation, is defined in fibers.ss (the drain loop
+;; charges each dispatch's bytes to its fiber with it)
 ;; A budget is #(start limit k fiber bytes-start bytes-limit): fiber the one (or #f, a thread) whose count start is
 ;; on. Only a budget of the running fiber (or thread) is read against now: a park's
 ;; unwind runs with no fiber current, on the carrier's count, and a fiber's budget read
@@ -5755,6 +5753,11 @@
                       (cond
                         ((and (= sig 2) target (jolt-sigint-trip! target)) (loop))
                         ;; SIGINFO: the dump, written here, and the watcher waits again
+                        ;; jolt-mark-mt! here is set mid-run, not by the context that makes a second
+                        ;; mutator (locks.ss's race-free argument does not hold): one single-threaded
+                        ;; fast-path operation already in flight on the main thread can race the dump's
+                        ;; reads. For a hang's evidence that is taken (its mutator is usually stuck), and
+                        ;; a dump that fails says so on stderr (jolt-siginfo-dump!'s guard). flow, 2026-11-15.
                         ((eqv? sig jolt-dump-signal)
                          (jolt-mark-mt!)
                          (guard (_ (#t #f)) (jolt-siginfo-dump!))

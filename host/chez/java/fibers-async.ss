@@ -530,6 +530,11 @@
     (jolt-fiber-monitor! fib
       (lambda (err) (jolt-invoke cb (if err (jolt-unwrap-throw err) jolt-nil))))
     jolt-nil))
+;; (jolt.host/fiber-cost f) -> [ticks bytes cpu-ns]: what fiber f's dispatches have run so far, summed
+;; by the drain loop (fibers.ss jolt-fiber-drain!): its engine ticks, the bytes it allocated and the CPU
+;; time it took. CPU time counts C (foreign calls, the collector's copying) that ticks never do.
+(def-var! "jolt.host" "fiber-cost"
+  (lambda (f) (jolt-vector (jolt-fiber-ticks f) (jolt-fiber-bytes f) (jolt-fiber-cpu-ns f))))
 (def-var! "jolt.host" "fiber-state"
   (lambda (fib) (jolt-keyword (symbol->string (jolt-fiber-state fib)))))
 ;; Meaningful only once the fiber is terminal — join reads it from inside the
@@ -595,8 +600,8 @@
 ;; pending deadlines are dropped (their waiters were the parent's; any fiber parked
 ;; on one in the child is gone with its carrier), the watcher is disarmed, and the
 ;; child's mask is emptied, the default mask jolt gives every child it spawns
-;; (jolt-with-empty-sigmask): SIGTERM ends it until a hook registered here re-arms
-;; the watcher. The process's locks are made afresh (locks.ss, define-process-local):
+;; (jolt-with-empty-sigmask); a child of an armed process then arms its own watcher
+;; (jolt-rearm-after-fork!). The process's locks are made afresh (locks.ss, define-process-local):
 ;; one held at the fork by a thread the fork did not copy is held by nobody here.
 ;; Pools made with jolt-fiber-pool-make are not restarted: their carriers are gone
 ;; too, and a spawn onto one parks; a forking program makes them after the fork.
@@ -607,6 +612,15 @@
   (disable-interrupts)
   (jolt-after-fork-child!*)
   (enable-interrupts))
+;; A child of an armed process arms its own watcher (concurrency.ss jolt-arm-shutdown!), once it
+;; runs with interrupts on: the parent's watcher thread is not copied by fork(2), so without one the
+;; child's SIGINFO dump waits for an event check (an agent's 0-byte dumps, flow 2026-11-15) and its
+;; SIGTERM ends it by the signal's default (a parent reads "signal 15" where it now reads "exit 143").
+(define jolt-rearm-after-fork #f)
+(define (jolt-rearm-after-fork!)
+  (when jolt-rearm-after-fork
+    (set! jolt-rearm-after-fork #f)
+    (jolt-arm-shutdown!)))
 (define (jolt-after-fork-child!*)
   ;; the process's locks are made afresh before anything here takes one (locks.ss,
   ;; define-process-local): a thread fork(2) did not copy may hold one at the fork instant without
@@ -669,6 +683,8 @@
       (set! timeout-running? #f))
     (when (unbox jolt-shutdown-armed)
       (set-box! jolt-shutdown-armed #f)
+      ;; armed again once the child runs (jolt-rearm-after-fork!): its own watcher thread
+      (set! jolt-rearm-after-fork #t)
       (when jolt-empty-sigset
         (let ((old (sa-foreign-alloc 128)))
           (c-pthread-sigmask jolt-sig-setmask-how jolt-empty-sigset old)
@@ -694,7 +710,7 @@
     ;; then the hooks a library registered for what it holds across a fork (jolt.async.remote
     ;; closes the ends it inherited), oldest first
     (for-each (lambda (h) (h)) (reverse jolt-after-fork-hooks))))
-(def-var! "jolt.host" "after-fork-child!" (lambda () (jolt-after-fork-child!) jolt-nil))
+(def-var! "jolt.host" "after-fork-child!" (lambda () (jolt-after-fork-child!) (jolt-rearm-after-fork!) jolt-nil))
 ;; (jolt.host/fork-alone ms) -> the child's pid in the parent, 0 in the child, -3 when no other
 ;; thread parked within ms. The one way to fork a jolt process. A fork beside a
 ;; thread running Scheme gives the child that thread's half-done work, so Chez's fork_alone waits,
@@ -716,6 +732,7 @@
       (let ((pid (fork-alone bound-ms)))
         (when (= pid 0) (jolt-after-fork-child!))
         (enable-interrupts)
+        (when (= pid 0) (jolt-rearm-after-fork!))
         pid))))
 ;; (jolt.host/fork-alone ms): every fork states its bound; -3 when no other thread has parked within ms, and
 ;; (jolt.host/fork-holders) then names who held it. There is no unbounded wait.

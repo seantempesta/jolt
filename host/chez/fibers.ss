@@ -127,8 +127,13 @@
           ;; "ns:line" a go form's expansion passes, one constant every spawn from
           ;; that form shares, else the procedure the spawner handed over (its body:
           ;; a fn literal's code name says the fn it was written in). Set at the spawn.
-          site)
-  (nongenerative jolt-fiber-v13))
+          site
+          ;; the bytes its dispatches allocated and the CPU time they took, summed as ticks are
+          ;; (jolt-fiber-drain!): CPU time counts what ticks cannot, C (foreign calls, the
+          ;; collector's copying, dlsym), so a dispatch far over its ticks was time in C
+          (mutable bytes)
+          (mutable cpu-ns))
+  (nongenerative jolt-fiber-v14))
 
 ;; --- the per-fiber dynamic slice ---------------------------------------------
 ;; R2 (jolt-nvpr.3). jolt's `binding` macro pushes by calling the
@@ -812,7 +817,7 @@
             (make-jolt-dslice (jolt-slice-stack-param)
                               (jolt-slice-ns-param)
                               #f)
-            c #f '() 0 #f #f 0 #f ibox #f #f #f #f 0 #f #f #f under under site)))
+            c #f '() 0 #f #f 0 #f ibox #f #f #f #f 0 #f #f #f under under site 0 0)))
     (jolt-fiber-register! f)
     (when ibox (jolt-fiber-own-ibox! f ibox))
     (when before-run (before-run f))
@@ -1094,10 +1099,10 @@
        (for-each
          (lambda (e)
            (let ((f (car e)) (n (cdr e)))
-             (fprintf port "fiber ~a: ~a, carrier ~a, parked on ~a, wait state ~a, ~a ticks, ~a~%"
+             (fprintf port "fiber ~a: ~a, carrier ~a, parked on ~a, wait state ~a, ~a ticks, ~a bytes, ~a cpu ns, ~a~%"
                       n (jolt-fiber-state f) (or (carrier-index (jolt-fiber-carrier f)) "of a pool")
                       (jolt-fiber-describe-wait (jolt-fiber-parked-on f))
-                      (or (jolt-fiber-wstate f) "none") (jolt-fiber-ticks f)
+                      (or (jolt-fiber-wstate f) "none") (jolt-fiber-ticks f) (jolt-fiber-bytes f) (jolt-fiber-cpu-ns f)
                       (jolt-fiber-site-text f))
              (cond
                ;; a running fiber's k is the one it last parked with, stale: only a parked one's is shown
@@ -2042,6 +2047,19 @@
 ;; parks (jolt-fiber-park!) stops the drain until resumed. The scheduler's
 ;; slice is captured at entry — the caller's dynamic state, which every park
 ;; restores onto the carrier.
+;; The calling thread's own allocation (Chez jolt/thread-bytes: S_thread_bytes_allocated), never
+;; another thread's or the collector's copying; on a Chez without the counter the process-wide count.
+;; A budget's byte limit reads it too (concurrency.ss).
+(define jolt-thread-bytes
+  (if (foreign-entry? "(cs)thread_bytes_allocated")
+      (foreign-procedure "(cs)thread_bytes_allocated" () uptr)
+      (lambda () (bytes-allocated))))
+;; The calling thread's CPU time in nanoseconds (macOS clock_gettime_nsec_np, CLOCK_THREAD_CPUTIME_ID
+;; 16), made once at load; 0 where it does not resolve (Linux: clock_gettime's struct form, later).
+(define jolt-thread-cpu-ns
+  (cond ((foreign-entry? "clock_gettime_nsec_np")
+         (let ((f (foreign-procedure "clock_gettime_nsec_np" (int) unsigned-64))) (lambda () (f 16))))
+        (else (lambda () 0))))
 (define (jolt-fiber-drain! c)
   (jolt-fiber-install-preempt-handler!)
   ;; The carrier's own interrupt depth, measured once per drain. Every fiber is
@@ -2053,12 +2071,14 @@
   (let loop ()
     (let ((f (jolt-fiber-dequeue! c)))
       (when f
-        ;; the dispatch's ticks are this fiber's (jolt-ticks)
-        (let ((mark (jolt-thread-ticks)))
+        ;; the dispatch's ticks are this fiber's (jolt-ticks), and so are its bytes and CPU time
+        (let ((mark (jolt-thread-ticks)) (b0 (jolt-thread-bytes)) (c0 (jolt-thread-cpu-ns)))
           (vector-set! (jolt-ticks-cell) 3 mark)
           (jolt-fiber-run f)
           (let ((d (- (jolt-thread-ticks) mark)))
             (jolt-fiber-ticks-set! f (+ (jolt-fiber-ticks f) d))
+            (jolt-fiber-bytes-set! f (+ (jolt-fiber-bytes f) (- (jolt-thread-bytes) b0)))
+            (jolt-fiber-cpu-ns-set! f (+ (jolt-fiber-cpu-ns f) (- (jolt-thread-cpu-ns) c0)))
             (let ((n (jolt-fiber-spawned-under f))) (when n (jolt-charge-lineage! n d)))))
         (loop)))))
 

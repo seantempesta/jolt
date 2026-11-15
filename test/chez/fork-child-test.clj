@@ -100,8 +100,11 @@
     (check-eq "a child of a process whose poller ran waits on a socket: its table starts afresh, not on the parent's dead kqueue"
               (in-child remote-echo) 0)
 
-    (check-eq "the reset starts no thread: the child is the one thread it forked as"
-              (in-child-now #(= 1 (count (Thread/getAllStackTraces)))) 0)
+    ;; a child of an armed process arms its own watcher (jolt-rearm-after-fork!: its SIGINFO dump and
+    ;; SIGTERM hooks need one, siginfo-dump-child-test.clj); the reset starts no other thread, and the
+    ;; watcher, parked in sigwait, never holds a fork (the double fork below)
+    (check-eq "the reset starts no thread but the child's own watcher"
+              (in-child-now #(= 1 (count (remove #{"jolt-shutdown"} (map (fn [t] (.getName ^Thread t)) (keys (Thread/getAllStackTraces))))))) 0)
     (check-eq "a child that forks again (a double fork) gives a grandchild whose parked go resumes"
               (in-child-now #(= 0 (in-child parked-go))) 0)
     (check-eq "a child forked while a thread it does not get holds the timer's mutex sets a deadline: its runtime mutexes are its own"
