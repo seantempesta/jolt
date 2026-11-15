@@ -70,6 +70,7 @@ extension-value
 ffi-varargs-compile
 fiber-carrier-count
 fiber-carrier-count-set!
+fiber-cost
 fiber-dump
 fiber-instance?
 fiber-interrupt!
