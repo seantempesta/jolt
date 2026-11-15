@@ -18,7 +18,7 @@
   ([] {:ins {:in "asks"} :outs {}})
   ([_] {})
   ([s _] s)
-  ([s _ _] (deliver answer (flow/ping @G 600000)) [s {}]))
+  ([s _ _] (deliver answer (flow/ping @G :timeout-ms 600000)) [s {}]))
 (defn blocker
   ([] {:ins {:in "holds"} :outs {}})
   ([_] {})
@@ -37,7 +37,7 @@
   (flow/resume g)
   @(flow/inject g [:b :in] [:hold])
   ;; :b is mid-step once its site says so (read without asking it)
-  (loop [i 0] (when (and (< i 300) (not (:stepping (::flow/site (get (flow/ping g 1) :b))))) (Thread/sleep 10) (recur (inc i))))
+  (loop [i 0] (when (and (< i 300) (not (:stepping (::flow/site (get (flow/ping g :timeout-ms 1) :b))))) (Thread/sleep 10) (recur (inc i))))
   @(flow/inject g [:a :in] [:ask])
   (let [r @answer
         unanswered (set (::flow/unanswered (meta r)))]
