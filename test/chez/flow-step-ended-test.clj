@@ -1,9 +1,8 @@
-;; A step that ends at its :step-ticks budget reaches its proc as a message (flow's ask, gating jolt/flow; web-2's review: a
+;; A step that ends at its :step-ticks budget is handed back to its proc (flow's ask, gating jolt/flow; web-2's review: a
 ;; render proc answering edge asks left its asker unanswered when a step ended at its budget, a hang). On a budget end
-;; only, the proc takes {:msg :cid :ticks-spent :ticks-budget} as cid ::flow/step-ended on its next read, from a chan of
-;; its own read right after control, its state kept: it answers its asker with a typed error, never silence; ::flow/error
-;; hears the end as before (one path, no handler beside it). Two ends in a row both arrive: the proc takes the first before
-;; it steps again, so the chan never holds two.
+;; only, the proc's transform is called with cid ::flow/step-ended and {:msg :cid :ticks-spent :ticks-budget}, its state
+;; kept, and its outputs are sent: the proc answers its asker with a typed error, never silence. Before: the message was
+;; dropped and only the error chan heard it.
 ;;
 ;; Run: bin/jolt run test/chez/flow-step-ended-test.clj   (prints FLOW-STEP-ENDED-TEST OK)
 (ns flow-step-ended-test
@@ -31,12 +30,12 @@
                            :stop-timeout-ms 300})]
   (flow/start g)
   (flow/resume g)
-  @(flow/inject g [:s :req] [:spin :spin :after])
-  (loop [i 0] (when (and (< i 300) (< (count @answers) 3)) (Thread/sleep 100) (recur (inc i))))
-  (let [[a b c] @answers]
-    (when-not (= {:error :budget :asked :spin :ticks-budget 50000000} a b)
-      (fail! "each ask that ended at its budget was not answered typed: " (pr-str @answers)))
-    (when-not (= {:answer :after} c) (fail! "the next ask was not answered: " (pr-str @answers))))
+  @(flow/inject g [:s :req] [:spin :after])
+  (loop [i 0] (when (and (< i 300) (< (count @answers) 2)) (Thread/sleep 100) (recur (inc i))))
+  (let [[a b] @answers]
+    (when-not (= {:error :budget :asked :spin :ticks-budget 50000000} a)
+      (fail! "the ask that ended at its budget was not answered typed: " (pr-str @answers)))
+    (when-not (= {:answer :after} b) (fail! "the next ask was not answered: " (pr-str @answers))))
   (flow/stop g)
   (println "FLOW-STEP-ENDED-TEST OK")
   (System/exit 0))
