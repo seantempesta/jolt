@@ -1867,6 +1867,16 @@
           tn (if i (subs tag (inc i)) tag)]
       (q-intern (str "(jolt-tagged-literal (jolt-symbol " (if tns (chez-str-lit tns) "#f") " "
                      (chez-str-lit tn) ") " (emit-quoted (get form :form)) ")")))
+    ;; reader-literal VALUES, as a reader or data reader builds them (eval of read text, a program read back from EDN): each
+    ;; emits the constructor its reader form emits above, so a quoted value compiles as its source does (task
+    ;; jolt.backend/eval-emits-a-quoted-uuid-and-inst; gate emitquotedvalues)
+    (uuid? form) (str "(jolt-uuid-from-string " (chez-str-lit (str form)) ")")
+    (inst? form) (str "(jolt-inst-from-string " (chez-str-lit (second (re-find #"\"(.*)\"" (pr-str form)))) ")")
+    (decimal? form) (str "(jolt-bigdec-from-string " (chez-str-lit (str form)) ")")
+    (tagged-literal? form)
+    (let [t (:tag form)]
+      (q-intern (str "(jolt-tagged-literal (jolt-symbol " (if (namespace t) (chez-str-lit (namespace t)) "#f") " "
+                     (chez-str-lit (name t)) ") " (emit-quoted (:form form)) ")")))
     ;; plain jolt VALUES (metadata maps and anything nested in them)
     (map? form) (emit-quoted-map-value form)
     (vector? form) (q-intern (str "(jolt-vector " (str/join " " (map emit-quoted form)) ")"))
@@ -1875,7 +1885,9 @@
                                                (vec (sort (map emit-quoted form)))))
                                ")"))
     (seq? form) (q-intern (str "(jolt-list " (str/join " " (map emit-quoted form)) ")"))
-    :else (throw (ex-info (str "emit-quoted: unsupported quoted form " (pr-str form)) {}))))
+    ;; a value no reader form builds (an object a macro spliced in): nothing to emit that builds it again
+    :else (throw (ex-info (str "emit-quoted: a quoted value of type " (type form) " has no reader form to compile: " (pr-str form))
+                          {:jolt.error/type :jolt.backend/unquotable-value :type (str (type form))}))))
 
 ;; A def's :meta is a jolt map value. Non-empty? (a plain def carries {}).
 (defn- jmeta-nonempty? [m] (and (map? m) (pos? (count m))))
