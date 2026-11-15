@@ -1098,11 +1098,18 @@
                     ""))
        ;; the names a foreign-procedure was resolved for most often: one whose count grows with its calls is
        ;; resolved per call (a dlsym walk over every loaded object each time)
+       ;; past the table's 256 names the rest are counted in one slot, "(other names)": printed apart, so the
+       ;; evidence never reads smaller than it is (flow)
        (when jolt-foreign-lookups-proc
-         (let ((top (jolt-first-n (list-sort (lambda (a b) (> (cdr a) (cdr b))) (jolt-foreign-lookups-proc)) 5)))
+         (let* ((all (jolt-foreign-lookups-proc))
+                (past (assoc "(other names)" all))
+                (top (jolt-first-n (list-sort (lambda (a b) (> (cdr a) (cdr b)))
+                                              (filter (lambda (e) (not (equal? (car e) "(other names)"))) all))
+                                   5)))
            (unless (null? top)
              (fprintf port "foreign lookups (most first): ~{~a ~a~^, ~}~%"
-                      (apply append (map (lambda (e) (list (car e) (cdr e))) top))))))
+                      (apply append (map (lambda (e) (list (car e) (cdr e))) top))))
+           (when past (fprintf port "  (~a lookups past the table, unnamed)~%" (cdr past)))))
        (for-each
          (lambda (e)
            (let ((f (car e)) (n (cdr e)))
