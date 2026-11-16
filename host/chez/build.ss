@@ -1259,6 +1259,7 @@
                            (loop (cdr ks) (+ i 1))))
                        (hashtable-set! bld-emit-deltas ns dstr)
                        (set! bld-emit-hits (+ bld-emit-hits 1))
+                       (bld-emit-debug ns "hit" dstr)
                        recs)))
               (let* ((before (bld-emit-snapshot))
                      (recs (thunk))
@@ -1267,6 +1268,7 @@
                      (dstr ((var-deref "clojure.core" "pr-str") delta)))
                 (hashtable-set! bld-emit-deltas ns dstr)
                 ;; kept only when the delta reads back as itself (a value with no printed form is never cached)
+                (bld-emit-debug ns (if (guard (e (#t #f)) (jolt-truthy? ((var-deref "clojure.core" "=") delta ((var-deref "clojure.core" "read-string") dstr)))) "miss" "unstorable") dstr)
                 (when (guard (e (#t #f)) (jolt-truthy? ((var-deref "clojure.core" "=") delta ((var-deref "clojure.core" "read-string") dstr))))
                   (guard (e (#t #f))
                     (bld-mkdir-p (bld-build-cache-dir))
@@ -1276,6 +1278,10 @@
                       (rename-file tmp file))))
                 recs))))))
 (define bld-emit-hits 0)
+(define (bld-emit-debug ns what dstr)
+  (when (getenv "JOLT_EMIT_CACHE_DEBUG")
+    (display (string-append "[emit] " what " " ns " " (if dstr (number->string (aot-content-hash dstr) 16) "-") "\n")
+             (current-error-port))))
 
 (define (bld-wp-infer! ordered)
   ;; the build's compilation unit (ei-unit) is created + published by the build setup
