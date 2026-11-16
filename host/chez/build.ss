@@ -3107,6 +3107,9 @@
                   ;; lambda could run before a dependency's (var-routed calls,
                   ;; out-of-order cells). The named let runs strictly in
                   ;; `ordered` order (deps first), matching the loader.
+                  ;; the emit cache's two helpers, compiled before any namespace's counters are seeded: compiled inside a
+                  ;; namespace's emit they took names from its counters, and a cached build's names differed from an uncached one's
+                  (unless (or (getenv "JOLT_NO_EMIT_CACHE") (bld-env-off? "JOLT_EMIT_CACHE")) (bld-emit-fns!))
                   (let ((core-records (dce-blob-records "host/chez/seed/prelude.ss"))
                         (app-records
                           (let ((per-ns '()))
