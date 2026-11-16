@@ -150,17 +150,21 @@
          (let ((n (record-type-name t)))
            (if (symbol? n) (symbol->string n) (call-with-string-output-port (lambda (p) (write n p))))))
         (else (call-with-string-output-port (lambda (p) (write t p))))))
+;; Answers (dynamic static top live): live is the heap's bytes read at the census's own collection, so the parts and the
+;; whole are one moment's; read later (when an error is built from it) live took what was allocated since.
 (define (sa-with-object-counts thunk top-n)
   (dynamic-wind
     (lambda () (enable-object-counts #t))
     thunk
     (lambda () (enable-object-counts #f)))
+  (let ((live (sa-bytes-allocated)))
   (let loop ((counts (object-counts)) (dyn 0) (static 0) (acc '()))
     (if (null? counts)
         (let ((sorted (list-sort (lambda (a b) (> (caddr a) (caddr b))) acc)))
           (list dyn static
                 (let take ((l sorted) (n top-n))
-                  (if (or (null? l) (<= n 0)) '() (cons (car l) (take (cdr l) (- n 1)))))))
+                  (if (or (null? l) (<= n 0)) '() (cons (car l) (take (cdr l) (- n 1)))))
+                live))
         (let* ((e (car counts))
                (gens (filter (lambda (g) (not (eq? (car g) 'static))) (cdr e)))
                (st (fold-left + 0 (map cddr (filter (lambda (g) (eq? (car g) 'static)) (cdr e)))))
@@ -169,7 +173,7 @@
           (loop (cdr counts) (+ dyn b) (+ static st)
                 (if (> b 0)
                     (cons (list (sa-object-type-name (car e)) c b gens) acc)
-                    acc))))))
+                    acc)))))))
 
 ;; (sa-total-memory-bytes) -> exact integer
 ;; Total process heap bytes — what the collector has reserved from the OS

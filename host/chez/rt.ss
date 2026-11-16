@@ -1014,7 +1014,9 @@
 (define (heap-histogram->jolt h)
   (let ((m (lambda (kvs) (jolt-hash-map-build kvs)))
         (kw (lambda (n) (keyword #f n))))
-    (m (list (kw "live") (sa-bytes-allocated)
+    ;; live as the census read it (sa-with-object-counts' fourth), never read again here: an OOM's error is built after the
+    ;; collection, and the heap read then held what the failing loop allocated since
+    (m (list (kw "live") (if (pair? (cdddr h)) (cadddr h) (sa-bytes-allocated))
              (kw "static") (sa-static-bytes)
              (kw "dynamic") (car h)
              (kw "ceiling") (or jolt-heap-ceiling-bytes jolt-nil)
