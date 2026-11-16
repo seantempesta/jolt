@@ -1154,8 +1154,10 @@
         (phase-off (if (eq? phase 'emit) (expt 2 20) 0)))
     ((var-deref "clojure.core" "reset!") (jolt-get unit (keyword #f "gensym-counter")) 0)
     ((var-deref "clojure.core" "reset!") (jolt-get unit (keyword #f "fresh-counter")) 0)
+    ;; per namespace too, in a band of its own: a counter carried from namespace to namespace made a namespace's
+    ;; names depend on which ones before it were emitted, which an emit-cache hit skips
     ((var-deref "jolt.analyzer" "set-name-counter!")
-     (+ bld-name-base (if (eq? phase 'emit) (expt 2 39) 0)))
+     (+ (expt 2 43) (* (bld-gensym-slot ns) (expt 2 21)) (if (eq? phase 'emit) (expt 2 20) 0)))
     ;; clojure.core/gensym and the reader's three (#() params, a read `,
     ;; a compiled `): each a quarter of the namespace's range for the phase
     (let ((base (+ bld-name-base (* (bld-gensym-slot ns) (expt 2 21)) phase-off)))
