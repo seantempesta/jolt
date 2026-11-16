@@ -1051,6 +1051,28 @@
   (check-eq "the thread's CPU clock does not count a sleep" (< (- c1 c0) 50000000) true)
   (check-eq "the thread's CPU clock counts work" (> (- c3 c2) 0) true))
 
+;; jolt.host/spawn-detached: argv run directly in a session of its own (POSIX_SPAWN_SETSID), stdin /dev/null, output appended to a
+;; file, its pid answered at once. A session leader leads its process group too, so the child's group is its own pid; a child of
+;; ProcessBuilder is in this process's group (the control: the same report, the other answer). A failure is data, never a throw.
+;; The child's report is read from its file, each wait bounded (a hung check names itself, never blocks the gate)
+(let [out (java.io.File/createTempFile "jolt-detached" ".out")
+      path (.getPath out)
+      report "echo $$ $(ps -o pgid= -p $$)"
+      read-report (fn [] (loop [n 0] (let [t (str/trim (slurp out))]
+                                       (if (or (seq t) (> n 200)) t (do (Thread/sleep 10) (recur (inc n)))))))
+      r (jolt.host/spawn-detached {:argv ["sh" "-c" report] :out path :err path})
+      [pid pgid] (str/split (read-report) #"\s+")
+      _ (spit out "")
+      p (.start (doto (ProcessBuilder. ["sh" "-c" report]) (.redirectOutput out)))
+      _ (.waitFor p)
+      [cpid cpgid] (str/split (read-report) #"\s+")]
+  (check-eq "spawn-detached answers the child's pid" (str (:pid r)) pid)
+  (check-eq "a detached child leads its own process group" pgid pid)
+  (check-eq "a ProcessBuilder child does not (the control)" (= cpgid cpid) false)
+  (check-eq "a program that is not there is answered as data"
+            (select-keys (jolt.host/spawn-detached {:argv ["/no/such/program"]}) [:errno]) {:errno 2})
+  (.delete out))
+
 (if (empty? @failures)
   (println "PROCESS-TEST OK")
   (do (doseq [f @failures] (println "FAIL:" f))

@@ -633,6 +633,8 @@
 (define proc-c-sigemptyset (jolt-foreign-proc-safe "sigemptyset" '(void*) 'int))
 (define proc-c-sigaddset   (jolt-foreign-proc-safe "sigaddset"   '(void* int) 'int))
 (define proc-POSIX-SPAWN-SETSIGDEF #x04)
+;; <spawn.h>: Darwin's POSIX_SPAWN_SETSID is 0x0400, glibc's 0x80 (jolt.host/spawn-detached)
+(define (proc-POSIX-SPAWN-SETSID) (if (eq? (sa-os-family) 'macos) #x0400 #x80))
 (define proc-SIGPIPE 13)
 (define proc-attr-bytes 512)
 (define proc-sigset-bytes 256)
@@ -2539,3 +2541,73 @@
 ;; instance? and (class x) for the ProcessBuilder / Process / Redirect shims are
 ;; DERIVED from the jhost-tag->fqn rows in class-hierarchy.ss (via the arms in
 ;; host-static-classes.ss) — no per-class instance-check arm here.
+
+;; --- jolt.host/spawn-detached ---------------------------------------------------
+;; A child that outlives this process and is waited for by nothing: posix_spawn of argv itself (no /bin/sh), in a session of its own
+;; (POSIX_SPAWN_SETSID: it leads a new session and process group, so no signal to this process's group reaches it), holding no
+;; descriptor of this process's (CLOEXEC_DEFAULT on Darwin, else every inherited descriptor closed), stdin /dev/null, stdout and
+;; stderr appended to the files named (each created when missing; the same file twice is one descriptor), in dir when given, its
+;; environment this process's with env's entries over it. The ProcessBuilder has no such mode on the JVM, so it is a jolt.host
+;; function of one data map, never a ProcessBuilder extension:
+;;   (jolt.host/spawn-detached {:argv ["prog" "arg"] :env {"K" "v"} :dir "/d" :out "/log" :err "/log"}) -> {:pid n}
+;; A failure is answered as data, at once: {:errno n :error "why"} (a program not found, an unopenable file, posix_spawn's own
+;; error), never a throw later. The pid is the caller's to watch (jolt.io-poller's exit-chan) if it cares how the child ends.
+(define proc-fa-addopen
+  (jolt-foreign-proc-safe "posix_spawn_file_actions_addopen" '(void* int string int int) 'int))
+(define (proc-o-flags-append) (if (eq? (sa-os-family) 'macos) (fxior #x1 #x200 #x8) (fxior #x1 #x40 #x400))) ; O_WRONLY|O_CREAT|O_APPEND
+(define proc-O-RDONLY 0)
+(define (proc-spawn-detached m)
+  (let* ((kw (lambda (n) (let ((v (jolt-get m (keyword #f n)))) (if (jolt-nil? v) #f v))))
+         (str (lambda (v) (and v (jolt-str-render-one v))))
+         (answer-error (lambda (errno why) (jolt-hash-map (keyword #f "errno") errno (keyword #f "error") why)))
+         (argv (let ((a (kw "argv"))) (if a (map jolt-str-render-one (seq->list (jolt-seq a))) '())))
+         (dir (str (kw "dir")))
+         (out (or (str (kw "out")) "/dev/null"))
+         (err (or (str (kw "err")) "/dev/null")))
+    (cond
+      ((or proc-win? (not proc-spawn-fd-ok?) (not proc-fa-addopen) (not proc-attr-init))
+       (answer-error 0 "spawn-detached: this host spawns without posix_spawn"))
+      ((null? argv) (answer-error 22 "spawn-detached: no :argv"))
+      ((and dir (not proc-fa-chdir)) (answer-error 0 "spawn-detached: this host's posix_spawn takes no :dir"))
+      (else
+       (let ((path (proc-resolve-direct (car argv) dir)))
+         (if (not path)
+             (answer-error 2 (string-append "spawn-detached: no program " (car argv)))
+             (let ((env (let ((em (make-proc-env-map)))
+                          (let ((e (kw "env"))) (when e (proc-env-put-all! em e)))
+                          (proc-env-with-pwd (proc-env-map-pairs em) dir))))
+               (jolt-with-mutex proc-spawn-fd-mutex
+                 (let* ((fa (sa-foreign-alloc 128))
+                        (attr (sa-foreign-alloc proc-attr-bytes))
+                        (pidbuf (sa-foreign-alloc 8))
+                        (cloexec? (proc-cloexec-default?))
+                        (sigdef? (proc-sigdefault-ok?)))
+                   (proc-fa-init fa)
+                   (proc-attr-init attr)
+                   (proc-attr-setflags attr (fxior (proc-POSIX-SPAWN-SETSID)
+                                                   (if cloexec? proc-POSIX-SPAWN-CLOEXEC-DEFAULT 0)
+                                                   (if sigdef? proc-POSIX-SPAWN-SETSIGDEF 0)))
+                   (when sigdef?
+                     (let ((set (sa-foreign-alloc proc-sigset-bytes)))
+                       (proc-c-sigemptyset set) (proc-c-sigaddset set proc-SIGPIPE)
+                       (proc-attr-setsigdefault attr set) (sa-foreign-free set)))
+                   (proc-fa-addopen fa 0 "/dev/null" proc-O-RDONLY 0)
+                   (proc-fa-addopen fa 1 out (proc-o-flags-append) #o644)
+                   (if (string=? out err)
+                       (proc-fa-dup2 fa 1 2)
+                       (proc-fa-addopen fa 2 err (proc-o-flags-append) #o644))
+                   (when dir (proc-fa-chdir fa dir))
+                   ;; LAST, as the fd-level spawn does: under CLOEXEC_DEFAULT the kernel closes the rest
+                   (unless cloexec? (proc-close-inherited-fds! fa '()))
+                   (let* ((cargv (proc-marshal-argv argv))
+                          (cenv (proc-marshal-argv (map (lambda (p) (string-append (car p) "=" (cdr p))) env)))
+                          (rc (jolt-with-empty-sigmask
+                                (lambda () (proc-c-spawn pidbuf path fa attr (car cargv) (car cenv)))))
+                          (pid (sa-foreign-ref 'int pidbuf 0)))
+                     (proc-fa-destroy fa) (proc-attr-destroy attr)
+                     (sa-foreign-free fa) (sa-foreign-free attr) (sa-foreign-free pidbuf)
+                     (proc-free-argv cargv) (proc-free-argv cenv)
+                     (if (= rc 0)
+                         (jolt-hash-map (keyword #f "pid") pid)
+                         (answer-error rc (string-append "spawn-detached: posix_spawn of " path " failed")))))))))))))
+(def-var! "jolt.host" "spawn-detached" proc-spawn-detached)
