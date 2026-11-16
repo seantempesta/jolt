@@ -40,6 +40,7 @@ class-isa?
 class-object?
 class-supers
 class-value?
+collect-ceiling
 compile-ns
 condition-message
 cpu-nanos
@@ -158,6 +159,7 @@ gc-bytes
 gc-count
 gc-cpu-nanos
 gc-full!
+gc-generations!
 gc-old-growth-bytes
 gc-real-nanos
 gc-trip-bytes

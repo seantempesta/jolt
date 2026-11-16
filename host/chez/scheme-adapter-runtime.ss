@@ -77,7 +77,7 @@
                                               "cannot collect when multiple threads are active"))
                                'busy
                                (raise e))))
-               (collect (collect-maximum-generation))
+               (let ((top (sa-gc-top))) (collect top top))
                'ok)))
       (case r
         ;; no collect-request-handler ran, so undo the pins of arrays this one
@@ -96,7 +96,26 @@
 ;; Contract: return the maximum generation argument sa-gc-collect accepts.
 ;; Degradation: a single-generation (non-generational) collector returns 0.
 (define (sa-gc-max-generation)
-  (collect-maximum-generation))
+  (sa-gc-top))
+
+;; (sa-gc-top) -> exact integer
+;; The deepest generation this process collects: Chez's maximum, unless the process was forked
+;; from another (sa-gc-below-inherited!). Every collection here names its generations, its target
+;; at most this one, so nothing it allocated is ever promoted past it.
+(define sa-gc-top-generation #f)
+(define (sa-gc-top) (or sa-gc-top-generation (collect-maximum-generation)))
+
+;; (sa-gc-below-inherited!) -> exact integer, the new ceiling
+;; Collect only below what this process inherited across fork(2): one generation under its
+;; parent's ceiling, where the parent's live data sits once its collections promote it. The child
+;; then never traces or copies the parent's oldest generation, so those pages stay shared and a
+;; collection costs what the child allocated; the parent's own full collections still free what it
+;; replaced. A process that forks again lowers it again: each level of forks collects one
+;; generation less (a program forking deep raises (collect-maximum-generation) first). Never
+;; below 1: generation 0's survivors need a generation to go to.
+(define (sa-gc-below-inherited!)
+  (set! sa-gc-top-generation (fxmax 1 (fx- (sa-gc-top) 1)))
+  sa-gc-top-generation)
 
 ;; (sa-bytes-allocated) -> exact integer
 ;; Live-heap bytes — the "used" reading under current-memory-bytes that
@@ -1514,7 +1533,7 @@
   (let ((last-end (sa-monotonic-ns))
         (collect-full!
           (case-lambda
-            (() (collect (collect-maximum-generation)))
+            (() (let ((top (sa-gc-top))) (collect top top)))
             ;; ROOM: #f for an ordinary full collection, else the free bytes the tight
             ;; one has to work in
             ((room)
@@ -1524,7 +1543,7 @@
                      (lambda () (in-place-minimum-generation 1))
                      (lambda () (sa-collect-tight room))
                      (lambda () (in-place-minimum-generation saved))))
-                 (collect (collect-maximum-generation)))))))
+                 (let ((top (sa-gc-top))) (collect top top)))))))
     (collect-request-handler
       (lambda ()
         (if sa-full-collect-requested?
@@ -1533,7 +1552,7 @@
             ;; young collection for the nursery's time share to count
             (begin
               (set! sa-full-collect-requested? #f)
-              (collect (collect-maximum-generation))
+              (let ((top (sa-gc-top))) (collect top top))
               (sa-pin-drain-after-collect!))
             (let ((t0 (sa-monotonic-ns)))
               (sa-collect-young!)
@@ -1564,8 +1583,8 @@
 ;;
 ;; ROOM is unused: the collection no longer needs any to fit.
 (define (sa-collect-tight room)
-  (let ((cmg (collect-maximum-generation)))
-    (collect cmg 1 cmg)))
+  (let ((top (sa-gc-top)))
+    (collect top 1 top)))
 
 ;; The collection the hook runs in place of Chez's (collect). Chez's schedule
 ;; collects generation g every radix^g collections and otherwise only
@@ -1608,8 +1627,12 @@
   (if sa-young-tight?
       (if (> (+ (current-memory-bytes) (bytes-allocated 0) (bytes-allocated 1)) sa-young-tight?)
           (collect 0 1 1)
-          (collect))
-      (let* ((cmg (collect-maximum-generation))
+          ;; Chez's own schedule, its target capped at this process's ceiling (sa-gc-top)
+          (let* ((top (sa-gc-top))
+                 (g (let loop ((g (fx- top 1)))
+                      (if (or (fx<= g 0) (fx= 0 (modulo sa-young-count (expt (collect-generation-radix) g)))) g (loop (fx- g 1))))))
+            (collect g (fxmin top (fx+ g 1)))))
+      (let* ((cmg (sa-gc-top))
              (radix (collect-generation-radix))
              (g (let loop ((g (fx- cmg 1)))
                   (if (or (fx<= g 1) (fx= 0 (modulo sa-young-count (expt radix g))))

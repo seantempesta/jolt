@@ -630,6 +630,9 @@
     (set! jolt-rearm-after-fork #f)
     (jolt-arm-shutdown!)))
 (define (jolt-after-fork-child!*)
+  ;; the child collects only below what it inherited (sa-gc-below-inherited!): its parent's oldest
+  ;; generation is never traced or copied here, so its pages stay shared with the parent
+  (sa-gc-below-inherited!)
   ;; the process's locks are made afresh before anything here takes one (locks.ss,
   ;; define-process-local): a thread fork(2) did not copy may hold one at the fork instant without
   ;; counting as active, as the timer thread whose timed wait fired holds timeout-mu while it waits
@@ -719,6 +722,12 @@
     ;; closes the ends it inherited), oldest first
     (for-each (lambda (h) (h)) (reverse jolt-after-fork-hooks))))
 (def-var! "jolt.host" "after-fork-child!" (lambda () (jolt-after-fork-child!) (jolt-rearm-after-fork!) jolt-nil))
+;; (jolt.host/collect-ceiling) -> the deepest generation this process collects (sa-gc-top): Chez's maximum in a
+;; process no fork made, one less at each level of forks (a child never collects what it inherited)
+(def-var! "jolt.host" "collect-ceiling" (lambda () (sa-gc-top)))
+;; (jolt.host/gc-generations! n) -> n: Chez's maximum generation, raised by a program whose processes fork
+;; several levels deep (each level collects one generation less), before its first fork
+(def-var! "jolt.host" "gc-generations!" (lambda (n) (collect-maximum-generation (jnum->exact n)) n))
 ;; (jolt.host/fork-alone ms) -> the child's pid in the parent, 0 in the child, -3 when no other
 ;; thread parked within ms. The one way to fork a jolt process. A fork beside a
 ;; thread running Scheme gives the child that thread's half-done work, so Chez's fork_alone waits,
