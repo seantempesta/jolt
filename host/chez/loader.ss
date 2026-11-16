@@ -1262,12 +1262,23 @@
 ;; The var names a namespace interns, with the private flag (a consumer's
 ;; reference to a private var does not compile), as one hex digest. Asked after
 ;; the capture load, so it is what the namespace's top levels defined.
+;; What a var's metadata gives a consumer's compile beyond its name: its arglists and return :tag, which a
+;; build's per-namespace inference reads from a callee (a ^long return types the call), printed readably.
+(define aot-kw-arglists (keyword #f "arglists"))
+(define aot-kw-tag (keyword #f "tag"))
+(define (aot-var-sig c)
+  (let ((m (var-cell-meta c)))
+    (if (pmap? m)
+        (string-append " " (jolt-pr-str1 (jolt-get m aot-kw-arglists jolt-nil))
+                       " " (jolt-pr-str1 (jolt-get m aot-kw-tag jolt-nil)))
+        "")))
 (define (aot-ns-surface name)
   (let ((names (sort string<?
                      (fold-left (lambda (acc c)
                                   (if (var-cell-defined? c)
                                       (cons (string-append (var-cell-name c)
-                                                           (if (var-private? c) " p" ""))
+                                                           (if (var-private? c) " p" "")
+                                                           (aot-var-sig c))
                                             acc)
                                       acc))
                                 '() (ns-cells-list name)))))
@@ -1345,8 +1356,15 @@
 ;; The surface DEP contributes to a key computed with ASSUMED (the recorded
 ;; alist of the namespace being keyed) in force, or #f when it contributes its
 ;; whole digest.
+;; A dependency every consumer calls through its vars, never a spliced body: a namespace the compile options keep
+;; out of inlining (jolt.passes.inline/no-inline-ns?, *compiler-options*' :no-inline-ns-prefixes). Its consumers' emitted
+;; code reads only its surface even under jolt build's direct linking, so it narrows there too.
+(define (aot-narrow-dep? dep)
+  (and (ldr-build-aot-cache?)
+       (not (aot-env-off? "JOLT_AOT_NARROW"))
+       (jolt-truthy? ((var-deref "jolt.passes.inline" "no-inline-ns?") dep))))
 (define (aot-dep-surface dep assumed)
-  (and (aot-narrow?)
+  (and (or (aot-narrow?) (aot-narrow-dep? dep))
        (let ((st (aot-ct-state dep)))
          (cond ((string? st) st)
                ((eq? st 'relevant) #f)
@@ -2209,7 +2227,7 @@
     ;; The .cti records the direct deps whose key contribution was the inert
     ;; constant, so a later run whose dep flags are missing again can make the
     ;; same assumption and then VERIFY it after a hit (aot-assumptions-hold?).
-    (when (aot-narrow?)
+    (when (or (aot-narrow?) (and (ldr-build-aot-cache?) (not (aot-env-off? "JOLT_AOT_NARROW"))))
       (aot-write-ct! obase (aot-ct-relevant? name) (aot-ns-surface name))
       (aot-write-cti! obase
                       (fold-right (lambda (d acc)
