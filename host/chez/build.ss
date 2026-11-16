@@ -1167,6 +1167,23 @@
     ;; load left off unless seeded
     ((var-deref "jolt.backend-scheme" "seed-fnsrc-ns-counter!") ns bld-name-base)))
 
+;; A namespace's load in a build, with the reader's four name counters seeded for it (its slot, phase load) and put
+;; back after, so what it mints is the same whichever namespaces loaded, or hit the cache, before it (ldr-name-counters-wrap).
+(define (bld-load-name-counters ns thunk)
+  (let ((g jolt-gensym-counter) (a rdr-anon-counter) (r rdr-sq-gensym-counter) (h hc-sq-gensym-counter)
+        ;; a band of its own, above every slot's wp and emit ranges (bld-name-base + slot * 2^21, up to 2^41)
+        (base (+ (expt 2 42) (* (bld-gensym-slot ns) (expt 2 21)))))
+    (dynamic-wind
+      (lambda ()
+        (set! jolt-gensym-counter base)
+        (set! rdr-anon-counter (+ base (expt 2 18)))
+        (set! rdr-sq-gensym-counter (+ base (* 2 (expt 2 18))))
+        (set! hc-sq-gensym-counter (+ base (* 3 (expt 2 18)))))
+      thunk
+      (lambda ()
+        (set! jolt-gensym-counter g) (set! rdr-anon-counter a)
+        (set! rdr-sq-gensym-counter r) (set! hc-sq-gensym-counter h)))))
+
 (define (bld-wp-infer! ordered)
   ;; the build's compilation unit (ei-unit) is created + published by the build setup
   ;; before any flag is set, so the whole-program seeds set here — and the mode flags —
@@ -2800,6 +2817,7 @@
 
 (define (build-binary entry-ns out-path mode natives embed-dirs ext-roots direct-link? tree-shake? allow-dynamic library? includes)
   (ei-profile-init!)
+  (set! ldr-name-counters-wrap bld-load-name-counters)
   (bld-check-includes! includes)
   (let ((out-path (bld-output-path out-path library?)))
   (bld-check-build-preconditions! out-path mode natives library?)

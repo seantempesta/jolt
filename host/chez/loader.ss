@@ -3267,6 +3267,13 @@
 ;; namespace once in its extent (ldr-begin-load!). On a throw the mark is rolled
 ;; back IF this call made it (a retry then loads) and the caller's ns is restored —
 ;; matching Clojure, which marks a lib loaded only after success.
+;; A build sets this to (lambda (ns thunk) ...), which runs a namespace's load with the reader's name counters seeded for
+;; that namespace and restored after (build.ss bld-load-name-counters): a name a load mints (a syntax-quote's x#, a #()
+;; parameter, a gensym) then depends on the namespace alone, never on how many namespaces were read before it, which
+;; turned on which of them the cache served. #f outside a build.
+(define ldr-name-counters-wrap #f)
+(define (ldr-with-name-counters name thunk)
+  (let ((w ldr-name-counters-wrap)) (if w (w name thunk) (thunk))))
 (define (load-namespace name) (load-namespace* name #f))
 (define (load-namespace* name force?)
   ;; steps 1-6 above: 'loaded and 'recursive are both "complete normally, do
@@ -3329,7 +3336,8 @@
           (lambda ()
             (call-with-zipdir-read-scope
               (lambda ()
-                (lib-with-install-ns-mark name (lambda () (ldr-load-body name force? was-loaded?)))))
+                (lib-with-install-ns-mark name
+                  (lambda () (ldr-with-name-counters name (lambda () (ldr-load-body name force? was-loaded?)))))))
             (set! finished? #t)))
         (jolt-masked-cleanup lv
           (unless (jolt-park-unwinding?)
