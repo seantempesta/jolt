@@ -1374,8 +1374,20 @@
 (define (aot-dep-contribution dep assumed)
   (let ((sf (aot-dep-surface dep assumed)))
     (if sf
-        (aot-hash-mix 17 (aot-content-hash sf))
+        ;; the surface, then the digest of each home it forwards a var from (aot-ns-surface+homes)
+        (fold-left (lambda (h home) (aot-hash-mix h (aot-ns-digest home)))
+                   (aot-hash-mix 17 (aot-content-hash sf))
+                   (aot-surface-homes sf))
         (aot-ns-digest dep))))
+;; The homes a recorded surface names after its hex digest: its space-separated words, the first dropped.
+(define (aot-surface-homes sf)
+  (let ((n (string-length sf)))
+    (let loop ((i 0) (start 0) (words '()))
+      (cond ((fx=? i n) (let ((ws (reverse (if (fx>? i start) (cons (substring sf start i) words) words))))
+                          (if (pair? ws) (cdr ws) '())))
+            ((char=? #\space (string-ref sf i))
+             (loop (fx+ i 1) (fx+ i 1) (if (fx>? i start) (cons (substring sf start i) words) words)))
+            (else (loop (fx+ i 1) start words))))))
 ;; After a HIT, the artifact's own requires have loaded its deps: every dep the
 ;; key ASSUMED (dep . surface) must now read inert with that same surface, or the
 ;; artifact predates a change to that dep's compile-time surface. 'unknown still
@@ -2115,11 +2127,28 @@
                      ((aot-cacheable-file (car xs)) #t)
                      (else (loop (cdr xs)))))))))
 
+;; The project or library namespaces ns forwards a var from (:refer, :refer :all): a consumer can reach their vars as
+;; ns/x, so ns answers for them. Their digests are folded beside ns's surface (aot-dep-contribution), never ns's whole
+;; source: an ns that only refers a macro (every Seon namespace refers seon.contract's defn) stays inert.
+(define (aot-ns-forward-homes ns)
+  (let* ((one (jolt-with-mutex ns-map-mu
+                (let ((ks (hashtable-keys ns-refer-table)))
+                  (let loop ((i 0) (acc '()))
+                    (if (fx>=? i (vector-length ks)) acc
+                        (let* ((k (vector-ref ks i))
+                               (ref (and (pair? k) (string=? ns (car k)) (hashtable-ref ns-refer-table k #f))))
+                          (loop (fx+ i 1)
+                                (if (and (pair? ref) (aot-cacheable-file (car ref))) (cons (car ref) acc) acc))))))))
+         (alls (jolt-with-mutex ns-map-mu (hashtable-ref ns-refer-all-table ns '())))
+         (all (append one (filter aot-cacheable-file (if (pair? alls) alls '())))))
+    (sort string<? (fold-left (lambda (acc x) (if (member x acc) acc (cons x acc))) '() all))))
 (define (aot-ct-relevant? name)
   (or (aot-ns-has-macro-var? name)
       (aot-tbl-has-ns? chez-record-shapes-tbl name)
-      (aot-tbl-has-ns? chez-protocol-methods-tbl name)
-      (aot-ns-forwards-ref? name)))
+      (aot-tbl-has-ns? chez-protocol-methods-tbl name)))
+;; An inert namespace's recorded surface: its var digest, then the homes it forwards from ("<hex> <home> ...").
+(define (aot-ns-surface+homes name)
+  (fold-left (lambda (acc h) (string-append acc " " h)) (aot-ns-surface name) (aot-ns-forward-homes name)))
 
 ;; Compiles whose sidecars are not written yet: name -> the publishes waiting on
 ;; it (below), each (name . publish!). A data reader's namespace in here makes
@@ -2228,7 +2257,7 @@
     ;; constant, so a later run whose dep flags are missing again can make the
     ;; same assumption and then VERIFY it after a hit (aot-assumptions-hold?).
     (when (or (aot-narrow?) (and (ldr-build-aot-cache?) (not (aot-env-off? "JOLT_AOT_NARROW"))))
-      (aot-write-ct! obase (aot-ct-relevant? name) (aot-ns-surface name))
+      (aot-write-ct! obase (aot-ct-relevant? name) (aot-ns-surface+homes name))
       (aot-write-cti! obase
                       (fold-right (lambda (d acc)
                                     (let ((sf (aot-dep-surface d assumed)))
