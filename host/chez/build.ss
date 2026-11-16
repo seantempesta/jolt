@@ -1184,6 +1184,97 @@
         (set! jolt-gensym-counter g) (set! rdr-anon-counter a)
         (set! rdr-sq-gensym-counter r) (set! hc-sq-gensym-counter h)))))
 
+;; --- the emit cache -----------------------------------------------------------
+;; A namespace's emit is a function of its source, what its compile reads of its requires (its AOT key, aot-base-full) and
+;; what its requires' emits added to the unit's registries; it answers DCE records and adds to those registries itself. So
+;; a namespace the compile options keep out of inlining (no other namespace splices its bodies: jolt.passes.inline
+;; no-inline-ns?) keeps its records and its registry delta under that key, and a later build with the same key takes the
+;; records and applies the delta, emitting nothing. JOLT_NO_EMIT_CACHE=1 turns it off: a build with it and one without
+;; must produce the same binary byte for byte.
+(define bld-emit-reg-keys '("direct-link-defined" "direct-link-fns" "config" "user-sigs" "pm-rets" "escapes"))
+(define bld-emit-deltas (make-hashtable string-hash string=?))
+(define bld-emit-delta-fn #f)
+(define bld-emit-apply-fn #f)
+(define (bld-emit-fns!)
+  (unless bld-emit-delta-fn
+    (let ((ls (var-deref "clojure.core" "load-string")))
+      (set! bld-emit-delta-fn
+        (ls "(fn delta [b a]
+               (cond (and (map? a) (map? b))
+                     (reduce-kv (fn [m k v] (let [bv (get b k ::none)]
+                                              (cond (= v bv) m
+                                                    (and (map? v) (map? bv)) (assoc m k (delta bv v))
+                                                    :else (assoc m k v))))
+                                {} a)
+                     (and (set? a) (set? b)) (reduce (fn [s x] (if (contains? b x) s (conj s x))) #{} a)
+                     (= a b) nil
+                     :else a))"))
+      (set! bld-emit-apply-fn
+        (ls "(fn app [cur d]
+               (cond (nil? d) cur
+                     (and (map? cur) (map? d))
+                     (reduce-kv (fn [m k v] (let [cv (get m k)]
+                                              (assoc m k (cond (and (map? cv) (map? v)) (app cv v)
+                                                               (and (set? cv) (set? v)) (into cv v)
+                                                               :else v))))
+                                cur d)
+                     (and (set? cur) (set? d)) (into cur d)
+                     :else d))")))))
+(define (bld-emit-reg k) (jolt-get (ei-unit) (keyword #f k) jolt-nil))
+(define (bld-emit-snapshot)
+  (let ((deref (var-deref "clojure.core" "deref")))
+    (map (lambda (k) (deref (bld-emit-reg k))) bld-emit-reg-keys)))
+(define (bld-emit-cacheable? ns)
+  (and (not (bld-env-off? "JOLT_EMIT_CACHE")) (not (getenv "JOLT_NO_EMIT_CACHE"))
+       (jolt-truthy? ((var-deref "jolt.passes.inline" "no-inline-ns?") ns))))
+(define (bld-emit-key mode ns)
+  (let ((own (aot-own-key ns)))
+    (and own
+         (let* ((obase (aot-base-for-own ns own))
+                (deps (aot-read-dep-list (aot-dep-sidecar obase)))
+                (full (aot-base-full ns own deps (aot-read-dep-list (aot-res-sidecar obase))))
+                ;; what each require's emit added to the registries, as this build recorded it
+                (dd (fold-left (lambda (acc d) (string-append acc d "=" (hashtable-ref bld-emit-deltas d "") "\n")) ""
+                               (sort string<? deps))))
+           (bld-unit-key mode (string-append "emit\n" ns "\n" full "\n" (number->string (aot-content-hash dd) 16)))))))
+(define (bld-emit-file key) (string-append (bld-build-cache-dir) "/" key ".emit"))
+;; THUNK emits NS and answers its DCE records; answered from the cache, or emitted and kept.
+(define (bld-emit-ns-cached mode ns thunk)
+  (let ((key (and (bld-emit-cacheable? ns) (bld-emit-key mode ns))))
+    (if (not key)
+        (thunk)
+        (let ((file (bld-emit-file key)))
+          (bld-emit-fns!)
+          (or (and (file-exists? file)
+                   (guard (e (#t #f))
+                     (let* ((v (let ((ip (open-file-input-port file))) (let ((x (fasl-read ip))) (close-port ip) x)))
+                            (recs (vector-ref v 0)) (dstr (vector-ref v 1))
+                            (delta ((var-deref "clojure.core" "read-string") dstr))
+                            (swap (var-deref "clojure.core" "swap!")))
+                       (let loop ((ks bld-emit-reg-keys) (i 0))
+                         (unless (null? ks)
+                           (swap (bld-emit-reg (car ks)) bld-emit-apply-fn (jolt-nth delta i))
+                           (loop (cdr ks) (+ i 1))))
+                       (hashtable-set! bld-emit-deltas ns dstr)
+                       (set! bld-emit-hits (+ bld-emit-hits 1))
+                       recs)))
+              (let* ((before (bld-emit-snapshot))
+                     (recs (thunk))
+                     (after (bld-emit-snapshot))
+                     (delta (apply jolt-vector (map (lambda (b a) (bld-emit-delta-fn b a)) before after)))
+                     (dstr ((var-deref "clojure.core" "pr-str") delta)))
+                (hashtable-set! bld-emit-deltas ns dstr)
+                ;; kept only when the delta reads back as itself (a value with no printed form is never cached)
+                (when (guard (e (#t #f)) (jolt-truthy? ((var-deref "clojure.core" "=") delta ((var-deref "clojure.core" "read-string") dstr))))
+                  (guard (e (#t #f))
+                    (bld-mkdir-p (bld-build-cache-dir))
+                    (let ((tmp (string-append file ".tmp" (number->string (get-process-id)))))
+                      (let ((op (open-file-output-port tmp (file-options no-fail))))
+                        (fasl-write (vector recs dstr) op) (close-port op))
+                      (rename-file tmp file))))
+                recs))))))
+(define bld-emit-hits 0)
+
 (define (bld-wp-infer! ordered)
   ;; the build's compilation unit (ei-unit) is created + published by the build setup
   ;; before any flag is set, so the whole-program seeds set here — and the mode flags —
@@ -3040,7 +3131,8 @@
                                                      (ei-timed "emit: ns-prelude"
                                                        (lambda () (bld-ns-prelude (car nf) src)))))
                                               (ei-timed "emit: per-ns total"
-                                                (lambda () (ei-emit-ns-records (car nf) src)))
+                                                (lambda () (bld-emit-ns-cached mode (car nf)
+                                                             (lambda () (ei-emit-ns-records (car nf) src)))))
                                               (list
                                                 (dce-rec #t #f '() "(jolt-ns-load-vars-pop!)")
                                                 (dce-rec #t #f '() profile-form)))
@@ -3089,7 +3181,9 @@
                 ;; whose flags are all off (var-cache, source registration).
                 (ei-restore-unit! saved-unit))))))
         (when drop-compiler? (display "jolt build: dropping compiler image (no runtime eval)\n"))
-      (ei-mark! "emit app namespaces")
+      (begin (when (getenv "JOLT_BUILD_PROFILE")
+                 (display (string-append "jolt build: [profile] emit cache hits " (number->string bld-emit-hits) "\n") (current-error-port)))
+               (ei-mark! "emit app namespaces"))
       ;; The emit walk named each file it read (jolt-enter-file!) so a failure
       ;; in it reports where; it is over, and a later failure (the link, the
       ;; {:lib} check) is no file's, so it must not be reported "at" the last one.
