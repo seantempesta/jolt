@@ -1234,7 +1234,9 @@
     (and own
          (let* ((obase (aot-base-for-own ns own))
                 (deps (aot-read-dep-list (aot-dep-sidecar obase)))
-                (full (aot-base-full ns own deps (aot-read-dep-list (aot-res-sidecar obase))))
+                ;; under the build's posture, as pass 1 keyed it: a no-inline require counts by its surface (aot-narrow-dep?)
+                (full (parameterize ((ldr-build-aot-cache? #t))
+                        (aot-base-full ns own deps (aot-read-dep-list (aot-res-sidecar obase)))))
                 ;; what each require's emit added to the registries, as this build recorded it
                 (dd (fold-left (lambda (acc d) (string-append acc d "=" (hashtable-ref bld-emit-deltas d "") "\n")) ""
                                (sort string<? deps))))
