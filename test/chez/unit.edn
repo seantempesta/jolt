@@ -3536,6 +3536,8 @@
   {:suite "pmap-order" :expr "(reduce-kv (fn [a k v] (conj a k)) [] (sorted-map 3 1 1 2 2 3))" :expected "[1 2 3]"}
   {:suite "pmap-order" :expr "(do (defrecord KvRec [x y]) (reduce-kv (fn [a k v] (assoc a k v)) {} (->KvRec 1 2)))" :expected "{:x 1, :y 2}"}
   {:suite "pmap-order" :expr "(try (reduce-kv + 0 5) (catch IllegalArgumentException e :iae))" :expected ":iae"}
+  ;; a map whose seq is its own (Datahike's DB) folds that seq's entries as far as f goes, as the reference's slow path does
+  {:suite "pmap-order" :expr "(do (defrecord KvSeqRec [n] clojure.lang.Seqable (seq [_] (cons (clojure.lang.MapEntry. 0 :a) (lazy-seq (throw (ex-info \"walked\" {})))))) (reduce-kv (fn [a k v] (reduced [k v])) nil (->KvSeqRec 1)))" :expected "[0 :a]"}
   ;; satisfies? on a host interface (a Class, not a defprotocol) must throw — the
   ;; JVM errors too — but with a non-empty message naming the offending value.
   ;; Not JVM-certifiable (the JVM's own message differs), so a unit row.

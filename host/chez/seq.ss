@@ -2384,9 +2384,12 @@
                              (else (loop (step acc (jolt-nth (car es) 0) (jolt-nth (car es) 1))
                                          (cdr es))))))))
              ((iface-method coll "kvreduce" 3) => (lambda (m) (jolt-invoke m coll f init)))
+             ;; any other map folds its own seq's entries, lazily, as the reference's slow path (IKVReduce on Object)
+             ;; reduces over the map: a record whose seq is its own (Datahike's DB, its datoms) is walked only as far
+             ;; as f goes, never its keys realized whole first and each looked up again
              ((jolt-map? coll)
               (let ((step (kv-step f)))
-                (reduce-seq (lambda (acc k) (step acc k (jolt-get coll k))) init (jolt-seq (jolt-keys coll)))))
+                (reduce-seq (lambda (acc e) (step acc (jolt-nth e 0) (jolt-nth e 1))) init (jolt-seq coll))))
              (else (jolt-throw (jolt-host-throwable "java.lang.IllegalArgumentException"
                      (string-append "No implementation of method: :kv-reduce of protocol: #'clojure.core.protocols/IKVReduce found for class: "
                                     (guard (e (#t "?")) (jolt-class-name coll)))))))))
