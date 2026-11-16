@@ -587,15 +587,23 @@
 
 ;; ---------------------------------------------------------------------------
 ;; flatten-lets: (let [a (let [b X] Y) ..] body) -> (let [b X a Y ..] body).
-;; Safe because inlined bodies are alpha-renamed (every binder unique), so the
-;; hoisted bindings can't collide. Exposes a map-returning init directly to
-;; scalar-replace when it was wrapped in an inlined arg's let.
+;; Safe only for a let whose binders inlining alpha-renamed (fresh, every one unique):
+;; a hoisted binder then cannot capture a later binding's or the body's reference. A
+;; let the program wrote is never hoisted: (let [db A w (let [db B] C)] db) hoisted to
+;; (let [db A db B w C] db) answered B for db under direct linking. Exposes a
+;; map-returning init directly to scalar-replace when it was wrapped in an inlined
+;; arg's let.
 ;; ---------------------------------------------------------------------------
+(defn- renamed-binders?
+  "Are every one of let node n's binders a name inlining made fresh (fresh: <base>__il<n>)?"
+  [n]
+  (every? (fn [b] (let [s (str (nth b 0))] (some? (re-find #"__il[0-9]" s)))) (get n :bindings)))
+
 (defn- flatten-let-bindings [binds]
   ;; returns a flattened binding vector; sets dirty when it hoists.
   (reduce (fn [out b]
             (let [nm (nth b 0) init (nth b 1)]
-              (if (= :let (get init :op))
+              (if (and (= :let (get init :op)) (renamed-binders? init))
                 (do (mark!)
                     (conj (reduce conj out (get init :bindings))
                           [nm (get init :body)]))

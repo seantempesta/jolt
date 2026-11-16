@@ -125,6 +125,17 @@
 (defn sq3 [x] x)
 (chk "alter-var-root of *compiler-options*" (= 8 (use-sq3 2)))
 
+;; A let the program wrote is not flattened into its enclosing let: a later binding's
+;; inner db hoisted out answered the inner value for the outer db (flatten-lets, which
+;; is safe only for the fresh binders inlining makes).
+(defn shadow-mk [] {:n 0})
+(with-dl
+  (defn shadow-probe []
+    (let [db (let [db (shadow-mk)] (assoc db :n 1))
+          w (let [db (shadow-mk)] (assoc db :n 2))]
+      [(:n db) (:n w)])))
+(chk "a later binding's inner let does not rebind an earlier name" (= [1 2] (shadow-probe)))
+
 (if (empty? @failures)
   (println "REPL-DL OK")
   (doseq [f @failures] (println "FAIL:" f)))
