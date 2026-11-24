@@ -361,7 +361,8 @@
             (let ((h (car (async-chan-alt-takers ch))))
               (async-chan-alt-takers-set! ch (cdr (async-chan-alt-takers ch)))
               (if (alt-claim! h)
-                  (begin (alt-deliver! h (ac-take-head! ch) ch) (set! progress #t))
+                  (begin (alt-deliver! h (if (eq? (async-chan-kind ch) 'promise) (ac-peek ch) (ac-take-head! ch)) ch)
+                         (set! progress #t))
                   (set! progress #t)) ; dead registration — dropped
               (drain-takers)))))
       ;; Step 2: drain alt-putters → capacity
@@ -1349,8 +1350,28 @@
 (define (cca-thread-macro _form _env . body)
   (jolt-list cca-thread-spawn-sym (apply jolt-list cca-fn*-sym empty-pvec body)))
 
+;; --- a port that is not a channel ---------------------------------------------
+(define jolt-async-port-reader #f)
+(define (jolt-async-port x)
+  (if (or (async-chan? x) (not jolt-async-port-reader)) x (jolt-invoke jolt-async-port-reader x)))
+(define (jolt-async-ports ports)
+  (let ((n (pvec-count ports)))
+    (let scan ((i 0))
+      (cond ((fx=? i n) ports)
+            ((let ((p (pvec-nth-d ports i jolt-nil))) (or (pvec? p) (async-chan? p))) (scan (fx+ i 1)))
+            (else
+             (let loop ((j (fx- n 1)) (acc '()))
+               (if (fx<? j 0)
+                   (apply jolt-vector acc)
+                   (loop (fx- j 1)
+                         (cons (let ((p (pvec-nth-d ports j jolt-nil))) (if (pvec? p) p (jolt-async-port p)))
+                               acc)))))))))
+
 ;; --- install clojure.core.async ---------------------------------------------
 (define (cca-def! name v) (def-var! "clojure.core.async" name v))
+(cca-def! "__set-port-reader!" (lambda (f) (set! jolt-async-port-reader f) jolt-nil))
+(cca-def! "__port" jolt-async-port)
+(cca-def! "__ports" jolt-async-ports)
 (cca-def! "chan" jolt-async-chan)
 ;; (promise-chan) | (promise-chan xform) | (promise-chan xform ex-handler): the
 ;; transducer and handler go through chan, as on the JVM; they were dropped.
@@ -1363,11 +1384,12 @@
 (cca-def! "__promise-buffer" (lambda () (make-async-buffer 1 'promise)))
 (cca-def! "unblocking-buffer?" jolt-async-unblocking-buffer?)
 (cca-def! "close!" jolt-async-close!)
-(cca-def! "<!" jolt-async-take)   (cca-def! "<!!" jolt-async-take!!)
+(cca-def! "<!" (lambda (ch) (jolt-async-take (jolt-async-port ch))))
+(cca-def! "<!!" (lambda (ch) (jolt-async-take!! (jolt-async-port ch))))
 (cca-def! ">!" jolt-async-give)   (cca-def! ">!!" jolt-async-give!!)
 (cca-def! "timeout" jolt-async-timeout)
 (cca-def! "put!" jolt-async-put!)
-(cca-def! "take!" jolt-async-take!)
+(cca-def! "take!" (lambda (ch cb . rest) (apply jolt-async-take! (jolt-async-port ch) cb rest)))
 (cca-def! "offer!" jolt-async-offer!)
 (cca-def! "go-spawn" async-go-spawn)
 ;; thread-spawn: always a real OS thread, whatever *go-backend* says (thread

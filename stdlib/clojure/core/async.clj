@@ -459,6 +459,8 @@
 ;; The __do-alts host primitive handles the fast pass, registration, wait, and
 ;; unregistration atomically under per-channel locks.
 
+(defn- port-chan [port] (clojure.core.async/__port port))
+
 (defn- alt-attempt [port]
   (if (vector? port)
     (let [ch (nth port 0) v (nth port 1)]
@@ -473,7 +475,12 @@
   (assert (pos? (count ports)) "alts must have at least one channel operation")
   (let [ports (vec ports)
         n (count ports)
-        has-default (contains? opts :default)]
+        has-default (contains? opts :default)
+        chans (clojure.core.async/__ports ports)
+        own (fn [[v c :as r]]
+              (if (or (identical? chans ports) (= :default c))
+                r
+                [v (or (some (fn [i] (when (identical? c (nth chans i)) (nth ports i))) (range n)) c)]))]
     ;; Validate every put before the readiness scan can mutate any channel.
     (dotimes [i n]
       (let [port (nth ports i)]
@@ -484,13 +491,13 @@
           hit (loop [k 0]
                 (when (< k n)
                   (let [j (+ start k) i (if (< j n) j (- j n))]
-                    (or (alt-attempt (nth ports i))
+                    (or (alt-attempt (nth chans i))
                         (recur (inc k))))))]
-      (if hit
-        hit
-        (if has-default
-          [(:default opts) :default]
-          (clojure.core.async/__do-alts ports (boolean (:priority opts)) blocking?))))))
+      (own (if hit
+             hit
+             (if has-default
+               [(:default opts) :default]
+               (clojure.core.async/__do-alts chans (boolean (:priority opts)) blocking?)))))))
 
 (defn do-alts
   "Returns [val port] for the first ready op among ports. ports is a vector of
@@ -606,7 +613,7 @@
   "Takes a val from port if possible immediately. Never blocks. Returns the value
   or nil."
   [port]
-  (let [r (clojure.core.async/__poll! port)]
+  (let [r (clojure.core.async/__poll! (port-chan port))]
     (when (not= r ::none) r)))
 
 ;; --- thread variants --------------------------------------------------------

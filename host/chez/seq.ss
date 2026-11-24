@@ -2541,9 +2541,10 @@
              ;; a sorted map walks its tree's leaves, as PersistentTreeMap.kvreduce
              ;; walks its nodes, stopping at a reduced value (host-table.ss)
              ((htable-sorted-map? coll) (sc-reduce-kv coll (kv-step f) init))
+             ;; any other map folds its own seq's entries lazily (matching IKVReduce on Object)
              ((jolt-map? coll)
               (let ((step (kv-step f)))
-                (reduce-seq (lambda (acc k) (step acc k (jolt-get coll k))) init (jolt-seq (jolt-keys coll)))))
+                (reduce-seq (lambda (acc e) (step acc (jolt-nth e 0) (jolt-nth e 1))) init (jolt-seq coll))))
              (else (jolt-throw (jolt-host-throwable "java.lang.IllegalArgumentException"
                      (string-append "No implementation of method: :kv-reduce of protocol: #'clojure.core.protocols/IKVReduce found for class: "
                                     (guard (e (#t "?")) (jolt-class-name coll)))))))))

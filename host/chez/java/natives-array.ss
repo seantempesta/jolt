@@ -629,10 +629,19 @@
             (na-indexed-backing (ja-backing-len v) kind na-walk-backing v)))
          (else #f))))
 
+(define (na-backing-copy v)
+  (cond ((bytevector? v) (bytevector-copy v))
+        ((fxvector? v) (fxvector-copy v))
+        ((flvector? v) (flvector-copy v))
+        ((string? v) (string-copy v))
+        (else (vector-copy v))))
+
 (define (na-from-seq x kind)
-  (make-jolt-array (or (na-from-indexed x kind)
-                       (na-list->backing (seq->list (jolt-seq x)) kind))
-                   kind))
+  (if (and (jolt-array? x) (eq? (jolt-array-kind x) kind))
+      (make-jolt-array (na-backing-copy (jolt-array-vec x)) kind)
+      (make-jolt-array (or (na-from-indexed x kind)
+                           (na-list->backing (seq->list (jolt-seq x)) kind))
+                       kind)))
 
 ;; (T-array size init) has TWO forms on the JVM, and Numbers.T_array picks between
 ;; them with an instanceof: an init that is the element's own scalar type fills

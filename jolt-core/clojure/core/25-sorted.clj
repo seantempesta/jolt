@@ -212,9 +212,12 @@
 (defn sorted-set-by [comparator & xs]
   (ss-conj-many (make-sorted :jolt/sorted-set nil 0 (fn->cmp comparator) comparator ss-ops) (vec xs)))
 
+;; A type declaring clojure.lang.Sorted is sorted on the JVM (sorted? is an
+;; instance? test there), and subseq / rsubseq reach it through the interface.
+;; instance? is a macro defined later (30-macros); instance-check is its runtime fn.
 (defn sorted-map? [x] (= :map (jolt.host/sorted-kind x)))
 (defn sorted-set? [x] (= :set (jolt.host/sorted-kind x)))
-(defn sorted? [x] (or (sorted-map? x) (sorted-set? x)))
+(defn sorted? [x] (or (sorted-map? x) (sorted-set? x) (instance-check 'clojure.lang.Sorted x)))
 
 ;; --- subseq / rsubseq ---------------------------------------------------------
 ;; test is one of < <= > >= applied Clojure-style to the comparator result:
@@ -227,16 +230,27 @@
 
 (defn- sc-mode [sc] (if (sorted-map? sc) 0 1))
 
+;; jolt's own sorted colls walk their tree; any other Sorted is asked through the
+;; interface's comparator, entryKey, seqFrom and seq, as clojure.core does.
+(defn- native-sorted? [sc] (or (sorted-map? sc) (sorted-set? sc)))
+
 ;; clojure.core/mk-bound-fn
 (defn- mk-bound-fn [sc test k]
-  (let [cmp (the-cmp sc) map? (sorted-map? sc)]
-    (fn [e] (test (cmp (if map? (key e) e) k) 0))))
+  (if (native-sorted? sc)
+    (let [cmp (the-cmp sc) map? (sorted-map? sc)]
+      (fn [e] (test (cmp (if map? (key e) e) k) 0)))
+    (let [cmp (.comparator sc)]
+      (fn [e] (test (.compare cmp (.entryKey sc e) k) 0)))))
 
 (defn- seq-from [sc k asc?]
-  (jolt.host/sorted-seq-from (jolt.host/sorted-tree sc) asc? (sc-mode sc) (the-cmp sc) k))
+  (if (native-sorted? sc)
+    (jolt.host/sorted-seq-from (jolt.host/sorted-tree sc) asc? (sc-mode sc) (the-cmp sc) k)
+    (.seqFrom sc k asc?)))
 
 (defn- sc-seq [sc asc?]
-  (jolt.host/sorted-seq (jolt.host/sorted-tree sc) asc? (sc-mode sc)))
+  (if (native-sorted? sc)
+    (jolt.host/sorted-seq (jolt.host/sorted-tree sc) asc? (sc-mode sc))
+    (.seq sc asc?)))
 
 (defn- assert-sorted [sc]
   (when-not (sorted? sc)

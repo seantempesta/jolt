@@ -23,6 +23,9 @@
 (defprotocol ReadPort
   (take! [port handler] "derefable val if taken, nil if take was enqueued"))
 
+(defprotocol WritePort
+  (put! [port val handler] "derefable boolean if put, nil if put was enqueued"))
+
 ;; A channel reports the class name upstream's ManyToManyChannel has — that is
 ;; the class-arm in host/chez/java/async.ss — but the class graph carries no row
 ;; for the name, and value-host-tags, the list protocol dispatch looks a value up
@@ -59,4 +62,17 @@
 ;; registers no impl at all, and satisfies? stays false.
 (extend-type clojure.core.async.impl.channels.ManyToManyChannel
   ReadPort
-  (take! [port f] (clojure.core.async/take! port f)))
+  (take! [port f] (clojure.core.async/take! port f))
+  WritePort
+  (put! [port val f] (clojure.core.async/put! port val f)))
+
+(defn read-port
+  "A promise-chan holding what port answers, for a non-channel ReadPort value."
+  [port]
+  (let [c (clojure.core.async/promise-chan)
+        f (fn [v] (if (nil? v) (clojure.core.async/close! c) (clojure.core.async/put! c v)))
+        b (take! port f)]
+    (when (some? b) (f @b))
+    c))
+
+(clojure.core.async/__set-port-reader! (fn [x] (if (satisfies? ReadPort x) (read-port x) x)))
