@@ -46,7 +46,7 @@
 ;; mutex; the single-key lookup below stays unlocked, which is safe here for the
 ;; reasons set out at var-table in rt.ss.
 (define fn-form-tbl (make-hashtable string-hash string=?))
-(define fn-form-tbl-mu (make-mutex))
+(define-process-local fn-form-tbl-mu (make-mutex))
 
 
 ;; LIVE-NAMES is the optional fifth argument, and only a SPLICED copy of a
@@ -108,7 +108,7 @@
 ;; program asking the class of endlessly many distinct fns stops copying and
 ;; takes the uncached path past the bound.
 (define fn-class-token-box (box (make-weak-eq-hashtable)))
-(define fn-class-token-mu (make-mutex))
+(define-process-local fn-class-token-mu (make-mutex))
 (define (fn-literal-class-token-slow nm)
   (let ((c (fn-literal-class-of-name nm)))
     (if c (jolt-class-for c) 'none)))

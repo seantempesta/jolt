@@ -5,7 +5,7 @@
 
 (define embedded-file-system-uri "jar:file:jolt-embedded-resources.jar")
 (define embedded-open-file-systems (make-hashtable string-hash string=?))
-(define embedded-file-systems-mutex (make-mutex))
+(define-process-local embedded-file-systems-mutex (make-mutex))
 
 ;; "jar:file:jolt-embedded-resources.jar" with or without a "!/..." tail names it;
 ;; any other URI is another archive, which no provider here serves.

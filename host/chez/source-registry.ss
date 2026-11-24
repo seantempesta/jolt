@@ -28,7 +28,7 @@
 ;; of them with confidence, which is exactly the misattribution the marker exists
 ;; to prevent (400 contended pairs missed it 3 times). Reads stay unlocked: this is
 ;; a strong hashtable and every read of it is single-key.
-(define source-registry-mu (make-mutex))
+(define-process-local source-registry-mu (make-mutex))
 ;; The same records, keyed "ns/name" instead of by emitted procedure name. A
 ;; spliced call site names its callee by fqn (the trace marker carries it) and has
 ;; no procedure of its own to look up, so this is the index that answers it. Fed
@@ -39,16 +39,59 @@
   (and (string? fqn) (hashtable-ref source-registry-by-fqn fqn #f)))
 (define (jolt-register-source! procname ns nm file line)
   (jolt-with-mutex source-registry-mu
-    (let ((rec (vector ns nm file line))
-          (existing (hashtable-ref source-registry procname #f)))
+    (let* ((cell (hashtable-ref var-table (string-append ns "/" nm) #f))
+           (root (and cell (var-cell-root cell)))
+           ;; The def's procedure is the var's root at this point (the back end
+           ;; emits the registration right after binding it): its CODE object is
+           ;; the identity a frame carries, which a short name is not.
+           (code (and (procedure? root) (#%$closure-code root)))
+           (rec (vector ns nm file line code))
+           (existing (hashtable-ref source-registry procname #f)))
       (hashtable-set! source-registry-by-fqn (string-append ns "/" nm) rec)
+      (when code (eq-hashtable-set! source-registry-by-code code rec))
       (cond
         ((not existing) (hashtable-set! source-registry procname rec))
         ((and (vector? existing)
               (or (not (equal? (vector-ref existing 0) ns))
                   (not (equal? (vector-ref existing 1) nm))))
-         (hashtable-set! source-registry procname 'ambiguous)))))
+         (hashtable-set! source-registry procname 'ambiguous))
+        ((vector? existing) (hashtable-set! source-registry procname rec)))))
   jolt-nil)
+;; The record of the var whose procedure has this code object, or #f. A frame's
+;; code is its procedure's identity: two vars (or a runtime procedure) that share
+;; a short name never share code, so a frame is named for its own var only.
+(define source-registry-by-code (make-eq-hashtable))
+(define (srcreg-frame-code io)
+  (guard (e (#t #f))
+    (let ((c (io 'code))) (and c (c 'value)))))
+;; The record a frame maps to: by code identity when its def recorded one, else
+;; (a def whose root was no procedure when registered) by short name.
+;; An evaluated top-level form's frame (compile-eval.ss jolt-ce-eval-frame), answering the fn: its code ->
+;; #(ns "eval<n>" file line #f), as the JVM names the fn Compiler.eval wraps a form in (ns$eval<n>).
+;; Weak: a REPL makes one per form, and an entry lives as long as its code (a frame on a kept
+;; continuation holds it).
+(define source-registry-eval-frames (make-weak-eq-hashtable))
+(define (jolt-eval-frame-register! proc ns nm line)
+  (let ((code (#%$closure-code proc)))
+    (jolt-with-mutex source-registry-mu
+      ;; the file as a def's record holds it: *file*, the path being loaded (a trace prints it, an
+      ;; element takes its name); in an eval with no file (NO_SOURCE_PATH), *source-path* (NO_SOURCE_FILE), the JVM element's
+      (eq-hashtable-set! source-registry-eval-frames code
+                         (vector ns nm (let ((sv (lambda (n) (let ((c (var-cell-lookup "clojure.core" n)))
+                                                                (and c (let ((f (var-cell-deref c))) (and (string? f) f)))))))
+                                         (let ((f (sv "*file*")))
+                                           (if (and f (not (string=? f "NO_SOURCE_PATH"))) f (sv "*source-path*"))))
+                                 ;; the form's line, which a report reads when a frame names none;
+                                 ;; no code in the value: a weak table's value holding its key keeps it
+                                 line #f))))
+  proc)
+(define (srcreg-frame-record io nm)
+  (let ((code (srcreg-frame-code io)))
+    (or (and code (jolt-with-mutex source-registry-mu
+                    (or (hashtable-ref source-registry-by-code code #f)
+                        (eq-hashtable-ref source-registry-eval-frames code #f))))
+        (let ((src (hashtable-ref source-registry nm #f)))
+          (and (vector? src) (not (vector-ref src 4)) src)))))
 (def-var! "jolt.host" "register-source!" jolt-register-source!)
 
 ;; The continuation to walk for an uncaught value: the one jolt-throw captured for
@@ -83,9 +126,21 @@
                               ((char=? (string-ref body i) #\$) i)
                               (else (loop (fx- i 1))))))
               (fqn (if dollar (substring body 0 dollar) body))
-              (rec (srcreg-record-for-fqn fqn)))
-         (and (vector? rec)
-              (list (vector-ref rec 0) (vector-ref rec 1)
+              (rec (srcreg-record-for-fqn fqn))
+              (slash (let loop ((i 0))
+                       (cond ((fx>=? i (string-length fqn)) #f)
+                             ((char=? (string-ref fqn i) #\/) i)
+                             (else (loop (fx+ i 1)))))))
+         ;; A def nothing registered (eval'd code) still names its anonymous fn:
+         ;; the label is jfn$<ns>/<def>$<n>, so ns and def are in it. A literal
+         ;; outside any def, jfn$<ns>/$<n> (a top-level form's fn, a defmethod's
+         ;; body, a record's method), has no def to name it by: #f, as for any
+         ;; label no def covers.
+         (and (or (vector? rec)
+                  (and slash (fx>? slash 0) (fx<? (fx+ slash 1) (string-length fqn))))
+              (list (if (vector? rec) (vector-ref rec 0) (substring fqn 0 slash))
+                    (if (vector? rec) (vector-ref rec 1)
+                        (substring fqn (fx+ slash 1) (string-length fqn)))
                     (if dollar (substring body (fx+ dollar 1) n) "0"))))))
 
 ;; A frame inspector's procedure name as a string, or #f for a non-frame / unnamed.
@@ -188,9 +243,12 @@
 ;; A frame's OWN line — where its execution is paused, which Chez annotates with
 ;; the position of the call that CREATED the frame: the call site inside the
 ;; caller, exactly what the JVM prints for a frame. Resolve the frame's
-;; (source-name . offset) through the marker lookup: a .scm path resolves via the
-;; on-disk marker table (jolt-marker-line-in-file), a synthetic eval name via the
-;; eval registry (jolt-eval-source-line). #f when the frame carries no source or
+;; (source-name . offset) through the marker lookup: a namespace's code through the
+;; table its unit or cached artifact registered as it loaded (a built binary's unit,
+;; build.ss bld-write-unit!; an AOT artifact, loader.ss aot-publish-artifact!), a
+;; synthetic eval name via the eval registry (jolt-eval-source-line). The .scm itself
+;; is never read: every path that loads marked code registers its table, so the whole-
+;; file scan a first trace once paid is gone. #f when the frame carries no source or
 ;; no marker precedes its offset — the renderer then falls back to the defn line.
 ;; Exception-proof: the reporter runs while an error is being reported.
 (define (srcreg-source-pair-entry pair ns)
@@ -200,15 +258,21 @@
            (cond
              ((jolt-eval-source-name? name) (jolt-eval-source-entry name offset))
              ((jolt-baked-marker-table ns) => (lambda (t) (jolt-marker-line-from-table t offset)))
-             (else (jolt-marker-entry-in-file name offset)))))))
+             (else #f))))))
 
 ;; The logical frames one physical frame stands for, innermost first, or '() for
 ;; a frame a trace leaves out: unnamed, or plumbing that maps to no jolt fn. nm
 ;; is the frame's procedure name and source-pair a thunk answering its
 ;; (source-name . offset); only a mapped frame reads it, since only a mapped
 ;; frame prints a line. Error traces and the sampler both resolve through this.
-(define (srcreg-logical-frames nm source-pair)
-  (let ((src (and nm (hashtable-ref source-registry nm #f))))
+;; MERGE-REVIEW(deep-fixes): upstream factored the per-frame lookup out of
+;; jolt-frame-records into this function (for its sampler too); ours (d5cbb8ac "wip frame
+;; identity", bc221f38) looked the record up by the frame's code object first
+;; (srcreg-frame-record) and folded repeated frames with srcreg-push-frame. Chosen: an
+;; optional record thunk, which jolt-frame-records passes as srcreg-frame-record; the
+;; sampler keeps the by-name lookup. Gate: degradedbacktrace, errorreport, traceemit.
+(define (srcreg-logical-frames nm source-pair . record)
+  (let ((src (and nm (if (pair? record) ((car record)) (hashtable-ref source-registry nm #f)))))
     (if (not (and nm (or src (not (srcreg-plumbing-name? nm)))))
         '()
         (let* ((parts (and (not src) (srcreg-jfn-parts nm)))
@@ -228,7 +292,7 @@
 ;; their defn lines and lost every spliced frame, and so did one assembled from
 ;; build-cache units, which name the directory of the build that first compiled
 ;; them. So each unit carries its own table and registers it here as it loads,
-;; under the namespaces it holds (build.ss bld-append-marker-table!); a frame's
+;; under the namespaces it holds (build.ss bld-write-unit!); a frame's
 ;; namespace is its fn's, which the walk already has.
 (define jolt-baked-marker-tables (make-hashtable string-hash string=?))   ; ns -> table
 (define (jolt-register-marker-table! nses table)
@@ -403,7 +467,8 @@
           (reverse acc)
           (let* ((io (car ios))
                  (nm (srcreg-frame-name io))
-                 (fs (srcreg-logical-frames nm (lambda () (srcreg-frame-source-pair io)))))
+                 (fs (srcreg-logical-frames nm (lambda () (srcreg-frame-source-pair io))
+                                            (lambda () (srcreg-frame-record io nm)))))
             (when (and debug? nm)
               (display (string-append "  [frame] " nm
                                       (cond ((hashtable-ref source-registry nm #f) " *MAPPED*")
@@ -434,9 +499,17 @@
             ;; was spliced into it. They come back innermost first, and acc is
             ;; reversed on return, so each is consed IN ORDER — a left fold, not
             ;; a recursive cons, which would put them on backwards.
+            ;; A frame jolt.debug read locals for is its own element: a run of
+            ;; recursion has a value per frame, and folding the run (srcreg-push-frame)
+            ;; would keep one frame and lose the rest's locals, keyed by frame.
             (loop (cdr ios)
-                  (let add ((fs fs) (a acc))
-                    (if (null? fs) a (add (cdr fs) (cons (car fs) a)))))))))))
+                  (let ((sink (jolt-debug-locals-sink)))
+                    (let add ((fs fs) (a acc))
+                      (cond ((null? fs) a)
+                            ((and sink (or (eq-hashtable-contains? sink (car fs))
+                                           (and (pair? a) (eq-hashtable-contains? sink (car a)))))
+                             (add (cdr fs) (cons (car fs) a)))
+                            (else (add (cdr fs) (srcreg-push-frame (car fs) a)))))))))))))
 
 ;; --- clj-line lookup for generated .scm offsets ---------------------------------
 ;;
@@ -466,7 +539,6 @@
 ;; Deliberately NOT handled (the emitter cannot produce them): #; datum
 ;; comments, and bar-delimited |symbol| syntax containing #|.
 (define jolt-marker-cache-text (make-hashtable string-hash string=?))
-(define jolt-marker-cache-file (make-hashtable string-hash string=?))
 
 ;; Forward scan -> sorted vector of (start . line) pairs, one per real marker.
 (define (jolt-marker-table text)
@@ -658,7 +730,7 @@
 ;; form, under tracing only, negligible against the analysis+emit already paid.
 (define jolt-eval-source-max 4096)
 (define jolt-eval-source-counter 0)
-(define jolt-eval-source-mutex (make-mutex))
+(define-process-local jolt-eval-source-mutex (make-mutex))
 (define jolt-eval-marker-registry (make-hashtable string-hash string=?))
 (define jolt-eval-source-queue '())          ; names in insertion order (FIFO)
 (define jolt-eval-source-queue-tail '())
@@ -691,23 +763,31 @@
                 (if (string? v) v #f))))
     (and (string? ns)
          (vector file ns (car (jolt-profile-form-labels written ns))))))
+;; NAME #f mints the next jolt-eval-src-<n>. A form whose compiled code is reused
+;; (compile-eval.ss jolt-ce-run-emitted) carries the name its text's digest gives,
+;; jolt-eval-src-<key>, in every process that loads it; registering a name already
+;; registered replaces its table and keeps its place in the eviction order.
 (define (jolt-register-eval-marker-table! scm . info)
+  (apply jolt-register-eval-marker-table-as! #f scm info))
+(define (jolt-register-eval-marker-table-as! given scm . info)
   (define prof (and (sa-profile-instrumenting?) (= (length info) 3)
                     (apply jolt-profile-source-entry scm info)))
   (define dbg (and (jolt-debug-locals-instrumenting?) (= (length info) 3)
                    (apply jolt-debug-source-entry info)))
   (jolt-lock! jolt-eval-source-mutex)
-  (let ((name (string-append "jolt-eval-src-"
-                             (number->string jolt-eval-source-counter)))
+  (let ((name (or given
+                  (let ((n (string-append "jolt-eval-src-" (number->string jolt-eval-source-counter))))
+                    (set! jolt-eval-source-counter (+ jolt-eval-source-counter 1))
+                    n)))
         (table (jolt-marker-table scm)))
-    (set! jolt-eval-source-counter (+ jolt-eval-source-counter 1))
-    (when (fx>=? (hashtable-size jolt-eval-marker-registry) jolt-eval-source-max)
-      (let ((old (jolt-eval-queue-pop!)))
-        (when old
-          (hashtable-delete! jolt-eval-marker-registry old)
-          (hashtable-delete! jolt-debug-sources old))))
+    (unless (hashtable-contains? jolt-eval-marker-registry name)
+      (when (fx>=? (hashtable-size jolt-eval-marker-registry) jolt-eval-source-max)
+        (let ((old (jolt-eval-queue-pop!)))
+          (when old
+            (hashtable-delete! jolt-eval-marker-registry old)
+            (hashtable-delete! jolt-debug-sources old))))
+      (jolt-eval-queue-push! name))
     (hashtable-set! jolt-eval-marker-registry name table)
-    (jolt-eval-queue-push! name)
     (when prof (jolt-profile-note-source! name prof))
     (when dbg (hashtable-set! jolt-debug-sources name dbg))
     (jolt-unlock! jolt-eval-source-mutex)
@@ -721,8 +801,9 @@
   (jolt-marker-entry-line (jolt-eval-source-entry name offset)))
 ;; Is this source name a registry key rather than a real file? The distinguisher
 ;; between "consult the eval registry" and "read a .scm off disk": every name
-;; this registry mints is "jolt-eval-src-" followed by decimal digits, and no
-;; generated artifact on disk is ever named that.
+;; this registry mints is "jolt-eval-src-" followed by a counter (decimal) or a
+;; text key (hex digits and dashes, loader.ss aot-text-key), and no generated
+;; artifact on disk is ever named that.
 (define (jolt-eval-source-name? name)
   (and (string? name)
        (let ((n (string-length name)))
@@ -730,8 +811,9 @@
               (string=? (substring name 0 14) "jolt-eval-src-")
               (let loop ((i 14))
                 (or (fx>=? i n)
-                    (and (char<=? #\0 (string-ref name i) #\9)
-                         (loop (fx+ i 1)))))))))
+                    (let ((c (string-ref name i)))
+                      (and (or (char<=? #\0 c #\9) (char<=? #\A c #\F) (char=? c #\-))
+                           (loop (fx+ i 1))))))))))
 
 ;; --- jolt.profile: execution counts by clj line --------------------------------
 ;; Code compiled while instrumentation is on (sa-profile-instrument!) carries a
@@ -1107,23 +1189,6 @@
 (def-var! "jolt.host" "profile-stats"
   (lambda () (apply jolt-vector (vector->list (sa-stats)))))
 
-;; Convenience wrapper for a generated file on disk. Cached per path+mtime: the
-;; same .scm serves every frame of a backtrace, so read+scan it once. Whole-
-;; second mtime granularity means a file regenerated within the same second can
-;; serve a stale table — acceptable on a debug path, never a correctness claim.
-(define (jolt-marker-entry-in-file path offset)
-  (define (read-table)
-    (call-with-input-file path
-      (lambda (p) (jolt-marker-table (get-string-all p)))))
-  (let* ((mtime (div (sa-file-mtime-ms path) 1000))
-         (entry (hashtable-ref jolt-marker-cache-file path #f)))
-    (unless (and entry (= (car entry) mtime))
-      (set! entry (cons mtime (read-table)))
-      (hashtable-set! jolt-marker-cache-file path entry))
-    (jolt-marker-line-from-table (cdr entry) offset)))
-(define (jolt-marker-line-in-file path offset)
-  (jolt-marker-entry-line (jolt-marker-entry-in-file path offset)))
-
 ;; Render a list of (frame-name . record) pairs (innermost/deepest first) to a
 ;; backtrace string. record is a source vector #(ns name file line) -> "ns/name
 ;; (file:line)", or 'ambiguous / #f -> the bare frame name. A run of the same
@@ -1191,6 +1256,20 @@
 (define (srcreg-frame-nm f) (vector-ref f 0))
 (define (srcreg-frame-rec f) (vector-ref f 1))
 (define (srcreg-frame-line f) (vector-ref f 2))
+;; A run of the same frame at the same line (deep recursion through one fn) is
+;; kept as ONE frame holding its count in a fourth slot, so a run never spends
+;; the trace's room: the frames outside it stay in the trace.
+(define (srcreg-frame-count f) (if (fx>? (vector-length f) 3) (vector-ref f 3) 1))
+(define (srcreg-push-frame f acc)
+  (if (and (pair? acc)
+           (let ((p (car acc)))
+             (and (string=? (srcreg-frame-nm p) (srcreg-frame-nm f))
+                  (eqv? (srcreg-frame-line p) (srcreg-frame-line f)))))
+      (let ((p (car acc)))
+        (cons (vector (srcreg-frame-nm p) (srcreg-frame-rec p) (srcreg-frame-line p)
+                      (fx+ (srcreg-frame-count p) (srcreg-frame-count f)))
+              (cdr acc)))
+      (cons f acc)))
 
 (define (jolt-render-recs recs)
   (let ((port (open-output-string)))
@@ -1199,9 +1278,9 @@
           (get-output-string port)
           (let* ((f (car rs)) (frame-name (srcreg-frame-nm f)) (r (srcreg-frame-rec f)))
             ;; count a maximal run of the same frame-name
-            (let run ((tail (cdr rs)) (cnt 1))
+            (let run ((tail (cdr rs)) (cnt (srcreg-frame-count f)))
               (if (and (pair? tail) (string=? (srcreg-frame-nm (car tail)) frame-name))
-                  (run (cdr tail) (fx+ cnt 1))
+                  (run (cdr tail) (fx+ cnt (srcreg-frame-count (car tail))))
                   (begin
                     (put-string port "    ")
                     (if (vector? r)
@@ -1463,7 +1542,7 @@
 ;; protocol declares is kept (records.ss chez-protocol-methods-tbl), so a
 ;; Java-interface method or a protocol-less name never matches.
 (define jolt-proto-impl-names (make-hashtable string-hash string=?))
-(define jolt-proto-impl-mu (make-mutex))
+(define-process-local jolt-proto-impl-mu (make-mutex))
 (define (jolt-note-proto-impl! proto method fn)
   (when (and (string? proto) (string? method) (procedure? fn))
     (let* ((slash (let find ((i (fx- (string-length proto) 1)))
@@ -1571,8 +1650,30 @@
               (ste-make (or (fn-literal-class-of-name (srcreg-frame-nm f))
                             (string-append (cls (car p) (cadr p)) "$fn__" (caddr p)))
                         "invoke"
-                        (file-of (vector-ref rec 2)) (if (fixnum? line) line -1)))))
+                        (if (vector? rec) (file-of (vector-ref rec 2)) jolt-nil)
+                        (if (fixnum? line) line -1)))))
+      ;; A Clojure fn's frame whose def nothing registered (compiled app code carries no
+      ;; source registry): the frame is real and its name is known, so it is an
+      ;; element with no file or line, as the JVM prints a frame without debug info
+      ;; (Unknown Source). Left out it hid the whole app from a caught throwable's
+      ;; trace while printStackTrace showed it.
+      ;; Only a Clojure fn's frame (jfn$ns/def$n/name): the runtime's own frames
+      ;; (na-chunk-map-first, map-seq, an anonymous eval form) are not the program's.
+      ((and (string? (srcreg-frame-nm f)) (srcreg-literal-display (srcreg-frame-nm f)))
+       => (lambda (disp) (ste-make (ste-unmapped-class disp) "invoke" jolt-nil -1)))
       (else #f))))
+;; ns/def/inner as ns$def$inner, each part munged like a class name.
+(define (ste-unmapped-class disp)
+  (let ((n (string-length disp)))
+    (let loop ((i 0) (start 0) (acc '()))
+      (cond
+        ((fx=? i n)
+         (let ((parts (reverse (cons (class-munge-name (substring disp start n)) acc))))
+           (let join ((ps (cdr parts)) (out (car parts)))
+             (if (null? ps) out (join (cdr ps) (string-append out "$" (car ps)))))))
+        ((char=? (string-ref disp i) #\/)
+         (loop (fx+ i 1) (fx+ i 1) (cons (class-munge-name (substring disp start i)) acc)))
+        (else (loop (fx+ i 1) start acc))))))
 
 ;; A throwable's own frames as a StackTraceElement array, or an empty one for a
 ;; throwable that was never thrown (the JVM fills one in at construction; jolt
@@ -1611,7 +1712,9 @@
        (list (string-append (vector-ref r 0) "/" (vector-ref r 1)) (vector-ref r 2)
              (or line (vector-ref r 3)) locals))
       ;; an anonymous fn: a named literal by its own name, else as Clojure
-      ;; demunges its class (ns/def/fn--n)
+      ;; demunges the JVM's ns$def$fn__n, ns/def/fn--n. Its def may be one nothing
+      ;; registered (eval'd code; srcreg-jfn-parts names it from the label alone),
+      ;; and then the frame has no file, and no line but its own.
       ((srcreg-jfn-parts (srcreg-frame-nm f))
        => (lambda (p)
             (let ((rec (srcreg-record-for-fqn (string-append (car p) "/" (cadr p))))
@@ -1619,7 +1722,8 @@
               (list (or (srcreg-literal-display (srcreg-frame-nm f))
                         (and c (compiler-demunge c))
                         (string-append (car p) "/" (cadr p) "/fn--" (caddr p)))
-                    (vector-ref rec 2) (or line (vector-ref rec 3)) locals))))
+                    (and (vector? rec) (vector-ref rec 2))
+                    (or line (and (vector? rec) (vector-ref rec 3))) locals))))
       (else #f))))
 (define (jolt-debug-recs->rows recs sink)
   (let loop ((fs recs) (acc '()))
@@ -1682,7 +1786,18 @@
 (define (jolt-stack-trace-list k)
   (guard (e (#t '()))
     (jolt-recs->stack-trace (jolt-continuation-recs k #t))))
+;; The elements of a trace, capped as the JVM caps one (1024) but keeping BOTH ends
+;; when it is longer: the innermost 768 say where it failed, the outermost 256 say
+;; who asked. Equal runs are one frame already (srcreg-push-frame).
+(define jolt-trace-keep-inner 768)
+(define jolt-trace-keep-outer 256)
 (define (jolt-recs->stack-trace recs)
+  (let* ((all (jolt-recs->stack-trace* recs)) (n (length all)))
+    (if (fx<=? n (fx+ jolt-trace-keep-inner jolt-trace-keep-outer))
+        all
+        (append (list-head all jolt-trace-keep-inner)
+                (list-tail all (fx- n jolt-trace-keep-outer))))))
+(define (jolt-recs->stack-trace* recs)
   (let loop ((fs recs) (acc '()))
     (cond ((null? fs) (reverse acc))
           ((ste-of-frame (car fs)) => (lambda (e) (loop (cdr fs) (cons e acc))))
@@ -1728,6 +1843,12 @@
 ;; of going through the uncaught reporter. Returns the "  trace:\n<frames>" block
 ;; from the tail-frame HISTORY only — the live continuation in a REPL is just the
 ;; REPL's own machinery — or nil when tracing is off (so a caller can when-let).
+;; The latest failure of the stack-limit hook's own measuring, "<count>: <condition and frames>", or nil
+;; (rt.ss jolt-stack-check!): kept so a failure that enforces nothing is still read.
+(def-var! "jolt.host" "stack-check-failure"
+  (lambda ()
+    (let ((f jolt-stack-check-failure))
+      (if f (string-append (number->string (car f)) ": " (cdr f)) jolt-nil))))
 (def-var! "jolt.host" "backtrace-string"
   (lambda ()
     (let ((bt (jolt-history-backtrace)))

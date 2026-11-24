@@ -264,7 +264,7 @@
 ;; 3 the descending map. The table is an ephemeron one, so a view (which holds
 ;; its map) does not keep the map alive; writes take the mutex, reads do not.
 (define jutil-views-tbl (make-ephemeron-eq-hashtable))
-(define jutil-views-mu (make-mutex))
+(define-process-local jutil-views-mu (make-mutex))
 (define (jutil-view m slot make)
   (let ((v (hashtable-ref jutil-views-tbl m #f)))
     (or (and v (vector-ref v slot))

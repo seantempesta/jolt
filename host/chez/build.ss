@@ -1120,6 +1120,64 @@
     bld-runtime-manifest)
   (set! bld-segment-out #f))
 
+;; --- jolt's install sources, carried by an app that keeps the compiler -------
+;; An app that can compile at runtime can require a namespace it did not compile
+;; in, and jolt's own (jolt-core, stdlib, the vendored libraries) are where the
+;; loader looks first: an embedded key outranks every root (resolve-on-roots), and
+;; bld-dep-resources leaves a dependency's copy of one out because jolt supplies
+;; it. So the app carries them, keyed as jolt itself carries them, and resolves
+;; them the same way wherever it runs — never by a path into the build machine
+;; (#1232) or one relative to the binary's working directory.
+;;
+;; ((name . bytes) ...) sorted by name: what this jolt carries in its source blob
+;; (a release jolt), else what its install roots hold on disk (source mode),
+;; first root first, as resolve-on-roots would find them.
+(define (bld-install-sources)
+  (let ((seen (make-hashtable string-hash string=?)) (acc '()))
+    (define (add! name bytes)
+      (unless (hashtable-ref seen name #f)
+        (hashtable-set! seen name #t)
+        (set! acc (cons (cons name (bytes)) acc))))
+    (vector-for-each
+      (lambda (k)
+        (when (and (string? k) (ldr-source-path? k))
+          (add! k (lambda () (embedded-resource-ref k)))))
+      (hashtable-keys embedded-source-index))
+    (for-each
+      (lambda (root)
+        (when (file-directory? root)
+          (for-each (lambda (rp)
+                      (when (ldr-source-path? (car rp))
+                        (add! (car rp) (lambda () (read-file-bytes-on-disk (cdr rp))))))
+                    (reverse (bld-walk-files root "" '())))))
+      ldr-install-roots)
+    (sort (lambda (a b) (string<? (car a) (car b))) acc)))
+
+;; Emit the install sources as one blob, each file its own gzip frame as in
+;; build-jolt.ss's jb-blob-add!, attached with its index (java/io.ss
+;; jolt-source-blob-attach-bytes!). The bytes are read only when a namespace
+;; loads from source.
+(define (bld-emit-install-sources out)
+  (let-values (((port extract) (open-bytevector-output-port)))
+    (let loop ((es (bld-install-sources)) (offset 0) (index '()))
+      (if (null? es)
+          (put-string out
+            (string-append
+              "\n;; === jolt install sources (read when a namespace loads from source) ===\n"
+              "(jolt-source-blob-attach-bytes! "
+              (with-output-to-string (lambda () (write (extract))))
+              " '("
+              (apply string-append
+                     (map (lambda (e)
+                            (string-append "(" (ei-str-lit (car e)) " " (number->string (cadr e))
+                                           " " (number->string (caddr e)) ")"))
+                          (reverse index)))
+              "))\n"))
+          (let ((bv (parameterize ((compress-format 'gzip)) (bytevector-compress (cdar es)))))
+            (put-bytevector port bv)
+            (loop (cdr es) (+ offset (bytevector-length bv))
+                  (cons (list (caar es) offset (bytevector-length bv)) index)))))))
+
 ;; --- app emission -----------------------------------------------------------
 ;; Re-emit one app namespace to a list of Scheme strings: run-passes (const-fold +
 ;; numeric-annotate in every mode; inference also in release/optimized; inline +
@@ -1196,8 +1254,10 @@
         (phase-off (if (eq? phase 'emit) (expt 2 20) 0)))
     ((var-deref "clojure.core" "reset!") (jolt-get unit (keyword #f "gensym-counter")) 0)
     ((var-deref "clojure.core" "reset!") (jolt-get unit (keyword #f "fresh-counter")) 0)
+    ;; per namespace too, in a band of its own: a counter carried from namespace to namespace made a namespace's
+    ;; names depend on which ones before it were emitted, which an emit-cache hit skips
     ((var-deref "jolt.analyzer" "set-name-counter!")
-     (+ bld-name-base (if (eq? phase 'emit) (expt 2 39) 0)))
+     (+ (expt 2 43) (* (bld-gensym-slot ns) (expt 2 21)) (if (eq? phase 'emit) (expt 2 20) 0)))
     ;; clojure.core/gensym and the reader's three (#() params, a read `,
     ;; a compiled `): each a quarter of the namespace's range for the phase
     (let ((base (+ bld-name-base (* (bld-gensym-slot ns) (expt 2 21)) phase-off)))
@@ -1208,6 +1268,122 @@
     ;; anon literals outside a def: named per namespace, counted from where the
     ;; load left off unless seeded
     ((var-deref "jolt.backend-scheme" "seed-fnsrc-ns-counter!") ns bld-name-base)))
+
+;; A namespace's load in a build, with the reader's four name counters seeded for it (its slot, phase load) and put
+;; back after, so what it mints is the same whichever namespaces loaded, or hit the cache, before it (ldr-name-counters-wrap).
+(define (bld-load-name-counters ns thunk)
+  (let ((g jolt-gensym-counter) (a rdr-anon-counter) (r rdr-sq-gensym-counter) (h hc-sq-gensym-counter)
+        ;; a band of its own, above every slot's wp and emit ranges (bld-name-base + slot * 2^21, up to 2^41)
+        (base (+ (expt 2 42) (* (bld-gensym-slot ns) (expt 2 21)))))
+    (dynamic-wind
+      (lambda ()
+        (set! jolt-gensym-counter base)
+        (set! rdr-anon-counter (+ base (expt 2 18)))
+        (set! rdr-sq-gensym-counter (+ base (* 2 (expt 2 18))))
+        (set! hc-sq-gensym-counter (+ base (* 3 (expt 2 18)))))
+      thunk
+      (lambda ()
+        (set! jolt-gensym-counter g) (set! rdr-anon-counter a)
+        (set! rdr-sq-gensym-counter r) (set! hc-sq-gensym-counter h)))))
+
+;; --- the emit cache -----------------------------------------------------------
+;; A namespace's emit is a function of its source, what its compile reads of its requires (its AOT key, aot-base-full) and
+;; what its requires' emits added to the unit's registries; it answers DCE records and adds to those registries itself. So
+;; a namespace the compile options keep out of inlining (no other namespace splices its bodies: jolt.passes.inline
+;; no-inline-ns?) keeps its records and its registry delta under that key, and a later build with the same key takes the
+;; records and applies the delta, emitting nothing. JOLT_NO_EMIT_CACHE=1 turns it off: a build with it and one without
+;; must produce the same binary byte for byte.
+(define bld-emit-reg-keys '("direct-link-defined" "direct-link-fns" "config" "user-sigs" "pm-rets" "escapes"))
+(define bld-emit-deltas (make-hashtable string-hash string=?))
+(define bld-emit-delta-fn #f)
+(define bld-emit-apply-fn #f)
+(define (bld-emit-fns!)
+  (unless bld-emit-delta-fn
+    (let ((ls (var-deref "clojure.core" "load-string")))
+      (set! bld-emit-delta-fn
+        (ls "(fn delta [b a]
+               (cond (and (map? a) (map? b))
+                     (reduce-kv (fn [m k v] (let [bv (get b k ::none)]
+                                              (cond (= v bv) m
+                                                    (and (map? v) (map? bv)) (assoc m k (delta bv v))
+                                                    :else (assoc m k v))))
+                                {} a)
+                     (and (set? a) (set? b)) (reduce (fn [s x] (if (contains? b x) s (conj s x))) #{} a)
+                     (= a b) nil
+                     :else a))"))
+      (set! bld-emit-apply-fn
+        (ls "(fn app [cur d]
+               (cond (nil? d) cur
+                     (and (map? cur) (map? d))
+                     (reduce-kv (fn [m k v] (let [cv (get m k)]
+                                              (assoc m k (cond (and (map? cv) (map? v)) (app cv v)
+                                                               (and (set? cv) (set? v)) (into cv v)
+                                                               :else v))))
+                                cur d)
+                     (and (set? cur) (set? d)) (into cur d)
+                     :else d))")))))
+(define (bld-emit-reg k) (jolt-get (ei-unit) (keyword #f k) jolt-nil))
+(define (bld-emit-snapshot)
+  (let ((deref (var-deref "clojure.core" "deref")))
+    (map (lambda (k) (deref (bld-emit-reg k))) bld-emit-reg-keys)))
+(define (bld-emit-cacheable? ns)
+  (and (not (bld-env-off? "JOLT_EMIT_CACHE")) (not (getenv "JOLT_NO_EMIT_CACHE"))
+       (jolt-truthy? ((var-deref "jolt.passes.inline" "no-inline-ns?") ns))))
+(define (bld-emit-key mode ns)
+  (let ((own (aot-own-key ns)))
+    (and own
+         (let* ((obase (aot-base-for-own ns own))
+                (deps (aot-read-dep-list (aot-dep-sidecar obase)))
+                ;; under the build's posture, as pass 1 keyed it: a no-inline require counts by its surface (aot-narrow-dep?)
+                (full (parameterize ((ldr-build-aot-cache? #t))
+                        (aot-base-full ns own deps (aot-read-dep-list (aot-res-sidecar obase)))))
+                ;; what each require's emit added to the registries, as this build recorded it
+                (dd (fold-left (lambda (acc d) (string-append acc d "=" (hashtable-ref bld-emit-deltas d "") "\n")) ""
+                               (sort string<? deps))))
+           (bld-unit-key mode (string-append "emit\n" ns "\n" full "\n" (number->string (aot-content-hash dd) 16)))))))
+(define (bld-emit-file key) (string-append (bld-build-cache-dir) "/" key ".emit"))
+;; THUNK emits NS and answers its DCE records; answered from the cache, or emitted and kept.
+(define (bld-emit-ns-cached mode ns thunk)
+  (let ((key (and (bld-emit-cacheable? ns) (bld-emit-key mode ns))))
+    (if (not key)
+        (thunk)
+        (let ((file (bld-emit-file key)))
+          (bld-emit-fns!)
+          (or (and (file-exists? file)
+                   (guard (e (#t #f))
+                     (let* ((v (let ((ip (open-file-input-port file))) (let ((x (fasl-read ip))) (close-port ip) x)))
+                            (recs (vector-ref v 0)) (dstr (vector-ref v 1))
+                            (delta ((var-deref "clojure.core" "read-string") dstr))
+                            (swap (var-deref "clojure.core" "swap!")))
+                       (let loop ((ks bld-emit-reg-keys) (i 0))
+                         (unless (null? ks)
+                           (swap (bld-emit-reg (car ks)) bld-emit-apply-fn (jolt-nth delta i))
+                           (loop (cdr ks) (+ i 1))))
+                       (hashtable-set! bld-emit-deltas ns dstr)
+                       (set! bld-emit-hits (+ bld-emit-hits 1))
+                       (bld-emit-debug ns "hit" dstr)
+                       recs)))
+              (let* ((before (bld-emit-snapshot))
+                     (recs (thunk))
+                     (after (bld-emit-snapshot))
+                     (delta (apply jolt-vector (map (lambda (b a) (bld-emit-delta-fn b a)) before after)))
+                     (dstr ((var-deref "clojure.core" "pr-str") delta)))
+                (hashtable-set! bld-emit-deltas ns dstr)
+                ;; kept only when the delta reads back as itself (a value with no printed form is never cached)
+                (bld-emit-debug ns (if (guard (e (#t #f)) (jolt-truthy? ((var-deref "clojure.core" "=") delta ((var-deref "clojure.core" "read-string") dstr)))) "miss" "unstorable") dstr)
+                (when (guard (e (#t #f)) (jolt-truthy? ((var-deref "clojure.core" "=") delta ((var-deref "clojure.core" "read-string") dstr))))
+                  (guard (e (#t #f))
+                    (bld-mkdir-p (bld-build-cache-dir))
+                    (let ((tmp (string-append file ".tmp" (number->string (get-process-id)))))
+                      (let ((op (open-file-output-port tmp (file-options no-fail))))
+                        (fasl-write (vector recs dstr) op) (close-port op))
+                      (rename-file tmp file))))
+                recs))))))
+(define bld-emit-hits 0)
+(define (bld-emit-debug ns what dstr)
+  (when (getenv "JOLT_EMIT_CACHE_DEBUG")
+    (display (string-append "[emit] " what " " ns " " (if dstr (number->string (aot-content-hash dstr) 16) "-") "\n")
+             (current-error-port))))
 
 (define (bld-wp-infer! ordered)
   ;; the build's compilation unit (ei-unit) is created + published by the build setup
@@ -1466,7 +1642,7 @@
   (let ((clean (list->string
                  (map (lambda (c) (if (or (char-alphabetic? c) (char-numeric? c) (memv c '(#\. #\- #\_))) c #\_))
                       (string->list ns)))))
-    (if (string=? clean ns) ns (string-append clean "$" (bld-text-key ns)))))
+    (if (string=? clean ns) ns (string-append clean "$" (aot-text-key ns)))))
 
 ;; (define (jolt-app-init!) …) calling NAMES in order, after PRE (forms to run first).
 (define (bld-emit-app-init-main out names pre)
@@ -2797,7 +2973,14 @@
   ;; is the order they ran in when they lived in the boot file. Being
   ;; inside the guard is a bonus — a throw from an app top-level form used
   ;; to escape as Chez's opaque dump, and now reports like any other.
-  (put-string out "      (jolt-app-init!)\n")
+  ;; Bound to the process's argv (after the program name), as clojure.main binds it
+  ;; for a -m run while the namespace loads: an app's top-level forms can read their
+  ;; command line (ours, fce0f40c, re-applied to upstream's bld-emit-launcher!).
+  (put-string out (string-append
+                    "      (jolt-with-thread-bindings\n"
+                    "        (jolt-hash-map (jolt-var \"clojure.core\" \"*command-line-args*\")\n"
+                    "                       (if (null? args) jolt-nil (list->cseq args)))\n"
+                    "        jolt-app-init!)\n"))
   (bld-emit-natives out natives 'optional)
    (put-string out (string-append
                       "      (let ((base (or (getenv \"JOLT_PWD\") \".\")))\n"
@@ -2838,7 +3021,11 @@
                     "            (lambda ()\n"
                     "              (jolt-with-ns-load-vars\n"
                     "                (lambda ()\n"
-                    "                  (let ((jolt-main-result (apply jolt-invoke (var-cell-root maincell) args)))\n"
+                    "                  (let ((jolt-main-result\n"
+                    "                          (jolt-with-thread-bindings\n"
+                    "                            (jolt-hash-map (jolt-var \"clojure.core\" \"*command-line-args*\")\n"
+                    "                                           (if (null? args) jolt-nil (list->cseq args)))\n"
+                    "                            (lambda () (apply jolt-invoke (var-cell-root maincell) args)))))\n"
                     "                    " (bld-startup-profile-form "entry -main") "\n"
                     "                    jolt-main-result))))))))\n"
                     ;; as the CLI: a non-daemon Thread the program started
@@ -2905,6 +3092,7 @@
 
 (define (build-binary entry-ns out-path mode natives embed-dirs ext-roots direct-link? tree-shake? allow-dynamic library? includes)
   (ei-profile-init!)
+  (set! ldr-name-counters-wrap bld-load-name-counters)
   (bld-check-includes! includes)
   (let ((out-path (bld-output-path out-path library?)))
   (bld-check-build-preconditions! out-path mode natives library?)
@@ -3026,6 +3214,9 @@
                 ;; mode flag below lands on it (the unit the per-form emit reads).
                 ;; The build emits app + core forms that reference clojure.core, which
                 ;; must lower to var-deref, so prelude mode is on for the whole build.
+                ;; The unit before it stays the one the process's own evals compile
+                ;; against (compile-eval.ss ce-outside-build).
+                (ce-build-unit-enter! ((var-deref "jolt.backend-scheme" "current-unit")))
                 (ei-fresh-unit!)
                 ((var-deref "jolt.backend-scheme" "set-prelude-mode!") #t)
                 ;; The passes run for every mode but dev. "release" and
@@ -3104,6 +3295,9 @@
                   ;; lambda could run before a dependency's (var-routed calls,
                   ;; out-of-order cells). The named let runs strictly in
                   ;; `ordered` order (deps first), matching the loader.
+                  ;; the emit cache's two helpers, compiled before any namespace's counters are seeded: compiled inside a
+                  ;; namespace's emit they took names from its counters, and a cached build's names differed from an uncached one's
+                  (unless (or (getenv "JOLT_NO_EMIT_CACHE") (bld-env-off? "JOLT_EMIT_CACHE")) (bld-emit-fns!))
                   (let ((core-records (dce-blob-records "host/chez/seed/prelude.ss"))
                         (app-records
                           (let ((per-ns '()))
@@ -3130,7 +3324,8 @@
                                                      (ei-timed "emit: ns-prelude"
                                                        (lambda () (bld-ns-prelude (car nf) src)))))
                                               (ei-timed "emit: per-ns total"
-                                                (lambda () (ei-emit-ns-records (car nf) src)))
+                                                (lambda () (bld-emit-ns-cached mode (car nf)
+                                                             (lambda () (ei-emit-ns-records (car nf) src)))))
                                               (list
                                                 (dce-rec #t #f '() "(jolt-ns-load-vars-pop!)")
                                                 (dce-rec #t #f '() profile-form)))
@@ -3148,6 +3343,7 @@
                                 (not (dce-needs-compiler? core-records app-records
                                                           entry-main allow-dynamic)))))))
               (lambda ()
+                (ce-build-unit-leave!)
                 (set-optimize! #f)
                 (set-guarded-inline-flag! bld-guarded-inline-was)
                 (set-direct-link-flag! #f)
@@ -3179,7 +3375,9 @@
                 ;; whose flags are all off (var-cache, source registration).
                 (ei-restore-unit! saved-unit))))))
         (when drop-compiler? (display "jolt build: dropping compiler image (no runtime eval)\n"))
-      (ei-mark! "emit app namespaces")
+      (begin (when (getenv "JOLT_BUILD_PROFILE")
+                 (display (string-append "jolt build: [profile] emit cache hits " (number->string bld-emit-hits) "\n") (current-error-port)))
+               (ei-mark! "emit app namespaces"))
       ;; The emit walk named each file it read (jolt-enter-file!) so a failure
       ;; in it reports where; it is over, and a later failure (the link, the
       ;; {:lib} check) is no file's, so it must not be reported "at" the last one.
@@ -3241,11 +3439,14 @@
             ;; release, --opt and --dev share a single cache entry.
             (put-string out ";; jolt runtime half\n")
             (bld-emit-runtime out drop-compiler? core-strs)
+            (unless drop-compiler? (bld-emit-install-sources out))
             (close-port out)))
         (let ((out (open-output-file flat-ss 'replace)))
           (if split?
               (put-string out ";; app half — the runtime half is compiled separately (runtime.ss)\n")
-              (bld-emit-runtime out drop-compiler? core-strs))
+              (begin
+                (bld-emit-runtime out drop-compiler? core-strs)
+                (unless drop-compiler? (bld-emit-install-sources out))))
           (set! bld-lazy-shims-mode 'source)
           ;; Load native libs, bake embedded resources, and point source roots at
           ;; the build-time app roots — all BEFORE the app forms. The app's
@@ -3263,17 +3464,17 @@
                   (let loop ((gs groups) (fs group-files) (acc '()))
                     (if (null? gs)
                         acc
-                        (let ((gout (if split? (open-output-file (car fs) 'replace) out)))
+                        ;; a split unit is assembled in memory and written once (bld-write-unit!)
+                        (let ((gout (if split? (open-output-string) out)))
                           (when split?
                             (put-string gout (string-append ";; app unit: " (caar gs) "\n")))
                           (let-values (((decls bodies) (bld-defer-app-strs (cdar gs))))
                             (for-each (lambda (s) (put-string gout s) (put-string gout "\n")) decls)
                             (let ((ns-names (bld-emit-app-chunks gout (bld-unit-tag (caar gs)) bodies)))
                               (when split?
-                                (close-port gout)
                                 ;; a shaken app is one group holding every namespace
-                                (bld-append-marker-table! (car fs)
-                                                          (if tree-shake? (map car ordered) (list (caar gs)))))
+                                (bld-write-unit! (car fs) (get-output-string gout)
+                                                 (if tree-shake? (map car ordered) (list (caar gs)))))
                               (loop (cdr gs) (cdr fs) (append acc ns-names)))))))))
             (when split?
               (close-port out)
@@ -3342,6 +3543,23 @@
 ;; and written once, rather than writing the file, reading it back to hash it, and
 ;; appending. Same bytes, same fingerprint, one pass over a multi-megabyte file
 ;; instead of three.
+;; The Chez boots this runtime runs on are part of what it is: a unit compiled or
+;; vfasl-converted by one Chez build is wrong code under another with the same
+;; version string (a vfasl fix changed how negative bignum constants convert, and
+;; the build cache, keyed only on the runtime source, kept serving the old
+;; images). So the fingerprint also hashes petite.boot and scheme.boot, as bytes:
+;; about 4 MB once per runtime build.
+(define (bld-file-bytes-hash path)
+  (let* ((bv (call-with-port (open-file-input-port path) get-bytevector-all))
+         (n (bytevector-length bv)))
+    (let loop ((i 0) (h 2166136261))
+      (if (fx=? i n)
+          (string-append (number->string n 16) "." (number->string h 16))
+          (loop (fx+ i 1)
+                (fxlogand (fx* (fxlogxor h (bytevector-u8-ref bv i)) 16777619) #xFFFFFFFF))))))
+(define (bld-boot-identity)
+  (string-append (bld-file-bytes-hash (string-append (bld-csv-dir) "/petite.boot")) "."
+                 (bld-file-bytes-hash (string-append (bld-csv-dir) "/scheme.boot"))))
 (define (bld-prepend-prologue! flat-ss)
   (let* ((prologue (bld-kernel-prologue flat-ss))
          (src (string-append
@@ -3349,7 +3567,8 @@
                 prologue
                 (read-file-string flat-ss)))
          (fp (string-append (number->string (string-length src) 16) "-"
-                            (number->string (aot-content-hash src) 16)))
+                            (number->string (aot-content-hash src) 16) "-"
+                            (bld-boot-identity)))
          (out (open-output-file flat-ss 'replace)))
     (put-string out src)
     (put-string out (string-append
@@ -3539,7 +3758,7 @@
         ((bld-profile-use) => (lambda (p) (string-append "profile-use " (cdr p))))
         (else "")))
 
-;; FNV-1a over bytes, as hex: bld-text-key's first half, for a binary file.
+;; FNV-1a over bytes, as hex: aot-text-key's first half, for a binary file.
 (define (bld-bytes-key bv)
   (let ((n (bytevector-length bv)))
     (let loop ((i 0) (h 2166136261))
@@ -3613,19 +3832,53 @@
 ;; unit edit recompiles that one unit and a cache hit brings its own table. It goes
 ;; AFTER the code, so no offset it records moves. A unit with no markers
 ;; registers nothing.
-(define (bld-append-marker-table! path nses)
-  (let ((table (jolt-marker-table (read-file-string path))))
+;;
+;; The unit's TEXT is the code as emitted, assembled in memory: its table is read
+;; off that string (the offsets are the file's, as it is written as is), and the
+;; unit is written once as UTF-8 bytes. Before, each unit went out through a
+;; textual port and was read back off the disk for its table: seon.main's "write
+;; flat.ss" (93 MB over 312 units) took 2.6-3.8 s, and takes 2.0-2.3 s this way
+;; (2026-10-27, unpaired runs on a loaded machine); a byte port alone writes the
+;; same 93 MB in 165 ms against the textual port's 636. A unit is held whole in
+;; memory to be written: one namespace's (seon.main's largest is 4 MB), or a
+;; shaken app's one unit, the whole app.
+(define (bld-write-unit! path text nses)
+  (let ((table (jolt-marker-table text))
+        (out (open-file-output-port path (file-options no-fail))))
+    (put-bytevector out (string->utf8 text))
     (when (and (pair? nses) (fx>? (vector-length table) 0))
-      (let ((out (open-output-file path 'append)))
-        (put-string out ";; === source line markers ===\n")
-        (put-string out (string-append
-                          "(jolt-register-marker-table! '"
-                          (with-output-to-string (lambda () (write nses)))
-                          " '" (with-output-to-string (lambda () (write table)))
-                          ")\n"))
-        (close-port out)))))
+      (put-bytevector out
+        (string->utf8
+          (string-append ";; === source line markers ===\n"
+                         "(jolt-register-marker-table! '"
+                         (with-output-to-string (lambda () (write nses)))
+                         " '" (with-output-to-string (lambda () (write table)))
+                         ")\n"))))
+    (close-port out)))
 (define (bld-chez-compile-file mode src so)
   (bld-chez-compile-params! (bld-mode-params mode) src so))
+;; The release app half keeps Chez's inspector information, so a frame prints its
+;; name and file:line, but not the expanded source that information also holds
+;; (each procedure's expression and free list, each return point's expression):
+;; measured on Seon's 303 app units, that source and what only it references is
+;; 213 MB of the 1,199 MB idle footprint (986 MB with it dropped, 917 -> 647 MB of
+;; static heap, a 250 -> 111 MB binary, `./seon ports` 0.47 -> 0.28 s) and a
+;; frame loses only its expression. The names of a frame's variables (the live
+;; vectors and masks, and the return points with no source object) go too, as
+;; nothing reads them: Chez fork option inspector-variables. Every other mode keeps its row: "optimized"
+;; has no inspector information to drop, dev keeps Chez's defaults. The drop is
+;; part of the unit's cache key, so a cached unit is never the other kind.
+(define (bld-app-drops-expressions? mode) (equal? mode "release"))
+
+;; Compile app unit SRC to SO under MODE's parameters, then drop its expanded
+;; source when MODE does (bld-app-drops-expressions?). A unit that will not
+;; strip ships as compiled.
+(define (bld-chez-compile-app-file mode src so)
+  (bld-chez-compile-file mode src so)
+  (when (bld-app-drops-expressions? mode)
+    (let ((out (string-append so ".stripped")))
+      (when (sa-drop-inspector-expressions! so out)
+        (rename-file out so)))))
 
 ;; --- runtime-half fasl cache -------------------------------------------------
 ;; The runtime half of the flat source (rt.ss + the clojure.core prelude +
@@ -3712,23 +3965,34 @@
 (define (bld-cache-put! from to)
   (let ((tmp (string-append to ".tmp" (number->string (get-process-id)))))
     (guard (e (#t (guard (e2 (#t #f)) (when (file-exists? tmp) (delete-file tmp))) #f))
-      (bld-copy-file! from tmp)
-      (rename-file tmp to)
-      #t)))
+      ;; an empty file is no compiled unit and no image: never an entry (two builds
+      ;; of one directory at once, one of them killed, left one under a key, and
+      ;; every later build of that text linked in a unit that defines nothing)
+      (and (bld-nonempty-file? from)
+           (begin (bld-copy-file! from tmp)
+                  (rename-file tmp to)
+                  #t)))))
+;; Is PATH a file that holds something?
+(define (bld-nonempty-file? path)
+  (guard (e (#t #f)) (and (file-exists? path) (> (sa-file-size path) 0))))
 ;; Copy a cache entry to TO; #f when there is none. Another build's prune can
 ;; delete the entry between the existence check and the read, which is a miss.
-;; A hit moves the entry's mtime to now: the prunes evict oldest mtime first, so
-;; the mtime has to say when the entry was last USED, or an entry every build
-;; reads goes first merely for having been created first.
+;; A hit writes nothing to the entry: the prunes evict the oldest written first
+;; (loader.ss aot-prune-to-budget! says why), and an entry evicted while still
+;; in use is a miss that compiles and stores it anew.
 (define (bld-cache-fetch! cache to)
   (guard (e (#t #f))
     (and (file-exists? cache)
+         ;; an empty entry is a miss, and goes: nothing that wrote it can have meant it
+         (or (bld-nonempty-file? cache)
+             (begin (guard (e (#t #f)) (delete-file cache)) #f))
          (begin
-           (bld-copy-file! cache to)
-           (guard (e (#t #f))           ; a cache we cannot mark is still a hit
-             (let ((t (current-time)))
-               (set-file-mtime-millis! cache (+ (* (time-second t) 1000)
-                                                (quotient (time-nanosecond t) 1000000)))))
+           ;; to a name of this process's own, then renamed: TO is whole or absent to
+           ;; any other build of this directory (one storing TO as it was being
+           ;; written here read it empty, and stored that)
+           (let ((part (bld-part-path to)))
+             (bld-copy-file! cache part)
+             (rename-file part to))
            #t))))
 
 ;; Compile the runtime half under the runtime profile, reusing a cached fasl
@@ -4046,23 +4310,11 @@
   ;; without a runtime fingerprint a key cannot tell two jolts apart
   (and (not (bld-env-off? "JOLT_BUILD_CACHE")) (aot-runtime-fingerprint) #t))
 
-;; FNV-1a and a multiplicative hash with a different basis and multiplier, in one
-;; pass; answered as hex text. Both multipliers stay under 2^24 so a product of a
-;; 32-bit state is a fixnum on every 64-bit target.
-(define (bld-text-key s)
-  (let ((n (string-length s)))
-    (let loop ((i 0) (h1 2166136261) (h2 1540483477))
-      (if (fx=? i n)
-          (string-append (number->string n 16) "-" (number->string h1 16) "-" (number->string h2 16))
-          (let ((c (char->integer (string-ref s i))))
-            (loop (fx+ i 1)
-                  (fxlogand (fx* (fxlogxor h1 c) 16777619) #xFFFFFFFF)
-                  (fxlogand (fx+ (fx* (fxlogxor h2 (fxsrl h2 15)) #x5bd1e9) c) #xFFFFFFFF)))))))
-
 (define (bld-unit-key mode text)
-  (bld-text-key
+  (aot-text-key
     (string-append (scheme-version) " " (sa-host-tag) " " (or (aot-runtime-fingerprint) "") "\n"
                    (bld-params-bindings (or (bld-mode-params mode) '()) "\n") "\n"
+                   (if (bld-app-drops-expressions? mode) "inspector-expressions inspector-variables\n" "")
                    (bld-profile-tag) "\n"
                    text)))
 
@@ -4114,15 +4366,18 @@
 ;; under a temp name and renamed into place only once complete: a child that
 ;; raises, runs out of heap or is killed part way leaves nothing, and the parent
 ;; compiles that unit again in process, where a failure reports itself.
+;; Where this process writes PATH before it is whole: its own name, so two
+;; builds of one directory never write one file.
+(define (bld-part-path path) (string-append path ".part" (number->string (get-process-id))))
 (define (bld-run-job! job)
   (let ((src (vector-ref job 0)) (so (vector-ref job 1)) (vso (vector-ref job 2))
         (mode (vector-ref job 3)) (codec (vector-ref job 4)))
-    (let ((so-part (string-append so ".part")))
+    (let ((so-part (bld-part-path so)))
       (parameterize ((bld-block-profile (vector-ref job 5)))
-        (bld-chez-compile-file mode src so-part))
+        (bld-chez-compile-app-file mode src so-part))
       (rename-file so-part so))
     (when vso
-      (let ((vso-part (string-append vso ".part")))
+      (let ((vso-part (bld-part-path vso)))
         (when (sa-vfasl-convert-object-file so vso-part codec)
           (rename-file vso-part vso))))))
 
@@ -4207,8 +4462,13 @@
       (for-each
         (lambda (k)
           (let ((u (car k)))
-            (unless (and exe (file-exists? (cadr u)))
-              (bld-chez-compile-file mode (car u) (cadr u)))
+            ;; what a child left whole stands; anything else compiles here, to a
+            ;; name of this process's own and then renamed, as a child does, so no
+            ;; other build of this directory ever reads it half written
+            (unless (and exe (bld-nonempty-file? (cadr u)))
+              (let ((part (bld-part-path (cadr u))))
+                (bld-chez-compile-app-file mode (car u) part)
+                (rename-file part (cadr u))))
             (when cache?
               (bld-cache-store! (cadr u) (bld-unit-cache-so (cadr k)))
               (let ((vso (string-append (cadr u) ".vfasl")))
@@ -4412,7 +4672,8 @@
       (string-append
         "#include \"scheme.h\"\n#include \"jolt_zlib.h\"\n#include \"boot_data.h\"\n"
         (bld-boot-prefetch-defn)
-        "int main(int argc, char *argv[]) {\n"
+        "#if defined(__APPLE__) && defined(__aarch64__)\n#include <pthread.h>\n/* fork: the child re-protects MAP_JIT code (see stub/launcher.c) */\nstatic void jolt_fork_child_reprotect_code(void) { pthread_jit_write_protect_np(1); }\n#define JOLT_FORK_REPROTECT() pthread_atfork(NULL, NULL, jolt_fork_child_reprotect_code)\n#else\n#define JOLT_FORK_REPROTECT() ((void)0)\n#endif\n"
+        "int main(int argc, char *argv[]) {\n  JOLT_FORK_REPROTECT();\n"
         (bld-boot-prefetch-call)
         "  Sscheme_init(0);\n"
         "  Sregister_boot_file_bytes(\"jolt\", (void *)jolt_boot, jolt_boot_len);\n"

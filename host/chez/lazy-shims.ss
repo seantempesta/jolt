@@ -59,7 +59,7 @@
 ;; How many declared units have not loaded, for lazy-shims-status's readers. The
 ;; triggers do not go by it: see lazy-shims-seen.
 (define lazy-shims-pending 0)
-(define lazy-shims-mu (make-mutex))
+(define-process-local lazy-shims-mu (make-mutex))
 
 ;; WHICH UNITS THIS THREAD HAS SEEN LOADED, one bit each. A trigger runs after the
 ;; caller's lookup missed, and the lookup took no lock: another thread's load can

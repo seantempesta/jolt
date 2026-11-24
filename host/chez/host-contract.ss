@@ -17,8 +17,14 @@
 ;; ctx is opaque to the analyzer (only ever threaded to these contract fns); we
 ;; make it a box carrying the compile namespace. The var/ns registry it consults
 ;; is the global var-table (rt.ss).
-(define-record-type chez-actx (fields (mutable cns)) (nongenerative chez-actx-v1))
-(define (make-analyze-ctx ns) (make-chez-actx ns))
+;; priv: the analysis env's optional :private? function, or #f. resolve-global asks it (var ns, var name) before a var's own
+;; :private meta: :private or :public is its answer, nil leaves the meta to answer (see hc-private-var?).
+(define-record-type chez-actx (fields (mutable cns) (mutable priv)) (nongenerative chez-actx-v2))
+(define (make-analyze-ctx ns . opts)
+  (make-chez-actx ns
+    (and (pair? opts)
+         (let ((f (jolt-get (car opts) hc-kw-private?)))
+           (and (not (jolt-nil? f)) f)))))
 
 ;; Interned keywords reused for form tags + resolve-global's result map.
 (define hc-kw-jolt-type (keyword "jolt" "type"))
@@ -32,6 +38,9 @@
 (define hc-kw-name  (keyword #f "name"))
 (define hc-kw-var   (keyword #f "var"))
 (define hc-kw-private (keyword #f "private"))
+(define hc-kw-public (keyword #f "public"))
+(define hc-kw-private? (keyword #f "private?"))
+(define hc-kw-macro (keyword #f "macro"))
 (define hc-kw-unresolved (keyword #f "unresolved"))
 (define hc-kw-class (keyword #f "class"))
 (define hc-kw-num-ret (keyword #f "num-ret"))
@@ -107,8 +116,15 @@
 ;; *unchecked-math* read at compile time: when truthy (a file's (set!
 ;; *unchecked-math* …)), the analyzer rewrites +/-/*/inc/dec to their wrapping
 ;; unchecked-* forms for the rest of that file, like the JVM.
+;; Read on every list form the analyzer meets, so the var's cell is found once
+;; (jolt-var interns it: the cell is the var for the process's life, unless
+;; clojure.core or jolt.host itself is removed, which nothing does) and each
+;; read is the cell's binding-aware deref, not an "ns/name" string built and
+;; probed in the var table (~550 B a read, the analyzer's largest per-node cost).
+(define unchecked-math-cell #f)
 (define (hc-unchecked-math?)
-  (jolt-truthy? (guard (e (#t #f)) (var-deref "clojure.core" "*unchecked-math*"))))
+  (unless unchecked-math-cell (set! unchecked-math-cell (jolt-var "clojure.core" "*unchecked-math*")))
+  (jolt-truthy? (var-cell-deref unchecked-math-cell)))
 
 ;; *allow-unresolved-vars* read at compile time — clojure.core's var, the same one
 ;; RT.ALLOW_UNRESOLVED_VARS is on the JVM. Default false: an unqualified symbol
@@ -128,8 +144,19 @@
 ;; hand-written one. nil (the default) costs one deref per var call analyzed.
 ;; jolt.loader binds it while evaluating a context's source, so `require` and
 ;; its kin carry the loader that owns the code, whoever calls the fn later.
+;; Its cell found once, as *unchecked-math*'s above.
+(define resolve-unresolved-cell #f)
+;; jolt.host/*resolve-unresolved* read at compile time: a REPL's fallback for a
+;; symbol nothing resolves (jolt.analyzer/resolve-fallback). nil by default.
+(define (hc-unresolved-resolver)
+  (unless resolve-unresolved-cell (set! resolve-unresolved-cell (jolt-var "jolt.host" "*resolve-unresolved*")))
+  (let ((f (var-cell-deref resolve-unresolved-cell)))
+    (if (or (not f) (jolt-nil? f)) #f f)))
+
+(define invoke-rewrite-cell #f)
 (define (hc-invoke-rewriter)
-  (let ((f (guard (e (#t #f)) (var-deref "jolt.host" "*invoke-rewrite*"))))
+  (unless invoke-rewrite-cell (set! invoke-rewrite-cell (jolt-var "jolt.host" "*invoke-rewrite*")))
+  (let ((f (var-cell-deref invoke-rewrite-cell)))
     (if (or (not f) (jolt-nil? f)) #f f)))
 
 ;; --- form accessors ---------------------------------------------------------
@@ -487,6 +514,30 @@
              (if (fx>=? i (pvec-count items)) s
                  (loop (fx+ i 1) (pset-conj s (pvec-nth-d items i jolt-nil)))))))))
 (define (hc-macro-arg x) (hc-walk-form hc-set-form->set x))
+
+;; Does form hold a reader set form anywhere hc-macro-arg would rewrite one? A
+;; scan of the same shapes that allocates nothing. The analyzer asks it once per
+;; top-level form: a macro builds real sets, never the reader's set form, so when
+;; the form as read holds none, no call form any of its macros is handed holds
+;; one, and expanding one need not walk it (form-expand-1's normalize? argument).
+;; Walking every call form whole made nested macros quadratic: each expansion
+;; walked every level below it again, a list cell per node even when nothing
+;; changed (100 nested whens: 1.69 MB, against 0.21 MB as if/do).
+(define (hc-holds-set-form? x)
+  (cond
+    ((rdr-set-form? x) #t)
+    ((symbol-t? x) (let ((m (symbol-t-meta x))) (and (pmap? m) (hc-holds-set-form? m))))
+    ((or (hc-literal? x) (empty-list-t? x)) #f)
+    ((cseq? x) (let loop ((s x))
+                 (cond ((jolt-nil? s) #f)
+                       ((hc-holds-set-form? (seq-first s)) #t)
+                       (else (loop (jolt-seq (seq-more s)))))))
+    ((pvec? x) (let ((n (pvec-count x)))
+                 (let loop ((i 0))
+                   (and (fx<? i n) (or (hc-holds-set-form? (pvec-nth-in-range x i)) (loop (fx+ i 1)))))))
+    ((pset? x) (pset-fold x (lambda (e a) (or a (hc-holds-set-form? e))) #f))
+    ((pmap? x) (pmap-fold x (lambda (k v a) (or a (hc-holds-set-form? k) (hc-holds-set-form? v))) #f))
+    (else #f)))
 ;; &form and &env are the expander fn's first two PARAMETERS, as on the JVM —
 ;; the lowering that adds them is analyzer.clj's macro-fn-arities (and its build
 ;; path twin, ce-macro-arities). They used to be dynamic vars bound around the
@@ -496,7 +547,8 @@
 ;; ArityException. Params also outlive the expansion, so a closure a macro
 ;; returns over &form still has it.
 ;; The analyzer passes amp-env (the in-scope locals); macroexpand-1 has none, so
-;; it defaults to {}.
+;; it defaults to {}. The analyzer passes normalize? #f when its top-level form
+;; holds no reader set form (hc-holds-set-form?); every other caller walks.
 ;; &form meta matches the JVM's {:line :column}. hc-kw-file is defined above
 ;; with hc-kw-line/hc-kw-column. hc-form-sans-file strips :file from &form meta
 ;; so a macro reading (meta &form) doesn't see it — libraries branch on its presence.
@@ -507,13 +559,13 @@
         (jolt-with-meta form (jolt-dissoc2 m hc-kw-file)))))
 ;; The compiler's expansion: the call form's position carried onto the
 ;; expansion (hc-propagate-pos), so code a macro built names the call site.
-(define (hc-expand-1 ctx form . maybe-env)
-  (hc-propagate-pos form (apply hc-expand-1-raw ctx form maybe-env)))
+(define (hc-expand-1 ctx form . opts)
+  (hc-propagate-pos form (apply hc-expand-1-raw ctx form opts)))
 ;; What the macro itself returned. clojure.core/macroexpand-1 answers this: the
 ;; reference's hands back the expander's value untouched, so (meta
 ;; (macroexpand-1 '(when x y))) is nil there -- the position the compiler gives
 ;; an expansion comes from its LINE, not from the form.
-(define (hc-expand-1-raw ctx form . maybe-env)
+(define (hc-expand-1-raw ctx form . opts)
   ;; Normalize the WHOLE call form once, then take both the arguments and &form
   ;; out of the result. Walking each argument separately left &form holding the
   ;; raw shapes — a macro reading (nth &form 1) rather than its parameter still
@@ -521,12 +573,12 @@
   ;; #762 hazard surviving in the one place the argument walk did not reach. One
   ;; walk is also less work than one per argument, and an unchanged form comes
   ;; back unallocated.
-  (let* ((nform (hc-macro-arg form))
+  (let* ((nform (if (and (pair? opts) (pair? (cdr opts)) (not (cadr opts))) form (hc-macro-arg form)))
          (items (seq->list nform))
          (head (car items))
          (args (cdr items))
          (expander (var-cell-root (hc-resolve-cell ctx head)))
-         (amp-env (if (pair? maybe-env) (car maybe-env) (jolt-hash-map))))
+         (amp-env (if (pair? opts) (car opts) (jolt-hash-map))))
     ;; A macro's two implicit parameters are invisible to its caller, so an arity
     ;; error names the DECLARED count: (m 1 2) on a one-param macro is (2), not
     ;; the (4) the expander is actually called with. The JVM corrects that after
@@ -653,6 +705,15 @@
   (or (not (hc-compiling-to-run))
       (string=? target "jolt.host")))
 
+;; Whether the var cell is private for this analysis: its env's :private? function's answer (:private / :public) when it gives one, else
+;; the var's own meta. A caller analyzing a tree whose definitions differ from the running image's passes the tree's.
+(define (hc-private-var? ctx cell)
+  (let* ((f (chez-actx-priv ctx))
+         (a (and f (f (var-cell-ns cell) (var-cell-name cell)))))
+    (cond ((eq? a hc-kw-private) #t)
+          ((eq? a hc-kw-public) #f)
+          (else (var-private? cell)))))
+
 (define (hc-resolve-global ctx sym)
   (let* ((nm (symbol-t-name sym))
          (cell (hc-resolve-cell ctx sym)))
@@ -661,12 +722,15 @@
                                     hc-kw-ns (var-cell-ns cell)
                                     hc-kw-name (var-cell-name cell)))
                (nr (hc-cell-num-ret cell))
-               (base (if nr (jolt-assoc base hc-kw-num-ret nr) base)))
+               (base (if nr (jolt-assoc base hc-kw-num-ret nr) base))
+               ;; :macro, so a caller holding the answer need not ask form-macro?
+               ;; of the same symbol again (a var reference asked it twice more)
+               (base (if (macro-var? cell) (jolt-assoc base hc-kw-macro #t) base)))
           ;; :private — a ^:private var of ANOTHER namespace, which the analyzer
           ;; refuses to reference ("var: a/hidden is not public"), as the JVM's
           ;; Compiler.resolveIn / isMacro do. (var a/hidden) still takes it.
           (if (and (not (string=? (var-cell-ns cell) (chez-actx-cns ctx)))
-                   (var-private? cell)
+                   (hc-private-var? ctx cell)
                    (not (and (string=? (var-cell-ns cell) "clojure.core")
                              (hashtable-ref hc-native-op-name-table (var-cell-name cell) #f))))
               (jolt-assoc base hc-kw-private #t)
@@ -740,7 +804,7 @@
 ;; now parallel across namespaces, and unlocked two threads draw the same number
 ;; — see jolt-gensym in converters.ss.
 (define hc-sq-gensym-counter 0)
-(define hc-sq-gensym-mutex (make-mutex))
+(define-process-local hc-sq-gensym-mutex (make-mutex))
 (define (hc-sq-gensym base)
   (jolt-symbol #f (string-append base "__"
                                  (number->string
@@ -1004,7 +1068,7 @@
 ;; fetch is a single-key read and stays unlocked: it sits at every candidate call
 ;; site, and an unlocked read of a strong table is safe (see var-table in rt.ss).
 (define inline-stash-table (make-hashtable string-hash string=?))
-(define inline-stash-mu (make-mutex))
+(define-process-local inline-stash-mu (make-mutex))
 ;; Has this var been defined more than once, with a value, in the program loaded
 ;; so far? The inline pass asks before stashing: splicing a var that is redefined
 ;; later freezes whichever definition was current when the CALLER compiled, so one
@@ -1260,7 +1324,7 @@
 
 ;; --- declare the hot clojure.core primitives so resolve-global sees them ------
 ;; Mirrors backend_scheme.clj native-ops keys (op-registry entries with a :call)
-;; minus the internal protocol-dispatch{1,2,3} emit helpers, which are not
+;; minus the internal protocol-dispatch1..8 emit helpers, which are not
 ;; clojure.core names. The emitter lowers each of these inline, so the declared
 ;; cell's unbound root is never deref'd. host/chez/manifest-check.sh fails CI if
 ;; this list drifts from native-ops.
@@ -1337,6 +1401,8 @@
   (def-var! "jolt.host" "allow-unresolved-vars?" hc-allow-unresolved-vars?)
   (def-dynvar! "jolt.host" "*invoke-rewrite*" jolt-nil)
   (def-var! "jolt.host" "invoke-rewriter" hc-invoke-rewriter)
+  (def-dynvar! "jolt.host" "*resolve-unresolved*" jolt-nil)
+  (def-var! "jolt.host" "unresolved-resolver" hc-unresolved-resolver)
   (def-var! "jolt.host" "form-bigdec?" hc-bigdec?)
   (def-var! "jolt.host" "form-bigdec-source" hc-bigdec-source)
   (def-var! "jolt.host" "form-float-value?" hc-float-value?)
@@ -1367,10 +1433,11 @@
   ;; was compiled in (jolt-5n2p): its free symbols resolve there and not at the
   ;; site the value was spliced into, which is the same reason the image restore
   ;; path compiles its wrapper in (image-fnsrc-ns x).
-  (def-var! "jolt.host" "ctx-for-ns" (lambda (ns) (make-analyze-ctx ns)))
+  (def-var! "jolt.host" "ctx-for-ns" (lambda (ns . opts) (apply make-analyze-ctx ns opts)))
   (def-var! "jolt.host" "late-bind?" hc-late-bind?)
   (def-var! "jolt.host" "form-macro?" hc-macro?)
   (def-var! "jolt.host" "form-expand-1" hc-expand-1)
+  (def-var! "jolt.host" "form-holds-set-form?" hc-holds-set-form?)
   (def-var! "jolt.host" "resolve-global" hc-resolve-global)
   (def-var! "jolt.host" "resolvable-names" hc-resolvable-names)
   (def-var! "jolt.host" "host-class-name?" hc-host-class-name?)
@@ -1398,7 +1465,10 @@
   (def-var! "jolt.host" "var-redefined?" hc-var-redefined?)
   (def-var! "jolt.host" "seed-callable?" hc-seed-callable?)
   (def-var! "jolt.host" "protocol-call-key" hc-protocol-call-key)
-  (def-var! "jolt.host" "mark-spliced!" hc-mark-spliced!))
+  (def-var! "jolt.host" "mark-spliced!" hc-mark-spliced!)
+  ;; (jolt.host/spliced-fqns) -> ["ns/name" ...]: every callee whose body this process's inline pass copied into a caller
+  ;; (mark-spliced!), so a build can show which vars a redefinition would not reach
+  (def-var! "jolt.host" "spliced-fqns" (lambda () (apply jolt-vector (inline-spliced-fqns)))))
 
 (hc-install!)
 

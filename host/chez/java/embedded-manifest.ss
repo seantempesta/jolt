@@ -331,7 +331,7 @@
 ;; same Manifest each time, as the JDK's caching JarFile does, and whether the
 ;; archive is multi-release is read from it once.
 (define embedded-archive-manifest-cache #f)
-(define embedded-archive-manifest-mutex (make-mutex))
+(define-process-local embedded-archive-manifest-mutex (make-mutex))
 (define (embedded-archive-manifest-parse)
   (let* ((content (and (embedded-public-resource? "META-INF/MANIFEST.MF")
                        (embedded-resource-ref "META-INF/MANIFEST.MF")))

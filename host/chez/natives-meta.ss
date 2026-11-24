@@ -62,7 +62,7 @@
 ;; collection), so a program whose record metadata is all gone again skips the
 ;; lookup.
 (define meta-table (make-weak-eq-hashtable))
-(define meta-table-mu (make-mutex))
+(define-process-local meta-table-mu (make-mutex))
 (define meta-gen (box 0))
 (define (meta-gen-bump!) (set-box! meta-gen (fx+ 1 (unbox meta-gen))))
 (define (meta-table-set! k v)
@@ -214,7 +214,7 @@
 ;; as the JVM's wrapper hands it to the original's applyTo. The table is plain
 ;; R6RS (no Chez wrapper procedures), so the Gambit target runs this as is.
 (define fn-meta-targets (make-weak-eq-hashtable))
-(define fn-meta-mu (make-mutex))
+(define-process-local fn-meta-mu (make-mutex))
 (define (fn-meta-target-of x)
   (and (procedure? x)
        (jolt-with-mutex fn-meta-mu (hashtable-ref fn-meta-targets x #f))))

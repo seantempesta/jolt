@@ -602,7 +602,7 @@
 ;; U+FFFD. The count is read unlocked as the "nothing waits anywhere" test,
 ;; so a plain string write takes no lock.
 (define sink-pending (make-weak-eq-hashtable))
-(define sink-pending-mu (make-mutex))
+(define-process-local sink-pending-mu (make-mutex))
 (define (sink-text sink p)
   (cond
     ((and (string? p) (fx=? sink-pending-live 0)) p)
@@ -734,7 +734,7 @@
 ;; Only the real process stream takes this path: with-out-str resolves 'out to a
 ;; string port, which can only take characters, so a byte[] written there decodes
 ;; as before.
-(define pw-byte-port-mu (make-mutex))
+(define-process-local pw-byte-port-mu (make-mutex))
 (define pw-stdout-bytes (box #f))
 (define pw-stderr-bytes (box #f))
 (define (pw-byte-port-memo cell open)
@@ -1969,7 +1969,7 @@
 ;; #(tag epoch iterator #(iterator-tag hasNext next)), the last filled by the
 ;; first walk and replaced whole, as host-tostring-last is.
 (define reduce-iter-seen '())
-(define reduce-iter-mu (make-mutex))
+(define-process-local reduce-iter-mu (make-mutex))
 (define (reduce-iter-entry t)
   (let loop ((es reduce-iter-seen))
     (cond ((null? es) #f)

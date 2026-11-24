@@ -98,7 +98,7 @@
 ;; stm-mu serializes the publish. It is held for the checks and the writes only —
 ;; never across user code or a wait — so it is a leaf.
 (define stm-clock 0)
-(define stm-mu (make-mutex))
+(define-process-local stm-mu (make-mutex))
 (define *txn* (make-thread-parameter #f))
 (define stm-retry-limit 10000)
 (define stm-barge-ms 10)        ; how long a transaction runs before it may barge
@@ -151,7 +151,7 @@
 ;; retry is caught by jolt-sync and never reported, and under contention the
 ;; capture was most of a retry's cost.
 (define stm-retry-ex #f)
-(define stm-retry-mu (make-mutex))
+(define-process-local stm-retry-mu (make-mutex))
 (define (stm-retry!)
   (unless stm-retry-ex
     (jolt-with-mutex stm-retry-mu

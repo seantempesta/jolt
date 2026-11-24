@@ -354,16 +354,277 @@
 ;; top-level form ran last — and WRITTEN, the form the user wrote (FORM, or the
 ;; macro call it was unrolled from), to name its fn by.
 (define (jolt-eval-with-source scm form written ns)
+  (let ((name (jolt-register-eval-marker-table! scm (hc-form-position form) written ns)))
+    (sa-profile-compile (lambda () (eval (jolt-ce-annotated scm name) (interaction-environment))))))
+;; SCM read with source objects naming NAME, the registry key its marker table is under.
+(define (jolt-ce-annotated scm name)
   (let* ((bv (string->utf8 scm))
-         (name (jolt-register-eval-marker-table! scm (hc-form-position form) written ns))
-         (sfd (make-source-file-descriptor name (open-bytevector-input-port bv)))
-         (ann (call-with-values
-               (lambda ()
-                 (get-datum/annotations
-                  (transcoded-port (open-bytevector-input-port bv) (native-transcoder))
-                  sfd 0))
-               (lambda (a p) a))))
-    (sa-profile-compile (lambda () (eval ann (interaction-environment))))))
+         (sfd (make-source-file-descriptor name (open-bytevector-input-port bv))))
+    (call-with-values
+      (lambda ()
+        (get-datum/annotations
+         (transcoded-port (open-bytevector-input-port bv) (native-transcoder))
+         sfd 0))
+      (lambda (a p) a))))
+
+;; --- a form's compiled code, reused by digest ---------------------------------
+;; Chez's compile of a form's emitted Scheme is most of its eval (two thirds of
+;; Seon's forms' eval, 2026-11-14), and the same unchanged form was compiled again
+;; in every process that evaluated it. The emitted text is the whole input to that
+;; compile but for its labels: fresh-label (backend_scheme.clj) numbers each local
+;; binder from one process-wide counter (_kc$285 here, _kc$9351 in a process that
+;; compiled more first), the counter the build restarts per namespace for its own
+;; cache because every name it makes is lexical (build.ss, #1059). So the text is
+;; renumbered: each label this form's emit made is renamed to its stem and its
+;; order of first binding, the renumbered text is what compiles, and its digest
+;; keys the compiled code in the AOT cache's generation (loader.ss aot-form-code):
+;; a form any process compiled is loaded, not compiled, by every later one.
+;;
+;; A label is renamed only when renaming it is alpha conversion, shown on the form
+;; itself: its number is one the counter gave out during this form's emit, it is
+;; none of munge-name's spellings (jolt-debug-demunge answers #f), a lambda or let
+;; of the form binds it, it never appears free nor inside quoted data, its new name
+;; is no other symbol of the form's, and the text scan replaced it exactly as many
+;; times as the reader saw it. Anything else stays as written, so a form whose
+;; text keeps some process's number misses, and never runs another form's code.
+;; The same renumbered text compiles on a hit and on a miss, so which one a
+;; process took changes nothing it can observe.
+
+;; NAME's stem when NAME is one of the labels numbered in (LO, HI], else #f.
+(define (jolt-ce-label-stem name lo hi)
+  (let ((n (string-length name)))
+    (let loop ((i n))
+      (if (and (fx>? i 0) (char<=? #\0 (string-ref name (fx- i 1)) #\9))
+          (loop (fx- i 1))
+          (and (fx<? i n) (fx>? i 0)
+               (let ((k (string->number (substring name i n))))
+                 (and (> k lo) (<= k hi)))
+               (not (jolt-debug-demunge name))
+               (substring name 0 i))))))
+
+;; The labels DATUM binds that it never uses free nor holds as data, in order of
+;; first binding; each one's occurrence count (eq table); and every other symbol
+;; DATUM holds (eq table).
+(define (jolt-ce-form-labels datum lo hi)
+  (let ((scope (make-eq-hashtable))   ; label -> its binders in scope here
+        (uses (make-eq-hashtable))    ; label -> occurrences
+        (bad (make-eq-hashtable))     ; seen free or as data
+        (all (make-eq-hashtable))     ; every symbol
+        (stems (make-eq-hashtable))   ; symbol -> stem or #f
+        (order '()))
+    (define (label? s)
+      (let ((v (hashtable-ref stems s 'unseen)))
+        (if (eq? v 'unseen)
+            (let ((v (jolt-ce-label-stem (symbol->string s) lo hi))) (hashtable-set! stems s v) v)
+            v)))
+    (define (bind! s)
+      (when (symbol? s)
+        (hashtable-set! all s #t)
+        (when (label? s)
+          (unless (hashtable-contains? uses s) (set! order (cons s order)))
+          (hashtable-update! uses s (lambda (n) (fx+ n 1)) 0)
+          (hashtable-update! scope s (lambda (n) (fx+ n 1)) 0))))
+    (define (unbind! s)
+      (when (and (symbol? s) (hashtable-contains? scope s))
+        (hashtable-update! scope s (lambda (n) (fx- n 1)) 0)))
+    (define (formals f)               ; (a b . c) or c -> its symbols
+      (cond ((pair? f) (cons (car f) (formals (cdr f))))
+            ((symbol? f) (list f))
+            (else '())))
+    (define (data! x)
+      (cond ((symbol? x) (hashtable-set! all x #t) (hashtable-set! bad x #t))
+            ((pair? x) (data! (car x)) (data! (cdr x)))
+            ((vector? x) (vector-for-each data! x))))
+    (define (bindings? b)
+      (and (list? b) (for-all (lambda (e) (and (pair? e) (symbol? (car e)) (list? (cdr e)))) b)))
+    (define (each! xs) (for-each walk xs))
+    (define (walk x)
+      (cond
+        ((symbol? x)
+         (hashtable-set! all x #t)
+         (when (label? x)
+           (if (fx>? (hashtable-ref scope x 0) 0)
+               (hashtable-update! uses x (lambda (n) (fx+ n 1)) 0)
+               (hashtable-set! bad x #t))))
+        ((vector? x) (data! x))
+        ((pair? x)
+         (let ((h (car x)) (r (cdr x)))
+           (cond
+             ((memq h '(quote quasiquote syntax quasisyntax)) (data! r))
+             ((and (eq? h 'lambda) (pair? r) (list? (cdr r)))
+              (let ((fs (formals (car r))))
+                (for-each bind! fs) (each! (cdr r)) (for-each unbind! fs)))
+             ((and (eq? h 'case-lambda) (list? r) (for-all (lambda (c) (and (pair? c) (list? (cdr c)))) r))
+              (for-each (lambda (c)
+                          (let ((fs (formals (car c))))
+                            (for-each bind! fs) (each! (cdr c)) (for-each unbind! fs)))
+                        r))
+             ;; (let name ((v e) ...) body ...): the inits outside, name and vars in the body
+             ((and (eq? h 'let) (pair? r) (symbol? (car r)) (pair? (cdr r))
+                   (bindings? (cadr r)) (list? (cddr r)))
+              (let ((vs (map car (cadr r))))
+                (for-each (lambda (b) (each! (cdr b))) (cadr r))
+                (bind! (car r)) (for-each bind! vs)
+                (each! (cddr r))
+                (unbind! (car r)) (for-each unbind! vs)))
+             ((and (eq? h 'let) (pair? r) (bindings? (car r)) (list? (cdr r)))
+              (let ((vs (map car (car r))))
+                (for-each (lambda (b) (each! (cdr b))) (car r))
+                (for-each bind! vs) (each! (cdr r)) (for-each unbind! vs)))
+             ((and (eq? h 'let*) (pair? r) (bindings? (car r)) (list? (cdr r)))
+              (for-each (lambda (b) (each! (cdr b)) (bind! (car b))) (car r))
+              (each! (cdr r))
+              (for-each (lambda (b) (unbind! (car b))) (car r)))
+             ((and (memq h '(letrec letrec*)) (pair? r) (bindings? (car r)) (list? (cdr r)))
+              (let ((vs (map car (car r))))
+                (for-each bind! vs)
+                (for-each (lambda (b) (each! (cdr b))) (car r))
+                (each! (cdr r))
+                (for-each unbind! vs)))
+             ;; anything else binds nothing here: a label it binds is then seen free
+             (else (let loop ((p x))
+                     (cond ((pair? p) (walk (car p)) (loop (cdr p)))
+                           ((null? p) (void))
+                           (else (walk p))))))))
+        (else (void))))
+    (walk datum)
+    (let ((labels (filter (lambda (s) (not (hashtable-contains? bad s))) (reverse order))))
+      (for-each (lambda (s) (hashtable-delete! all s)) labels)
+      (values labels uses all))))
+
+;; SCM with each atom RENAME maps (string -> string) replaced, counting each
+;; replacement by its new name in COUNTS. Strings, comments, |symbols| and #\chars
+;; pass whole, as the reader takes them.
+(define (jolt-ce-rename-atoms scm rename counts)
+  (let ((n (string-length scm)) (out (open-output-string)))
+    (define (delim? c)
+      (or (char<=? c #\space)
+          (char=? c #\() (char=? c #\)) (char=? c #\") (char=? c #\;) (char=? c #\')
+          (char=? c #\[) (char=? c #\]) (char=? c #\`) (char=? c #\,)))
+    (define (at? i c) (and (fx<? i n) (char=? (string-ref scm i) c)))
+    (let loop ((i 0) (start 0))
+      (if (fx>=? i n)
+          (begin (put-string out scm start (fx- n start)) (get-output-string out))
+          (let ((c (string-ref scm i)))
+            (cond
+              ((char=? c #\")
+               (let s ((j (fx+ i 1)))
+                 (cond ((fx>=? j n) (loop n start))
+                       ((char=? (string-ref scm j) #\\) (s (fx+ j 2)))
+                       ((char=? (string-ref scm j) #\") (loop (fx+ j 1) start))
+                       (else (s (fx+ j 1))))))
+              ((char=? c #\;)
+               (let s ((j i))
+                 (if (or (fx>=? j n) (char=? (string-ref scm j) #\newline)) (loop j start) (s (fx+ j 1)))))
+              ((and (char=? c #\#) (at? (fx+ i 1) #\|))   ; #| ... |#, nested
+               (let s ((j (fx+ i 2)) (d 1))
+                 (cond ((fx>=? (fx+ j 1) n) (loop n start))
+                       ((and (at? j #\|) (at? (fx+ j 1) #\#))
+                        (if (fx=? d 1) (loop (fx+ j 2) start) (s (fx+ j 2) (fx- d 1))))
+                       ((and (at? j #\#) (at? (fx+ j 1) #\|)) (s (fx+ j 2) (fx+ d 1)))
+                       (else (s (fx+ j 1) d)))))
+              ((and (char=? c #\#) (at? (fx+ i 1) #\\))   ; #\x, #\space, #\x41
+               (let s ((j (fx+ i 3)))
+                 (if (or (fx>=? j n) (delim? (string-ref scm j))) (loop j start) (s (fx+ j 1)))))
+              ((char=? c #\|)
+               (let s ((j (fx+ i 1)))
+                 (cond ((fx>=? j n) (loop n start))
+                       ((char=? (string-ref scm j) #\\) (s (fx+ j 2)))
+                       ((char=? (string-ref scm j) #\|) (loop (fx+ j 1) start))
+                       (else (s (fx+ j 1))))))
+              ((delim? c) (loop (fx+ i 1) start))
+              (else
+               (let s ((j i))
+                 (if (or (fx>=? j n) (delim? (string-ref scm j)) (char=? (string-ref scm j) #\|))
+                     (let ((new (and (char<=? #\0 (string-ref scm (fx- j 1)) #\9)
+                                     (hashtable-ref rename (substring scm i j) #f))))
+                       (if new
+                           (begin (put-string out scm start (fx- i start))
+                                  (put-string out new)
+                                  (hashtable-update! counts new (lambda (k) (fx+ k 1)) 0)
+                                  (loop j j))
+                           (loop j start)))
+                     (s (fx+ j 1)))))))))))
+
+;; SCM with the labels numbered in (LO, HI] renumbered from 0 in order of first
+;; binding, or #f when that is not shown to be the same program (see above).
+(define (jolt-ce-renumber scm lo hi)
+  (let ((datum (guard (e (#t (void))) (read (open-input-string scm)))))   ; unreadable: compiled as written
+    (and (not (eq? datum (void)))
+         (let-values (((labels uses all) (jolt-ce-form-labels datum lo hi)))
+           (let ((rename (make-hashtable string-hash string=?))
+                 (want (make-hashtable string-hash string=?))
+                 (counts (make-hashtable string-hash string=?)))
+             (and
+              (let loop ((ls labels) (i 0))
+                (or (null? ls)
+                    (let* ((old (symbol->string (car ls)))
+                           (new (string-append (jolt-ce-label-stem old lo hi) (number->string i))))
+                      (and (not (hashtable-contains? all (string->symbol new)))
+                           (begin (hashtable-set! rename old new)
+                                  (hashtable-set! want new (hashtable-ref uses (car ls) 0))
+                                  (loop (cdr ls) (fx+ i 1)))))))
+              (let ((out (jolt-ce-rename-atoms scm rename counts)))
+                (let-values (((ks vs) (hashtable-entries want)))
+                  (let check ((i 0))
+                    (cond ((fx=? i (vector-length ks)) out)
+                          ((fx=? (vector-ref vs i) (hashtable-ref counts (vector-ref ks i) -1))
+                           (check (fx+ i 1)))
+                          (else #f)))))))))))
+
+;; The label counter fresh-label draws from (the emit unit's).
+(define jolt-ce-kw-gensym-counter (keyword #f "gensym-counter"))
+(define (jolt-ce-label-count)
+  (jolt-deref (jolt-get (jolt-ce-current-unit) jolt-ce-kw-gensym-counter jolt-nil)))
+
+;; #(compiles hits) of this process's top-level forms: a compile is Chez compiling
+;; a form's emitted text, a hit its code loaded from the cache.
+(define jolt-eval-compile-counts (vector 0 0))
+(define (jolt-ce-count! i)
+  (vector-set! jolt-eval-compile-counts i (fx+ 1 (vector-ref jolt-eval-compile-counts i))))
+
+;; Everything besides the text that decides what a compile makes: whether it is
+;; annotated, and the compiler parameters a binary's boot sets (build-jolt.ss).
+;; The runtime is the generation's (aot-generation-dir).
+(define (jolt-ce-compile-tag traced)
+  (format "~a ~s ~s ~s ~s\n" (if traced "traced" "plain") (optimize-level) (debug-level)
+          (generate-inspector-information) (generate-procedure-source-information)))
+
+;; A form's compiled code reused by digest: #f here, so an image without loader.ss (a state image, the
+;; fn-form mint) compiles every form; loader.ss sets it to the procedure that answers the code for a key's text
+;; (aot-form-code) when the cache may hold it for this form, else #f. Not while jolt.profile instruments (its
+;; counters are this process's).
+(define jolt-ce-form-cache #f)
+(define (jolt-ce-reuse?)
+  (and jolt-ce-form-cache (not (sa-profile-instrumenting?)) (not (compile-profile)) (jolt-ce-form-cache 'ok?)))
+
+;; Compile and run SCM, FORM's emitted Scheme whose labels were numbered in
+;; (LO, HI]: its code from the cache when a process compiled the same renumbered
+;; text, else compiled here and published.
+(define (jolt-ce-run-emitted scm lo hi form written ns)
+  (let ((traced (jolt-ce-trace-frames?))
+        (text (and (jolt-ce-reuse?) (jolt-ce-renumber scm lo hi))))
+    (cond
+      (text
+       (let* ((keytext (string-append (jolt-ce-compile-tag traced) text))
+              (name (and traced
+                         (jolt-register-eval-marker-table-as!
+                          (string-append "jolt-eval-src-" (jolt-ce-form-cache 'key keytext)) text (hc-form-position form) written ns)))
+              (compiled #f)
+              (run (jolt-ce-form-cache 'code keytext
+                      (lambda ()
+                        (set! compiled #t)
+                        (let-values (((port get) (open-bytevector-output-port)))
+                          (compile-to-port (list (if traced (jolt-ce-annotated text name) (read (open-input-string text))))
+                                           port)
+                          (get))))))
+         (jolt-ce-count! (if compiled 0 1))
+         (run)))
+      (else
+       (jolt-ce-count! 0)
+       (if traced
+           (jolt-eval-with-source scm form written ns)
+           (eval (read (open-input-string scm)) (interaction-environment)))))))
 
 ;; (with-meta sym m) -> sym, else x — an (ns ^:no-doc name …) yields the name with
 ;; reader metadata as a with-meta form; strip it to read the bare ns symbol.
@@ -504,6 +765,11 @@
 ;; pre-scan here (ce-scan-requires! is for the walks that never run the form):
 ;; the aliases in force are the ones earlier forms registered by RUNNING.
 ;; --- the unit tap (jolt.analyzer/*unit-tap*) ---------------------------------
+;; A tool binds jolt.analyzer/*unit-tap* to a fn of [form node] around an eval to be
+;; given every top-level unit the spine analyzes (see the var's comment). Read per
+;; unit through var-deref, so a thread binding is what counts; the unit's run is
+;; scoped with the tap bound to nil (jolt-run-unit), so code the run itself compiles
+;; (a require's file, an eval) is not reported as the caller's.
 (define jolt-unit-tap-cell (jolt-var "jolt.analyzer" "*unit-tap*"))
 (define (jolt-unit-tap)
   (let ((t (var-deref "jolt.analyzer" "*unit-tap*")))
@@ -513,7 +779,42 @@
       (dyn-with-frame (list (cons jolt-unit-tap-cell jolt-nil)) thunk)
       (thunk)))
 
+;; A build publishes its own compilation unit for its walks (build.ss), and that
+;; unit is a closed world: its direct-link registry names every def the emit walk
+;; has emitted so far, whose jv$ bindings exist only in the emitted TEXT, never in
+;; the building process. Code the building process itself compiles and runs
+;; meanwhile -- an (eval …) inside a macro expander, as tools.reader's
+;; compile-when does at expansion, a top-level flag set! -- is open-world runtime
+;; code, so it compiles against the unit the process had before the build (the
+;; one its pass-1 load used), with the build's direct-link/optimize flags off.
+;; Compiled against the build's unit it referenced an unbound jv$ variable as soon
+;; as the referenced def had been emitted (JOLT_NO_WP_INFER=1 analyzes in the emit
+;; walk; whole-program inference analyzed before any def was emitted, so it hid it).
+(define ce-build-runtime-unit #f)   ; the process's unit while a build's is published
+(define (ce-build-unit-enter! runtime-unit) (set! ce-build-runtime-unit runtime-unit))
+(define (ce-build-unit-leave!) (set! ce-build-runtime-unit #f))
+(define jolt-ce-set-emit-unit! (var-deref "jolt.backend-scheme" "set-emit-unit!"))
+(define (ce-outside-build thunk)
+  (let ((runtime ce-build-runtime-unit))
+    (if (not runtime)
+        (thunk)
+        (let ((build-unit #f) (opt hc-optimize?) (dl hc-direct-link?))
+          (dynamic-wind
+            (lambda ()
+              (set! build-unit (jolt-ce-current-unit))
+              (set! ce-build-runtime-unit #f)
+              (jolt-ce-set-emit-unit! runtime)
+              (set-optimize! #f)
+              (set-direct-link-flag! #f))
+            thunk
+            (lambda ()
+              (set-direct-link-flag! dl)
+              (set-optimize! opt)
+              (jolt-ce-set-emit-unit! build-unit)
+              (set! ce-build-runtime-unit runtime)))))))
 (define (jolt-analyze-emit-form form ns)
+  (ce-outside-build (lambda () (jolt-analyze-emit-form* form ns))))
+(define (jolt-analyze-emit-form* form ns)
   (let* ((ctx (make-analyze-ctx ns))
          ;; the form runs as soon as it compiles (hc-late-bound-namespace?)
          (node (parameterize ((hc-compiling-to-run #t)) (jolt-ce-analyze ctx form))))
@@ -748,6 +1049,36 @@
 ;; OUTER is the form the user wrote that FORM was unrolled from, a macro call
 ;; whose (do ...) expansion it is a child of, or #f. jolt.profile names a form's
 ;; code after it: a defrecord's methods are in its children.
+;; An evaluated form runs in a fn of its own, named as the JVM's Compiler.eval names the fn it
+;; wraps a form in: ns/eval<n>, so the form is a frame of a throw's trace (ns$eval<n>), and
+;; clojure.main's triage names it, as a REPL error says "at user/eval12 (REPL:1)". A form whose
+;; head is a def… symbol is evaluated as it stands, as on the JVM, and so is one compiled with
+;; direct linking (its defs are top-level defines). The fn's code is registered for the walk
+;; (source-registry.ss jolt-eval-frame-register!).
+(define jolt-ce-eval-n 0)
+;; "eval<n>" for a form evaluated in a fn of its own, else #f
+(define (jolt-ce-eval-name form)
+  (if (or (hc-compiler-direct-linking?)
+          (not (or (cseq? form) (pvec? form) (pmap? form) (pset? form)))
+          (and (cseq? form) (symbol-t? (seq-first form))
+               (let ((h (symbol-t-name (seq-first form))))
+                 (and (fx>=? (string-length h) 3) (string=? (substring h 0 3) "def")))))
+      #f
+      (begin (set! jolt-ce-eval-n (fx+ jolt-ce-eval-n 1))
+             (string-append "eval" (number->string jolt-ce-eval-n)))))
+(define (jolt-ce-eval-frame ns nm line scm)
+  (if (not nm)
+      scm
+      (begin
+        (let* ((b (string-append "|" ns "/" nm "|")))
+          ;; the body through jolt-frame-keep (values.ss): its last call is not a tail call, so the
+          ;; fn stays a frame under it, as the JVM's eval fn does
+          ;; called as what the registration answers, so Chez cannot inline the fn into the form's
+          ;; own code (a small body was, and its frame was gone)
+          (string-append "(let ((" b " (lambda () (jolt-frame-keep " scm ")))) ((jolt-eval-frame-register! " b " "
+                         (format "~s" ns) " " (format "~s" nm) " "
+                         ;; the form's line (a form built in code has none: 1, its first)
+                         (number->string (if (fixnum? line) line 1)) ")))")))))
 (define (jolt-compile-eval-form form ns) (jolt-compile-eval-form/outer form ns #f))
 (define (jolt-compile-eval-form/outer form ns outer)
   (if (or (cseq? form) (jolt-lazyseq? form) (empty-list-t? form) (symbol-t? form)
@@ -791,7 +1122,10 @@
      ;; record this form's source location first, so a compile- or run-time error
      ;; in it reports the right place.
      (jolt-enter-form! form)
-     (let* ((scm (jolt-analyze-emit-form form ns))
+     (let* ((nm (jolt-ce-eval-name form))
+            (lo (jolt-ce-label-count))           ; the labels this emit makes: (lo, hi]
+            (scm (jolt-ce-eval-frame ns nm (hc-form-line form) (jolt-analyze-emit-form form ns)))
+            (hi (jolt-ce-label-count))
             (cap (jolt-aot-capture)))            ; tee for the AOT cache (loader.ss)
        (when cap (put-string cap scm) (newline cap))
        ;; the run is a root as much as the compile was: expanding the form ran
@@ -806,10 +1140,7 @@
        ;; captured: SCM does not repeat it.
        (let ((run (lambda ()
                     (jolt-run-unit
-                      (lambda ()
-                        (if (jolt-ce-trace-frames?)
-                            (jolt-eval-with-source scm form (or outer form) ns)
-                            (eval (read (open-input-string scm)) (interaction-environment))))))))
+                      (lambda () (jolt-ce-run-emitted scm lo hi form (or outer form) ns))))))
          (if cap
              (parameterize ((jolt-aot-capture #f)) (run))
              (run)))))))

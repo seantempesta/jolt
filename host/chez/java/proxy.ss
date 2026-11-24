@@ -43,7 +43,7 @@
 ;; rather than once per instance (memoized by eq on the vector; weak, so a site
 ;; that is gone takes its entry with it).
 (define proxy-site-protos-memo (make-weak-eq-hashtable))
-(define proxy-site-protos-mu (make-mutex))
+(define-process-local proxy-site-protos-mu (make-mutex))
 (define (proxy-site-protos v)
   (or (hashtable-ref proxy-site-protos-memo v #f)
       (let ((ps (reify-proto-names (map proxy-name->string (seq->list v)))))
@@ -90,7 +90,7 @@
 ;; class, else Object with every name an interface. One name per (ns, supers),
 ;; memoized; its place in the class graph is the super, the interfaces and IProxy.
 (define proxy-class-names (make-hashtable equal-hash equal?))
-(define proxy-class-names-mu (make-mutex))
+(define-process-local proxy-class-names-mu (make-mutex))
 (define (proxy-fqn n) (if (memv #\. (string->list n)) n (jch-fqn-of-simple n)))
 ;; CLASS? is whether the first name is the superclass: one jolt could construct
 ;; (the proxy got a base), or one the class graph knows that is no interface (an

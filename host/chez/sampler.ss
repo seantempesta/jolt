@@ -37,7 +37,7 @@
 (define jolt-sample-start-stats #f)
 (define jolt-sample-stop-stats #f)
 (define jolt-sample-tables '())       ; every joined thread's record, for the reader
-(define jolt-sample-mu (make-mutex))
+(define-process-local jolt-sample-mu (make-mutex))
 
 ;; The demand a thread starts with, and the bounds on the adapted one. The lower
 ;; bound keeps a thread in a slow foreign-heavy stretch from paying a clock read

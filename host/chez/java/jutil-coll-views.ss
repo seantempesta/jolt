@@ -374,7 +374,7 @@
                       '(("-keyset" . key) ("-values" . value) ("-entryset" . entry))))
           hm-families)
 (define hmv-seq-seen '())               ; ((tag-object . elems) ...), written under the mutex
-(define hmv-seq-mu (make-mutex))
+(define-process-local hmv-seq-mu (make-mutex))
 (define (hmv-view-elems x)
   (and (jhost? x)
        (let ((t (jhost-tag x)))
@@ -726,7 +726,7 @@
 ;; str and pr, by the kind its declared class gives (a proxy with a delegate is
 ;; the delegate's, jutil-colls.ss). Last in each walk: they are rare.
 (define abs-kind-memo (make-weak-eq-hashtable))
-(define abs-kind-mu (make-mutex))
+(define-process-local abs-kind-mu (make-mutex))
 (define (abs-proxy-kind x)
   (and (jreify? x) (not (jreify-delegate x))
        (let ((ps (jreify-protos x)))

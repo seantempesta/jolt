@@ -29,7 +29,7 @@
 ;; written: a declaration copies both under enum-mu, fills the copies and
 ;; publishes each with one store (tools/enum-registry-model.pl checks the
 ;; protocol: no torn read, no lost declaration).
-(define enum-mu (make-mutex))
+(define-process-local enum-mu (make-mutex))
 ;; class name (FQN and short) -> #(fqn names consts by-name)
 (define enum-class-tbl (make-hashtable string-hash string=?))
 ;; constant -> (info . ordinal)

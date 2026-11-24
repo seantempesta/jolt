@@ -29,7 +29,7 @@
 ;; Serializes every write to the registries in this file (class-statics-write!,
 ;; class-ctor-set!, register-host-methods!, ...). Chez mutexes are recursive, so
 ;; a writer that calls another takes it again freely.
-(define host-registry-mu (make-mutex))
+(define-process-local host-registry-mu (make-mutex))
 
 ;; Does `nm` name a registered host class (has statics or a constructor)? The
 ;; analyzer's contract layer asks this to treat a bare Capitalized symbol as a
@@ -1133,7 +1133,7 @@
 ;; the mutex, and an entry is replaced by one reference write. The key asked
 ;; last is kept as one (key . slots) pair, so a run of one type skips the table.
 (define print-arms-tbl (make-weak-eq-hashtable))
-(define print-arms-mutex (make-mutex))
+(define-process-local print-arms-mutex (make-mutex))
 (define print-arms-last (cons #f #f))
 (define (print-arms-slots k)
   (let ((l print-arms-last))
@@ -1171,7 +1171,7 @@
 ;; host object's tag, a plain record's descriptor) except for host tables, cached
 ;; against the arm list it came from, so a new arm retires it.
 (define class-arms-tbl (make-weak-eq-hashtable))
-(define class-arms-mutex (make-mutex))
+(define-process-local class-arms-mutex (make-mutex))
 (define class-arms-last (cons #f #f))
 (set-class-arms-for!
   (lambda (arms x)
@@ -1623,7 +1623,7 @@
 ;; cell itself is a mutable vector whose slot is written outside the lock, which
 ;; is a whole-value write and needs none — this only has to guarantee that both
 ;; writers reach the SAME cell.
-(define mutable-statics-mu (make-mutex))
+(define-process-local mutable-statics-mu (make-mutex))
 (define mutable-statics-tbl (make-hashtable string-hash string=?))
 (define (mutable-static-cell class member create?)
   (if create?
@@ -1739,7 +1739,7 @@
 ;; and the held-registration list go under this mutex; the load itself does NOT,
 ;; because an install namespace requires others and a nested autoload would
 ;; deadlock on a non-recursive mutex.
-(define lib-claims-mu (make-mutex))
+(define-process-local lib-claims-mu (make-mutex))
 ;; Called under lib-claims-mu, except for the core providers below, which claim
 ;; at boot before any second thread exists.
 (define (lib-claim-pending! p)
@@ -2504,7 +2504,7 @@
 ;; racing registration can only understamp; a miss is not cached, so the
 ;; autoload and var paths below still run every time they are needed.
 (define host-new-cache (make-weak-eq-hashtable))
-(define host-new-cache-mu (make-mutex))
+(define-process-local host-new-cache-mu (make-mutex))
 (define (host-new-ctor class)
   (let ((e (hashtable-ref host-new-cache class #f)))
     (if (and e (fx= (car e) class-ctor-epoch))

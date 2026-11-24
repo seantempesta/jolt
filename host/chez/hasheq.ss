@@ -779,7 +779,7 @@
 ;; seq views) compute directly as before. Compute outside the lock:
 ;; hash-ordered recurses into elements, and a seq of seqs re-enters.
 (define seq-hasheq-tbl (make-weak-eq-hashtable))
-(define seq-hasheq-mu (make-mutex))
+(define-process-local seq-hasheq-mu (make-mutex))
 (define (seq-hasheq-cached x)
   (if (or (cseq? x) (jolt-lazyseq? x))
       (or (jolt-with-mutex seq-hasheq-mu (hashtable-ref seq-hasheq-tbl x #f))

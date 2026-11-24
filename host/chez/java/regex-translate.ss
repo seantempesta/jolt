@@ -385,7 +385,7 @@
 ;; takes its own so a direct caller (a gate, a REPL) is safe too — a Chez
 ;; hashtable written from two threads faults in the collector.
 (define unicode-property-cache (make-hashtable string-hash string=?))
-(define unicode-property-mutex (make-mutex 'unicode-properties))
+(define-process-local unicode-property-mutex (make-mutex 'unicode-properties))
 (define (unicode-property-sre name in?)
   (or (hashtable-ref unicode-property-cache name #f)
       (jolt-with-mutex unicode-property-mutex

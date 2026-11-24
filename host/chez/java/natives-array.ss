@@ -76,7 +76,7 @@
 ;; into-array / make-array asks, and the munge walk cost them 2x. Reads are the
 ;; bare hashtable-ref; only a first-ever name takes the lock to publish.
 (define na-name-kind-tbl (make-hashtable string-hash string=?))
-(define na-name-kind-mu (make-mutex))
+(define-process-local na-name-kind-mu (make-mutex))
 (hashtable-set! na-name-kind-tbl na-string-kind na-string-kind)
 (define (na-name-kind n)
   (or (hashtable-ref na-name-kind-tbl n #f)
@@ -1948,7 +1948,7 @@
 ;; compile and link. Registered when the site's top-level form loads, so a build
 ;; served from the AOT cache sees the same set as one that macroexpanded.
 (define jolt-native-regions '())
-(define jolt-native-regions-mutex (make-mutex))
+(define-process-local jolt-native-regions-mutex (make-mutex))
 (define (jolt-native-register! sym src)
   (jolt-with-mutex jolt-native-regions-mutex
     (unless (assoc sym jolt-native-regions)

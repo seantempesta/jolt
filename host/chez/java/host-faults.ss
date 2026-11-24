@@ -31,7 +31,7 @@
 
 (define fault-throwables (make-ephemeron-eq-hashtable))   ; condition -> throwable
 (define fault-conditions (make-ephemeron-eq-hashtable))   ; throwable -> condition
-(define fault-mutex (make-mutex))
+(define-process-local fault-mutex (make-mutex))
 
 ;; Substring test on a message template. Local so classification depends on
 ;; nothing loaded after this file: a fault raised while the runtime is still
