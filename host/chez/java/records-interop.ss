@@ -140,6 +140,7 @@
 ;; it (a proxy is an IProxy, and is its abstract superclass)
 (define (reify-class-isa? val tname)
   (let ((c (reify-class-name val))) (and c (jch-isa? c tname) #t)))
+(def-var! "jolt.host" "declares-sorted?" (lambda (x) (own-type-declares? "clojure.lang.Sorted" x)))
 
 (define (instance-check-base type-sym val)
   (let ((tname (symbol-t-name type-sym)))

@@ -306,6 +306,7 @@ slice
 sorted-cmp
 sorted-cmp-fn
 sorted-cnt
+declares-sorted?
 sorted-kind
 sorted-ops
 sorted-seq

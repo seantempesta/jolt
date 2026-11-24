@@ -217,7 +217,7 @@
 ;; instance? is a macro defined later (30-macros); instance-check is its runtime fn.
 (defn sorted-map? [x] (= :map (jolt.host/sorted-kind x)))
 (defn sorted-set? [x] (= :set (jolt.host/sorted-kind x)))
-(defn sorted? [x] (or (sorted-map? x) (sorted-set? x) (instance-check 'clojure.lang.Sorted x)))
+(defn sorted? [x] (or (sorted-map? x) (sorted-set? x) (jolt.host/declares-sorted? x)))
 
 ;; --- subseq / rsubseq ---------------------------------------------------------
 ;; test is one of < <= > >= applied Clojure-style to the comparator result:
