@@ -51,6 +51,14 @@
 ;; -- died on the unbound name and silently dropped the def.
 (define user-instance-checks '())
 (define (user-instance-checks-empty?) (null? user-instance-checks))
+(define (instance-claim-covers? claim tname val)
+  (or (not claim)
+      (and (or (not (car claim)) (htable? val))
+           (or (not (cdr claim)) (and tname (member tname (cdr claim)) #t)))))
+(define (user-instance-checks-may-claim? tname val)
+  (let loop ((fs user-instance-checks))
+    (and (pair? fs)
+         (or (instance-claim-covers? (cdar fs) tname val) (loop (cdr fs))))))
 
 ;; Object / java.lang.Object is the root of the type hierarchy: every non-nil
 ;; value is an instance of Object; nil is not an instance of anything. This is
@@ -328,7 +336,7 @@
                      (let* ((e (instance-kind-entry k tname ts val))
                             (before (vector-ref e 1)))
                        (cond ((not (eq? before 'pass)) (if before #t #f))
-                             ((user-instance-checks-empty?) (if (vector-ref e 2) #t #f))
+                             ((not (user-instance-checks-may-claim? tname val)) (if (vector-ref e 2) #t #f))
                              (else 'uncached)))))))
     ;; each entry is published behind a release: on a weakly ordered machine
     ;; (ARM64) another thread could otherwise see the new entry before its slots

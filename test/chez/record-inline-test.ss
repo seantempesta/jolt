@@ -213,7 +213,9 @@
   ;; function, a transient's count, an unbound-var marker
   '(("host/chez/seq.ss" jolt-var-unbound? jolt-var-unbound-ns jolt-var-unbound-name
                         jreify? jreify-protos jolt-transient?)
-    ("host/chez/natives-meta.ss" juuid? jvol?)))
+    ("host/chez/natives-meta.ss" juuid? jvol?)
+    ("host/chez/values.ss" juuid?)
+    ("host/chez/hasheq.ss" juuid?)))
 (define (forward-refs path)
   (let ((here (hashtable-ref load-index path #f))
         (allowed (cond ((assoc path forward-allowed) => cdr) (else '())))
