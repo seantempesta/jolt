@@ -155,6 +155,28 @@
                         (sa-foreign-procedure-blocking name args res)))))
          #'(if (eq? (sa-os-family) 'windows) win unx))))))
 
+;; Same, answering (values result errno), errno captured at the call's own boundary (Chez's __errno
+;; convention, saved before the thread reactivates). A read of errno in a later call is not the call's:
+;; between the two this thread may collect or, on a fiber, be preempted for another fiber, and an EAGAIN
+;; read as another errno ended a child's output as if it were complete (seon.lib/sh, `git status` exit 0
+;; with no output, 2026-11-12). Windows (no literal convention at boot, see io-errno-loc) reads the
+;; location right after the call.
+(define-syntax jolt-foreign-proc-blocking-errno
+  (lambda (x)
+    (syntax-case x (quote)
+      ((_ name (quote args) (quote res))
+       (with-syntax
+           ((win #'(let ((p (jolt-foreign-proc-blocking name (quote args) (quote res))))
+                     (and p (lambda xs
+                              (let ((loc (and io-errno-loc (io-errno-loc))))
+                                (let ((r (apply p xs)))
+                                  (values r (if loc (sa-foreign-ref 'int loc 0) 0))))))))
+            (unx #'(guard (e (#t #f))
+                   (sa-load-shared-object #f)
+                   (and (sa-foreign-entry? name)
+                        (jolt-ffi-native-error-procedure (__collect_safe) name args res)))))
+         #'(if (eq? (sa-os-family) 'windows) win unx))))))
+
 ;; --- the process's output streams ---------------------------------------------
 ;; On the JVM, System.out and System.err are PrintStreams, and a PrintStream never
 ;; throws: when the descriptor stops taking output (the reader of the pipe went
@@ -239,6 +261,9 @@
               (jolt-swallow-io fail!
                 (write-char c inner)
                 (when (char=? c #\newline) (flush-output-port inner)))))))
+    ;; a process stream's lock is the process's own (locks.ss define-process-local): a forked
+    ;; child's first print must not wait on a parent thread caught mid-write
+    (jolt-process-local-add! (lambda () mu) (lambda () (set! mu (make-mutex))))
     (let ((p (sa-make-output-port name
                (lambda (c) (jolt-with-mutex mu (put! c)))
                (lambda (s start count) (jolt-with-mutex mu (put-some! s start count)) count)
@@ -327,7 +352,14 @@
 (define jolt-c-exit (jolt-foreign-proc-safe "_exit" '(int) 'void))
 (define jolt-exit-shutdown-runner (box #f))
 (define (jolt-exit-process code)
-  (if (or (eqv? (get-thread-id) jolt-boot-thread-id) (not jolt-c-exit))
+  ;; As the JVM's Runtime.exit: the shutdown hooks run, the console is flushed, and the process
+  ;; halts, from whichever thread called it. Never through Chez's exit on the boot thread: its
+  ;; base handler leaves through the program's top-level continuation, which unwinds every
+  ;; dynamic-wind on the way, so a `finally` around the call ran, and one that exited again
+  ;; replaced the status (a Seon agent's (System/exit 3) reached its root as 1, the status its
+  ;; forked process's boundary set in a `finally`). The hooks' runner is once per process
+  ;; (concurrency.ss), loaded after this file: resolved when called.
+  (if (not jolt-c-exit)
       (exit code)
       (begin
         (let ((run-hooks (unbox jolt-exit-shutdown-runner)))
@@ -635,6 +667,7 @@
                ". Give it at least twice that, or JOLT_MAX_HEAP=off for no ceiling.")))
     (set! jolt-heap-ceiling-bytes ceiling)
     (gc-nursery-setup! ceiling)
+    (sa-gc-reserve-ratio! (min 1 (gc-reserve-cap)))
     (gc-overhead-setup!)
     ;; The hook itself is target-specific, so it goes through the adapter
     ;; (sa-gc-install-after-collect!): this file is portable and the natives that
@@ -647,6 +680,7 @@
       (set! gc-live-after-full (sa-bytes-allocated))
       (set! gc-log? (jolt-env-flag? "JOLT_GC_LOG"))
       (jolt-gc-stall-setup!)
+      (set! gc-raise-after-rendezvous? (sa-gc-install-after-rendezvous! jolt-after-collection!))
       (unless (sa-gc-install-after-collect!
                 (lambda (collect-full!)
                   ;; The live baseline the nursery bound and the old-generation
@@ -694,7 +728,10 @@
 ;; stack to most of the machine before overflowing. With no ceiling at all
 ;; (JOLT_MAX_HEAP=off) it is 80% of RLIMIT_AS if that is finite, else of
 ;; RLIMIT_DATA, else of physical RAM. Applied to each thread's stack
-;; separately, as Guile's is per thread.
+;; separately, as Guile's is per thread. Under a ceiling, the limit in force is
+;; also never more than 80% of the room the ceiling leaves the stack
+;; (jolt-stack-limit-in-force): in a process already holding much of its ceiling,
+;; a recursion otherwise met the ceiling first, as an OutOfMemoryError.
 ;;
 ;; The default follows the ceiling actually in force whichever is installed
 ;; first: jolt-install-gc-policy! tells the stack limit when it sets or drops
@@ -718,14 +755,16 @@
 ;; On Windows neither getrlimit nor sysconf is there, so there is no default
 ;; and the stack is unbounded unless JOLT_STACK_LIMIT sets one.
 (define jolt-stack-limit-bytes #f)       ; #f = no limit (or not installed)
+(define jolt-stack-floor-bytes 0)        ; RLIMIT_STACK, read when a limit is set (jolt-stack-limit-for)
 (define jolt-stack-limit-defaulted? #f)  ; the limit is the default, not the env's
 (define (jolt-stack-limit) jolt-stack-limit-bytes)
 ;; N bytes, or #f for none. Without the hook nothing would enforce a limit, so
 ;; then it reads back as none rather than as one that is not there.
 (define (jolt-stack-limit-set! n)
+  (set! jolt-stack-floor-bytes (or (jolt-rlimit-bytes 'stack) 0))
   (set! jolt-stack-limit-defaulted? #f)
   (set! jolt-stack-limit-bytes
-    (and n (sa-gc-install-after-rendezvous! jolt-stack-check!) n)))
+    (and n (sa-gc-install-after-rendezvous! jolt-after-collection!) n)))
 ;; "-1", "0", "off", "none" (any case) -> 'off; digits with an optional k/m/g suffix -> bytes; anything else #f.
 (define (jolt-stack-limit-parse v)
   (let* ((t (string-downcase v))
@@ -768,6 +807,7 @@
        (guard (e (#t #f))
          (let ((code (case resource
                        ((data) 2)
+                       ((stack) 3)
                        ((as) (if (eq? (sa-os-family) 'macos) 5 9))
                        (else #f)))
                (buf (make-bytevector 16 0)))
@@ -813,12 +853,63 @@
 ;; StackOverflowError inside it, which the walk's guard swallows, leaving the
 ;; first with no trace.
 (define jolt-stack-overflowing (make-thread-parameter #f))
+;; A FAILED MEASUREMENT is not an overflow. The hook runs at a safe point of whatever the thread was
+;; doing, so a raise out of the measuring would land in that computation: a fiber that threw out of
+;; it answered nothing to the take waiting on its channel (Datahike's background gc hung one run in
+;; ten with `car: false is not a pair` raised here: 5 runs of 40 with the hook, 0 of 40 with
+;; JOLT_STACK_LIMIT=-1). The measurement is a heuristic whose contract already has "cannot measure"
+;; (sa-current-stack-bytes answers #f), so a failure of it is that: the check enforces nothing this
+;; time, and the failure is KEPT -- count, condition and the frames it was raised in -- for
+;; (jolt-stack-check-failure) and jolt.host/stack-check-failure, so it is read, not lost.
+;; The StackOverflowError below is the one raise the hook exists for and is outside the guard.
+(define jolt-stack-check-failure #f)    ; (count . "condition, frames") of the latest, or #f
+(define (jolt-stack-check-failed! c)
+  (set! jolt-stack-check-failure
+    (cons (fx+ 1 (if jolt-stack-check-failure (car jolt-stack-check-failure) 0))
+          (guard (e (#t "unprintable"))
+            (call-with-string-output-port
+              (lambda (p)
+                (display-condition c p)
+                (when (continuation-condition? c)
+                  (let loop ((o (inspect/object (condition-continuation c))) (n 0))
+                    (when (and o (< n 24) (eq? (o 'type) 'continuation))
+                      (let ((nm (guard (e (#t #f)) ((o 'code) 'name))))
+                        (display "\n  " p) (display (or nm "?") p))
+                      (loop (guard (e (#t #f)) (o 'link)) (fx+ n 1))))))))))
+  #f)
+;; The limit in force for a stack of N bytes: the configured one, and never more than 80% of the
+;; room the heap ceiling leaves this stack (the ceiling less what else is live). 80% of the whole
+;; ceiling cannot be reached in a process whose live heap is already a fifth of it, and there the
+;; recursion met the ceiling first, as an OutOfMemoryError whose continuation is the overflowed
+;; stack: a caught one kept (a test report) held the heap at the ceiling (a Seon agent's test
+;; child, 2026-10-28: 1.3 GB live of a 2.4 GB ceiling). What else is live is read from the last
+;; full collection (gc-live-after-full, less this stack), never more than the heap now: this check
+;; runs after a young pass, before the policy's full one, when the heap still holds old garbage
+;; that would make the room look smaller than it is and overflow a recursion that fits.
+;; Never under the stack the OS gives a thread (RLIMIT_STACK): with the heap at its ceiling the room
+;; is nothing, and a limit of 0 threw StackOverflowError from a loop a few frames deep, where the
+;; error is the heap's (the ceiling's OutOfMemoryError test, 1 run in 5). Read when a limit is set,
+;; never in the hook: the check runs at any safe point of any thread, and a first read there is a
+;; foreign call that takes the FFI's locks, which another thread may hold (forkheldlocks hung).
+(define (jolt-stack-floor) jolt-stack-floor-bytes)
+(define (jolt-stack-limit-for limit n ceiling other-live floor)
+  (if ceiling
+      (let ((other (max 0 (- other-live n))))
+        (min limit (max floor (quotient (* 4 (max 0 (- ceiling other))) 5))))
+      limit))
+(define (jolt-stack-limit-in-force limit n)
+  (jolt-stack-limit-for limit n jolt-heap-ceiling-bytes (min (sa-bytes-allocated) gc-live-after-full)
+                        (jolt-stack-floor)))
 (define (jolt-stack-check!)
   (let ((limit jolt-stack-limit-bytes))
-    (when (and limit (fx=? 0 (jolt-locks-held)) (not (jolt-stack-overflowing)))
-      (let ((n (sa-current-stack-bytes)))
-        (when (and n (> n limit))
-          (jolt-stack-overflow! limit))))))
+    (when limit
+      (let ((n (guard (c (#t (jolt-stack-check-failed! c)))
+                 (and (fx=? 0 (jolt-locks-held)) (not (jolt-stack-overflowing))
+                      (sa-current-stack-bytes)))))
+        (when n
+          (let ((in-force (jolt-stack-limit-in-force limit n)))
+            (when (> n in-force)
+              (jolt-stack-overflow! in-force))))))))
 ;; The throwable's trace is resolved here, at the throw, and kept as frames
 ;; rather than as the continuation (rt.ss jolt-remember-throw! keeps a k for
 ;; every other throwable): the continuation IS the overflowed stack, and a
@@ -905,20 +996,105 @@
     (set! gc-live-after-full (sa-bytes-allocated))
     (set! gc-total-stuck? (> (sa-total-memory-bytes) hard))
     (when (> (sa-bytes-allocated) hard)
-      (error 'jolt
+      (gc-raise-after!
              (string-append
                "out of memory: the heap ceiling of "
                (number->string hard)
                " bytes was exceeded (live "
                (number->string (sa-bytes-allocated))
                "). Raise or disable it with JOLT_MAX_HEAP=<n>[k|m|g] or "
-               "JOLT_MAX_HEAP=off."))))
+               "JOLT_MAX_HEAP=off.")
+             ;; what holds it, from one more full collection with the per-type counts on: only the
+             ;; collection that decides the error pays for them, and in place like the one before
+             (sa-with-object-counts (lambda () (collect-full! (max 0 (- hard (sa-bytes-allocated)))))
+                                    gc-histogram-top))))
   (gc-fit-reserve! hard)
   (let ((pressure (+ (sa-total-memory-bytes) (sa-bytes-allocated))))
     (cond ((and (not gc-tight?) (> pressure hard))
            (set! gc-tight? #t) (sa-gc-tight! hard))
           ((and gc-tight? (< pressure (quotient (* 3 hard) 4)))
            (set! gc-tight? #f) (sa-gc-tight! #f)))))
+;; --- a policy's error is raised after the collection ----------------------------
+;; The ceiling's and the overhead limit's OutOfMemoryError are decided in the collect-request
+;; handler, which runs inside the collection's rendezvous: the thread running it holds Chez's
+;; thread-context mutex with interrupts off. A raise there runs the handlers that act before anything
+;; unwinds (a fiber's report, a channel's close, a timer's cancel), and they take Jolt's locks. One
+;; held by a thread that its own collect-safe pause had converted, and that waits for the
+;; thread-context mutex to come back from it, stopped both for good (a Seon agent's test child,
+;; 2026-10-28). So the handler records the error, as a signal handler records its signal, and the
+;; thread that ran it raises it after the rendezvous, at the safe point the stack check raises from
+;; (jolt-after-collection!), with that mutex released and interrupts on: the same safe point the
+;; handler raised from, so under a counted lock too, as it always was (waiting those out, as the stack
+;; check does, left a thread allocating under one of the runtime's mutexes collecting at the ceiling
+;; for good). Not while it builds an overflow's trace: that thread's next collection raises it. One
+;; error is kept, the latest. A target with no rendezvous hook raises it in the handler, as before.
+;; --- what holds the heap: the histogram an OutOfMemoryError carries ------------------------------
+;; The ceiling's error says how much was live, never what. So the collection that decides it is followed
+;; by one more with Chez's per-type object counts on (sa-with-object-counts, only then), and the error
+;; carries the top types by bytes as its data, :jolt/heap, the way the JVM's HeapDumpOnOutOfMemoryError
+;; leaves a dump: {:live :static :dynamic :ceiling :top [{:type :count :bytes :gens} ...]}, bytes
+;; descending, :gens a map of generation to bytes. jolt.host/heap-histogram answers the same shape on
+;; demand.
+(define gc-histogram-top 20)
+(define (heap-histogram->jolt h)
+  (let ((m (lambda (kvs) (jolt-hash-map-build kvs)))
+        (kw (lambda (n) (keyword #f n))))
+    ;; live as the census read it (sa-with-object-counts' fourth), never read again here: an OOM's error is built after the
+    ;; collection, and the heap read then held what the failing loop allocated since
+    (m (list (kw "live") (if (pair? (cdddr h)) (cadddr h) (sa-bytes-allocated))
+             (kw "static") (sa-static-bytes)
+             (kw "dynamic") (car h)
+             (kw "ceiling") (or jolt-heap-ceiling-bytes jolt-nil)
+             (kw "top")
+             (apply jolt-vector
+                    (map (lambda (e)
+                           (m (list (kw "type") (car e)
+                                    (kw "count") (cadr e)
+                                    (kw "bytes") (caddr e)
+                                    (kw "gens") (m (apply append
+                                                          (map (lambda (g) (list (car g) (cddr g)))
+                                                               (cadddr e)))))))
+                         (caddr h)))))))
+;; The histogram on demand: one full collection with the counts on.
+(define (jolt-heap-histogram n)
+  (heap-histogram->jolt (sa-with-object-counts sa-gc-collect n)))
+
+(define gc-raise-after-rendezvous? #f)
+(define gc-pending-raise #f)              ; (thread-id message . histogram) the handler recorded, or #f
+(define (gc-raise-after! msg . hist)
+  (if gc-raise-after-rendezvous?
+      (set! gc-pending-raise (cons (get-thread-id) (cons msg (and (pair? hist) (car hist)))))
+      (error 'jolt msg)))
+(define (jolt-gc-raise-pending!)
+  (let ((p gc-pending-raise))
+    (when (and p (eqv? (car p) (get-thread-id)) (not (jolt-stack-overflowing)))
+      (set! gc-pending-raise #f)
+      (if (cddr p)
+          ;; the same class host-faults.ss gives the message, with the data. Its capture is set (to no
+          ;; frames) so the throw keeps no continuation on it, as the stack overflow's: the continuation
+          ;; holds the heap that filled, and a caught error holding it left the ceiling raising again
+          (let ((t (make-jolt-ex-info-record "java.lang.OutOfMemoryError" (cadr p) jolt-nil
+                                             (jolt-hash-map-build (list (keyword "jolt" "heap") (heap-histogram->jolt (cddr p)))) 0)))
+            (jolt-ex-info-record-capture-set! t (cons 'resolved '()))
+            (jolt-throw t))
+          (error 'jolt (cadr p))))))
+;; After each collection, on each thread that took part (sa-gc-install-after-rendezvous!): the
+;; policy's pending error, the stack check, then the spawned fibers collected with an error
+;; nobody read (jolt-fibers-collected!).
+(define (jolt-after-collection!)
+  (jolt-gc-raise-pending!)
+  (jolt-stack-check!)
+  (jolt-fibers-collected!))
+;; Report the spawned fibers collected with an error nobody read (fibers.ss
+;; jolt-fiber-unread-drain!). Run after the rendezvous above, and after a collection the program
+;; asked for (jolt-collect-full!), which with one thread active collects at once and passes no
+;; rendezvous. The reporter is fibers-async.ss's, called only for a fiber it watched, so never
+;; before that file is loaded. The drain is the collector's work (sa-collector-work): what it
+;; allocates (its lock's winders, the list of fibers taken) is not counted to the thread a
+;; collection happened to run on, so a call that collects reads the same bytes as one that does not.
+(define (jolt-fibers-collected!) (sa-collector-work jolt-fibers-collected-now!))
+(define (jolt-fibers-collected-now!)
+  (jolt-fiber-unread-drain! (lambda (e) (jolt-fiber-report-unread! e))))
 ;; --- the GC overhead limit ----------------------------------------------------
 ;; The JVM's answer to a heap that fits but only just (UseGCOverheadLimit, on by
 ;; default; G1CollectedHeap::update_gc_overhead_counter in the JDK): after each
@@ -956,7 +1132,7 @@
           (set! gc-overhead-count 0))
       (when (>= gc-overhead-count gc-overhead-threshold)
         (set! gc-overhead-count 0)
-        (error 'jolt
+        (gc-raise-after!
                (string-append
                  "out of memory: GC overhead limit exceeded: "
                  (number->string (exact (round (* 100 gc-share-long))))
@@ -969,10 +1145,16 @@
 (define gc-total-stuck? #f)                ; the last forced full left the total over
 ;; Keep only the free memory that fits: half the room over the heap in use, as a
 ;; ratio of it, never more than Chez's own 1:1.
+;; The free memory a full collection keeps is at most JOLT_MAX_HEAP_FREE_RATIO's
+;; share of the heap, as -XX:MaxHeapFreeRatio bounds the JVM's: P% free is
+;; P/(100-P) of the memory in use, 1x at the default 50 (Chez's own 1.0). Under
+;; a ceiling it is fitted to the room left, and never over that bound: fitted
+;; alone, a 1.2GB-live process under a 4GB ceiling kept 1x, 300-450MB free.
+(define (gc-reserve-cap) (/ gc-free-ratio (- 100 gc-free-ratio)))
 (define (gc-fit-reserve! hard) (gc-fit-reserve-to! hard (sa-bytes-allocated)))
 (define (gc-fit-reserve-to! hard used)
   (let ((used (max 1 used)))
-    (sa-gc-reserve-ratio! (max 0 (min 1 (/ (max 0 (- hard used)) (* 2 used)))))))
+    (sa-gc-reserve-ratio! (max 0 (min (gc-reserve-cap) (/ (max 0 (- hard used)) (* 2 used)))))))
 
 ;; --- the nursery ---------------------------------------------------------------
 ;; How much a program allocates between two collections (the trip threshold)
@@ -990,9 +1172,10 @@
 ;;     collection is 1/(1+N), 10%. Above it the nursery doubles; under a quarter of
 ;;     it the nursery halves back.
 ;;   JOLT_MAX_HEAP_FREE_RATIO=P (-XX:MaxHeapFreeRatio, default 50): at most P% of
-;;     the heap may be nursery headroom over the live data -- the heap live after
-;;     the last full collection -- so the nursery grows to live*P/(100-P), 1x the
-;;     live set by default. This is the footprint bound: a nursery is memory held
+;;     the heap is kept free after a full collection (gc-reserve-cap), and at most
+;;     P% may be nursery headroom over the live data -- the heap live after
+;;     the last full collection, less the static generation (gc-collectable) --
+;;     so the nursery grows to live*P/(100-P), 1x the live set by default. This is the footprint bound: a nursery is memory held
 ;;     on top of the program's data, and without it a loop with 40MB live ran in
 ;;     1.4GB for a 1.4x speedup (the JVM, which bounds its young generation by
 ;;     pause time instead, ran the same loop in 4.1GB).
@@ -1060,11 +1243,12 @@
         (max gc-room-min (quotient (max 0 (- c (sa-bytes-allocated))) 4))
         gc-trip-cap)))
 (define (gc-max-trip) (min gc-trip-cap (gc-room-cap)))
-;; The footprint bound: live * P/(100-P), within [floor, cap].
+;; The footprint bound: live * P/(100-P), within [floor, cap], where live is the
+;; heap the collector can collect (gc-collectable).
 (define (gc-trip-limit)
   (min (gc-max-trip)
        (max gc-trip-floor
-            (quotient (* gc-live-after-full gc-free-ratio) (- 100 gc-free-ratio)))))
+            (quotient (* (gc-collectable gc-live-after-full) gc-free-ratio) (- 100 gc-free-ratio)))))
 ;; Growth past the bound is a bet that a bigger window lets more die young, and
 ;; it does not always pay: a program whose working set spans the window copies
 ;; more the bigger it is (writ's prover: 10.6ms a young collection at 256MB, 105ms
@@ -1151,9 +1335,9 @@
 ;; live passed 12GB allocated between collections. It happened at the fixed 16MB
 ;; too, only slower -- writ's examples ran at 7.7GB resident for ~100MB of data.
 ;; So the old generations are also collected by HEAP GROWTH, the rule Go's GOGC
-;; and the JVM's occupancy trigger use: once the heap is more than twice what was
-;; live after the last full collection (and 64MB past it, so a tiny heap does not
-;; collect constantly), collect everything and measure again. The footprint is
+;; and the JVM's occupancy trigger use: once the collectable heap is more than
+;; twice what was live after the last full collection (and 64MB past it, so a tiny
+;; heap does not collect constantly), collect everything and measure again. The footprint is
 ;; then bounded by the program's own live data, whatever the nursery.
 ;;
 ;; "Twice" is where it starts, not a constant. A full collection copies all the
@@ -1165,6 +1349,18 @@
 ;; the allowance grows by half, up to 8x live, and below a quarter of it shrinks
 ;; back toward 2x. A program with little churn keeps the tight bound.
 (define gc-live-after-full 0)
+;; The nursery bound and the growth allowance are headroom for garbage, so they
+;; are sized from the heap the collector can collect: the live bytes less the
+;; static generation (sa-static-bytes), which is never collected or copied. It
+;; holds the boot image in every process (~70MB of a hello world's 73MB) and
+;; whatever a program made static itself; a server that moves its preloaded data
+;; there before forking (~430MB of 432MB live) grew a 400MB nursery for 30MB of
+;; collectable data, and its growth allowance did not fire until 870MB. Static
+;; data only grows, by promoting what was live, so subtracting today's figure
+;; from a live set measured earlier is right whichever came first. The heap
+;; ceiling still bounds the total, static included: that is memory the process
+;; holds.
+(define (gc-collectable live) (max 0 (- live (sa-static-bytes))))
 (define gc-live-measured? #f)
 (define gc-full-this-time #f)
 (define gc-full-ms-this-time 0)
@@ -1173,19 +1369,28 @@
 ;; A full collection asked for by the program (System/gc, Runtime.gc,
 ;; jolt.host/gc-full!) measures the live set as the policy's own do, so what the
 ;; heap may grow by afterwards is sized from it rather than from whatever was live
-;; at the policy's last full one. Raises what sa-gc-collect raises.
-(define (jolt-collect-full!)
-  (sa-gc-collect)
+;; at the policy's last full one, then reports the fibers it collected with an error nobody
+;; read (jolt-fibers-collected!). Raises what sa-gc-collect raises.
+;; The measuring is the collector's work too (sa-collector-work): none of it is counted
+;; to the thread that asked.
+(define (jolt-collect-full!) (sa-collector-work jolt-collect-full-now!) (jolt-fibers-collected!))
+(define (jolt-collect-full-now!)
+  (sa-gc-collect-now)
   (set! gc-live-after-full (sa-bytes-allocated)))
+;; System.gc and Runtime.gc: a hint, which never throws. The guard is inside the uncounted
+;; extent, so what it allocates is not the caller's either.
+(define (jolt-collect-full-hint!) (sa-collector-work jolt-collect-full-hint-now!) (jolt-fibers-collected!))
+(define (jolt-collect-full-hint-now!) (guard (e (#t #f)) (jolt-collect-full-now!)))
 ;; How far the heap may grow past the live set before the older generations are
 ;; collected: garbage promoted before then stays, so work that holds nothing can
 ;; raise the footprint by up to this (jolt.host/gc-old-growth-bytes).
 (define (gc-old-growth-limit live)
   (max (exact (floor (* gc-old-factor live))) (+ live (* 64 1024 1024))))
-(define (gc-old-growth-bytes) (- (gc-old-growth-limit gc-live-after-full) gc-live-after-full))
+(define (gc-old-growth-bytes)
+  (let ((live (gc-collectable gc-live-after-full))) (- (gc-old-growth-limit live) live)))
 (define (gc-collect-old-when-grown! collect-full!)
   (let ((live gc-live-after-full))
-    (when (> (sa-bytes-allocated) (gc-old-growth-limit live))
+    (when (> (gc-collectable (sa-bytes-allocated)) (gc-old-growth-limit (gc-collectable live)))
       (let ((t0 (sa-real-time-ms)))
         ;; tight (in place) when a second copy of the live data would not fit
         ;; under a heap ceiling, as for the ceiling's own collections
@@ -1703,7 +1908,7 @@
 ;; backtrace path where a lock would be pointless anyway. One mutex for all four
 ;; because one registration writes up to four of them and they are never read
 ;; under it.
-(define jolt-callsite-mu (make-mutex))
+(define-process-local jolt-callsite-mu (make-mutex))
 ;; Membership is answered by a companion index, not by scanning the list being
 ;; built. jolt-tail-entries is keyed by CALLEE, so its list is every tail site
 ;; that reaches one function: (member entry cur) made registering n of them cost
@@ -1738,6 +1943,23 @@
         (when tail?
           (jolt-table-add! jolt-tail-exits fqn (cons line callee))
           (jolt-table-add! jolt-tail-entries callee (cons fqn line)))))
+  jolt-nil)
+;; A def's registrations as ONE quoted table (the back end's trace-callsite-reg):
+;; a vector of groups, one per traced fn, each #("ns/f" line "callee" tail? line
+;; "callee" tail? ...). Registering is the same call per entry, in the same order,
+;; so the tables hold exactly what one jolt-register-callsite! per entry made;
+;; what changes is the emitted code, which is one call and one constant per def
+;; instead of a call (and its return point's inspector data) per call site.
+(define (jolt-register-callsites! groups)
+  (let ((ng (vector-length groups)))
+    (let gloop ((g 0))
+      (when (fx<? g ng)
+        (let* ((v (vector-ref groups g)) (n (vector-length v)) (fqn (vector-ref v 0)))
+          (let eloop ((i 1))
+            (when (fx<? i n)
+              (jolt-register-callsite! fqn (vector-ref v i) (vector-ref v (fx+ i 1)) (vector-ref v (fx+ i 2)))
+              (eloop (fx+ i 3)))))
+        (gloop (fx+ g 1)))))
   jolt-nil)
 ;; The lines of a fn's dynamic tail calls, or '().
 (define (jolt-callsite-dynamic-tail-lines fqn)
@@ -1880,7 +2102,7 @@
 ;; unsaved buffer) and not the file on disk. A load of the file from disk
 ;; forgets it (loader.ss load-jolt-file*): the disk is what that compiled.
 (define jolt-eval-source-texts (make-hashtable string-hash string=?))
-(define jolt-eval-text-mutex (make-mutex))
+(define-process-local jolt-eval-text-mutex (make-mutex)) ; merge: upstream's new lock, made process-local as ours are (16d668c5)
 (define (jolt-eval-source-text-set! path text)
   (jolt-with-mutex jolt-eval-text-mutex (hashtable-set! jolt-eval-source-texts path text)))
 (define (jolt-eval-source-text-forget! path)
@@ -1893,7 +2115,7 @@
 ;; wrapper -> the raise it wraps, so the uncaught report and the raise-time
 ;; position records describe the throw itself, as clojure.main's report does.
 (define jolt-load-wrap-origins (make-weak-eq-hashtable))
-(define jolt-load-wrap-mutex (make-mutex))
+(define-process-local jolt-load-wrap-mutex (make-mutex)) ; merge: upstream's new lock, made process-local as ours are (16d668c5)
 (define (jolt-load-wrap-origin raw)
   (let ((v (jolt-unwrap-throw raw)))
     (or (and (jolt-ex-info-record? v)
@@ -2057,12 +2279,50 @@
 ;; Var.threadBound, and the whole reason a var read is not O(binding depth). See
 ;; dyn-binding.ss, which owns it; it lives here because it has to be a field for
 ;; the same reason meta and macro? are.
+;;
+;; root, watches and validator are Clojure's Var.root and ARef's watches and validator,
+;; all three volatile on the JVM, and ordered here as volatiles are: each is stored with
+;; a store-release and read with a load-acquire, and the watches move by a sequentially
+;; consistent CAS (var-cell-watches-cas!). A def stores the root and then reads the
+;; watches; an add-watch CASes the watches and then its caller reads the root; an stlr
+;; or a CAS then an ldar of another location is not reordered, so the two never both
+;; miss (atoms.ss def-var!, the varwatchorder gate). watches is an immutable alist,
+;; '() when unwatched; validator is jolt-nil when there is none. Macros, so a var read
+;; stays an inline load; a value that is not a var-cell goes to the plain accessor for
+;; its error.
 (define-record-type var-cell
-  (fields ns name (mutable root) (mutable defined?) (mutable meta) (mutable macro?)
-          (mutable dyn-bound?) (mutable dynamic?))
-  (nongenerative var-cell-v5))
+  (fields ns name (mutable root var-cell-root-plain var-cell-root-plain-set!)
+          (mutable defined?) (mutable meta) (mutable macro?)
+          (mutable dyn-bound?) (mutable dynamic?)
+          (mutable watches var-cell-watches-plain var-cell-watches-plain-set!)
+          (mutable validator var-cell-validator-plain var-cell-validator-plain-set!))
+  (nongenerative var-cell-v6))
+(define-syntax var-cell-ordered-ref
+  (syntax-rules ()
+    ((_ c i plain) (let ((x c)) (#%$record-ref-acquire (if (var-cell? x) x (plain x)) i)))))
+(define-syntax var-cell-ordered-set!
+  (syntax-rules ()
+    ((_ c i plain v) (let ((x c) (y v))
+                       (#%$record-set-release! (if (var-cell? x) x (plain x)) i y)))))
+(define-syntax var-cell-root
+  (syntax-rules () ((_ c) (var-cell-ordered-ref c 2 var-cell-root-plain))))
+(define-syntax var-cell-root-set!
+  (syntax-rules () ((_ c v) (var-cell-ordered-set! c 2 var-cell-root-plain v))))
+(define-syntax var-cell-watches
+  (syntax-rules () ((_ c) (var-cell-ordered-ref c 8 var-cell-watches-plain))))
+(define-syntax var-cell-validator
+  (syntax-rules () ((_ c) (var-cell-ordered-ref c 9 var-cell-validator-plain))))
+(define-syntax var-cell-validator-set!
+  (syntax-rules () ((_ c v) (var-cell-ordered-set! c 9 var-cell-validator-plain v))))
+;; a strong CAS of the watches: $record-ordered-cas! may refuse spuriously, so a
+;; refusal while the field still holds OLD is tried again (sa-record-cas!)
+(define (var-cell-watches-cas! c old new)
+  (let retry ()
+    (cond ((#%$record-ordered-cas! c 8 old new) #t)
+          ((eq? (var-cell-watches c) old) (retry))
+          (else #f))))
 (define var-table (make-hashtable string-hash string=?))
-(define var-table-mu (make-mutex))
+(define-process-local var-table-mu (make-mutex))
 ;; var-table-mu covers EVERY mutation of var-table and of ns-has-vars-set below
 ;; (jolt-var's insert, declare-var!'s insert, def-var!'s index write, remove-ns's
 ;; sweep in ns.ss, the gate harnesses' prune) and every WHOLE-TABLE scan
@@ -2135,7 +2395,7 @@
     (or (hashtable-ref var-table k #f)
         (jolt-with-mutex var-table-mu
           (or (hashtable-ref var-table k #f)
-              (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f #f #f #f #f)))
+              (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #f #f #f #f #f '() jolt-nil)))
                 (hashtable-set! var-table k c)
                 (ns-cells-add! c)
                 c))))))
@@ -2234,7 +2494,7 @@
 ;; later inside the collector naming nothing. Every read is cold — printing a fn's
 ;; arity name (seq.ss), the image walker (state-image.ss), the class arm
 ;; (java/host-class.ss) — so none of them can afford to skip it either.
-(define proc-name-mu (make-mutex))
+(define-process-local proc-name-mu (make-mutex))
 (define (proc-name-of v) (jolt-with-mutex proc-name-mu (hashtable-ref proc-name-tbl v #f)))
 ;; Name a procedure def-var! never saw. A core fn in VALUE position compiles to
 ;; the runtime's own procedure, not the var's root, and a native that is
@@ -2274,6 +2534,67 @@
     (hashtable-contains? var-redefined-set (string-append ns "/" name))))
 (define (var-redefined-clear!)
   (jolt-with-mutex var-table-mu (hashtable-clear! var-redefined-set)))
+;; --- a constant collection literal as one quoted datum -----------------------------
+;; The back end (backend_scheme.clj const-datum) writes a literal made only of
+;; constants as data this reads back, instead of the nested constructor calls
+;; that build it: each call is code plus a return point and its inspector data,
+;; the datum is a constant. A built value is what the constructors made, with the
+;; same constructor for the same shape:
+;;   Chez symbol "ns/name" or "name"  a keyword        ()  nil
+;;   #(v item ...)  vector   #(l item ...)  list   #(y ns name)  symbol
+;;   #(a k v ...)   amap-slots->pmap (an all-keyword-key map literal)
+;;   #(h k v ...)   jolt-hash-map    #(c k v ...)  jolt-hash-map-checked
+;;   #(t item ...)  jolt-hash-set    #(u item ...) jolt-hash-set-checked
+;; and a string, number or boolean is itself. A keyword symbol never has a "/" in
+;; its name without a namespace: the back end leaves such a literal as code.
+;; A def's constants made by a call over literal arguments, as one table (the back end's
+;; emit-with-scope): (jolt-consts n #(tag arg ... tag arg ...)), answered as a vector of
+;; the n constants in order. k ns name: keyword; v ns name: var cell (jolt-var); s ns name:
+;; seed root of a var; w, h, j, i, t: a fresh call-site cache cell of jolt-kw-site,
+;; jolt-host-site-make, jrec-field-site-make, jolt-instance-site-make, host-static-site-make.
+;; Each is the call the back end used to emit apiece, so the values are the same.
+(define (jolt-consts n tbl)
+  (let ((out (make-vector n)) (len (vector-length tbl)))
+    (let loop ((i 0) (j 0))
+      (when (fx<? i len)
+        (let ((tag (vector-ref tbl i)))
+          (case tag
+            ((k) (vector-set! out j (keyword (vector-ref tbl (fx+ i 1)) (vector-ref tbl (fx+ i 2)))) (loop (fx+ i 3) (fx+ j 1)))
+            ((v) (vector-set! out j (jolt-var (vector-ref tbl (fx+ i 1)) (vector-ref tbl (fx+ i 2)))) (loop (fx+ i 3) (fx+ j 1)))
+            ((s) (vector-set! out j (jolt-seed-root (jolt-var (vector-ref tbl (fx+ i 1)) (vector-ref tbl (fx+ i 2))))) (loop (fx+ i 3) (fx+ j 1)))
+            ((w) (vector-set! out j (jolt-kw-site)) (loop (fx+ i 1) (fx+ j 1)))
+            ((h) (vector-set! out j (jolt-host-site-make)) (loop (fx+ i 1) (fx+ j 1)))
+            ((j) (vector-set! out j (jrec-field-site-make)) (loop (fx+ i 1) (fx+ j 1)))
+            ((i) (vector-set! out j (jolt-instance-site-make)) (loop (fx+ i 1) (fx+ j 1)))
+            (else (vector-set! out j (host-static-site-make)) (loop (fx+ i 1) (fx+ j 1)))))))
+    out))
+(define (jolt-datum-kw s)
+  (let* ((str (symbol->string s)) (n (string-length str)))
+    (let loop ((i 0))
+      (cond ((fx=? i n) (keyword #f str))
+            ((char=? (string-ref str i) #\/)
+             (keyword (substring str 0 i) (substring str (fx+ i 1) n)))
+            (else (loop (fx+ i 1)))))))
+(define (jolt-datum d)
+  (cond
+    ((symbol? d) (jolt-datum-kw d))
+    ((vector? d)
+     (let* ((n (vector-length d)) (m (fx- n 1)) (out (make-vector m)))
+       (let loop ((i 1))
+         (when (fx<? i n)
+           (vector-set! out (fx- i 1) (jolt-datum (vector-ref d i)))
+           (loop (fx+ i 1))))
+       (case (vector-ref d 0)
+         ((v) (make-pvec out))
+         ((l) (apply jolt-list (vector->list out)))
+         ((a) (amap-slots->pmap out))
+         ((h) (apply jolt-hash-map (vector->list out)))
+         ((c) (apply jolt-hash-map-checked (vector->list out)))
+         ((t) (apply jolt-hash-set (vector->list out)))
+         ((u) (apply jolt-hash-set-checked (vector->list out)))
+         (else (jolt-symbol (vector-ref out 0) (vector-ref out 1))))))
+    ((null? d) jolt-nil)
+    (else d)))
 ;; --- one object per literal site, however many copies of it run ------------------
 ;; A literal that builds an object with identity -- a quoted list or symbol, a
 ;; regex, a constant collection literal -- is ONE object per source site on the
@@ -2285,7 +2606,7 @@
 ;; back end hoists the call, so it runs once per def load, not per evaluation.
 ;; Reads are unlocked (a single-key read of a strong table, as var-table).
 (define site-const-tbl (make-hashtable string-hash string=?))
-(define site-const-mu (make-mutex))
+(define-process-local site-const-mu (make-mutex))
 (define (jolt-site-const id make)
   (or (hashtable-ref site-const-tbl id #f)
       (let ((v (make)))
@@ -2311,15 +2632,29 @@
 ;; into a strong hashtable lose each other — see var-table above); the
 ;; single-key reads are unlocked for the reasons set out there.
 (define var-linked-tbl (make-eq-hashtable))
-(define var-linked-mu (make-mutex))
+(define-process-local var-linked-mu (make-mutex))
 ;; Called with the cell on every root write once something installs it: the
 ;; inline stash (host-contract.ss) drops a body stashed by a direct-linked REPL
 ;; form when its var is written again, since a caller compiled after that must
 ;; not splice the old body. #f until then, so a root write pays one test.
 (define var-root-write-hook #f)
 (define (set-var-root-write-hook! f) (set! var-root-write-hook f))
+;; The caller's own notice of a root write: jolt.host/*on-root-change*, a dynamic
+;; var (dyn-binding.ss defines it and sets this to its cell) bound to a jolt fn that
+;; is called with the var once its root is written. A binding conveys as any
+;; binding does, to the futures, go blocks, fibers and threads started inside it, so
+;; a REPL that binds it around an eval (jolt.host/on-root-change) notes everything
+;; the eval redefined, wherever it ran and whatever it came through (a def, load-
+;; string of a computed string, intern, alter-var-root). Unbound, a root write pays
+;; a test of this cell and of its dyn-bound? flag.
+(define jolt-on-root-change-cell #f)
 (define (var-root-set! c v)
   (when var-root-write-hook (var-root-write-hook c))
+  ;; the root this write replaces, read only while *on-root-change* is bound (its hook gets (f var old))
+  (let* ((cell jolt-on-root-change-cell)
+         (h (and cell (var-cell-dyn-bound? cell)
+                 (let ((h (dyn-binding-value cell))) (and (not (eq? h dyn-no-binding)) (not (jolt-nil? h)) h))))
+         (old (and h (var-cell-root c))))
   (let ((l (hashtable-ref var-linked-tbl c #f)))
     (if l
         ;; The cell and the binding are ONE value, so the two writes are one
@@ -2330,7 +2665,11 @@
         (jolt-with-mutex var-linked-mu
           (var-cell-root-set! c v)
           ((cdr l) v))
-        (var-cell-root-set! c v))))
+        (var-cell-root-set! c v)))
+  ;; after the write and outside the mutex, with the root it replaced; bound to nil while it runs, so a root it
+  ;; writes itself is not noted again
+  (when h
+    (dyn-with-frame (list (cons cell jolt-nil)) (lambda () (jolt-invoke2 h c old))))))
 ;; The jv$ symbol a linked var is bound under, or #f. jolt.host/seed-callable?
 ;; answers it so an app's direct call site applies the binding itself (the back end's
 ;; emit-invoke) rather than a root hoisted once at load.
@@ -2358,6 +2697,20 @@
           (((car ps) v) #t)
           (else (loop (cdr ps))))))
 
+;; A var's validator and watches, as ARef.validate and notifyWatches (the cell's
+;; fields, ordered as volatiles: see var-cell). var-notify is called after the root
+;; is stored: the watches' load-acquire follows the root's store-release, so a def
+;; and an add-watch-then-deref never both miss (the varwatchorder gate). No lock:
+;; none is needed for that order, and a def is not a read-modify-write.
+(define (var-validate c v)
+  (let ((vf (var-cell-validator c)))
+    (when (and (not (jolt-nil? vf)) (jolt-not (jolt-invoke1 vf v)))
+      (jolt-iref-state-throw))))
+(define (var-notify c old new)
+  (let ((ws (var-cell-watches c)))
+    (unless (null? ws)
+      (for-each (lambda (kv) (jolt-invoke4 (cdr kv) (car kv) c old new))
+                (reverse ws)))))
 (define (def-var! ns name v)
   ;; first def of a given proc wins, so an alias like (def inc' inc) — which binds
   ;; the SAME proc to a second var — doesn't rename inc.
@@ -2389,7 +2742,13 @@
     (when (not (jolt-var-unbound? (var-cell-root c)))
       (jolt-with-mutex var-table-mu
         (hashtable-set! var-redefined-set (string-append ns "/" name) #t)))
-    (var-root-set! c v) (var-cell-defined?-set! c #t) c))
+    ;; Var.bindRoot's order: validate, store the root, then read the watches and
+    ;; call them (atoms.ss var-notify, the varwatchorder gate)
+    (let ((old (var-cell-root c)))
+      (var-validate c v)
+      (var-root-set! c v) (var-cell-defined?-set! c #t)
+      (var-notify c old v)
+      c)))
 ;; A def whose form declared NO metadata. Same as def-var!, plus the half of the
 ;; :dynamic assignment def-var-with-meta! does from the other side: a def ASSIGNS
 ;; the flag from what it declared, so a plain (def *x* 2) over a
@@ -2624,7 +2983,68 @@
 ;; maximum minus the total at the reset; and the collector's trip threshold,
 ;; which bounds how far work that holds nothing can raise the footprint.
 (def-var! "jolt.host" "reset-maximum-memory-bytes!" (lambda () (sa-reset-max-memory-bytes!) jolt-nil))
+;; The heap by type, the shape an OutOfMemoryError carries as :jolt/heap (jolt-heap-histogram): FORCES ONE
+;; FULL COLLECTION with Chez's per-type object counts on, then answers {:live :static :dynamic :ceiling
+;; :top [{:type :count :bytes :gens}]} with the N types holding the most collectable bytes.
+(def-var! "jolt.host" "heap-histogram" (lambda (n) (jolt-heap-histogram n)))
 (def-var! "jolt.host" "gc-trip-bytes" (lambda () (sa-gc-trip-bytes)))
+;; --- the host, as the platform answers it ---------------------------------------------------------
+;; What differs between macOS and Linux lives here, behind one name each; a program that asks the
+;; host never branches on the platform itself.
+
+;; jolt.host/process-footprint-bytes: this process's memory as the platform CHARGES it, one call
+;; and no walk of the address space. macOS: task_info(TASK_VM_INFO)'s phys_footprint (what Activity
+;; Monitor and jetsam charge: private dirty pages, compressed ones included, never a page it only
+;; shares copy-on-write). Linux: the proportional set size of /proc/self/smaps_rollup (every page
+;; the process maps, a shared page divided among the processes mapping it). Both are per process:
+;; a forked child is charged what it touches, and its parent keeps its own. #f when the platform
+;; refuses (task_info's failure; no /proc).
+(define jolt-mach-task-self (and (eq? (sa-os-family) 'macos) (jolt-foreign-proc-safe "mach_task_self" '() 'unsigned-32)))
+(define jolt-task-info (and (eq? (sa-os-family) 'macos) (jolt-foreign-proc-safe "task_info" '(unsigned-32 int void* void*) 'int)))
+(define (jolt-process-footprint-bytes)
+  (case (sa-os-family)
+    ((macos)
+     (and jolt-task-info jolt-mach-task-self
+          (let ((buf (foreign-alloc 1024)) (cnt (foreign-alloc 4)))
+            (foreign-set! 'unsigned-32 cnt 0 256)
+            (let ((kr (jolt-task-info (jolt-mach-task-self) 22 buf cnt)))   ; TASK_VM_INFO
+              (let ((r (and (= kr 0) (>= (foreign-ref 'unsigned-32 cnt 0) 37)   ; REV1: phys_footprint @144
+                            (foreign-ref 'unsigned-64 buf 144))))
+                (foreign-free buf) (foreign-free cnt)
+                r)))))
+    ((linux)
+     (guard (e (#t #f))
+       (call-with-port (open-input-file "/proc/self/smaps_rollup")
+         (lambda (in)
+           (let loop ()
+             (let ((line (get-line in)))
+               (cond ((eof-object? line) #f)
+                     ((and (> (string-length line) 4) (string=? (substring line 0 4) "Pss:"))
+                      (let ((kb (string->number (let skip ((i 4)) (if (char=? (string-ref line i) #\space) (skip (+ i 1))
+                                                                       (let take ((j i)) (if (char-numeric? (string-ref line j)) (take (+ j 1)) (substring line i j))))))))
+                        (and kb (* kb 1024))))
+                     (else (loop)))))))))
+    (else #f)))
+(def-var! "jolt.host" "process-footprint-bytes" (lambda () (or (jolt-process-footprint-bytes) jolt-nil)))
+
+;; jolt.host/signal-number is exposed in java/concurrency.ss over upstream's jolt-signal-numbers.
+
+;; jolt.host/monotonic-ns and thread-cpu-ns: the clocks a profiler reads, by name. The monotonic
+;; clock is the one that does not count time asleep and is not set (macOS CLOCK_UPTIME_RAW,
+;; Linux CLOCK_MONOTONIC_RAW); thread-cpu-ns is the calling thread's CPU time (CLOCK_THREAD_CPUTIME_ID).
+;; Scheme code calls jolt-monotonic-ns and jolt-thread-cpu-ns directly.
+(define jolt-clock-nsec-np (and (eq? (sa-os-family) 'macos) (jolt-foreign-proc-safe "clock_gettime_nsec_np" '(int) 'unsigned-64)))
+(define jolt-clock-gettime (and (not (eq? (sa-os-family) 'macos)) (jolt-foreign-proc-safe "clock_gettime" '(int u8*) 'int)))
+(define (jolt-clock-ns macos-id linux-id)
+  (if jolt-clock-nsec-np
+      (jolt-clock-nsec-np macos-id)
+      (let ((bv (make-bytevector 16)))
+        (jolt-clock-gettime linux-id bv)
+        (+ (* 1000000000 (bytevector-u64-native-ref bv 0)) (bytevector-u64-native-ref bv 8)))))
+(define (jolt-monotonic-ns) (jolt-clock-ns 8 4))
+(define (jolt-thread-cpu-ns) (jolt-clock-ns 16 3))
+(def-var! "jolt.host" "monotonic-ns" (lambda () (jolt-monotonic-ns)))
+(def-var! "jolt.host" "thread-cpu-ns" (lambda () (jolt-thread-cpu-ns)))
 ;; and how far the older generations may grow past the live set before they are
 ;; collected (rt.ss gc-collect-old-when-grown!): the rest of that bound.
 (def-var! "jolt.host" "gc-old-growth-bytes" (lambda () (gc-old-growth-bytes)))
@@ -2636,8 +3056,8 @@
 ;; lacks the binding, and only a caller that actually asks for a thread id should
 ;; fail there rather than the whole runtime failing to load.
 (def-var! "jolt.host" "thread-id" (lambda () (get-thread-id)))
-;; Whether the runtime has left its single-threaded lazy path (values.ss
-;; jolt-mt?): #t once a second thread could run jolt code, never #f again. A gate
+;; Whether the runtime has left its single-threaded lazy path (locks.ss
+;; jolt-mt?): #t once a second thread or any fiber could run jolt code, never #f again. A gate
 ;; reads it to pin that a program which starts no thread of its own keeps the
 ;; cheap path.
 (def-var! "jolt.host" "multi-threaded?" (lambda () jolt-mt?))
@@ -2729,7 +3149,7 @@
           (let ((c (hashtable-ref var-table k #f)))
             (if c
                 (begin (var-cell-defined?-set! c #t) c)
-                (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t #f #f #f #f)))  ; declared => interned/resolvable
+                (let ((c (make-var-cell ns name (make-jolt-var-unbound ns name) #t #f #f #f #f '() jolt-nil)))  ; declared => interned/resolvable
                   (hashtable-set! var-table k c)
                   (ns-cells-add! c)
                   c)))))))
@@ -3048,7 +3468,7 @@
 ;; coarse clock cannot hand out one seed twice.
 (define random-seeded? (make-thread-parameter #f))
 (define random-seed-counter 0)
-(define random-seed-mutex (make-mutex))
+(define-process-local random-seed-mutex (make-mutex))
 
 (define (seed-random!)
   (let* ((t (current-time 'time-utc))
@@ -3390,7 +3810,7 @@
 ;; loaded after its callee was redefined at a REPL (same source, so the same
 ;; cache entry) thus never runs the body the cache was compiled against.
 (define jolt-inline-marks (make-weak-eq-hashtable))
-(define jolt-inline-marks-mu (make-mutex))
+(define-process-local jolt-inline-marks-mu (make-mutex))
 (define jolt-inline-no-root (string #\nul))
 (define (jolt-inline-mark! v token)
   (jolt-with-mutex jolt-inline-marks-mu
@@ -3650,7 +4070,7 @@
 ;; var-cell or to the jrec base, or a reordered one, would read the wrong slot
 ;; with no type test to catch it. Check every number against a built instance
 ;; as the runtime loads, so a layout change fails the boot naming this place.
-(let ((c (make-var-cell 'ns 'name 'root #f #f #f 'dyn #f))
+(let ((c (make-var-cell 'ns 'name 'root #f #f #f 'dyn #f '() jolt-nil))
       (r (make-jrec2 'desc 'ext 0 'meta 'f0 'f1))
       (s (make-jrec* 'desc 'ext 0 'meta (vector 'v0)))
       (fail (lambda (what)

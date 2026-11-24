@@ -38,6 +38,9 @@
 
 ;; A waiter handler whose wake is fiber f — the fiber-wake strategy.
 (define (jolt-fiber-waiter f) (alt-handler-alloc f))
+;; a forked child's parent fibers' waits (fibers.ss jolt-fibers-forget-the-parents!): their handlers taken off.
+;; Set here, not in async.ss: fibers.ss loads after async.ss and its define would reset it.
+(set! jolt-fiber-retire-wait! (lambda (h) (when (alt-handler? h) (alt-handler-active?-set! h #f))))
 
 ;; ac-try-give!/locked can THROW — a nil value, or a transducer step raising — and
 ;; this path holds the channel mutex BY HAND, because it has to be able to release
@@ -179,33 +182,38 @@
 ;; read in fibers.ss (host setter jolt-fiber-carrier-count-set! for tests);
 ;; jolt-fiber-ensure-carrier! starts it at the first :fiber go spawn.
 
-;; (jolt-fiber-go-spawn thunk) -> buffered(1) channel. Conveys the parent's
-;; dynamic slice (sa-fiber-spawn reads the spawner's bindings; *txn* is never
-;; conveyed — a child spawned inside a dosync cannot join the parent's txn,
-;; the same rule async-go-spawn-thread enforces for threads).
-(define (jolt-fiber-go-spawn thunk)
-  (let ((w (ac-make 1 'fixed #f)))
-    (go-chan-register! w)                     ; before the spawn — see async.ss
-    (sa-fiber-spawn
-     (lambda ()
-       (*txn* #f)
-       (let ((r (guard (e (#t (cons #f e))) (cons #t (jolt-invoke thunk)))))
-         (if (car r)
-             (when (not (jolt-nil? (cdr r))) (jolt-async-give w (cdr r)))
-             (begin
-               (async-report-uncaught! "go/fiber body (channel closed)" (cdr r))
-               ;; Record it on the FIBER as well as on the channel. This guard is
-               ;; what keeps a throwing body from killing the fiber, which is
-               ;; right — the channel still has to be closed — but it also means
-               ;; the fiber reaches jolt-fiber-done! looking like a success, and
-               ;; a gate asking the fiber directly would read the failure as a
-               ;; clean run. The sm backend (sm.ss jolt-sm-drive) reaches
-               ;; jolt-fiber-dead! instead, which sets the same field.
-               (jolt-fiber-error-set! (jolt-current-fiber) (cdr r))))
-         ;; closes w, after publishing the outcome to the channel's monitors
-         (go-chan-finish! w (and (not (car r)) (cdr r))))))
-    (jolt-fiber-ensure-carrier!)
-    w))
+;; (jolt-fiber-go-spawn thunk site) -> buffered(1) channel; site is where it was
+;; spawned (the fiber record's site field): the "ns:line" a go form passes, else
+;; thunk. Conveys the parent's dynamic slice (sa-fiber-spawn reads the spawner's
+;; bindings; *txn* is never conveyed — a child spawned inside a dosync cannot join
+;; the parent's txn, the same rule async-go-spawn-thread enforces for threads).
+(define jolt-fiber-go-spawn
+  (case-lambda
+    ((thunk) (jolt-fiber-go-spawn thunk thunk))
+    ((thunk site)
+      (let ((w (ac-make 1 'fixed #f)))
+        (go-chan-register! w)                     ; before the spawn — see async.ss
+        (jolt-fiber-spawn-at
+         (lambda ()
+           (*txn* #f)
+           (let ((r (guard (e (#t (cons #f e))) (cons #t (jolt-invoke thunk)))))
+             (if (car r)
+                 (when (not (jolt-nil? (cdr r))) (jolt-async-give w (cdr r)))
+                 (begin
+                   (async-report-uncaught! "go/fiber body (channel closed)" (cdr r))
+                   ;; Record it on the FIBER as well as on the channel. This guard is
+                   ;; what keeps a throwing body from killing the fiber, which is
+                   ;; right — the channel still has to be closed — but it also means
+                   ;; the fiber reaches jolt-fiber-done! looking like a success, and
+                   ;; a gate asking the fiber directly would read the failure as a
+                   ;; clean run. The sm backend (sm.ss jolt-sm-drive) reaches
+                   ;; jolt-fiber-dead! instead, which sets the same field.
+                   (jolt-fiber-error-set! (jolt-current-fiber) (cdr r))))
+             ;; closes w, after publishing the outcome to the channel's monitors
+             (go-chan-finish! w (and (not (car r)) (cdr r)))))
+         site)
+        (jolt-fiber-ensure-carrier!)
+        w))))
 
 ;; Monitoring a go block is backend-neutral and lives with the go surface in
 ;; async.ss (go-chan-register! / go-chan-finish! / the go-monitor var). It
@@ -311,9 +319,9 @@
 ;; thread block. The one difference between the pairs is interruption: <!! / >!!
 ;; answer .interrupt with InterruptedException on either kind of waiter, as a
 ;; JVM thread blocked in them does, and <! / >! do not (async.ss ac-intr-wait!).
-(cca-def! "<!" (lambda (ch) (if (jolt-current-fiber) (jolt-fiber-<! ch) (jolt-async-take ch))))
+(cca-def! "<!" (lambda (ch) (let ((ch (jolt-async-port ch))) (if (jolt-current-fiber) (jolt-fiber-<! ch) (jolt-async-take ch)))))
 (cca-def! ">!" (lambda (ch v) (if (jolt-current-fiber) (jolt-fiber->! ch v) (jolt-async-give ch v))))
-(cca-def! "<!!" (lambda (ch) (if (jolt-current-fiber) (jolt-fiber-<!* ch #t) (jolt-async-take!! ch))))
+(cca-def! "<!!" (lambda (ch) (let ((ch (jolt-async-port ch))) (if (jolt-current-fiber) (jolt-fiber-<!* ch #t) (jolt-async-take!! ch)))))
 (cca-def! ">!!" (lambda (ch v) (if (jolt-current-fiber) (jolt-fiber->!* ch v #t) (jolt-async-give!! ch v))))
 
 ;; (fiber-execute runnable) -> nil. Run RUNNABLE on a fiber and forget it: no
@@ -330,14 +338,7 @@
 ;; same arguments.
 (define (async-fiber-execute r)
   (let ((thunk (runnable->thunk r)))
-    (sa-fiber-spawn
-     (lambda ()
-       (*txn* #f)
-       (guard (e (#t (async-report-uncaught! "fiber-execute task" e)))
-         (jolt-invoke thunk))))
-    ;; a carrier may not exist yet on the very first spawn (fiber-spawn's own
-    ;; postlude does this too) — without it the fiber sits ready and unrun.
-    (jolt-fiber-ensure-carrier!)
+    (async-callback-execute (lambda () (jolt-invoke thunk)) thunk)
     jolt-nil))
 (cca-def! "fiber-execute" async-fiber-execute)
 
@@ -398,12 +399,58 @@
       (enable-interrupts)
       (jolt-fiber-check-interrupt! f))))
 (def-var! "jolt.host" "fiber-resume" sa-fiber-resume)
+;; (jolt.host/fiber-dump): every live fiber, what it is parked on and its frames, as text
+;; (fibers.ss, jolt-fiber-dump). SIGINFO (^T, kill -INFO) writes it to stderr at the next
+;; event check of a thread that takes the signal; a main carrier idle in its poller wakes for it.
+(def-var! "jolt.host" "fiber-dump"
+  (lambda () (let-values (((port text) (open-string-output-port))) (jolt-fiber-dump port) (text))))
+;; The dump goes to descriptor 2 as it is now, through one unbuffered port kept for the life of the
+;; process (a dropped file port is closed when collected, which would close descriptor 2): never the
+;; error port of the code the signal interrupted (an eval's capture), nor the port chosen at boot,
+;; which for a process started with its two streams on one pipe is stdout's, kept by every fork whose
+;; descriptor 2 was moved since (a Seon agent's dumps went to its root's log, 2026-10-28).
+;; the dump file's name holds the pid: getpid(2) of the dump's own (process.ss's is a lazy shim, which a
+;; file loaded at boot does not name)
+(define jolt-dump-getpid (jolt-foreign-proc-safe "getpid" '() 'int))
+(define jolt-dump-port #f)
+(define (jolt-dump-port!)
+  (or jolt-dump-port
+      (begin (set! jolt-dump-port (standard-error-port (buffer-mode none) (native-transcoder)))
+             jolt-dump-port)))
+;; SIGINFO's dump: descriptor 2 and JOLT_DUMP_DIR. The shutdown watcher calls it from its own thread
+;; (concurrency.ss, the signal blocked in every thread jolt forks); Chez's handler below, at the main
+;; thread's next event check, only where no watcher took the signal (a forked child before it arms,
+;; an embedded runtime). The edge: a dump that fails says so on stderr, with its condition.
+(define (jolt-siginfo-dump!)
+      (let ((p (jolt-dump-port!)))
+        (guard (e (#t (fprintf p "jolt fiber dump failed: ~a~%"
+                               (if (condition? e) (call-with-string-output-port (lambda (p) (display-condition e p))) e))))
+          (jolt-fiber-dump p #t)
+          (flush-output-port p)
+          ;; JOLT_DUMP_DIR: the dump also goes to <dir>/dump-<pid>.txt, appended, for a process whose
+          ;; descriptor 2 is a pipe to its parent (a forked test child), where stderr's copy is lost
+          (let ((dir (getenv "JOLT_DUMP_DIR")))
+            (when (and dir (not (string=? dir "")))
+              (let ((fp (open-file-output-port (format "~a/dump-~a.txt" dir (jolt-dump-getpid))
+                                               (file-options no-fail no-truncate append)
+                                               (buffer-mode block) (native-transcoder))))
+                (jolt-fiber-dump fp #f)
+                (close-port fp)))))))
+(when (eq? (sa-os-family) 'macos)
+  (register-signal-handler 29 (lambda (sig) (jolt-siginfo-dump!))))
 ;; The interrupt's throwable is a jolt value, raised as a throw would raise it,
 ;; so the fiber's own try/catch sees exactly what the caller passed.
 (def-var! "jolt.host" "fiber-interrupt!"
   (lambda (fib throwable) (if (jolt-fiber-interrupt! fib throwable) #t #f)))
+;; A fiber its killer ended is not reported unread (jolt-fiber-watch-unread!): the
+;; killer chose that end and holds the fiber, as Java reports no ThreadDeath. Cleared
+;; only when the kill lands (true); interrupt! leaves the mark, since the fiber may
+;; catch it, and one that dies of it is reported, as an exception leaving a run is.
 (def-var! "jolt.host" "fiber-kill!"
-  (lambda (fib throwable) (if (jolt-fiber-kill! fib throwable) #t #f)))
+  (lambda (fib throwable)
+    (if (jolt-fiber-kill! fib throwable)
+        (begin (jolt-fiber-unread-set! fib #f) #t)
+        #f)))
 (def-var! "jolt.host" "fiber-masked" (lambda (f) (jolt-fiber-masked (lambda () (jolt-invoke f)))))
 (def-var! "jolt.host" "fiber-unmasked" (lambda (f) (jolt-fiber-unmasked (lambda () (jolt-invoke f)))))
 ;; Unguarded full collect for the R8 gate: System/gc swallows Chez's
@@ -420,11 +467,37 @@
 ;; monitors fired), which is exactly what join/monitor! read. The raw park
 ;; protocol (fiber-park-commit!/fiber-to-scheduler!) stays out of the public
 ;; namespace — its commit/switch discipline belongs to the poller.
+;; Its error is the caller's to read, so a fiber collected with it unread is
+;; reported (jolt-fiber-watch-unread!).
 (def-var! "jolt.host" "fiber-spawn"
   (lambda (f)
-    (let ((fib (sa-fiber-spawn (lambda () (*txn* #f) (jolt-invoke f)))))
+    (let ((fib (jolt-fiber-spawn-at (lambda () (*txn* #f) (jolt-invoke f)) f)))
+      (jolt-fiber-watch-unread! fib)
       (jolt-fiber-ensure-carrier!)
       fib)))
+;; A spawned fiber's error that nobody read is reported when the fiber is collected
+;; (fibers.ss jolt-fiber-unread-drain!), where every other uncaught throw goes. The
+;; drain runs after each collection (rt.ss jolt-after-collection!), so the first
+;; watch makes sure that hook is installed: a run with no stack limit and no heap
+;; policy installs none. A target with no collection rendezvous to hook answers #f,
+;; and there an unread error goes unreported, as before.
+;;
+;; The install happens once, under jolt-fiber-unread-mu: two threads' first spawns
+;; at once would otherwise both enter it, and its own test of whether the
+;; rendezvous is already wrapped is unlocked too, so the rendezvous could be
+;; wrapped twice and the hook run twice a collection, for good. Every spawn after
+;; the first reads the flag alone. The other installs (rt.ss jolt-install-gc-
+;; policy!, jolt-stack-limit-set!) run only at startup, on the one thread.
+(define jolt-fiber-unread-hooked? #f)
+(define (jolt-fiber-watch-unread! fib)
+  (unless jolt-fiber-unread-hooked?
+    (jolt-with-mutex jolt-fiber-unread-mu
+      (unless jolt-fiber-unread-hooked?
+        (sa-gc-install-after-rendezvous! jolt-after-collection!)
+        (set! jolt-fiber-unread-hooked? #t))))
+  (jolt-fiber-unread-watch! fib))
+(define (jolt-fiber-report-unread! e)
+  (async-report-uncaught! "fiber whose error was never read" e))
 ;; Pools besides the default (fibers.ss, jolt-fiber-pool-make). A spawn into a
 ;; pool is fiber-spawn with the carrier taken from the pool; nil back means the
 ;; pool is shut down, which jolt.fibers/spawn reports.
@@ -441,16 +514,19 @@
   (lambda (fib) (or (jolt-fiber-pool-of fib) jolt-nil)))
 (def-var! "jolt.host" "fiber-pool-spawn"
   (lambda (p f)
-    (or (jolt-fiber-pool-spawn p (lambda () (*txn* #f) (jolt-invoke f)))
-        jolt-nil)))
+    (let ((fib (jolt-fiber-pool-spawn p (lambda () (*txn* #f) (jolt-invoke f)) f)))
+      (if fib (begin (jolt-fiber-watch-unread! fib) fib) jolt-nil))))
 (def-var! "jolt.host" "fiber-pool-shutdown!"
   (lambda (p) (jolt-fiber-pool-shutdown! p) jolt-nil))
 (def-var! "jolt.host" "fiber-instance?" (lambda (x) (if (jolt-fiber? x) #t #f)))
 (def-var! "jolt.host" "fiber-yield" (lambda () (sa-fiber-yield) jolt-nil))
 ;; The callback gets what a jolt catch would bind: the unwrapped error for a
-;; fiber that died, nil for a clean completion.
+;; fiber that died, nil for a clean completion. Registering reads the fiber's
+;; outcome (join comes through here too), so its error is not reported unread:
+;; the callback is handed it, exactly once.
 (def-var! "jolt.host" "fiber-monitor!"
   (lambda (fib cb)
+    (jolt-fiber-unread-set! fib #f)
     (jolt-fiber-monitor! fib
       (lambda (err) (jolt-invoke cb (if err (jolt-unwrap-throw err) jolt-nil))))
     jolt-nil))
@@ -474,6 +550,19 @@
 ;; seq, or nil for none (fibers.ss jolt-fiber-live).
 (def-var! "jolt.host" "fiber-live"
   (lambda () (list->cseq (jolt-fiber-live))))
+;; (jolt.host/fiber-cost f) -> [ticks bytes cpu-ns]: what fiber f's dispatches have run so far, summed
+;; by the drain loop (fibers.ss jolt-fiber-drain!): its engine ticks, the bytes it allocated and the CPU
+;; time it took. CPU time counts C (foreign calls, the collector's copying) that ticks never do.
+;; (jolt.host/foreign-lookups) -> {name count}: each foreign-procedure evaluation's lookup by name since the
+;; process started (our Chez, c/foreign.c S_foreign_lookups), or nil on a Chez without the counter. A name
+;; whose count grows with its calls is resolved per call: a dlsym walk over every loaded object each time.
+(def-var! "jolt.host" "foreign-lookups"
+  (lambda ()
+    (if jolt-foreign-lookups-proc
+        (fold-left (lambda (m e) (jolt-assoc m (car e) (cdr e))) (jolt-hash-map) (jolt-foreign-lookups-proc))
+        jolt-nil)))
+(def-var! "jolt.host" "fiber-cost"
+  (lambda (f) (jolt-vector (jolt-fiber-ticks f) (jolt-fiber-bytes f) (jolt-fiber-cpu-ns f))))
 (def-var! "jolt.host" "fiber-state"
   (lambda (fib) (jolt-keyword (symbol->string (jolt-fiber-state fib)))))
 ;; Meaningful only once the fiber is terminal — join reads it from inside the
@@ -506,3 +595,290 @@
                                     (jolt-keyword "given") (if n n jolt-nil)))))
       (jolt-fiber-preempt-ticks-set! n)
       jolt-nil)))
+
+;; --- the one thread a fork may run beside none of ----------------------------------
+;; (jolt-active-threads), called with Chez's $tc-mutex held: the threads running Scheme, as a fork that
+;; must be the only one reads them. Under our Chez's lock-free activation a thread in a collect-safe
+;; call stays counted in $active-threads until a converter deactivates it, and every reader converts
+;; first (thread.c, S_convert_native_threads: collect and compute-size-increments do); one that read
+;; the count bare saw a thread parked in a read as running, and a fork waiting for 1 waited for good
+;; (forkheldlocks on our Chez) or refused (seon.lib/fork!). Converting also sends that thread's return
+;; through the tc mutex the forker holds, so it cannot start running Scheme beside the fork. On a Chez
+;; without the entry the count needs no conversion.
+(define jolt-convert-native-threads
+  (if (foreign-entry? "(cs)convert_native_threads")
+      (foreign-procedure "(cs)convert_native_threads" () iptr)
+      (lambda () 0)))
+(define (jolt-active-threads)
+  (jolt-convert-native-threads)
+  (#%$top-level-value '$active-threads))
+
+;; --- a process fork's child ------------------------------------------------------
+;; fork(2) copies the calling thread only. Every thread jolt started (the fiber
+;; carriers, the timer, the shutdown watcher) is gone in the child, but its
+;; bookkeeping is copied: the carrier vector and started? flag, timeout-running?,
+;; the armed box, the live-thread and name tables. The child then believes its
+;; runtime threads exist: a go spawn is placed on a carrier no thread drains and
+;; parks forever, a deadline never fires, and SIGTERM (blocked in every jolt thread
+;; for the watcher's sigwait) stays pending. (jolt-after-fork-child!) is the
+;; pthread_atfork child rule for that bookkeeping: called by the forking code in
+;; the child, first, it drops what names a dead thread, so the pool, the timer and
+;; the watcher start afresh on first use. It starts NO thread: a child that forks
+;; again (a double fork) must still be the one thread it was. So the parent's
+;; pending deadlines are dropped (their waiters were the parent's; any fiber parked
+;; on one in the child is gone with its carrier), the watcher is disarmed, and the
+;; child's mask is emptied, the default mask jolt gives every child it spawns
+;; (jolt-with-empty-sigmask); a child of an armed process then arms its own watcher
+;; (jolt-rearm-after-fork!). The process's locks are made afresh (locks.ss, define-process-local):
+;; one held at the fork by a thread the fork did not copy is held by nobody here.
+;; Pools made with jolt-fiber-pool-make are not restarted: their carriers are gone
+;; too, and a spawn onto one parks; a forking program makes them after the fork.
+(define jolt-after-fork-hooks '())   ; jolt.host/after-fork-add!: (thunk ...), newest first
+;; The reset runs with interrupts disabled, whatever its caller did: a timer or a signal taken
+;; partway would run the scheduler over bookkeeping that is half the parent's.
+(define (jolt-after-fork-child!)
+  (disable-interrupts)
+  (jolt-after-fork-child!*)
+  (enable-interrupts))
+;; A child of an armed process arms its own watcher (concurrency.ss jolt-arm-shutdown!), once it
+;; runs with interrupts on: the parent's watcher thread is not copied by fork(2), so without one the
+;; child's SIGINFO dump waits for an event check (an agent's 0-byte dumps, flow 2026-11-15) and its
+;; SIGTERM ends it by the signal's default (a parent reads "signal 15" where it now reads "exit 143").
+(define jolt-rearm-after-fork #f)
+(define (jolt-rearm-after-fork!)
+  (when jolt-rearm-after-fork
+    (set! jolt-rearm-after-fork #f)
+    (jolt-arm-shutdown!)))
+(define (jolt-after-fork-child!*)
+  ;; the child collects only below what it inherited (sa-gc-below-inherited!): its parent's oldest
+  ;; generation is never traced or copied here, so its pages stay shared with the parent
+  (sa-gc-below-inherited!)
+  ;; the process's locks are made afresh before anything here takes one (locks.ss,
+  ;; define-process-local): a thread fork(2) did not copy may hold one at the fork instant without
+  ;; counting as active, as the timer thread whose timed wait fired holds timeout-mu while it waits
+  ;; to rejoin the active threads (a Seon agent's test child, 2026-10-27)
+  (jolt-process-locals-remake!)
+  ;; the objects' monitors are made afresh too, which the locks above do not reach (concurrency.ss)
+  (monitor-reset-after-fork!)
+  ;; all asleep (locks.ss): the child is its one thread, waiting on nothing, and its detector is
+  ;; the parent's (not forked)
+  (hashtable-clear! jolt-asleep-ids)
+  (hashtable-clear! jolt-asleep-on)
+  (set! jolt-boot-thread-id (get-thread-id))
+  (set! jolt-asleep-det-id #f)
+  (hashtable-clear! jolt-asleep-told)
+  (set! jolt-asleep-det-pending #f)
+  (set-box! jolt-asleep-det-started #f)
+  (set! jolt-asleep-said #f)
+  ;; the quiescence handler is the parent's (it closes over the parent's socket and state): a child starts with none
+  ;; and sets its own (fibers.ss jolt-on-quiescent!)
+  (set! jolt-quiescent-handler #f)
+  (set! jolt-quiescent-told #f)
+  (set! jolt-quiescent-notices 0)
+  (set! jolt-quiescent-last-answer #f)
+  (set! jolt-quiescent-last-error #f)
+  (let ((self (get-thread-id)))
+    (if jolt-main-thread
+        ;; a main-carrier program forked from inside its own fiber: the child keeps carrier 0
+        ;; and the loop beneath it (both on this one thread's stack), and, as fork(2) keeps
+        ;; only the calling thread, only the calling fiber: the queue is emptied, and a
+        ;; fiber parked in the parent is never resumed here
+        (let ((c (vector-ref jolt-fiber-carriers 0)))
+          (set! jolt-main-thread self)
+          (jolt-fibers-forget-the-parents!)
+          (jolt-carrier-head-set! c #f)
+          (jolt-carrier-tail-set! c #f))
+        (begin
+          (jolt-fibers-forget-the-parents!)
+          (set! jolt-fiber-carriers #f)
+          (set! jolt-fiber-rr 0)
+          (set! jolt-fiber-pool-started? #f)))
+    ;; MERGE-REVIEW(deep-fixes): upstream d2daa30d (slice 1) runs futures on a cached solo pool
+    ;; (concurrency.ss solo-pool) instead of a thread each; its workers are threads fork(2) did not
+    ;; copy, so a child's future would be handed to a parked worker that does not exist (shell's sh
+    ;; reads a child's pipes with futures). Added, not in either side: the child forgets the
+    ;; parent's pool, so its first future makes a fresh one (as cf-default-pool below would need if
+    ;; it is a thread pool: check). Gate: fork-child-test with a future in the child.
+    (set! solo-pool #f)
+    (jolt-with-mutex live-threads-mutex
+      (vector-for-each (lambda (id) (unless (eqv? id self) (hashtable-delete! live-threads id)))
+                       (hashtable-keys live-threads))
+      (hashtable-clear! thread-daemons))
+    (jolt-with-mutex thread-handles-mutex
+      (vector-for-each (lambda (id) (unless (eqv? id self) (hashtable-delete! thread-names-by-id id)))
+                       (hashtable-keys thread-names-by-id)))
+    (jolt-with-mutex timeout-mu
+      (vector-fill! timeout-heap #f)
+      (set! timeout-heap-n 0)
+      (set! timeout-heap-dead 0)
+      (set! timeout-running? #f))
+    (when (unbox jolt-shutdown-armed)
+      (set-box! jolt-shutdown-armed #f)
+      ;; armed again once the child runs (jolt-rearm-after-fork!): its own watcher thread
+      (set! jolt-rearm-after-fork #t)
+      (when jolt-empty-sigset
+        (let ((old (sa-foreign-alloc 128)))
+          (c-pthread-sigmask jolt-sig-setmask-how jolt-empty-sigset old)
+          (sa-foreign-free old))))
+    ;; the parent's shutdown hooks are the parent's: a child that exits runs only the ones it
+    ;; registers itself, once (a Seon root's hook stops root, and every fork of root ran that stop
+    ;; on its copy of root's state, against the shared store, at its own exit)
+    (jolt-with-mutex jolt-shutdown-mutex
+      (set-box! jolt-shutdown-hooks '())
+      (set-box! jolt-shutdown-ran #f))
+    ;; MERGE-REVIEW(deep-fixes): upstream 27766677/2bb457aa (slice 4) runs File.deleteOnExit's
+    ;; paths on every exit that runs the shutdown hooks; a child holds the parent's list, and
+    ;; would delete the parent's files at its own exit. Added, by the same rule as the hooks
+    ;; above (the parent's are the parent's): the child starts with none. Check the names and
+    ;; whether the list's lock is one of the process locals. Gate: fork-child-test.
+    (set-box! jolt-delete-on-exit-paths '())
+    (set-box! jolt-delete-on-exit-taken #f)
+    (hashtable-clear! jolt-delete-on-exit-seen)
+    ;; the poller's kqueue and thread are not inherited by fork: its table starts afresh, and
+    ;; the child's first wait sets it up for the child (a thread, or a main carrier's rounds).
+    ;; Without it, every child of a process whose poller had run waited on a dead kqueue
+    (when jolt-io-after-fork (jolt-io-after-fork))
+    ;; then the hooks a library registered for what it holds across a fork (jolt.async.remote
+    ;; closes the ends it inherited), oldest first
+    (for-each (lambda (h) (h)) (reverse jolt-after-fork-hooks))))
+(def-var! "jolt.host" "after-fork-child!" (lambda () (jolt-after-fork-child!) (jolt-rearm-after-fork!) jolt-nil))
+;; (jolt.host/collect-ceiling) -> the deepest generation this process collects (sa-gc-top): Chez's maximum in a
+;; process no fork made, one less at each level of forks (a child never collects what it inherited)
+(def-var! "jolt.host" "collect-ceiling" (lambda () (sa-gc-top)))
+;; (jolt.host/gc-generations! n) -> n: Chez's maximum generation, raised by a program whose processes fork
+;; several levels deep (each level collects one generation less), before its first fork
+(def-var! "jolt.host" "gc-generations!" (lambda (n) (collect-maximum-generation (jnum->exact n)) n))
+;; (jolt.host/fork-alone ms) -> the child's pid in the parent, 0 in the child, -3 when no other
+;; thread parked within ms. The one way to fork a jolt process. A fork beside a
+;; thread running Scheme gives the child that thread's half-done work, so Chez's fork_alone waits,
+;; under the tc mutex, for every other thread to park (in a wait or a collect-safe call), woken by
+;; each one that does, its one clock the caller's bound, and forks then: a thread that had just woken this one
+;; (the timer delivering, a carrier) is still finishing its turn for a moment, and the fork used to
+;; refuse beside it (3 in 100 right after a timeout; an agent clone's "cannot fork"). A thread that
+;; never parks is one no fork is safe beside: the bound ends that wait, and fork-holders names it.
+;; Interrupts stay disabled across it, and the child resets itself (jolt-after-fork-child!) BEFORE
+;; they return: a caller that enabled them first let a preemption switch the child to the scheduler
+;; over the parent's run queue, which ran the parent's ready fibers in the child (a Seon root's
+;; agents, 2026-11-10). The foreign entries are made at the first call, so loading this file asks
+;; nothing of a platform without fork(2).
+(define jolt-fork-alone
+  (let ((fork-alone #f))
+    (lambda (bound-ms)
+      (unless fork-alone (set! fork-alone (foreign-procedure "(cs)fork_alone" (iptr) int)))
+      (disable-interrupts)
+      (let ((pid (fork-alone bound-ms)))
+        (when (= pid 0) (jolt-after-fork-child!))
+        (enable-interrupts)
+        (when (= pid 0) (jolt-rearm-after-fork!))
+        pid))))
+;; (jolt.host/fork-alone ms): every fork states its bound; -3 when no other thread has parked within ms, and
+;; (jolt.host/fork-holders) then names who held it. There is no unbounded wait.
+(def-var! "jolt.host" "fork-alone" (lambda (ms) (jolt-fork-alone (jnum->exact ms))))
+;; (jolt.host/fork-holders) -> [{:id n :name s} ...]: the threads other than this one that hold a fork now (Chez
+;; fork_hold_state: active, running Scheme or in a C call that is not collect-safe), what a fork's bound names
+(define jolt-fork-holders
+  (let ((hold-state #f))
+    (lambda ()
+      (unless hold-state (set! hold-state (foreign-procedure "(cs)fork_hold_state" (scheme-object) int)))
+      (let ((me (get-thread-id)) (k-id (keyword #f "id")) (k-name (keyword #f "name")))
+        (let loop ((ts (#%$thread-list)) (acc '()))
+          (if (null? ts)
+              (apply jolt-vector (reverse acc))
+              (let* ((t (car ts)) (tc (#%$thread-tc t))
+                     (id (and (not (eq? tc 0)) (#%$tc-field (quote threadno) tc))))
+                (if (and id (not (eqv? id me)) (= 1 (hold-state t)))
+                    (loop (cdr ts) (cons (jolt-hash-map k-id id k-name (jolt-thread-name id)) acc))
+                    (loop (cdr ts) acc)))))))))
+(def-var! "jolt.host" "fork-holders" (lambda () (jolt-fork-holders)))
+;; (jolt.host/fiber-pump!): this fiber is a remote end's pump: never told a deadlock, not counted by a
+;; quiescence check (its record's pump field). (jolt.host/on-quiescent! f): f, or nil, hears a main
+;; carrier's quiescence with the dump (fibers.ss jolt-quiescent?).
+(def-var! "jolt.host" "fiber-pump!" (lambda () (jolt-fiber-mark-pump!) jolt-nil))
+(def-var! "jolt.host" "on-quiescent!" (lambda (f) (jolt-on-quiescent! (if (jolt-nil? f) #f f)) jolt-nil))
+;; (jolt.host/after-fork-add! f): f, a fn of no arguments, runs in every forked child that calls
+;; after-fork-child!, after the runtime has reset itself. For a library's own state across a fork
+(def-var! "jolt.host" "after-fork-add!"
+  (lambda (f) (set! jolt-after-fork-hooks (cons (lambda () (jolt-invoke f)) jolt-after-fork-hooks)) jolt-nil))
+
+;; The main carrier (fibers.ss): this process's fibers, timers and I/O on its one thread.
+(def-var! "jolt.host" "main-carrier-run!" (lambda (f) (jolt-main-carrier-run! (lambda () (jolt-invoke f)))))
+(def-var! "jolt.host" "main-carrier?" (lambda () (if jolt-main-thread #t #f)))
+;; jolt.io-poller's half: (f timeout-ms-or-nil) waits for readiness on this thread and
+;; answers true, or false when no descriptor is awaited; (wake) ends that wait from another thread;
+;; (leave), at the program's return, hands what is awaited to the poller's own thread
+(def-var! "jolt.host" "main-io-wait-set!"
+  (lambda (f wake leave)
+    (set! jolt-main-io-wait (lambda (ms) (jolt-truthy? (jolt-invoke f (if ms ms jolt-nil)))))
+    (set! jolt-main-io-wake (lambda () (jolt-invoke wake)))
+    (set! jolt-main-io-leave (lambda () (jolt-invoke leave)))
+    jolt-nil))
+;; all asleep on threads (locks.ss, fibers.ss jolt-asleep-check!): jolt.io-poller says whether a
+;; descriptor is awaited, and its thread's round is counted asleep while none is
+;; quiescence (fibers.ss jolt-quiescent?): jolt.io-poller says whether a fiber that is no pump waits on it
+(def-var! "jolt.host" "io-work-awaited-set!"
+  (lambda (f) (set! jolt-io-work-awaited (lambda () (jolt-truthy? (jolt-invoke f)))) jolt-nil))
+(def-var! "jolt.host" "fiber-pump?" (lambda (f) (and (jolt-fiber? f) (jolt-fiber-pump? f) #t)))
+(def-var! "jolt.host" "io-awaited-set!"
+  (lambda (f) (set! jolt-io-awaited (lambda () (jolt-truthy? (jolt-invoke f)))) jolt-nil))
+(def-var! "jolt.host" "asleep-while"
+  (lambda (f) (jolt-asleep-while #f #f (lambda () (jolt-invoke f)))))
+;; jolt.io-poller's reset of its table in a forked child, registered when it loads
+(def-var! "jolt.host" "io-after-fork-set!"
+  (lambda (f) (set! jolt-io-after-fork (lambda () (jolt-invoke f))) jolt-nil))
+
+;; (jolt.host/ticks) -> the engine ticks the running fiber, else this thread, has run
+;; (fibers.ss jolt-ticks: the count the timer keeps). The cost of a body is the
+;; difference of two reads around it; a budget (jolt.host/run-interruptible) reads
+;; the same count.
+(def-var! "jolt.host" "ticks" (lambda () (jolt-ticks)))
+;; (jolt.host/ticks-of thunk) -> the engine ticks (thunk) ran. The count advances only
+;; while the timer is armed (a budget, a fiber's quantum); with nothing armed, the
+;; measure arms one too far off ever to fire, counts itself open on the thread, and on
+;; every way out (a throw too) closes and disarms. Off a fiber only: on one the quantum is
+;; always armed.
+;; MERGE-REVIEW(deep-fixes): ours armed the measure with jolt-set-timer! and relied on our
+;; jolt-fiber-rearm-preempt! to keep it after a bounded run inside it; upstream 8620bef7
+;; removed rearm (the timer is ticks.ss's scheduler's). Chosen: the measure is a demand in
+;; the scheduler's preempt slot (off a fiber that slot is otherwise unused): solo it is the
+;; same jolt-set-timer!, and a run-interruptible inside it moves it into the state vector
+;; (jolt-tick-go-multi! keeps the remaining arm as the preempt demand) and back. A measure
+;; opened while another demand is armed (idle? false) stops counting if that demand ends
+;; inside it, as before. Gate: nested-budget-test's ticks-of cases.
+;; (jolt-measure thunk label) -> (values v ticks): thunk run in a measure, its value and the ticks it ran.
+;; The measure is a node #(parent ticks-box owner start label): the fibers its body spawns charge it
+;; (fibers.ss jolt-charge-lineage!), this context's own count adds it while it is open
+;; (jolt-own-lineage-ticks), and a fiber's dump names it, label and the ticks its owner has run since start
+;; (its own count at the open, jolt-fiber-own-ticks). A Flow step runs in one labelled [pid in-port]
+;; (flow impl), so a hung step's dump says which step and how long it has run.
+(define (jolt-measure thunk label)
+  (let* ((s (jolt-ticks-cell))
+         (off? (not (jolt-current-fiber)))
+         (idle? (and off? (fx=? 0 (vector-ref s 2))))
+         (f (jolt-current-fiber))
+         (node (vector (jolt-current-measure) (box 0) (or f (get-thread-id)) (and f (jolt-fiber-own-ticks f)) label))
+         (t0 #f)
+         (t1 #f))
+    (let ((v (dynamic-wind
+               (lambda ()
+                 (jolt-set-current-measure! node)
+                 ;; open on the thread whether or not it arms: the watch counts while a measure is open
+                 ;; (ticks.ss jolt-tick-watch-arm!), so a body outlasting an older arm is counted whole
+                 (when off? (vector-set! s 4 (fx+ (vector-ref s 4) 1)))
+                 (when idle? (jolt-tick-preempt! (most-positive-fixnum)))
+                 (unless t0 (set! t0 (jolt-ticks))))
+               thunk
+               (lambda ()
+                 ;; read before the node closes, so the count holds what its fibers ran
+                 (set! t1 (jolt-ticks))
+                 (jolt-set-current-measure! (vector-ref node 0))
+                 (when off?
+                   (vector-set! s 4 (fx- (vector-ref s 4) 1))
+                   ;; the last measure out disarms the arm it made and puts the thread's watch back
+                   (when (and idle? (fx=? 0 (vector-ref s 4))) (jolt-tick-preempt! 0) (jolt-tick-watch!)))))))
+      (values v (- t1 t0)))))
+(def-var! "jolt.host" "ticks-of"
+  (lambda (thunk) (let-values (((v n) (jolt-measure thunk #f))) n)))
+;; (jolt.host/measured label thunk) -> thunk's value, run in a measure labelled label (any value; the dump
+;; prints it): a step's scope, what the dump names while the step runs.
+(def-var! "jolt.host" "measured"
+  (lambda (label thunk) (let-values (((v n) (jolt-measure thunk label))) v)))

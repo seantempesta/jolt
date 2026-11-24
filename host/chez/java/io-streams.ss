@@ -25,7 +25,7 @@
 ;; program source in cli-core.ss. A second port on the same descriptor buffers
 ;; ahead on its own, and whichever read first would eat input the other never
 ;; sees. Memoized under a mutex for the same reason across threads.
-(define jolt-stdin-port-mu (make-mutex))
+(define-process-local jolt-stdin-port-mu (make-mutex))
 (define jolt-stdin-port-memo #f)
 (define (jolt-stdin-binary-port)
   (unless jolt-stdin-port-memo
@@ -158,7 +158,7 @@
 ;; has no port-length of its own, so it registers how to ask its file's size
 ;; here, the way Reader ports register a ready probe below.
 (define port-size-probes (make-weak-eq-hashtable))
-(define port-size-probes-mu (make-mutex))
+(define-process-local port-size-probes-mu (make-mutex))
 (define (port-size-probe! port size)
   (jolt-with-mutex port-size-probes-mu (hashtable-set! port-size-probes port size))
   port)
@@ -211,7 +211,7 @@
 ;; closure nothing outside can ask (input-port-ready? on one raises), so each
 ;; custom port jolt builds for a Reader registers how to ask it here.
 (define port-ready-probes (make-weak-eq-hashtable))
-(define port-ready-probes-mu (make-mutex))
+(define-process-local port-ready-probes-mu (make-mutex))
 (define (port-ready-probe! port probe)
   (jolt-with-mutex port-ready-probes-mu (hashtable-set! port-ready-probes port probe))
   port)
@@ -335,8 +335,15 @@
                              (n (in-stream-read-some! self port tmp 0 len)))
                         (if (eof-object? n) -1
                             (begin (ja-bv->bytes! tmp 0 buf off n) (->num n)))))))))))
-   (cons "readAllBytes" (lambda (self) (let ((bv (get-bytevector-all (in-stream-live-port self))))
-                                         (na-byte-array (if (eof-object? bv) (make-bytevector 0) bv)))))
+   ;; a port that knows its length and position (a ByteArrayInputStream's bytevector, a file) reads
+   ;; exactly what remains, once, into the array's own bytevector; get-bytevector-all grows chunks and
+   ;; joins them (7.2 KB to read 1.3 KB, konserve's every node read) and the array copied it again
+   (cons "readAllBytes" (lambda (self)
+                          (let* ((port (in-stream-live-port self))
+                                 (bv (if (and (port-has-port-position? port) (port-has-port-length? port))
+                                         (get-bytevector-n port (max 0 (- (port-length port) (port-position port))))
+                                         (get-bytevector-all port))))
+                            (make-jolt-array (if (eof-object? bv) (make-bytevector 0) bv) 'byte))))
    (cons "skip" (lambda (self n)
                   (let ((port (in-stream-live-port self)) (n (jnum->exact n)))
                     (or (in-stream-skip-on-channel! self port n)
@@ -1553,13 +1560,13 @@
   (open-path-guarded (if (pair? given) (car given) path) path
     (lambda (p)
       (make-char-reader (open-java-utf8-input-port
-                          (open-file-input-port p (file-options) (buffer-mode block))
+                          (jolt-open-file-input-port p (file-options) (buffer-mode block))
                           p)))))
 
 (reg-ctor! '("FileInputStream" "java.io.FileInputStream")
   (lambda (src . _)
     (open-file-guarded src
-      (lambda (p) (stream-classed! (make-in-stream (open-file-input-port p (file-options) (buffer-mode block)))
+      (lambda (p) (stream-classed! (make-in-stream (jolt-open-file-input-port p (file-options) (buffer-mode block)))
                                    "java.io.FileInputStream")))))
 (reg-ctor! '("FileOutputStream" "java.io.FileOutputStream")
   (lambda (src . rest)
@@ -1567,7 +1574,7 @@
       (open-file-guarded src
         (lambda (p)
           (stream-classed!
-            (make-out-stream (open-file-output-port p
+            (make-out-stream (jolt-open-file-output-port p
                                (if append? (file-options no-fail no-truncate append) (file-options no-fail))
                                (buffer-mode block)))
             "java.io.FileOutputStream"))))))
@@ -1846,35 +1853,251 @@
 ;; with-in-str is the only way to feed read-line. Both differences are supersets:
 ;; on the JVM, mixing the two loses input and redirecting read-line is impossible.
 ;;
-;; Waits in a nap, NOT inside the read. Chez's blocking read holds the whole
+;; Waits for readiness, NOT inside the read. Chez's blocking read holds the whole
 ;; Scheme world while it waits: no other thread runs at all, so a future stopped
 ;; ticking and an agent stopped draining the moment the main thread reached a
 ;; prompt, and the SIGTERM watcher (concurrency.ss) could not wake to run the
 ;; shutdown hooks either. On the JVM those all keep running while a thread sits in
-;; System.in.read(). The nap is collect-safe, so parking THERE and reading only
-;; once the port has something leaves every other thread alive (jolt-p9ua). Backs
-;; off 1ms -> 20ms, the shape proc-wait-blocking uses.
+;; System.in.read(). poll(2) on the port's descriptor with no timeout is the same
+;; wait without that hold: the call is collect-safe, so every other thread and the
+;; collector run while it blocks, and the kernel wakes it when input arrives,
+;; the descriptor hangs up, or a signal lands (jolt-p9ua). Nothing wakes in
+;; between, where the nap this replaced woke 50 times a second for as long as
+;; nothing came (an idle Seon root: ~67 context switches/s). A fiber parks on the
+;; descriptor with jolt.io-poller, the one mechanism jolt.socket and the process
+;; pipes use, and gives its carrier up. A signal is not input: EINTR polls again
+;; after the port is asked once more. Where there is no poll(2) (Windows) or no
+;; poller to park on, the old nap stands, backing off 1ms -> 20ms, the shape
+;; proc-wait-blocking uses.
 ;;
-;; Whether a port can answer input-port-ready? at all is settled ONCE per port
-;; rather than under a guard per line — the guard was most of the cost when this
-;; was measured. A port that cannot answer (a custom port, e.g. a pipe) reads the
-;; blocking way. input-port-ready? and not char-ready?, which is textual only.
+;; Whether a port can answer input-port-ready? at all, and which descriptor
+;; stands behind it, is settled ONCE per port rather than under a guard per line
+;; -- the guard was most of the cost when this was measured. A port that cannot
+;; answer (a custom port, e.g. a pipe) reads the blocking way. input-port-ready?
+;; and not char-ready?, which is textual only.
 (define jolt-stdin-poll-step0 1)              ; 1ms
 (define jolt-stdin-poll-step-max 20)          ; 20ms
-(define jolt-stdin-poll-port (box #f))        ; the port the answer below is about
+(define jolt-stdin-poll-port (box #f))        ; the port the answers below are about
 (define jolt-stdin-poll-ok (box #f))
+(define jolt-stdin-poll-fd (box #f))          ; its descriptor, or #f
+(define jolt-stdin-waits (box 0))             ; times a wait went to sleep: the work count
+(def-var! "jolt.host" "stdin-waits" (lambda () (unbox jolt-stdin-waits)))
+;; The host calls the stdin wait makes, and the poller bridge process.ss's pipe
+;; reads share. They live here, not in process.ss, because process.ss is lazy
+;; (rt.ss lazy-load) and this file may not name a lazy file's definitions
+;; (tools/lazy-shims-gen.ss, rule eager-ref); process.ss, loaded after this file,
+;; uses them by name.
+;; errno, to tell a waitpid that was merely interrupted (EINTR — retry) from one
+;; that can never succeed (ECHILD — the child is gone, retrying is an infinite
+;; loop). All three spellings of the location accessor: Darwin/BSD, glibc/musl,
+;; then bionic (Android — __errno_location does not exist there, and leaving it
+;; out reads every error as 0, so an EINTR retry never fires).
+(define proc-errno-loc
+  (or (jolt-foreign-proc-safe "__error" '() 'void*)
+      (jolt-foreign-proc-safe "__errno_location" '() 'void*)
+      (jolt-foreign-proc-safe "__errno" '() 'void*)))
+(define (proc-errno)
+  (if proc-errno-loc (guard (e (#t 0)) (sa-foreign-ref 'int (proc-errno-loc) 0)) 0))
+
+;; jolt.socket is the only thing in the tree that requires jolt.io-poller, so a
+;; program that drives subprocesses from fibers without ever touching a socket
+;; — a build-tool wrapper, a shell pipeline — would find wait-ready unbound and
+;; take the blocking fallback below, pinning its carrier: exactly the starvation
+;; this whole file's R8 extension exists to remove. Autoload the poller instead,
+;; at the one moment it is known to be needed, and only when there IS a fiber to
+;; park: a plain thread keeps the cheaper blocking read rather than paying a
+;; private kqueue/epoll per wait.
+;;
+;; Safe from inside a port read even though a load can park and can race another
+;; thread's: loader.ss's claim protocol owns both cases (ldr-begin-load! steps
+;; 2-3), and leaning on it rather than on a latch of our own is what makes the
+;; CONCURRENT case come out right. Two fibers on two carriers reach their first
+;; EAGAIN at once routinely -- it is the ordinary shape of "read several
+;; subprocesses from go blocks", the thing this whole extension is for. A
+;; boolean "already tried" latch set before the load would let the second fiber
+;; skip straight past it, find the var still unbound because the first is only
+;; part way through, and take the blocking fallback -- clearing O_NONBLOCK on
+;; its own fd for good, so that one port never parks again for the life of the
+;; process. Calling load-namespace instead makes the second fiber WAIT on the
+;; first's claim (fiber-aware, via jolt-lock-parked, so it parks rather than
+;; pinning), then find a fully built namespace. Already-loaded is a hashtable
+;; lookup, and we only get here when the var is unbound anyway.
+;;
+;; The one thing the loader cannot decide for us is a load that FAILS
+;; (jolt.io-poller off the source roots in a trimmed install): the loader rolls
+;; its own mark back on a throw, deliberately, so a retry can work. Nothing
+;; about the next EAGAIN will have changed, though, so record the failure here
+;; and stop asking.
+(define proc-poller-load-failed #f)
+(define (proc-poller-autoload!)
+  (unless proc-poller-load-failed
+    (guard (e (#t (set! proc-poller-load-failed #t) #f))
+      (load-namespace "jolt.io-poller"))))
+
+;; Bridge to jolt.io-poller/wait-ready: var-deref never throws for a
+;; missing var -- jolt-var auto-vivifies a jolt-var-unbound placeholder
+;; instead (rt.ss:662-669), checkable via the record type's own
+;; predicate. Off a fiber an unbound var stays unbound (see
+;; proc-poller-autoload! above for why the load is fiber-only) and this
+;; returns #f, so the caller falls back to a real blocking wait it
+;; implements itself (the EAGAIN branches in
+;; proc-fd-input-port/proc-fd-output-port below -- a bare 0-byte return
+;; there would misread as EOF, since the pipe fd is genuinely
+;; non-blocking by then). On a fiber the same #f is only reachable when
+;; the autoload itself failed.
+(define (proc-poller-wait-ready fd filt-kw)
+  (let* ((f0 (var-deref "jolt.io-poller" "wait-ready"))
+         (f (if (and (jolt-var-unbound? f0) (jolt-current-fiber))
+                (begin (proc-poller-autoload!)
+                       (var-deref "jolt.io-poller" "wait-ready"))
+                f0)))
+    (if (jolt-var-unbound? f)
+        #f
+        (begin (jolt-invoke2 f fd filt-kw) #t))))
+
+(define proc-c-pipe  (jolt-foreign-proc-safe "pipe"  '(void*) 'int))
+(define proc-c-close (jolt-foreign-proc-safe "close" '(int)   'int))
+(define proc-c-write (jolt-foreign-proc-blocking "write" '(int void* size_t) 'ssize_t))
+
+(define jolt-poll-fn (jolt-foreign-proc-blocking "poll" '(void* unsigned-long int) 'int))
+(define jolt-poll-eintr 4)
+;; --- opening a path whose open or reads may wait: a FIFO, a device -----------------
+;; Task jolt.host/a-blocking-call-on-a-main-carrier-parks. A FIFO's open waits for
+;; its other end, and its reads and writes for the other side; run in C on a main
+;; carrier, any of them holds the carrier, so no other fiber runs and the wait is
+;; invisible (an open of a FIFO nobody wrote held one 80 minutes, 2026-11-13). Every
+;; path-opening ctor opens through these two, which answer what open-file-input-port
+;; and open-file-output-port answer. A regular file, a missing path or a directory,
+;; and any open off a fiber, take that ordinary path unchanged (Chez's own open and
+;; reads are collect-safe, so a thread waiting there stops no collection:
+;; blockingopencollects). On a fiber, any other path's open, and each of its port's
+;; reads and writes, runs as a collect-safe call on an OS thread while the fiber parks
+;; on its answer (io-elsewhere). Not the poller: on macOS (27, measured) neither
+;; kqueue nor poll reports a FIFO's writer leaving, nor a writer that opens and closes
+;; having written nothing, where read answers EOF, so a read parked there would wait
+;; for good. The path is handed to C in foreign memory: a collect-safe call may see
+;; the collector move a Scheme string.
+(define io-O-WRONLY 1)
+(define io-O-CLOEXEC (if (eq? (sa-os-family) 'macos) #x1000000 #x80000))
+(define io-c-open-waits (jolt-foreign-proc-blocking-errno "open" '(void* int) 'int))
+(define (io-path-may-wait? p)
+  (and (string? p) io-c-open-waits (jolt-current-fiber)
+       (not (file-regular? p)) (file-exists? p) (not (file-directory? p))))
+;; THUNK's values, the C call it makes run on an OS thread while this fiber parks on a promise (the base
+;; runtime's: core.async's thread is not loaded until a program requires it); off a fiber, here. A wait the
+;; fiber's interrupt ends leaves the thread to finish its call; LATE, when given, is applied to what it
+;; answers then (an open's descriptor, closed).
+(define (io-elsewhere thunk . late)
+  (if (jolt-current-fiber)
+      (let ((p (jolt-promise-new)) (gone (box #f)))
+        (fork-thread/daemon #t
+          (lambda ()
+            (jolt-thread-name-set! (get-thread-id) "jolt-io-wait")
+            (let ((r (guard (e (#t (cons 'raised e))) (cons 'values (call-with-values thunk list)))))
+              (jolt-deliver p r)
+              (when (and (unbox gone) (pair? late) (eq? (car r) 'values))
+                (apply (car late) (cdr r))))))
+        (let ((r (guard (e (#t (set-box! gone #t) (raise e))) (jolt-promise-deref p))))
+          (if (eq? (car r) 'raised) (raise (cdr r)) (apply values (cdr r)))))
+      (thunk)))
+(define (io-c-path p)
+  (let* ((bv (string->utf8 p)) (n (bytevector-length bv)) (m (sa-foreign-alloc (fx+ n 1))))
+    (do ((i 0 (fx+ i 1))) ((fx=? i n)) (sa-foreign-set! 'unsigned-8 m i (bytevector-u8-ref bv i)))
+    (sa-foreign-set! 'unsigned-8 m n 0)
+    m))
+(define (io-open-elsewhere p flags)
+  (let ((cp (io-c-path p)))
+    (let-values (((fd err) (io-elsewhere (lambda () (io-c-open-waits cp (fxior flags io-O-CLOEXEC)))
+                                         (lambda (fd err) (when (>= fd 0) (proc-c-close fd))))))
+      (sa-foreign-free cp)
+      (when (< fd 0)
+        (raise (condition (if (= err 13) (make-i/o-file-protection-error p) (make-i/o-filename-error p))
+                          (make-who-condition 'open)
+                          (make-message-condition (string-append "open failed: errno " (number->string err))))))
+      fd)))
+;; The child-pipe ports are process.ss's, which loads lazily (on a first ProcessBuilder): loaded here, so a
+;; program that has started no process can open a FIFO (it was "variable ... is not bound" under jolt -e), and
+;; reached through the pair process.ss sets as it loads, (input-port-maker . output-port-maker), since an eagerly
+;; loaded file names nothing of a lazy one (lazy-shims-gen.ss, rule eager-ref).
+(define jolt-fd-ports #f)
+(define (io-pipe-ports)
+  (lazy-shim-load! "host/chez/java/process.ss" "a FIFO's port")
+  jolt-fd-ports)
+(define (jolt-open-file-input-port p . rest)
+  (if (io-path-may-wait? p)
+      (let ((ports (io-pipe-ports))) ((car ports) (io-open-elsewhere p 0) io-elsewhere))
+      (apply open-file-input-port p rest)))
+(define (jolt-open-file-output-port p . rest)
+  (if (io-path-may-wait? p)
+      (let ((ports (io-pipe-ports))) ((cdr ports) (io-open-elsewhere p io-O-WRONLY) io-elsewhere))
+      (apply open-file-output-port p rest)))
+
+;; Sleeps until fd has something to read, hangs up or errors, or the thread is
+;; interrupted; -> #t for the port to be asked again (a signal is not input, and
+;; an interrupt is raised by the caller), #f for the read to go ahead. A wake pipe
+;; sits beside the descriptor in the poll set and the thread's interrupt box
+;; carries a waker that writes to it (locks.ss jolt-interrupt-wait-add!), so a
+;; sleep with no timeout is still something an interrupt can end. The pipe is
+;; this wait's own, closed under the waker's mutex so a late waker never writes to
+;; a descriptor number another open has been handed.
+(define (jolt-stdin-poll-wait! fd)
+  (let ((b (current-interrupt-box)) (pipe (sa-foreign-alloc 8)))
+    (cond
+      ((unbox b) (sa-foreign-free pipe) #t)
+      ;; no descriptor for a wake pipe: wait on the port alone, uninterruptibly
+      ((not (= 0 (proc-c-pipe pipe)))
+       (sa-foreign-free pipe)
+       (let ((pfd (sa-foreign-alloc 8)))
+         (sa-foreign-set! 'int pfd 0 fd) (sa-foreign-set! 'short pfd 4 1)
+         (sa-foreign-set! 'short pfd 6 0)
+         (let ((rc (jolt-poll-fn pfd 1 -1)))
+           (sa-foreign-free pfd)
+           (and (< rc 0) (= (proc-errno) jolt-poll-eintr)))))
+      (else
+        (let* ((rd (sa-foreign-ref 'int pipe 0)) (wr (sa-foreign-ref 'int pipe 4))
+               (pfds (sa-foreign-alloc 16)) (byte (sa-foreign-alloc 1))
+               (mu (make-mutex)) (open? #t)
+               (waker (lambda ()
+                        (jolt-with-mutex mu (when open? (proc-c-write wr byte 1))))))
+          (sa-foreign-free pipe)
+          (sa-foreign-set! 'unsigned-8 byte 0 0)
+          (sa-foreign-set! 'int pfds 0 fd) (sa-foreign-set! 'short pfds 4 1)
+          (sa-foreign-set! 'short pfds 6 0)
+          (sa-foreign-set! 'int pfds 8 rd) (sa-foreign-set! 'short pfds 12 1)
+          (sa-foreign-set! 'short pfds 14 0)
+          (jolt-interrupt-wait-add! b waker)
+          (let* ((rc (if (unbox b) 1 (jolt-poll-fn pfds 2 -1)))
+                 (eintr? (and (< rc 0) (= (proc-errno) jolt-poll-eintr))))
+            (jolt-interrupt-wait-remove! b waker)
+            (jolt-with-mutex mu (set! open? #f) (proc-c-close rd) (proc-c-close wr))
+            (sa-foreign-free pfds) (sa-foreign-free byte)
+            (or eintr? (and (unbox b) #t))))))))
+
 (define (jolt-stdin-wait-ready! in)
   (unless (eq? (unbox jolt-stdin-poll-port) in)
     (set-box! jolt-stdin-poll-ok (guard (_ (#t #f)) (input-port-ready? in) #t))
+    (set-box! jolt-stdin-poll-fd
+              (and (not (eq? (sa-os-family) 'windows)) jolt-poll-fn
+                   (guard (_ (#t #f)) (port-file-descriptor in))))
     (set-box! jolt-stdin-poll-port in))
   (when (unbox jolt-stdin-poll-ok)
-    (let loop ((step jolt-stdin-poll-step0))
-      (unless (input-port-ready? in)
-        ;; jolt-pause-ms and not (sleep): on a fiber this parks for the step and
-        ;; gives the carrier up, so (read-line) from a go block no longer stops
-        ;; every other fiber placed on that carrier until input arrives.
-        (jolt-pause-ms step)
-        (loop (min jolt-stdin-poll-step-max (* step 2)))))))
+    (let ((fd (unbox jolt-stdin-poll-fd)))
+      (let loop ((step jolt-stdin-poll-step0))
+        (unless (input-port-ready? in)
+          (set-box! jolt-stdin-waits (+ (unbox jolt-stdin-waits) 1))
+          (cond
+            ((and fd (jolt-current-fiber) (proc-poller-wait-ready fd (jolt-keyword "read")))
+             (void))                            ; woken by readiness: the read sees it
+            ((and fd (not (jolt-current-fiber)))
+             (when (jolt-stdin-poll-wait! fd)
+               (jolt-interrupt-poll-check! "read-line")
+               (loop step)))
+            (else
+             ;; jolt-pause-ms and not (sleep): on a fiber this parks for the step and
+             ;; gives the carrier up, so (read-line) from a go block no longer stops
+             ;; every other fiber placed on that carrier until input arrives.
+             (jolt-pause-ms step)
+             (loop (min jolt-stdin-poll-step-max (* step 2))))))))))
 
 ;; readLine ends a line on \n, on \r, or on \r\n. A \r ends the line at once; the
 ;; \n that may follow is taken then and there when the stream already has it, and
@@ -2178,7 +2401,7 @@
     (let ((cs (if (and (pair? rest) (ctor-charset? (car rest))) (charset-arg-name (car rest)) "UTF-8")))
       (open-file-guarded src
         (lambda (p)
-          (let ((bp (open-file-input-port p (file-options) (buffer-mode block))))
+          (let ((bp (jolt-open-file-input-port p (file-options) (buffer-mode block))))
             (stream-classed!
               (make-char-reader (guard (e (#t (close-port bp) (raise e)))
                                   (charset-input-port bp cs p)))
@@ -2194,7 +2417,7 @@
            (append? (and (pair? flag) (jolt-truthy? (car flag)))))
       (open-file-guarded src
         (lambda (p)
-          (let ((bp (open-file-output-port p
+          (let ((bp (jolt-open-file-output-port p
                       (if append? (file-options no-fail no-truncate append) (file-options no-fail))
                       (buffer-mode block))))
             (make-charset-writer bp cs #f #t "java.io.FileWriter")))))))
@@ -2831,7 +3054,7 @@
   ;; file: URL -- and it opened unguarded, so a missing path came back carrying
   ;; Chez's own wording where every FileInputStream above reports the JVM's.
   (open-path-guarded (if (pair? given) (car given) p) p
-    (lambda (rp) (make-in-stream (open-file-input-port rp (file-options) (buffer-mode block))))))
+    (lambda (rp) (make-in-stream (jolt-open-file-input-port rp (file-options) (buffer-mode block))))))
 ;; Both take io.clj's options. A byte stream has no charset, so :encoding is
 ;; accepted and has nothing to do, as on the JVM; :append opens the output file
 ;; without truncating it.
@@ -2902,7 +3125,7 @@
            (open-path-guarded (file-path-of x) (path-of x)
              (lambda (p)
                (stream-classed!
-                 (make-out-stream (open-file-output-port p
+                 (make-out-stream (jolt-open-file-output-port p
                                     (if append? (file-options no-fail no-truncate append) (file-options no-fail))
                                     (buffer-mode block)))
                  "java.io.BufferedOutputStream")))))
@@ -3105,7 +3328,7 @@
 (define (stream-source-port input)
   (cond ((in-stream? input) (values (in-stream-port input) (lambda () #f)))
         ((user-in-stream? input) (values (in-stream-source-port input) (lambda () #f)))
-        ((jfile? input) (let ((p (open-file-input-port (path-of input))))
+        ((jfile? input) (let ((p (jolt-open-file-input-port (path-of input))))
                           (values p (lambda () (close-port p)))))
         (else (values #f #f))))
 ;; Read PORT to its end a chunk at a time, handing each bytevector to SINK!;
@@ -3117,11 +3340,14 @@
           total
           (begin (sink! bv) (loop (+ total (bytevector-length bv))))))))
 ;; INPUT's bytes into SINK! a chunk at a time when it is a stream, else its
-;; bytes (or its text encoded under ENC, UTF-8 by default) whole; the byte count.
+;; bytes (or its text encoded under ENC, UTF-8 by default) whole; the byte count. The
+;; source is released when the copy ends, never at a park of the fiber copying (a read of a
+;; pipe or a socket parks): its winder's before-thunk is jolt-finally-in, which a park
+;; drops (fibers.ss jolt-finally-winder?).
 (define (copy-bytes-into! input sink! . enc)
   (let-values (((port release!) (stream-source-port input)))
     (if port
-        (dynamic-wind (lambda () #f)
+        (dynamic-wind jolt-finally-in
                       (lambda () (copy-port-chunks! port sink!))
                       release!)
         (let ((bv (or (input-bytes input)
@@ -3159,14 +3385,15 @@
      (let-values (((src release!) (if (string? input) (values #f #f) (stream-source-port input))))
        (cond
          (src
-          (dynamic-wind (lambda () #f)
+          ;; released at the copy's end, never at a park (as copy-bytes-into!)
+          (dynamic-wind jolt-finally-in
                         (lambda ()
-                          (with-port (open-file-output-port (path-of output) (file-options no-fail) (buffer-mode block))
+                          (with-port (jolt-open-file-output-port (path-of output) (file-options no-fail) (buffer-mode block))
                             (lambda (port) (copy-port-chunks! src (lambda (bv) (put-bytevector port bv))))))
                         release!))
          ((and (not (string? input)) (input-bytes input))
           => (lambda (bv)
-               (with-port (open-file-output-port (path-of output) (file-options no-fail) (buffer-mode block))
+               (with-port (jolt-open-file-output-port (path-of output) (file-options no-fail) (buffer-mode block))
                  (lambda (port) (put-bytevector port bv)))))
          (else (jolt-spit output (input-text input enc) io-kw-encoding enc)))))
     ;; a byte-output-stream shim (a host tagged-table with :jolt/output-stream,

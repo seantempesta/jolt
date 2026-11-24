@@ -335,7 +335,7 @@
 ;; the same TBox there too, since Frame.clone shares the map. Weak keys so a
 ;; popped frame's boxes go with it.
 (define tbox-tbl (make-weak-eq-hashtable))
-(define tbox-mutex (make-mutex))
+(define-process-local tbox-mutex (make-mutex))
 (define (jolt-var-thread-binding v)
   (let ((p (and (var-cell? v) (dyn-find-binding v))))
     (if (not p)
@@ -367,7 +367,7 @@
 (define (jolt-set-var! v val)
   (if (var-cell? v)
       (begin
-        (iref-validate v val)
+        (var-validate v val)
         (let ((f (dyn-find-binding-frame v)))
           (cond ((not f)
                  (throw-jvm (quote IllegalStateException)
@@ -414,10 +414,10 @@
     (lambda ()
       (let* ((old (var-cell-root v))
              (new (apply jolt-invoke f old args)))
-        (iref-validate v new)
+        (var-validate v new)
         (var-root-set! v new)
         (var-cell-defined?-set! v #t)
-        (iref-notify v old new)
+        (var-notify v old new)
         new))))
 
 ;; __local-var: a fresh free-standing var cell (not interned). with-local-vars
@@ -432,7 +432,7 @@
 ;; the whole reason for the counter, and unlocked two threads draw the same
 ;; number. See jolt-gensym in converters.ss.
 (define local-var-counter 0)
-(define local-var-mutex (make-mutex))
+(define-process-local local-var-mutex (make-mutex))
 (define local-var-meta (jolt-hash-map (keyword #f "dynamic") #t))
 (define (jolt-local-var . args)
   (let* ((name (string-append "local-"
@@ -442,7 +442,7 @@
                                  local-var-counter))))
          (c (make-var-cell "" name
                            (if (pair? args) (car args) (make-jolt-var-unbound "" name))
-                           #t #f #f #f #t)))
+                           #t #f #f #f #t '() jolt-nil)))
     ;; Clojure builds these with Var/create + setDynamic, so a local var takes a
     ;; thread binding like any other — tools.reader hands one to with-bindings.
     ;; Hence the flag in the constructor above, beside the metadata that says the
@@ -530,3 +530,12 @@
 ;; the pre-chain values).
 (def-var! "clojure.core" "var-get" jolt-var-get)
 (def-var! "clojure.core" "deref" jolt-deref)
+
+;; jolt.host/*on-root-change* (rt.ss var-root-set!): a fn called with each var whose root is written while it,
+;; and the root that write replaced, (f var old),
+;; is bound; jolt.host/on-root-change binds it around a thunk. Defined here, after the binding machinery, so
+;; var-root-set! reads it only once a binding can exist.
+(def-dynvar! "jolt.host" "*on-root-change*" jolt-nil)
+(set! jolt-on-root-change-cell (var-cell-lookup "jolt.host" "*on-root-change*"))
+(def-var! "jolt.host" "on-root-change"
+  (lambda (f thunk) (dyn-with-frame (list (cons jolt-on-root-change-cell f)) (lambda () (jolt-invoke0 thunk)))))

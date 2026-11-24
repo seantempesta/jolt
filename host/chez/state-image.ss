@@ -143,7 +143,7 @@
 ;; dump outright ("incorrect number of arguments to #<procedure constructor>").
 ;; Memoized per rtd — the walk asks once per object.
 (define image-record-fields-tbl (make-eq-hashtable))
-(define image-record-fields-mutex (make-mutex))
+(define-process-local image-record-fields-mutex (make-mutex))
 (define (image-record-fields rtd)      ; -> vector of (name . accessor)
   (or (hashtable-ref image-record-fields-tbl rtd #f)
       (let* ((chain (let up ((r rtd) (acc '()))
@@ -530,6 +530,16 @@
   (and (record? x)
        (record-rtd x)
        (eq? (record-type-uid (record-rtd x)) 'jolt-ex-info-record-v1)))
+;; A cell's claim from an image written while the cell was being forced, by a
+;; runtime whose tail-claim was jolt-tail-claim-v1 (tail owner token). The uid is
+;; retired (seq.ss tail-claim is v2), so the fasl materializes the old rtd and the
+;; instance is not a tail-claim?: read as a realized tail it came back as the
+;; cell's rest. No force is running in a restored image, so it restores as what a
+;; stale claim is put back to, the pending word it carries (field 0).
+(define (image-legacy-tail-claim? x)
+  (and (record? x)
+       (record-rtd x)
+       (eq? (record-type-uid (record-rtd x)) 'jolt-tail-claim-v1)))
 ;; A map from an image written before the meta slot (format <= 7). Two
 ;; generations: chez-pmap-v5 (root cnt hasheq) is the current layout minus the
 ;; slot; chez-pmap-v4 (root cnt order hasheq all-kw, format <= 6) has a trie
@@ -920,7 +930,14 @@
                                         (if (fx=? i n)
                                             (reverse acc)
                                             (loop (fx+ i 1) (cons (list 'jolt-fnsrc-probe i) acc)))))
-                                (slots (image-flat-free-values (apply mk sent))))
+                                (slots (image-flat-free-values (apply mk sent)))
+                                ;; a spliced copy's constant entries (a one-element vector in its
+                                ;; live names) capture nothing: their value travels in the
+                                ;; registration, so their sentinel is not looked for
+                                (consts (let loop ((l (jolt-seq (vector-ref reg 3))) (acc '()))
+                                          (if (jolt-nil? l)
+                                              (reverse acc)
+                                              (loop (jolt-next l) (cons (not (string? (jolt-first l))) acc))))))
                            (if (not slots)
                                'none
                                (let ((perm (map (lambda (s)
@@ -929,7 +946,12 @@
                                                           ((eq? (car l) s) i)
                                                           (else (loop (cdr l) (fx+ i 1))))))
                                                 sent)))
-                                 (if (memq #f perm) 'none perm))))))))
+                                 (if (let miss ((p perm) (c consts))
+                                       (and (pair? p)
+                                            (or (and (not (car p)) (not (and (pair? c) (car c))))
+                                                (miss (cdr p) (if (pair? c) (cdr c) c)))))
+                                     'none
+                                     perm))))))))
             (image-fn-form-layout-set! reg v)
             v)))))
 
@@ -1241,6 +1263,8 @@
                       (walk-ref-restore (image-ref-val x) x path))
                      ((and restore? (image-legacy-ref? x))
                       (walk-ref-restore (legacy-ref-val x) x path))
+                     ((and restore? (image-legacy-tail-claim? x))
+                      (walk ((record-accessor (record-rtd x) 0) x) path))
                      ((and restore? (image-legacy-jrec? x))
                       (walk-legacy-jrec x path))
                      ((and restore? (image-legacy-ex-info? x))
@@ -1817,7 +1841,7 @@
                       (let ((nx (make-var-cell (var-cell-ns x) (var-cell-name x)
                                                jolt-nil (var-cell-defined? x)
                                                #f (var-cell-macro? x) #f
-                                               (var-cell-dynamic? x))))
+                                               (var-cell-dynamic? x) '() jolt-nil)))
                         (hashtable-set! memo x nx)
                         (var-cell-root-set! nx (walk (var-cell-root x) (cons vp path)))
                         (var-cell-meta-set! nx (and m (walk m mp)))

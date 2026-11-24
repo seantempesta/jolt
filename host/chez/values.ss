@@ -67,8 +67,8 @@
 ;; fences and claims while it is #f. Defined here, in the first shared file,
 ;; because seq.ss and natives-meta.ss load long before lazy-bridge.ss and read
 ;; it as soon as they run.
-(define jolt-mt? #f)
-(define (jolt-mark-mt!) (set! jolt-mt? #t))
+;; jolt-mt? and jolt-mark-mt! live in locks.ss (loaded before this file so
+;; fibers.ss can set jolt-mt? on first fiber spawn).
 
 ;; A fixnum's decimal text. Chez's number->string is (format "~d" x): the
 ;; general formatter, ~230 ns for a fixnum, and its control-string cache sits
@@ -267,6 +267,10 @@
 ;; The body is never reached for its value — a finally has no before-thunk — so
 ;; #f is arbitrary.
 (define jolt-finally-in (lambda () #f))
+;; Frame keeper for evaluated top-level forms (compile-eval.ss): a top-level
+;; procedure Chez does not fold into a tail call, so the eval'd form's frame
+;; stays on the stack in a throw's trace.
+(define (jolt-frame-keep v) v)
 
 ;; The older seam, still used by HOST dynamic-winds that want exit-only cleanup
 ;; but cannot use the marker because they need a real before-thunk of their own
@@ -314,7 +318,7 @@
 ;; under the lock. So the hot path — every keyword after the first — is the same
 ;; bare hashtable-ref it was, and only a first-ever intern pays the mutex.
 ;; The lock is a leaf: compute-keyword-hasheq is pure arithmetic.
-(define keyword-table-mu (make-mutex))
+(define-process-local keyword-table-mu (make-mutex))
 (define (keyword ns name)
   (if ns
       (let ((k (keyword-intern-key ns name)))
@@ -379,7 +383,7 @@
 ;; argument as khash below, and the reason the memo needs no lock while the
 ;; identity-conferring string slot does.
 (define symbol-string-pool (make-hashtable string-hash string=?))
-(define symbol-string-pool-mu (make-mutex))
+(define-process-local symbol-string-pool-mu (make-mutex))
 (define (make-symstr s) (cons s #f))
 (define (symstr-str c) (car c))
 (define (symstr-mhash c) (cdr c))                   ; murmur3-hash-unencoded-chars

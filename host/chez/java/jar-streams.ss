@@ -22,14 +22,14 @@
   (fields (mutable man) (mutable first) (mutable try-manifest))
   (nongenerative jolt-jarin-v1))
 (define jarin-states (make-weak-eq-hashtable))
-(define jarin-states-mu (make-mutex))
+(define-process-local jarin-states-mu (make-mutex)) ; merge: upstream's new lock, made process-local as ours are (16d668c5)
 (define (jarin-of self)
   (let ((z (zipin-of self)))
     (and z (jolt-with-mutex jarin-states-mu (hashtable-ref jarin-states z #f)))))
 
 ;; The manifest section a JarInputStream's entry was created under.
 (define jar-entry-stream-attrs (make-weak-eq-hashtable))
-(define jar-entry-stream-attrs-mu (make-mutex))
+(define-process-local jar-entry-stream-attrs-mu (make-mutex)) ; merge: upstream's new lock, made process-local as ours are (16d668c5)
 
 ;; read(b, off, len): -1 while the constructor's read-ahead entry is pending
 (define (jarin-read z bv start count)
@@ -139,7 +139,7 @@
 (define jar-magic #xCAFE)
 ;; The streams whose next entry is their first, keyed by the zout record.
 (define jarout-first (make-weak-eq-hashtable))
-(define jarout-first-mu (make-mutex))
+(define-process-local jarout-first-mu (make-mutex)) ; merge: upstream's new lock, made process-local as ours are (16d668c5)
 
 ;; hasMagic: does the extra field hold a 0xCAFE block? A malformed field
 ;; answers false, as the JDK's caught index exception does.

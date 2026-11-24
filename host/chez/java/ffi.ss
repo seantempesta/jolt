@@ -387,7 +387,7 @@
 ;; first-inclusion order hands load-natives!) and a path set so the same .so is
 ;; not dlopen'd twice. Mutated only from load-natives!/jolt-build-load-native,
 ;; but guarded anyway in case a repl loads a native lazily.
-(define ffi-native-mu (make-mutex))
+(define-process-local ffi-native-mu (make-mutex))
 ;; cell[0] = list of (path . handle) pairs, oldest first. The PATH rides along
 ;; only so a duplicate-symbol report can name the libraries involved (issue
 ;; #731); resolution itself reads the handle.
@@ -624,6 +624,8 @@
 ;; The pending table is the loader's, reached by name: gates load this file
 ;; without loader.ss, and there nothing is pending.
 (define (jolt-ffi-dlsym-native sym)
+  ;; counted by name (fibers.ss jolt-count-foreign-lookup): a cfn resolved on every call shows here
+  (when jolt-count-foreign-lookup (jolt-count-foreign-lookup sym))
   (or (ffi-dlsym-loaded sym)
       (and (not (sa-foreign-entry? sym))
            (let ((load-all (sa-baked-global 'ldr-natives-load-all!)))
@@ -680,7 +682,7 @@
 ;; non-interned keyword, or a program minting type keywords, from growing it.
 (define ffi-type-memo '())
 (define ffi-type-memo-count 0)
-(define ffi-type-memo-mu (make-mutex))
+(define-process-local ffi-type-memo-mu (make-mutex))
 (define (ffi-type->chez kw)
   (let ((hit (and (keyword-t? kw) (assq kw ffi-type-memo))))
     (if hit
@@ -909,7 +911,8 @@
   (let* ((n (jnum->exact n)) (p (jnum->exact ptr))
          (bv (begin (ffi-check-array-count n) (make-bytevector n))))
     (sa-foreign-bytes-ref! p bv n)
-    (na-bv->bytearray bv)))
+    ;; the bytevector just filled is the array's own: no second copy
+    (make-jolt-array bv 'byte)))
 
 ;; (read-into! ptr arr off n) -> n. Copy n bytes at ptr into arr starting at off
 ;; (the java.io.InputStream/read argument order). Throws rather than writing out
@@ -936,9 +939,13 @@
 (define (ffi-read-into! ptr arr off n)
   (let* ((n (ffi-byte-index n)) (off (ffi-byte-index off)) (p (jnum->exact ptr)))
     (ffi-check-byte-range "read-into!" arr off n)
-    (let ((bv (make-bytevector n)))
-      (sa-foreign-bytes-ref! p bv n)
-      (ja-bv->bytes! bv 0 arr off n)
+    (let ((v (jolt-array-vec arr)))
+      ;; from the start of an array backed by a bytevector the bytes go straight in
+      (if (and (fx=? off 0) (bytevector? v))
+          (sa-foreign-bytes-ref! p v n)
+          (let ((bv (make-bytevector n)))
+            (sa-foreign-bytes-ref! p bv n)
+            (ja-bv->bytes! bv 0 arr off n)))
       n)))
 
 (define ffi-write-array
@@ -947,9 +954,13 @@
     ((ptr arr off n)
      (let* ((n (ffi-byte-index n)) (off (ffi-byte-index off)) (p (jnum->exact ptr)))
        (ffi-check-byte-range "write-array" arr off n)
-       (let ((bv (make-bytevector n)))
-         (ja-bytes->bv! arr off bv 0 n)
-         (sa-foreign-bytes-set! p bv n))
+       (let ((v (jolt-array-vec arr)))
+         ;; from the start of an array backed by a bytevector: its own bytes, no copy
+         (if (and (fx=? off 0) (bytevector? v))
+             (sa-foreign-bytes-set! p v n)
+             (let ((bv (make-bytevector n)))
+               (ja-bytes->bv! arr off bv 0 n)
+               (sa-foreign-bytes-set! p bv n))))
        n))))
 (def-var! "jolt.ffi" "read-array" ffi-read-array)
 (def-var! "jolt.ffi" "read-into!" ffi-read-into!)
@@ -1492,7 +1503,7 @@
 ;; Both tables are written at RUN time — __ccallable mints a callback and
 ;; ffi-export registers a name — from whatever thread does it, so every mutation
 ;; takes this mutex. Single-key reads stay unlocked.
-(define ffi-tbl-mu (make-mutex))
+(define-process-local ffi-tbl-mu (make-mutex))
 (define ffi-callable-table (make-eqv-hashtable))   ; entry-point addr -> code object
 (define (jolt-ffi-register-callable! co)
   (sa-lock-object co)
@@ -1693,11 +1704,12 @@
 ;; masking them directly would put every entry in shard 0.
 (define ffi-size-shard-count 16)
 (define ffi-size-tables (make-vector ffi-size-shard-count))
-(define ffi-size-mutexes (make-vector ffi-size-shard-count))
+(define-process-local ffi-size-mutexes
+  (let ((v (make-vector ffi-size-shard-count)))
+    (do ((i 0 (fx+ i 1))) ((fx=? i ffi-size-shard-count) v) (vector-set! v i (make-mutex)))))
 (let loop ((i 0))
   (when (fx<? i ffi-size-shard-count)
     (vector-set! ffi-size-tables i (make-eqv-hashtable))
-    (vector-set! ffi-size-mutexes i (make-mutex))
     (loop (fx+ i 1))))
 
 ;; An address is a fixnum on every 64-bit host this file runs on, so the shard
@@ -1755,7 +1767,7 @@
 ;; without the lock: a stale zero only defers a release to the next drain, and
 ;; registration bumps the count before the guardian holds the cell, so a nonzero
 ;; count is never missed for a cell the guardian could already return.
-(define ffi-auto-mu (make-mutex))
+(define-process-local ffi-auto-mu (make-mutex))
 (define ffi-auto-guardian (make-guardian))
 (define ffi-auto-live 0)
 (define ffi-auto-none (make-pvec (vector)))

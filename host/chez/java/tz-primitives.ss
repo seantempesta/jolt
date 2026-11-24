@@ -12,7 +12,7 @@
 
 ;; LC_TIME varies by platform: 5 on macOS, 2 on Linux/glibc.
 (define tzp-LC_TIME (if (eq? (sa-os-family) 'macos) 5 2))
-(define tzp-mutex (make-mutex))
+(define-process-local tzp-mutex (make-mutex))
 
 ;; Guard-wrapped FFI via jolt-foreign-proc-safe (deferred symbol lookup so a
 ;; missing entry doesn't abort boot). nil on failure -> graceful fallback.
@@ -259,7 +259,7 @@
              (tm (sa-foreign-alloc 56)))
          ;; tm is freed on the way out however the body leaves, throw included.
          (dynamic-wind
-           (lambda () #f)
+           jolt-finally-in
            (lambda ()
              (sa-foreign-set! 'integer-32 tm 0 0) (sa-foreign-set! 'integer-32 tm 4 0)
              (sa-foreign-set! 'integer-32 tm 8 0) (sa-foreign-set! 'integer-32 tm 12 1)

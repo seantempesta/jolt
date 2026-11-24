@@ -78,14 +78,26 @@
 ;; handler, retry over a short window and degrade to a no-op, because
 ;; System.gc must hint, never throw. Any other collector error still raises.
 (define sa-full-collect-requested? #f)
-(define (sa-gc-collect)
+;; What the request allocates on its way (the guard's handler, the rendezvous: 608 B, or
+;; 704 B when another thread was active) is the collector's bookkeeping, like the
+;; collection's own, never the caller's: taken back from the calling thread's count where
+;; the Chez keeps one ((cs)thread_bytes_uncount), so a call reads the same bytes whether or
+;; not it asked for a collection.
+(define sa-collector-work
+  (if (and (foreign-entry? "(cs)thread_bytes_allocated") (foreign-entry? "(cs)thread_bytes_uncount"))
+      (let ((thread-bytes (foreign-procedure "(cs)thread_bytes_allocated" () uptr))
+            (thread-bytes-uncount (foreign-procedure "(cs)thread_bytes_uncount" (uptr) void)))
+        (lambda (f) (let ((since (thread-bytes))) (f) (thread-bytes-uncount since))))
+      (lambda (f) (f))))
+(define (sa-gc-collect) (sa-collector-work sa-gc-collect-now))
+(define (sa-gc-collect-now)
   (let loop ((tries (if sa-collect-handler-installed? 0 100)))
     (let ((r (guard (e (#t (if (and (message-condition? e)
                                     (string=? (condition-message e)
                                               "cannot collect when multiple threads are active"))
                                'busy
                                (raise e))))
-               (sa-gc-collect-guard (lambda () (collect (collect-maximum-generation))))
+               (sa-gc-collect-guard (lambda () (let ((top (sa-gc-top))) (collect top top))))
                'ok)))
       (case r
         ;; no collect-request-handler ran, so undo the pins of arrays this one
@@ -104,7 +116,26 @@
 ;; Contract: return the maximum generation argument sa-gc-collect accepts.
 ;; Degradation: a single-generation (non-generational) collector returns 0.
 (define (sa-gc-max-generation)
-  (collect-maximum-generation))
+  (sa-gc-top))
+
+;; (sa-gc-top) -> exact integer
+;; The deepest generation this process collects: Chez's maximum, unless the process was forked
+;; from another (sa-gc-below-inherited!). Every collection here names its generations, its target
+;; at most this one, so nothing it allocated is ever promoted past it.
+(define sa-gc-top-generation #f)
+(define (sa-gc-top) (or sa-gc-top-generation (collect-maximum-generation)))
+
+;; (sa-gc-below-inherited!) -> exact integer, the new ceiling
+;; Collect only below what this process inherited across fork(2): one generation under its
+;; parent's ceiling, where the parent's live data sits once its collections promote it. The child
+;; then never traces or copies the parent's oldest generation, so those pages stay shared and a
+;; collection costs what the child allocated; the parent's own full collections still free what it
+;; replaced. A process that forks again lowers it again: each level of forks collects one
+;; generation less (a program forking deep raises (collect-maximum-generation) first). Never
+;; below 1: generation 0's survivors need a generation to go to.
+(define (sa-gc-below-inherited!)
+  (set! sa-gc-top-generation (fxmax 1 (fx- (sa-gc-top) 1)))
+  sa-gc-top-generation)
 
 ;; (sa-bytes-allocated) -> exact integer
 ;; Live-heap bytes — the "used" reading under current-memory-bytes that
@@ -113,6 +144,56 @@
 ;; from total to compute free memory.
 (define (sa-bytes-allocated)
   (bytes-allocated))
+
+;; (sa-static-bytes) -> exact integer
+;; The part of sa-bytes-allocated the collector never collects: Chez's static
+;; generation, which holds the runtime's boot image (~70MB in every process) and
+;; whatever a program moved there with (collect max 'static). It is never
+;; copied and never freed, so it needs no collection headroom. Contract: bytes
+;; in that generation, never more than sa-bytes-allocated. Degradation: 0 for a
+;; collector with no such generation.
+(define (sa-static-bytes)
+  (bytes-allocated 'static))
+
+;; (sa-with-object-counts thunk top-n) -> (list dynamic-bytes static-bytes entries)
+;; Run THUNK (a collection) with Chez's per-type object counts on, and answer what
+;; the heap held by type: DYNAMIC-BYTES / STATIC-BYTES the totals (static is the
+;; boot image the collector never frees), ENTRIES the TOP-N types by collectable
+;; bytes, each (name count bytes gens), NAME a string (a record type by its record
+;; name) and GENS a list of (generation count . bytes). The counts are gathered
+;; only while THUNK runs, so no other collection pays for them; THUNK's collection
+;; is the one they describe. Contract: counts of the objects that collection
+;; found. Degradation: (list 0 0 '()) for a collector with no per-type counts.
+(define (sa-object-type-name t)
+  (cond ((symbol? t) (symbol->string t))
+        ((record-type-descriptor? t)
+         (let ((n (record-type-name t)))
+           (if (symbol? n) (symbol->string n) (call-with-string-output-port (lambda (p) (write n p))))))
+        (else (call-with-string-output-port (lambda (p) (write t p))))))
+;; Answers (dynamic static top live): live is the heap's bytes read at the census's own collection, so the parts and the
+;; whole are one moment's; read later (when an error is built from it) live took what was allocated since.
+(define (sa-with-object-counts thunk top-n)
+  (dynamic-wind
+    (lambda () (enable-object-counts #t))
+    thunk
+    (lambda () (enable-object-counts #f)))
+  (let ((live (sa-bytes-allocated)))
+  (let loop ((counts (object-counts)) (dyn 0) (static 0) (acc '()))
+    (if (null? counts)
+        (let ((sorted (list-sort (lambda (a b) (> (caddr a) (caddr b))) acc)))
+          (list dyn static
+                (let take ((l sorted) (n top-n))
+                  (if (or (null? l) (<= n 0)) '() (cons (car l) (take (cdr l) (- n 1)))))
+                live))
+        (let* ((e (car counts))
+               (gens (filter (lambda (g) (not (eq? (car g) 'static))) (cdr e)))
+               (st (fold-left + 0 (map cddr (filter (lambda (g) (eq? (car g) 'static)) (cdr e)))))
+               (c (fold-left + 0 (map cadr gens)))
+               (b (fold-left + 0 (map cddr gens))))
+          (loop (cdr counts) (+ dyn b) (+ static st)
+                (if (> b 0)
+                    (cons (list (sa-object-type-name (car e)) c b gens) acc)
+                    acc)))))))
 
 ;; (sa-total-memory-bytes) -> exact integer
 ;; Total process heap bytes — what the collector has reserved from the OS
@@ -563,9 +644,25 @@
 ;; for an arch (rt.ss binds _exit through jolt-foreign-proc-safe at its line
 ;; 135, and the first caller of sa-arch is host-static-methods.ss at 1553), and
 ;; re-taking it would re-promote it above every :jolt/native loaded since.
+;;
+;; (sa-entry-once resolve) -> a thunk answering what (resolve) answered at the first
+;; call, #f if it raised. A C entry is looked up once, so a function that calls it
+;; does not: evaluated, (foreign-entry? "f") and (foreign-procedure "f" ...) each look
+;; "f" up through dlsym over every loaded object, and inside a function body they did
+;; so on every call ((System/getenv) twice a call, and the walk of the environment
+;; besides: 46% of one thread of a hung Seon system, 2026-11-12). At the first call,
+;; not at load, for the reason above: the boot takes the process handle after this
+;; file loads. Two threads' first calls both resolve, to the same entry.
+(define (sa-entry-once resolve)
+  (let ((v 'unresolved))
+    (lambda ()
+      (when (eq? v 'unresolved) (set! v (guard (e (#t #f)) (resolve))))
+      v)))
+(define sa-uname-proc
+  (sa-entry-once (lambda () (and (foreign-entry? "uname") (foreign-procedure "uname" (void*) int)))))
 (define (sa-uname-field n)
   (guard (e (#t #f))
-    (and (foreign-entry? "uname")
+    (and (sa-uname-proc)
          (let* ((linux? (eq? (sa-os-family) 'linux))
                 (width (if linux? 65 256))
                 (off (* n width))
@@ -578,7 +675,7 @@
                    (foreign-set! 'unsigned-8 buf i 0)
                    (loop (fx+ i 1)))))
              (lambda ()
-               (and (= 0 ((foreign-procedure "uname" (void*) int) buf))
+               (and (= 0 ((sa-uname-proc) buf))
                     (let loop ((i 0) (acc '()))
                       (let ((b (foreign-ref 'unsigned-8 buf (fx+ off i))))
                         (if (or (fx=? b 0) (fx>=? i (fx- width 1)))
@@ -596,12 +693,17 @@
 ;; JVM's answer for an os.version it cannot read. Read in process: this used to
 ;; run those two programs through the shell, so a machine with an empty PATH,
 ;; or Windows, where the shell is cmd.exe, answered nothing.
+(define sa-sysctlbyname-proc
+  (sa-entry-once
+    (lambda ()
+      (and (foreign-entry? "sysctlbyname")
+           (foreign-procedure "sysctlbyname" (string u8* u8* void* size_t) int)))))
 (define (sa-os-release)
   (guard (e (#t #f))
     (case (sa-os-family)
       ((macos)
-       (and (foreign-entry? "sysctlbyname")
-            (let* ((f (foreign-procedure "sysctlbyname" (string u8* u8* void* size_t) int))
+       (and (sa-sysctlbyname-proc)
+            (let* ((f (sa-sysctlbyname-proc))
                    (out (make-bytevector 64 0))
                    (len (make-bytevector 8 0)))
               (bytevector-u64-native-set! len 0 64)
@@ -640,12 +742,25 @@
       (unless resolved
         (set! resolved #t)
         (guard (e (#t #f)) (load-shared-object "kernel32.dll"))
-        (when (foreign-entry? "GetEnvironmentStringsW")
-          (set! entries
-                (cons (sa-foreign-procedure-runtime "GetEnvironmentStringsW" '() 'void* #f)
-                      (and (foreign-entry? "FreeEnvironmentStringsW")
-                           (sa-foreign-procedure-runtime "FreeEnvironmentStringsW" '(void*) 'int #f))))))
+        (set! entries
+              (and (foreign-entry? "GetEnvironmentStringsW")
+                   (cons (sa-foreign-procedure-runtime "GetEnvironmentStringsW" '() 'void* #f)
+                         (and (foreign-entry? "FreeEnvironmentStringsW")
+                              (sa-foreign-procedure-runtime "FreeEnvironmentStringsW" '(void*) 'int #f))))))
       entries)))
+;; The posix table's reader, resolved once (sa-entry-once): a thunk answering the
+;; current envp (setenv may move it), or #f where neither entry resolves.
+(define sa-posix-envp-reader
+  (sa-entry-once
+    (lambda ()
+      (cond
+        ((foreign-entry? "_NSGetEnviron")
+         (let ((get (foreign-procedure "_NSGetEnviron" () void*)))
+           (lambda () (foreign-ref 'void* (get) 0))))
+        ((foreign-entry? "environ")
+         (let ((addr (foreign-entry "environ")))
+           (lambda () (foreign-ref 'void* addr 0))))
+        (else #f)))))
 (define (sa-environment-pairs)
   (define (c-string addr)
     (let loop ((n 0))
@@ -670,12 +785,7 @@
               (let ((kv (split (c-string p))))
                 (loop (fx+ i 1) (if kv (cons kv acc) acc))))))))
   (define (posix-envp)
-    (cond
-      ((foreign-entry? "_NSGetEnviron")
-       (foreign-ref 'void* ((foreign-procedure "_NSGetEnviron" () void*)) 0))
-      ((foreign-entry? "environ")
-       (foreign-ref 'void* (foreign-entry "environ") 0))
-      (else #f)))
+    (let ((read (sa-posix-envp-reader))) (and read (read))))
   (define (windows-block)
     (and (sa-windows-env-entries)
          (let* ((get (car (sa-windows-env-entries)))
@@ -828,11 +938,12 @@
 ;; continuation. Degradation: '() when sa-introspect-enabled? is #f or the
 ;; target has no inspector — the backtrace then renders from the compile-time
 ;; tables alone (jolt-backwalk) or reports no frames.
+(define jolt-trace-raw-cap 10000)   ; raw continuation frames one trace walks; a frame costs ~1 us
 (define (sa-continuation-frames k)
   (guard (e (#t '()))
     (if (sa-introspect-enabled?)
         (let loop ((io (inspect/object k)) (n 0) (acc '()))
-          (if (or (not io) (fx>=? n 400))
+          (if (or (not io) (fx>=? n jolt-trace-raw-cap))
               (reverse acc)
               (loop (guard (e (#t #f)) (io 'link)) (fx+ n 1) (cons io acc))))
         '())))
@@ -1084,11 +1195,9 @@
   (unless sa-fbytes-probed?
     (set! sa-fbytes-probed? #t)                ; probe once, even if it throws
     (guard (e (#t #f))
-      (when (foreign-entry? "memcpy")
-        (set! sa-fbytes-in (foreign-procedure "memcpy" (u8* void* size_t) void*))
-        (set! sa-fbytes-out (foreign-procedure "memcpy" (void* u8* size_t) void*)))
-      (when (foreign-entry? "memset")
-        (set! sa-fbytes-zero (foreign-procedure "memset" (void* int size_t) void*))))))
+      (set! sa-fbytes-in (and (foreign-entry? "memcpy") (foreign-procedure "memcpy" (u8* void* size_t) void*)))
+      (set! sa-fbytes-out (and sa-fbytes-in (foreign-procedure "memcpy" (void* u8* size_t) void*)))
+      (set! sa-fbytes-zero (and (foreign-entry? "memset") (foreign-procedure "memset" (void* int size_t) void*))))))
 
 ;; (sa-foreign-bytes-ref! addr bv n) -> void
 ;; Copy the N octets at foreign address ADDR into BV[0,N). Contract: a
@@ -1453,6 +1562,20 @@
                                                 source-annotations profile-source))
     #t))
 
+;; (sa-drop-inspector-expressions! in out) -> boolean
+;; Copy the compiled object file IN to OUT without the expanded source its
+;; inspector information holds (each procedure's expression and free list, each
+;; return point's expression) and the names of the variables of its frames (each
+;; procedure's live vector, each return point's live mask, and the return points
+;; with no source object), keeping the rest: procedure and frame names and source
+;; objects (so file and line). Contract: OUT loads and runs as IN does, and a frame
+;; still prints its name and exactly the file:line it printed. Degradation: #f (OUT
+;; not written), and the caller ships IN.
+(define (sa-drop-inspector-expressions! in out)
+  (guard (e (#t (sa-delete-partial! out) #f))
+    (strip-fasl-file in out (fasl-strip-options inspector-expressions inspector-variables))
+    #t))
+
 ;; (sa-gc-install-after-collect! maintain observe) -> boolean
 ;; Hook every collection: the target performs its normal collection, then calls
 ;; (MAINTAIN collect-full!) -- collect-full! collects EVERY generation now, the
@@ -1481,7 +1604,7 @@
   (let ((last-end (sa-monotonic-ns))
         (collect-full!
           (case-lambda
-            (() (collect (collect-maximum-generation)))
+            (() (let ((top (sa-gc-top))) (collect top top)))
             ;; ROOM: #f for an ordinary full collection, else the free bytes the tight
             ;; one has to work in
             ((room)
@@ -1491,7 +1614,7 @@
                      (lambda () (in-place-minimum-generation 1))
                      (lambda () (sa-collect-tight room))
                      (lambda () (in-place-minimum-generation saved))))
-                 (collect (collect-maximum-generation)))))))
+                 (let ((top (sa-gc-top))) (collect top top)))))))
     (collect-request-handler
       (lambda ()
         (sa-gc-collect-guard
@@ -1502,7 +1625,7 @@
                 ;; young collection for the nursery's time share to count
                 (begin
                   (set! sa-full-collect-requested? #f)
-                  (collect (collect-maximum-generation))
+                  (let ((top (sa-gc-top))) (collect top top))
                   (sa-pin-drain-after-collect!))
                 (let ((t0 (sa-monotonic-ns)))
                   (sa-collect-young!)
@@ -1533,8 +1656,8 @@
 ;;
 ;; ROOM is unused: the collection no longer needs any to fit.
 (define (sa-collect-tight room)
-  (let ((cmg (collect-maximum-generation)))
-    (collect cmg 1 cmg)))
+  (let ((top (sa-gc-top)))
+    (collect top 1 top)))
 
 ;; The collection the hook runs in place of Chez's (collect). Chez's schedule
 ;; collects generation g every radix^g collections and otherwise only
@@ -1577,8 +1700,12 @@
   (if sa-young-tight?
       (if (> (+ (current-memory-bytes) (bytes-allocated 0) (bytes-allocated 1)) sa-young-tight?)
           (collect 0 1 1)
-          (collect))
-      (let* ((cmg (collect-maximum-generation))
+          ;; Chez's own schedule, its target capped at this process's ceiling (sa-gc-top)
+          (let* ((top (sa-gc-top))
+                 (g (let loop ((g (fx- top 1)))
+                      (if (or (fx<= g 0) (fx= 0 (modulo sa-young-count (expt (collect-generation-radix) g)))) g (loop (fx- g 1))))))
+            (collect g (fxmin top (fx+ g 1)))))
+      (let* ((cmg (sa-gc-top))
              (radix (collect-generation-radix))
              (g (let loop ((g (fx- cmg 1)))
                   (if (or (fx<= g 1) (fx= 0 (modulo sa-young-count (expt radix g))))
@@ -1953,6 +2080,88 @@
   (guard (e (#t (lambda (r) #f)))
     (record-accessor sa-winder-rtd 0)))
 
+;; A jolt try/catch on Chez (backend emit-try) is
+;;
+;;   (call-with-values (lambda () (jolt-try-body body)) (jolt-try-handler raw handler))
+;;
+;; It evaluates body; if anything is raised inside it, the stack unwinds to here
+;; (every dynamic-wind after-thunk on the way runs) and handler is evaluated, in
+;; tail position, with raw bound to the raised object. Body values pass through
+;; as they come, any number of them.
+;;
+;; This is R6RS `guard` with an else clause, minus what guard costs on the path
+;; that does not throw. Chez's $guard (s/exceptions.ss) takes a MULTI-SHOT
+;; call/cc, reads the continuation marks, and installs its handler through
+;; with-exception-handler, which is a parameterize: a swap closure, a box, a
+;; critical winder, and dynamic-wind's body thunk and values consumer. Measured
+;; at optimize-level 3: guard 18 ns and 297 B per entry over a bare call. And a
+;; multi-shot capture inside a one-shot frame (a letcc, a fiber) promotes that
+;; frame, so every later return through it copies the stack segment.
+;;
+;; Here the escape point is a ONE-SHOT continuation (64 B), and the handler is
+;; pushed onto Chez's handler stack by hand, with a plain winder that pops it on
+;; any escape and pushes it back on a re-entry. Per entry: the continuation, the
+;; call/1cc lambda's closure (its free variables), one closure h (holding only
+;; k), the handler-stack pair, the winder record and its chain pair:
+;; 64 + 16·n + 16 + 16 + 32 + 16 B, and no procedure call between the two pushes,
+;; nor between the two pops, so no interrupt can land between them.
+;;
+;; h is all three of the handler and the winder's in and out thunks (its arity
+;; tells them apart: raise calls it with the object, the winder with nothing):
+;;   (h c)  escape to k with the object, under a private marker. raise calls it
+;;          with the handler stack parameterized to the rest (a critical
+;;          winder); unwinding to k undoes that, then our winder below pops h.
+;;   (h)    on the way OUT (an escape past this try, a fiber park) h is the top
+;;          of the stack, so pop it; on the way back IN (a parked fiber resumed)
+;;          it is not, so push it onto whatever the resumed context has.
+;; The normal return pops both by hand, from the values saved in this frame.
+;;
+;; Why it is sound to bypass with-exception-handler: Chez reads the handler
+;; stack only through $current-handler-stack, and every other writer of it
+;; (with-exception-handler, raise, guard) goes through a winder, so each
+;; restores its own saved value on the way out, whatever is above it. The
+;; one-shot k survives a fiber park for the reason continuations.ss gives (the
+;; park captures and restores the whole segment chain, k's frame included).
+;;
+;; WHY TWO MACROS and the call-with-values in the emitted text: the frame the
+;; enclosing fn keeps while body runs is the return point of the call/1cc, and a
+;; backtrace reads that fn's line off the source of that call. Chez gives a
+;; macro's OUTERMOST output form the source of the macro use, so jolt-try-body
+;; expands to the call/1cc itself and the emitted (jolt-try-body ...) carries the
+;; try's position. One macro with the call/1cc nested inside its output left the
+;; frame with no source, and the trace fell back to the fn's definition line.
+(define jolt-try-caught (string->uninterned-symbol "jolt-try-caught"))
+(define-syntax jolt-try-body
+  (syntax-rules ()
+    ((_ body)
+     (call/1cc
+      (lambda (k)
+        (let ((oh (#%$current-handler-stack))
+              (ow (#%$current-winders)))
+          (letrec ((h (case-lambda
+                        ((c) (k jolt-try-caught c))
+                        (() (let ((cur (#%$current-handler-stack)))
+                              (#%$current-handler-stack
+                               (if (and (pair? cur) (eq? (car cur) h))
+                                   (cdr cur)
+                                   (cons h cur))))))))
+            (#%$current-winders
+             (cons (#%$record sa-winder-rtd h h (#%$current-attachments)) ow))
+            (#%$current-handler-stack (cons h oh))
+            (call-with-values
+              (lambda () body)
+              (case-lambda
+                ((v) (#%$current-handler-stack oh) (#%$current-winders ow) v)
+                (vs (#%$current-handler-stack oh) (#%$current-winders ow)
+                    (apply values vs)))))))))))
+(define-syntax jolt-try-handler
+  (syntax-rules ()
+    ((_ raw handler)
+     (case-lambda
+       ((v) v)
+       ((tag raw) (if (eq? tag jolt-try-caught) handler (values tag raw)))
+       (vs (apply values vs))))))
+
 
 ;; (sa-current-winders) -> the chain, innermost first.
 ;; (sa-current-winders-set! w) -> void. Replaces it wholesale.
@@ -1962,6 +2171,14 @@
 ;; chain on exit and would silently undo it. See jolt-park-drop-finallys!.
 (define (sa-current-winders) (#%$current-winders))
 (define (sa-current-winders-set! w) (#%$current-winders w))
+;; The same read and write as syntax, for a path that does them on every
+;; element (locks.ss jolt-claim-wind): Chez compiles each to one thread-context
+;; field access, where the procedures above are a call each.
+(define-syntax sa-winders (syntax-rules () ((_) (#%$current-winders))))
+(define-syntax sa-winders-set! (syntax-rules () ((_ w) (#%$current-winders w))))
+;; (sa-make-winder in out) -> a winder to put on the chain by hand, made once and
+;; reused (locks.ss jolt-claim-wind). No attachments: its thunks read none.
+(define (sa-make-winder in out) (#%$record sa-winder-rtd in out '()))
 
 ;; The pieces of a handler installation that runs its body INLINE, for jolt's
 ;; try (rt.ss jolt-guard). with-exception-handler takes the body as a thunk,
@@ -2144,10 +2361,11 @@
 
 (define (sa-term-open)
   (or (and sa-term-procs #t)
-      (and (foreign-entry? "(cs)ee_init_term")
-           ((foreign-procedure "(cs)ee_init_term" (iptr iptr) boolean) -1 -1)
-           (begin
-             (set! sa-term-procs
+      (begin
+        ;; the entries are kept once claimed (sa-entry-once's note on looking up once)
+        (set! sa-term-procs
+          (and (foreign-entry? "(cs)ee_init_term")
+               ((foreign-procedure "(cs)ee_init_term" (iptr iptr) boolean) -1 -1)
                (vector
                  (foreign-procedure "(cs)ee_raw" () void)                       ; 0
                  (foreign-procedure "(cs)ee_noraw" () void)                     ; 1
@@ -2167,8 +2385,8 @@
                  (foreign-procedure "(cs)ee_line_feed" () void)                 ; 15
                  (foreign-procedure "(cs)ee_bell" () void)                      ; 16
                  (foreign-procedure "(cs)ee_pause" () void)                     ; 17
-                 (foreign-procedure "(cs)ee_set_color" (int boolean) void)))    ; 18
-             #t))))
+                 (foreign-procedure "(cs)ee_set_color" (int boolean) void))))  ; 18
+        (and sa-term-procs #t))))
 
 (define (sa-term-raw!) ((sa-term-proc 0)))
 (define (sa-term-cooked!) ((sa-term-proc 1)))
@@ -2396,7 +2614,7 @@
 ;; does not move such objects, or one that cannot be asked not to).
 (define sa-pin-guardian (make-guardian))
 (define sa-pin-boxes (make-weak-eq-hashtable))
-(define sa-pin-mutex (make-mutex))
+(define-process-local sa-pin-mutex (make-mutex))
 ;; under sa-pin-mutex
 (define (sa-pin-release! b)
   (when (unbox b)

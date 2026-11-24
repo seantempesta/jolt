@@ -44,6 +44,14 @@
 ;; the dispatcher recomputes from the timer itself, so a late or spurious
 ;; delivery runs nothing that is not due.
 
+;; MERGE-REVIEW(deep-fixes): upstream's scheduler called Chez's set-timer directly; ours
+;; (ed1e37a1) keeps the thread's tick count at the one site that arms the timer,
+;; jolt-set-timer! (fibers.ss), which answers what set-timer answers and adds the ticks the
+;; last arm used to the count (jolt.host/ticks, ticks-of, a run's tick budget). Chosen:
+;; every set-timer here goes through jolt-set-timer!, so the scheduler's arms are counted
+;; and nested-budget-test's one-arm-site law holds. Cost: the solo jolt-tick-preempt! pays
+;; jolt-set-timer!'s thread-parameter read and two vector writes, what our pin's fiber
+;; dispatch already paid; upstream's "a yield costs a bare set-timer" no longer holds.
 (define jolt-vreg-ticks 13)
 
 ;; state vector layout
@@ -85,15 +93,26 @@
 (define-syntax jolt-tick-state
   (syntax-rules () ((_) (virtual-register 13))))
 
+;; Upstream's watch (e35d0103) keeps the timer armed on every thread off a fiber. Ours counts
+;; ticks at the timer's arm (jolt-set-timer!), so the watch arms through jolt-watch-timer!
+;; (fibers.ss), the one uncounted arm: an idle thread's count stands still under it, and a
+;; counted arm already running (a measure's, a budget's) is put back counted.
 (define jolt-tick-watch-ticks 1000000)
+;; The watch's arm: uncounted, unless a tick measure is open on this thread (jolt.host/ticks-of:
+;; the cell's measures count). A measure opened while an older counted arm still ran arms nothing
+;; of its own, so when that arm ends the watch that replaces it has to keep counting the body.
+(define (jolt-tick-watch-arm! n)
+  (if (fx>? (vector-ref (jolt-ticks-cell) 4) 0) (jolt-set-timer! n) (jolt-watch-timer! n)))
 ;; Arm the watch on this thread, leaving a timer that is already running alone.
 (define (jolt-tick-watch!)
   (disable-interrupts)
   (when (and (eq? (jolt-tick-state) 0) (not (jolt-current-fiber)))
-    (let ((rem (set-timer 0)))
+    (let* ((counted? (jolt-timer-counted?)) (rem (jolt-set-timer! 0)))
       (unless (eq? (timer-interrupt-handler) jolt-tick-fire)
         (timer-interrupt-handler jolt-tick-fire))
-      (set-timer (if (fx>? rem 0) rem jolt-tick-watch-ticks))))
+      (if (and counted? (fx>? rem 0))
+          (jolt-set-timer! rem)
+          (jolt-tick-watch-arm! (if (fx>? rem 0) rem jolt-tick-watch-ticks)))))
   (enable-interrupts)
   (void))
 
@@ -103,7 +122,7 @@
   (syntax-rules ()
     ((_ n) (let ((s (jolt-tick-state)) (m n))
              (if (eq? s 0)
-                 (begin (set-timer m) (void))
+                 (begin (jolt-set-timer! m) (void))
                  (jolt-tick-demand! s jolt-tick-slot-preempt m))))))
 
 ;; Arm (n > 0) or cancel (n = 0) the demand in a slot.
@@ -111,7 +130,7 @@
   (let ((s (jolt-tick-state)))
     (cond
       ((not (eq? s 0)) (jolt-tick-demand! s slot n))
-      ((fx=? slot jolt-tick-slot-preempt) (set-timer n) (void))
+      ((fx=? slot jolt-tick-slot-preempt) (jolt-set-timer! n) (void))
       ;; solo has no other demand to cancel
       ((fx=? n 0) (void))
       (else (jolt-tick-demand! s slot n)))))
@@ -145,7 +164,7 @@
 ;; would leave the fiber unpreemptible until its next dispatch. Off a fiber
 ;; there is nothing to preempt.
 (define (jolt-tick-go-multi!)
-  (let* ((rem (set-timer 0))
+  (let* ((rem (jolt-set-timer! 0))
          (pre (cond ((fx>? rem 0) rem)
                     ((jolt-current-fiber) 1)
                     (else #f)))
@@ -160,7 +179,7 @@
 ;; Charge every demand the ticks that passed since the timer was armed, and leave
 ;; it disarmed. A demand at or below zero is due.
 (define (jolt-tick-account! s)
-  (let* ((rem (set-timer 0))
+  (let* ((rem (jolt-set-timer! 0))
          (el (fxmax 0 (fx- (vector-ref s jolt-tick-armed) rem))))
     (vector-set! s jolt-tick-armed 0)
     (unless (fx=? el 0)
@@ -179,13 +198,13 @@
     (if (and may-go-solo? (not a) (not b) (not (vector-ref s jolt-tick-sampler)))
         (begin
           (set-virtual-register! 13 0)
-          (set-timer (if c (fxmax 1 c) jolt-tick-watch-ticks)))
+          (jolt-set-timer! (if c (fxmax 1 c) jolt-tick-watch-ticks)))
         (let* ((m (if (and b (or (not a) (fx<? b a))) b a))
                (m (if (and c (or (not m) (fx<? c m))) c m)))
           (when m
             (let ((n (fxmax 1 m)))
               (vector-set! s jolt-tick-armed n)
-              (set-timer n)))))))
+              (jolt-set-timer! n)))))))
 
 (define (jolt-tick-due? s slot)
   (let ((d (vector-ref s slot)))
@@ -205,7 +224,7 @@
       ((jolt-current-fiber) ((vector-ref jolt-tick-clients jolt-tick-slot-preempt)))
       ;; Off a fiber it was the watch. On a carrier between dispatches it was a
       ;; quantum that fell due mid-park, and the next dispatch overwrites this.
-      (else (set-timer jolt-tick-watch-ticks) (void)))))
+      (else (jolt-tick-watch-arm! jolt-tick-watch-ticks) (void)))))
 
 (define (jolt-tick-fire-multi s)
   (when (and jolt-tick-sampling? (not (vector-ref s jolt-tick-sampler)))

@@ -2594,7 +2594,7 @@
 ;; once is not safe. A channel holding locks is never collected: each lock is in
 ;; the process's table and names its channel.
 (define fc-guardian (make-guardian))
-(define fc-guardian-mu (make-mutex))
+(define-process-local fc-guardian-mu (make-mutex))
 (define (fc-collect-unclosed!)
   (let loop ()
     (let ((st (jolt-with-mutex fc-guardian-mu (fc-guardian))))
@@ -2647,7 +2647,7 @@
 
 ;; file-id -> the locks this process holds on that file, through any channel
 (define nio-file-locks (make-hashtable equal-hash equal?))
-(define nio-file-locks-mu (make-mutex))
+(define-process-local nio-file-locks-mu (make-mutex))
 (define (nio-file-locks-add! l)
   (let ((id (fc-file-id (fl-channel l))))
     (jolt-with-mutex nio-file-locks-mu
@@ -2947,8 +2947,10 @@
                             ;; as the JDK copies through an 8 KiB buffer: the
                             ;; stream never has to fit in memory
                             (let ((port (open-file-output-port d (file-options no-fail) (buffer-mode block))))
+                              ;; closed when the copy ends, never at a park of the
+                              ;; fiber copying (jolt-finally-in, as copy-bytes-into!)
                               (->num (dynamic-wind
-                                       (lambda () #f)
+                                       jolt-finally-in
                                        (lambda () (copy-bytes-into! src (lambda (bv) (put-bytevector port bv))))
                                        (lambda () (close-port port)))))))
                          ;; copy(Path, OutputStream): the file's bytes into the
@@ -2959,7 +2961,7 @@
                             (io-note-file-read! s)
                             (let ((port (nio-open-input-port s (nio-shown src))))
                               (->num (dynamic-wind
-                                       (lambda () #f)
+                                       jolt-finally-in
                                        (lambda ()
                                          (copy-port-chunks! port
                                            (lambda (bv)
@@ -4868,7 +4870,7 @@
         (nio-mime-split text (lambda (c) (char=? c #\newline)))))
     h))
 (define nio-mime-types-cache (make-hashtable string-hash string=?))
-(define nio-mime-types-mutex (make-mutex))
+(define-process-local nio-mime-types-mutex (make-mutex))
 (define (nio-mime-types path)
   ;; The file is read outside the lock, so a slow read holds up no other prober
   ;; and nothing blocks while preemption is refused. Two threads that both miss

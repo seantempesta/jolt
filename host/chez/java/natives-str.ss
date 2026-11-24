@@ -610,7 +610,7 @@
 ;; A reader dropped without close would keep its descriptor; the guardian hands
 ;; those back, and they are closed the next time a decoder is opened.
 (define iconv-guardian (make-guardian))
-(define iconv-guardian-mu (make-mutex))
+(define-process-local iconv-guardian-mu (make-mutex))
 (define (iconv-state-close! st)
   (when (vector-ref st 1)
     ((vector-ref (vector-ref st 0) 2) (vector-ref st 1))
@@ -706,7 +706,7 @@
         (sa-foreign-set! 'unsigned-64 cells 24 outcap)))
     (define (replace!) (put-bytevector acc #vu8(#xEF #xBF #xBD)))
     (let ((r (dynamic-wind
-      void
+      jolt-finally-in
       (lambda ()
         (let ((slice (make-bytevector n)))
           (bytevector-copy! bv lo slice 0 n)
@@ -1070,7 +1070,7 @@
 (define (str-intern-hash s) (if (string? s) (string-hash s) 0))
 (define (str-intern=? a b) (and (string? a) (string? b) (string=? a b)))
 (define jolt-str-intern-pool (make-ephemeron-hashtable str-intern-hash str-intern=?))
-(define jolt-str-intern-mu (make-mutex))
+(define-process-local jolt-str-intern-mu (make-mutex))
 (define (jolt-str-intern s)
   (or (hashtable-ref jolt-str-intern-pool s #f)
       (jolt-with-mutex jolt-str-intern-mu

@@ -266,7 +266,7 @@
 ;; before the parent reads its id leaves that marker behind, one fixnum key
 ;; that no later thread's id can equal. jolt-started-thread? reads #t only.
 (define live-threads (make-eqv-hashtable))
-(define live-threads-mutex (make-mutex))
+(define-process-local live-threads-mutex (make-mutex))
 (define (live-thread-ids)
   (jolt-with-mutex live-threads-mutex
     (let loop ((ks (vector->list (hashtable-keys live-threads))) (acc '()))
@@ -317,12 +317,15 @@
 ;;
 ;; All of it is under exit-mu and announced on exit-cv, whose only waiter is the
 ;; exiting main thread, so a plain condition is enough.
-(define exit-mu (make-mutex))
-(define exit-cv (make-condition))
+(define-process-local exit-mu (make-mutex))
+(define-process-local exit-cv (make-condition))
 (define exit-nondaemon-live 0)
 ;; What a thread's end means to its java.lang.Thread object (io.ss): it is no
 ;; longer alive, join returns, and the id-keyed tables let it go.
 (define jolt-thread-exit-hook (lambda (id) (void)))
+;; A thread's end wakes a main carrier that waits for every other thread to park or end before it
+;; reads the program as unable to wake (fibers.ss jolt-main-carrier-run/loop!): fibers.ss sets it.
+(define jolt-thread-end-wake (lambda () (void)))
 ;; The pools behind clojure.core's future/send-off (a cached pool: a worker idles
 ;; 60s after its last task before it exits) and send (a fixed pool: its workers
 ;; never exit). jolt runs that work on threads of its own, so the pool's idle
@@ -373,6 +376,8 @@
                       (lambda () #f)
                       thunk
                       (lambda ()
+                        ;; running until its exit hook has woken its joiners (locks.ss all asleep)
+                        (jolt-asleep-thread-exiting!)
                         ;; live-threads first, the exit hook after: Thread.start
                         ;; registers a handle only while jolt-started-thread?
                         ;; holds, so a hook that ran first could see its entries
@@ -386,7 +391,9 @@
                         (jolt-thread-exit-hook id)
                         (jolt-with-mutex live-threads-mutex
                           (hashtable-delete! thread-daemons id))
-                        (unless d (exit-nondaemon-leave!))))))))))))
+                        (unless d (exit-nondaemon-leave!))
+                        (jolt-asleep-thread-ended!)
+                        (jolt-thread-end-wake)))))))))))
          (id (sa-thread-id-of t)))
     (when id
       (jolt-with-mutex live-threads-mutex

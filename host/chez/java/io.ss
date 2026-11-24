@@ -435,23 +435,36 @@
 ;; the fasl index: written once by the launcher before scheme-start, read
 ;; afterwards by single-key hashtable-ref.
 ;;
-;; Empty in every path that carries no such array — dev bin/jolt, devcache, and
-;; `jolt build` app binaries, which register their own embeds eagerly — so the
-;; fetch returning #f is a normal answer there, not a failure. Written once while
-;; the heap is built, single-threaded, and read afterwards by single-key
-;; hashtable-ref, which is the same discipline the fasl index above keeps.
+;; A `jolt build` app that keeps the compiler carries the same blob, built from
+;; this jolt's install sources (build.ss bld-emit-install-sources), so a namespace
+;; it did not compile in loads as it does under jolt itself, wherever the binary
+;; runs. An app has no C array to link it into (the self-contained path appends a
+;; boot to a prebuilt stub), so its blob is ONE bytevector constant in the boot,
+;; attached by jolt-source-blob-attach-bytes!: one compressed object rather than
+;; a string per file, read off the boot with the rest of the heap.
+;;
+;; Empty in every path that carries neither — dev bin/jolt, devcache, and an app
+;; built without the compiler — so the fetch returning #f is a normal answer
+;; there, not a failure. Written once while the heap is built, single-threaded,
+;; and read afterwards by single-key hashtable-ref, which is the same discipline
+;; the fasl index above keeps.
 (define embedded-source-index (make-hashtable equal-hash equal?))
+(define embedded-source-bytes #f)
 (define (jolt-source-blob-attach! index)
   (for-each (lambda (entry)
               (hashtable-set! embedded-source-index (car entry)
                               (cons (cadr entry) (caddr entry))))
             index))
+(define (jolt-source-blob-attach-bytes! bv index)
+  (set! embedded-source-bytes bv)
+  (jolt-source-blob-attach! index))
 (define (jolt-source-blob-fetch offset length)
   (guard (e (else #f))
-    (let* ((base (sa-foreign-entry-address "jolt_source_blob"))
-           (bv (make-bytevector length))
-           (memcpy (sa-foreign-procedure "memcpy" (u8* uptr uptr) void*)))
-      (memcpy bv (+ base offset) length)
+    (let ((bv (make-bytevector length)))
+      (if embedded-source-bytes
+          (bytevector-copy! embedded-source-bytes offset bv 0 length)
+          ((sa-foreign-procedure "memcpy" (u8* uptr uptr) void*)
+           bv (+ (sa-foreign-entry-address "jolt_source_blob") offset) length))
       ;; Each slice is one bytevector-compress frame. Compressing pays here in a
       ;; way it does not for the boot image: the boot is read start to finish on
       ;; every single start, where unpacking outruns readahead and serializes a
@@ -563,7 +576,7 @@
 (define (read-file-bytes path)
   (if (jar-path? path)
       (or (jar-path-bytes path) (jar-path-missing path))
-      (with-port (open-file-input-port path)
+      (with-port (jolt-open-file-input-port path)
         (lambda (p) (let ((bv (get-bytevector-all p))) (if (eof-object? bv) (bytevector) bv))))))
 
 ;; Write an embedded bytevector resource out to a path. make-boot-file needs the
@@ -571,7 +584,7 @@
 (define (jolt-spill-embedded! name path)
   (let ((bv (jolt-embedded-bytes name)))
     (unless bv (error 'jolt-spill-embedded! "no embedded bytes for" name))
-    (with-port (open-file-output-port path (file-options no-fail) (buffer-mode block))
+    (with-port (jolt-open-file-output-port path (file-options no-fail) (buffer-mode block))
       (lambda (p) (put-bytevector p bv)))))
 
 ;; Frame an app boot onto a file that already holds the stub bytes. Layout:
@@ -584,7 +597,7 @@
   (let* ((head (read-file-bytes path))           ; the stub bytes already written
          (lb (make-bytevector 8 0)))
     (bytevector-u64-set! lb 0 (bytevector-length boot-bv) (endianness little))
-    (with-port (open-file-output-port path (file-options no-fail) (buffer-mode block))
+    (with-port (jolt-open-file-output-port path (file-options no-fail) (buffer-mode block))
       (lambda (p)
         (put-bytevector p head)
         (put-bytevector p boot-bv)
@@ -786,6 +799,7 @@
                         (loop (- n 1))
                         (substring given 0 n))))
          (base (if (string=? trimmed "") p trimmed)))
+    (io-note-file-read! p)   ; a listing is a read: its names (io-note-file-read!)
     (map (lambda (e) (string-append (if (string=? base "/") "" base) "/" e))
          (os-directory-list p))))
 (define (jolt-dir? path) (if (file-directory? (project-relative (file-path-of path))) #t #f))
@@ -1063,7 +1077,7 @@
             err
             (begin (c-close-fd fd) 0)))
       (guard (e ((i/o-file-already-exists-error? e) io-EEXIST))
-        (close-port (open-file-output-port p (file-options)))
+        (close-port (jolt-open-file-output-port p (file-options)))
         0)))
 
 ;; Temp entries are named and made the JDK's way (TempFileHelper, and
@@ -1299,7 +1313,7 @@
 ;; Run BODY with the wide copy of S, freeing it however BODY leaves.
 (define (win32-with-wstr s proc)
   (let ((w (win32-wstr s)))
-    (dynamic-wind (lambda () #f) (lambda () (proc w)) (lambda () (sa-foreign-free w)))))
+    (dynamic-wind jolt-finally-in (lambda () (proc w)) (lambda () (sa-foreign-free w)))))
 
 ;; The executable this process is running, asked of Windows (GetModuleFileNameW),
 ;; or #f off Windows or when it cannot say. argv[0] is no substitute: it is the
@@ -1388,7 +1402,7 @@
                       (create w access win32-FILE-SHARE-ALL 0
                               win32-OPEN-EXISTING (win32-attr-open-flags follow?) 0)))))
            (and (not (= h win32-INVALID-HANDLE-VALUE))
-                (dynamic-wind (lambda () #f) (lambda () (proc h)) (lambda () (close h))))))))
+                (dynamic-wind jolt-finally-in (lambda () (proc h)) (lambda () (close h))))))))
 
 ;; Files.setLastModifiedTime / setAttribute on Windows, as WindowsFileAttributeViews
 ;; does it: open the path for FILE_WRITE_ATTRIBUTES — with
@@ -1723,7 +1737,7 @@
     (and ff fc
          (let ((data (sa-foreign-alloc win32-find-data-size)))
            (dynamic-wind
-             (lambda () #f)
+             jolt-finally-in
              (lambda ()
                (let ((h (win32-with-wstr path (lambda (w) (ff w data)))))
                  (and (not (= h win32-INVALID-HANDLE-VALUE))
@@ -2357,6 +2371,7 @@
                                                            "java.io.File")))))
       ;; .list -> the child NAMES (a String[]), nil if not a readable directory.
       ((string=? name "list")
+       (io-note-file-read! fp)
        (list (jfile-listing fp (lambda () (jolt-ref-array (os-directory-list fp)
                                                            "java.lang.String")))))
       ((string=? name "length")         (list (->num (file-byte-size fp))))
@@ -2458,6 +2473,10 @@
 ;; cache key. Keying on the .clj alone left an edited SQL migration serving the
 ;; previous build's statements out of the cache, silently — the namespace source
 ;; is untouched, so its hash still matches (jolt#576).
+;;
+;; A DIRECTORY that is listed is announced the same way (jolt-list-dir, File.list,
+;; Files/walkFileTree, Files/newDirectoryStream): the cache keys it by its sorted
+;; names, so a macro that reads every file in a directory sees a file added there.
 ;;
 ;; A file that does NOT exist is announced too. (io/resource "migrations/003.sql")
 ;; answering nil is a compile-time answer like any other, and it stops being the
@@ -2613,7 +2632,7 @@
        (or (jar-path-bytes path) (jar-path-missing path))
        (apply read-file-bytes-on-disk path given))))
 (define (read-file-bytes-on-disk path . given)
-  (with-port (open-path-guarded (if (pair? given) (car given) path) path (lambda (p) (open-file-input-port p)))
+  (with-port (open-path-guarded (if (pair? given) (car given) path) path (lambda (p) (jolt-open-file-input-port p)))
     (lambda (p)
       ;; A port with no meaningful length — a fifo, a character device — reports
       ;; 0 or raises; both fall back to the growing read, which is correct for
@@ -3186,7 +3205,7 @@
                          (slurp-path fp (if (file-url-string? src) (file-url->path src) src)))))
     (else (io-cannot-open src #t))))
 
-(define io-counter-mutex (make-mutex))
+(define-process-local io-counter-mutex (make-mutex))
 (define (jolt-spit path content . opts)
   ;; Render BEFORE any file is touched — a throwing toString used to leave the
   ;; target truncated. Both writes then go to the target in place (below).
@@ -3211,7 +3230,7 @@
                   (unless (io-encoding-known? enc)
                     (close-port (open-path-guarded given p
                                   (lambda (rp)
-                                    (open-file-output-port rp
+                                    (jolt-open-file-output-port rp
                                       (if (io-append? opts)
                                           (file-options no-fail no-truncate append)
                                           (file-options no-fail))
@@ -3226,7 +3245,7 @@
     (when (file-directory? p) (file-open-error given p))
     (if (io-append? opts)
         (with-port (open-path-guarded given p
-                     (lambda (rp) (open-file-output-port rp (file-options no-fail no-truncate append)
+                     (lambda (rp) (jolt-open-file-output-port rp (file-options no-fail no-truncate append)
                                                          (buffer-mode block))))
           (lambda (port) (put-bytevector port bytes)))
         ;; In place, as the JVM's FileOutputStream does: a rename REPLACES the
@@ -3235,14 +3254,15 @@
         ;; though. Truncating a file with data costs the kernel a free and a
         ;; reallocation of its blocks (about 70us on Linux on disk, against 6us
         ;; to overwrite them), so the old tail goes after the write, when there
-        ;; is one. A device or fifo reports length 0 and has no tail.
+        ;; is one. A device or fifo reports length 0 and has no tail; one opened on a
+        ;; fiber is a port with no length at all (jolt-open-file-output-port).
         (with-port (open-path-guarded given p
-                     (lambda (rp) (open-file-output-port rp (file-options no-fail no-truncate)
+                     (lambda (rp) (jolt-open-file-output-port rp (file-options no-fail no-truncate)
                                                          (buffer-mode block))))
           (lambda (port)
             (put-bytevector port bytes)
             (flush-output-port port)
-            (when (> (port-length port) (bytevector-length bytes))
+            (when (and (port-has-port-length? port) (> (port-length port) (bytevector-length bytes)))
               (set-port-length! port (bytevector-length bytes))))))
     jolt-nil))
 
@@ -3735,7 +3755,7 @@
 ;; daemon status and priority live in the id-keyed tables below and in
 ;; lazy-bridge.ss, so an object made for it from another thread reads the same.
 (define java-thread-id-next 2)                 ; 1 is main's
-(define java-thread-id-mu (make-mutex))
+(define-process-local java-thread-id-mu (make-mutex))
 (define (next-java-thread-id!)
   (jolt-with-mutex java-thread-id-mu
     (let ((n java-thread-id-next)) (set! java-thread-id-next (+ n 1)) n)))
@@ -3829,7 +3849,7 @@
 ;; thread, and a child must not report the parent's object as its own.
 (define thread-handle-cell (make-thread-parameter #f))      ; (thread-id . object)
 (define thread-handles-by-id (make-eqv-hashtable))
-(define thread-handles-mutex (make-mutex))
+(define-process-local thread-handles-mutex (make-mutex))
 ;; Thread.start: the started thread IS its object. Registered by the parent right
 ;; after the fork and again by the child, so it is there whichever runs first.
 (define (register-thread-object! id obj)
@@ -4108,6 +4128,7 @@
 ;; The halves are kept as they are, unsigned; the text is written when str asks
 ;; (natives-misc.ss juuid-s).
 (define (uuid-from-halves msb lsb)
+  ;; a long's 64 bits read back unsigned through a bytevector (a bignum mask allocates)
   (define (u64 n)
     (let ((n (jnum->exact n)) (b (make-bytevector 8)))
       (if (< n 0)

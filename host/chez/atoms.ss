@@ -30,6 +30,16 @@
 ;; pointer that publishes it, so a reader that sees the pointer sees the
 ;; object; a reader's own loads are dependent and need nothing (the lock
 ;; version never fenced a deref either).
+;;
+;; A store-load fence after each successful CAS, of the value or of the watches,
+;; orders that store ahead of the thread's next load of the other slot, as the
+;; JVM's volatiles do: a swap! then reads the watches, an add-watch then reads
+;; the value (a deref), and with the fence one of the two always sees the other's
+;; store. Without it AArch64 lets each load pass its own CAS's store (Chez's CAS
+;; is a bare ldxr/stxr), and a thread that adds a watch and then checks the value
+;; missed a change that the changer's notify missed too (gate atomwatchorder).
+;; The writer pays; deref stays one plain load. memory-order-release is the
+;; fence: CSUG gives it store-load, and on AArch64 it is dmb ish.
 (define-record-type jolt-atom
   (fields (mutable val) (mutable watches) (mutable validator) lock)
   (nongenerative jolt-atom-v3))
@@ -120,7 +130,9 @@
 ;; success. The compute step (f) runs outside this; a loser recomputes.
 (define (jolt-atom-cas! a old nv)
   (when jolt-mt? (memory-order-release))
-  (sa-record-cas! a jolt-atom-val-slot old nv))
+  (and (sa-record-cas! a jolt-atom-val-slot old nv)
+       ;; the store-load fence: the notify that follows reads the watches after it
+       (begin (when jolt-mt? (memory-order-release)) #t)))
 ;; Unconditional exchange (AtomicReference.getAndSet): the old value.
 (define (jolt-atom-exchange! a v)
   (let retry ()
@@ -227,36 +239,36 @@
 ;; keeps its record slots (the hot swap!/reset! path); every OTHER watchable
 ;; reference type registers a predicate here and stores its watches/validator in
 ;; identity-keyed side tables. A ref type makes itself notify by calling
-;; iref-notify at its mutation points (vars do at root set).
+;; iref-notify at its mutation points. A var keeps its own in the cell (below).
 (define iref-arms '())
 (define (register-iref-arm! pred) (set! iref-arms (cons pred iref-arms)))
 (define (iref? r)
   (let loop ((as iref-arms))
     (cond ((null? as) #f) (((car as) r) #t) (else (loop (cdr as))))))
-;; Watches and validators for the IRefs that are NOT atoms (vars, refs) live in
-;; side-tables — an atom keeps its own in the record. A Chez hashtable is not
-;; thread-safe, and add-watch/set-validator! can be called from any thread while
-;; def-var! reads both tables on EVERY def, so both go through one mutex.
+;; Watches and validators for refs and agents live in side-tables — an atom and a
+;; var keep their own in the record. A Chez hashtable is not thread-safe, and
+;; add-watch/set-validator! can be called from any thread while a commit reads both
+;; tables, so both go through one mutex.
 ;;
 ;; The read side keeps a lock-free fast path, because the read side is the hot
 ;; one: iref-writes counts the add-watch / set-validator! calls that put an entry
 ;; in either table, so a program that watches nothing pays one box read instead of
-;; two weak-table probes per def — cheaper than before the lock. It is a call
+;; two weak-table probes per commit — cheaper than before the lock. It is a call
 ;; COUNT, not a live-entry count: nothing decrements it, so once a watch has
 ;; existed the fast path is off for good even if remove-watch took it away again.
 ;; That direction is the safe one, and it is why remove-watch does not bump — it
 ;; can only shrink an entry some earlier bump already accounted for.
 ;;
 ;; The bump is inside the mutex and BEFORE the table write, which is what makes
-;; the fast path sound: a def-var! racing an add-watch either misses the bump and
+;; the fast path sound: a commit racing an add-watch either misses the bump and
 ;; the entry both (the watch was not registered yet) or sees the bump and takes
 ;; the lock, where it finds whatever the writer left. Bumping after the write
 ;; would leave a window where the entry is in the table and iref-any? still reads
-;; 0, and that def would silently skip validation and notification. A fixnum box
+;; 0, and that commit would silently skip validation and notification. A fixnum box
 ;; read cannot tear.
 (define iref-watch-tbl (make-weak-eq-hashtable))
 (define iref-validator-tbl (make-weak-eq-hashtable))
-(define iref-tbl-mu (make-mutex))
+(define-process-local iref-tbl-mu (make-mutex))
 (define iref-writes (box 0))
 (define (iref-any?) (not (eqv? 0 (unbox iref-writes))))
 ;; call with iref-tbl-mu HELD — the read-modify-write is not atomic on its own.
@@ -268,6 +280,11 @@
       (jolt-with-mutex iref-tbl-mu (hashtable-ref iref-validator-tbl r jolt-nil))
       jolt-nil))
 (define (iref-notify r old new)
+  ;; the store-load fence: the caller has just stored the reference's value (an
+  ;; agent's state, a ref's commit), and a thread adding the first
+  ;; watch of the process bumps iref-writes and then reads that value; one of the two
+  ;; must see the other's store, as for an atom (above)
+  (when jolt-mt? (memory-order-release))
   (for-each (lambda (kv) (jolt-invoke4 (cdr kv) (car kv) r old new))
             (reverse (iref-watches-of r))))
 (define (iref-validate r v)
@@ -301,23 +318,34 @@
     (let* ((ws (jolt-atom-watches a)) (nws (f ws)))
       ;; NWS is a fresh alist that a swap! on another thread walks
       (memory-order-release)
-      (unless (sa-record-cas! a jolt-atom-watches-slot ws nws) (retry)))))
+      (if (sa-record-cas! a jolt-atom-watches-slot ws nws)
+          ;; the store-load fence: a deref that follows reads the value after it
+          (when jolt-mt? (memory-order-release))
+          (retry)))))
 (define (jolt-add-watch a key f)
   (cond
     ((jolt-atom? a)
      (jolt-atom-watches-update! a (lambda (ws) (jolt-watch-add ws key f)))
+     a)
+    ((var-cell? a)
+     (var-watches-update! a (lambda (ws) (jolt-watch-add ws key f)))
      a)
     ((iref? a)
      (jolt-with-mutex iref-tbl-mu
        (iref-tbl-bump!)
        (hashtable-set! iref-watch-tbl a
          (jolt-watch-add (hashtable-ref iref-watch-tbl a '()) key f)))
+     ;; the store-load fence: a deref that follows reads the value after the bump
+     (when jolt-mt? (memory-order-release))
      a)
     (else (jolt-invoke (jolt-ref-iface-method a "clojure.lang.IRef" "addWatch" 3) a key f))))
 (define (jolt-remove-watch a key)
   (cond
     ((jolt-atom? a)
      (jolt-atom-watches-update! a (lambda (ws) (remp (lambda (kv) (jolt=2 (car kv) key)) ws)))
+     a)
+    ((var-cell? a)
+     (var-watches-update! a (lambda (ws) (remp (lambda (kv) (jolt=2 (car kv) key)) ws)))
      a)
     ((iref? a)
      (jolt-with-mutex iref-tbl-mu
@@ -332,6 +360,10 @@
        (when (and (not (jolt-nil? vf)) (jolt-not (jolt-invoke1 vf (jolt-atom-val a))))
          (jolt-iref-state-throw))
        (jolt-atom-validator-set! a vf))
+      ((var-cell? a)
+       (when (and (not (jolt-nil? vf)) (jolt-not (jolt-invoke1 vf (jolt-deref a))))
+         (jolt-iref-state-throw))
+       (var-cell-validator-set! a vf))
       ((iref? a)
        (when (and (not (jolt-nil? vf)) (jolt-not (jolt-invoke1 vf (jolt-deref a))))
          (jolt-iref-state-throw))
@@ -342,6 +374,7 @@
     jolt-nil))
 (define (jolt-get-validator a)
   (cond ((jolt-atom? a) (jolt-atom-validator a))
+        ((var-cell? a) (var-cell-validator a))
         ((iref? a) (iref-validator-of a))
         (else (jolt-invoke (jolt-ref-iface-method a "clojure.lang.IRef" "getValidator" 1) a))))
 
@@ -358,7 +391,7 @@
 ;; ASK on every call rather than close over a fixed answer: iref? walks the arm
 ;; registry, and the agent arm is not registered until java/concurrency.ss loads,
 ;; long after this file.
-(define (jolt-iref-watchable? r) (or (jolt-atom? r) (iref? r)))
+(define (jolt-iref-watchable? r) (or (jolt-atom? r) (var-cell? r) (iref? r)))
 
 ;; ARef.getWatches is an IPersistentMap, so an unwatched reference reads {} and
 ;; not nil. Both alists are reverse-built (jolt-watch-add conses), and this walk
@@ -367,6 +400,7 @@
 ;; order notifyWatches uses.
 (define (jolt-get-watches r)
   (let ((alist (cond ((jolt-atom? r) (jolt-atom-watches r))
+                     ((var-cell? r) (var-cell-watches r))
                      ((iref? r) (iref-watches-of r))
                      (else (throw-jvm (quote ClassCastException)
                                       "getWatches: not a watchable reference")))))
@@ -382,28 +416,22 @@
 ;; in the side table, so the two notifiers stay separate here as they do there.
 (define (jolt-notify-watches r old new)
   (cond ((jolt-atom? r) (jolt-atom-notify r old new))
+        ((var-cell? r) (var-notify r old new))
         ((iref? r) (iref-notify r old new))
         (else (throw-jvm (quote ClassCastException)
                          "notifyWatches: not a watchable reference")))
   jolt-nil)
 
-;; vars are watchable IRefs: a root change (def / var-set on the root /
-;; alter-var-root) validates and notifies like Var.bindRoot. The def-var! wrap
-;; pays two weak-table probes per def and only does IRef work on a watched var.
-(register-iref-arm! var-cell?)
-(define def-var!-pre-iref def-var!)
-(set! def-var!
-  (lambda (ns name v)
-    (let ((c (jolt-var ns name)))
-      (if (and (iref-any?)
-               (or (pair? (iref-watches-of c))
-                   (not (jolt-nil? (iref-validator-of c)))))
-          (let ((old (var-cell-root c)))
-            (iref-validate c v)
-            (let ((r (def-var!-pre-iref ns name v)))
-              (iref-notify c old v)
-              r))
-          (def-var!-pre-iref ns name v)))))
+;; vars are watchable IRefs, as Clojure's Var is an ARef. The cell keeps its own
+;; watches and validator (rt.ss var-cell), and a root change validates, stores the
+;; root, then reads the watches and calls them (rt.ss var-notify): def and intern
+;; through def-var!, alter-var-root, with-redefs and .bindRoot through
+;; jolt-alter-var-root (dyn-binding.ss).
+;; the watch alist moves by CAS like an atom's: two threads adding at once both land
+(define (var-watches-update! c f)
+  (let retry ()
+    (let* ((ws (var-cell-watches c)) (nws (f ws)))
+      (unless (var-cell-watches-cas! c ws nws) (retry)))))
 
 (def-var! "clojure.core" "atom" jolt-atom-new)
 (def-var! "clojure.core" "deref" jolt-deref)

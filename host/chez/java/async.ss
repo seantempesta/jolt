@@ -181,7 +181,7 @@
       (ac-intr-wait! (async-chan-mu ch) (async-chan-cv ch) (lambda () (ac-cv-wait ch)) reg)
       (begin (ac-cv-wait ch) #t)))
 
-(define (ac-qnew) (vector '() '() 0))
+(define (ac-qnew) (vector '() '() 0 0))   ; front, rear, length, values a dropping or sliding buffer dropped
 (define (ac-qlen ch) (vector-ref (async-chan-items ch) 2))
 (define (ac-qempty? ch) (fx=? 0 (vector-ref (async-chan-items ch) 2)))
 (define (ac-qpush! ch entry)
@@ -204,6 +204,8 @@
     (cond ((memq entry (vector-ref q 0)) (vector-set! q 0 (remq entry (vector-ref q 0))))
           (else (vector-set! q 1 (remq entry (vector-ref q 1)))))
     (vector-set! q 2 (fx- (vector-ref q 2) 1))))
+(define (ac-qdropped+! ch)
+  (let ((q (async-chan-items ch))) (vector-set! q 3 (fx+ (vector-ref q 3) 1))))
 (define (ac-qdrop-oldest! ch)
   (let ((q (async-chan-items ch)))
     (ac-qfront! q)
@@ -213,8 +215,8 @@
 ;; enqueue honoring the buffer kind (used by the transducer step + buffered puts).
 (define (ac-buf-give! ch v)
   (case (async-chan-kind ch)
-    ((dropping) (when (< (ac-qlen ch) (async-chan-cap ch)) (ac-qpush! ch (cons v #f))))
-    ((sliding)  (when (>= (ac-qlen ch) (async-chan-cap ch)) (ac-qdrop-oldest! ch))
+    ((dropping) (if (< (ac-qlen ch) (async-chan-cap ch)) (ac-qpush! ch (cons v #f)) (ac-qdropped+! ch)))
+    ((sliding)  (when (>= (ac-qlen ch) (async-chan-cap ch)) (ac-qdrop-oldest! ch) (ac-qdropped+! ch))
                 (ac-qpush! ch (cons v #f)))
     ((promise)  (when (ac-qempty? ch) (ac-qpush! ch (cons v #f))))  ; first value stays
     (else       (ac-qpush! ch (cons v #f))))      ; fixed: caller ensured room
@@ -304,11 +306,11 @@
     (let ((mb (alt-handler-mailbox h)))
       (vector-set! mb 1 val) (vector-set! mb 2 port) (vector-set! mb 0 #t))
     (let ((w (alt-handler-wake h)))
-      (if w
-          (if jolt-fiber-wake-fn
-              (jolt-fiber-wake-fn w)
-              (jolt-cv-wake! (alt-handler-wcv h)))
-          (jolt-cv-wake! (alt-handler-wcv h))))))
+      (cond
+        ;; a callback waiter (put!/take!): it schedules its callback on a fiber
+        ((procedure? w) (w))
+        ((and w jolt-fiber-wake-fn) (jolt-fiber-wake-fn w))
+        (else (jolt-cv-wake! (alt-handler-wcv h)))))))
 
 ;; (ac-handler-await h intr?) -- a THREAD waiter's wait on handler H's mailbox,
 ;; with no channel mutex held. #t once a deliverer filled the mailbox; #f when
@@ -361,6 +363,9 @@
             (let ((h (car (async-chan-alt-takers ch))))
               (async-chan-alt-takers-set! ch (cdr (async-chan-alt-takers ch)))
               (if (alt-claim! h)
+                  ;; a promise channel's one value stays for every taker, the parked ones
+                  ;; and the ones after them (it popped, so a taker after the parked one
+                  ;; waited forever)
                   (begin (alt-deliver! h (if (eq? (async-chan-kind ch) 'promise) (ac-peek ch) (ac-take-head! ch)) ch)
                          (set! progress #t))
                   (set! progress #t)) ; dead registration — dropped
@@ -520,12 +525,16 @@
 ;; nothing more can go through the transducer. The field is cleared FIRST, so the
 ;; values the completion adds (whose ac-buf-give! notifies again) cannot run it
 ;; twice; a closed channel accepts no new put, so nothing reads it after. mu held.
+;; A completion's throw is reported on a fiber of its own: the report runs the
+;; program's uncaught-exception handler, which may park, and nothing parks holding
+;; a channel's mutex.
 (define (ac-complete-if-due! ch)
   (let ((xrf (async-chan-xrf ch)))
     (and xrf (async-chan-closed? ch) (null? (async-chan-alt-putters ch))
          (begin
            (async-chan-xrf-set! ch #f)
-           (guard (e (#t (async-report-uncaught! "transducer completion on close!" e)))
+           (guard (e (#t (async-callback-execute
+                          (lambda () (async-report-uncaught! "transducer completion on close!" e)))))
              (ac-xrf-apply* ch xrf))
            #t))))
 (define (jolt-async-close! ch) (jolt-with-mutex (async-chan-mu ch) (ac-close! ch)))
@@ -766,8 +775,8 @@
 ;;     forked stays alive forever. 100 sequential (timeout 1) calls left 100
 ;;     timer threads. The flag now means "the one timer thread exists", which
 ;;     once true never stops being true.
-(define timeout-mu (make-mutex))
-(define timeout-cv (make-condition))
+(define-process-local timeout-mu (make-mutex))
+(define-process-local timeout-cv (make-condition))
 ;; Pending timeouts as a binary min-heap on deadline — (deadline . thunk)
 ;; entries in timeout-heap[0..n), guarded by timeout-mu like the sorted list it
 ;; replaces. The list insert walked O(k) per (timeout ms) with k pending —
@@ -858,7 +867,10 @@
 ;; Everything due, removed from the list, newest deadline last. Called with
 ;; timeout-mu held; answers '() after waiting when nothing is due yet, so the
 ;; caller's loop is "collect, release, run, repeat".
-(define (timeout-collect-due!)
+;; Everything due, removed from the heap, earliest first, without waiting: '() when
+;; nothing is due. Called with timeout-mu held, by the timer thread (timeout-collect-due!)
+;; and by a main carrier's loop (jolt-timers-run-due!), the one place a deadline is taken.
+(define (timeout-take-due!/locked)
   (let due ((acc '()))
     (cond
       ;; a cancelled entry that reached the top is dropped whatever its deadline
@@ -872,28 +884,44 @@
        (let* ((e (theap-pop-min!)) (thunk (cdr e)))
          (set-cdr! e #f)
          (due (cons thunk acc))))
-      ((pair? acc) (reverse acc))
-      (else
-       (let ((m (theap-min)))
-         (if (not m)
-             (jolt-condition-wait timeout-cv timeout-mu)
-             (unless (mono-due? (car m))
-               (jolt-condition-wait timeout-cv timeout-mu (mono-duration-until (car m))))))
-       ;; Either deadline or signal, the answer is the same: come back and re-read
-       ;; the min. A spurious wake costs one empty trip.
-       '()))))
+      (else (reverse acc)))))
+
+;; Everything due, removed from the list, newest deadline last. Called with
+;; timeout-mu held; answers '() after waiting when nothing is due yet, so the
+;; caller's loop is "collect, release, run, repeat".
+(define (timeout-collect-due!)
+  (let ((due (timeout-take-due!/locked)))
+    (if (pair? due)
+        due
+        (let ((m (theap-min)))
+          (if (not m)
+              (jolt-condition-wait timeout-cv timeout-mu)
+              (unless (mono-due? (car m))
+                (jolt-condition-wait timeout-cv timeout-mu (mono-duration-until (car m)))))
+          ;; Either deadline or signal, the answer is the same: come back and re-read
+          ;; the min. A spurious wake costs one empty trip.
+          '()))))
+
+;; Run due thunks. The runtime's own are total: a channel close, a condition's wake, a
+;; CompletableFuture's settle handed to its executor. The one that runs foreign code is
+;; jolt.host/timer-at!'s fn, and its throw is its owner's error, never silence: on a main
+;; carrier the thunks run in the program's loop (jolt-timers-run-due!), so a throw ends
+;; main-carrier-run! with its cause; on the timer thread it is a thread body's throw, which
+;; goes where the JVM sends one (jolt-thread-uncaught!: the default handler, else a report),
+;; and the thread lives on for every other deadline. Swallowing it (an earlier guard) left
+;; no fact anywhere (test/chez/timer-throw-test.clj, main-carrier-timer-throw-test.clj).
+(define (timeout-fire! due) (for-each (lambda (fire) (fire)) due))
 
 (define (timeout-thread)
+  ;; its wait with no deadline is asleep (locks.ss): a deadline set is what wakes it, which the
+  ;; detector reads (timeout-pending-count)
+  (jolt-asleep-raw-counts #t)
   (let loop ()
-    (let ((due (jolt-with-mutex timeout-mu (timeout-collect-due!))))
-      (for-each (lambda (fire)
-                  ;; One thunk must not be able to stop the timer for everything
-                  ;; else. A channel close cannot raise; a wake takes a lock it does
-                  ;; not own the discipline of, so this is the seam where a bug in
-                  ;; somebody else's deadline stays theirs.
-                  (guard (e (#t #f)) (fire)))
-                due)
-      (loop))))
+    (for-each (lambda (fire)
+                (guard (e (#t (jolt-thread-uncaught! #f e "Exception in thread \"jolt-timer\":\n")))
+                  (fire)))
+              (jolt-with-mutex timeout-mu (timeout-collect-due!)))
+    (loop)))
 
 ;; (jolt-timer-at! deadline-ms thunk) — run thunk on the timer thread once the
 ;; deadline has passed, in mono-millis (host-static-methods.ss). The one deadline facility in the runtime.
@@ -902,13 +930,58 @@
 (define (jolt-timer-at! deadline-ms thunk)
   (let ((e (cons deadline-ms thunk)))
     (jolt-lock! timeout-mu)
-    (when (timeout-insert! e)
-      (condition-signal timeout-cv))
-    (unless timeout-running?
-      (set! timeout-running? #t)
-      (fork-thread/daemon #t timeout-thread))      ; a runtime thread: never keeps the process up
-    (jolt-unlock! timeout-mu)
+    (let ((first? (timeout-insert! e)))
+      (when first? (condition-signal timeout-cv))
+      ;; a main-carrier process runs its timers in its loop (jolt-timers-run-due!), not on a thread
+      (unless jolt-main-thread (timeout-thread-start!/locked))
+      (jolt-unlock! timeout-mu)
+      ;; and that loop waits toward the deadline it read last: one set ahead of it wakes it
+      (when (and first? jolt-main-thread) (jolt-main-wake-for-timer!)))
     e))
+
+;; Is a pending deadline earlier than mono-ms deadline next (#f: none was pending)? A main
+;; carrier's loop, about to wait toward next, holding carrier 0's mu (that mu, then timeout-mu).
+(define (jolt-timer-before? next)
+  (jolt-with-mutex timeout-mu
+    (let ((m (theap-min)))
+      (and m (cdr m) (or (not next) (< (car m) next))))))
+
+;; Start the timer thread once, timeout-mu held. A runtime thread: never keeps the process up.
+(define (timeout-thread-start!/locked)
+  (unless timeout-running?
+    (set! timeout-running? #t)
+    (fork-thread/daemon #t (lambda () (jolt-thread-name-set! (get-thread-id) "jolt-timer")
+                                 (set! jolt-timer-thread-id (get-thread-id))
+                                 (timeout-thread)))))
+
+;; The timer thread's id, or #f before it starts: a main carrier's loop reads the same heap for the
+;; deadlines it waits toward (jolt-timers-run-due!), so it never takes this thread's wait (toward a
+;; deadline, cancelled ones too) for work that may wake the program (fibers.ss jolt-other-thread-may-run?).
+(define jolt-timer-thread-id #f)
+
+;; A main-carrier program's return (fibers.ss, jolt-main-carrier-leave!): the deadlines it left
+;; pending are the timer thread's from now on, so it starts when any is.
+(define (jolt-timer-thread-ensure!)
+  (jolt-with-mutex timeout-mu
+    (when (fx>? (fx- timeout-heap-n timeout-heap-dead) 0) (timeout-thread-start!/locked))))
+
+;; The thread a main-carrier program runs on (fibers.ss, jolt-main-carrier-run!), #f
+;; otherwise: its timers run in its loop, so no timer thread starts.
+(define jolt-main-thread #f)
+
+;; The main carrier's half of the timer (fibers.ss, jolt-main-carrier-run!'s loop): run every deadline
+;; already due on the calling thread, and answer (fired? . next): whether any ran, and the
+;; earliest deadline still pending (mono millis) or #f. The same heap and cancel discipline as timeout-thread's, without its wait.
+(define (jolt-timers-run-due!)
+  (let ((due (jolt-with-mutex timeout-mu (timeout-take-due!/locked))))
+    (timeout-fire! due)
+    (cons (pair? due)
+          (jolt-with-mutex timeout-mu
+            (let next ()
+              (let ((m (theap-min)))
+                (cond ((and m (not (cdr m))) (theap-pop-min!) (set! timeout-heap-dead (fx- timeout-heap-dead 1)) (next))
+                      (m (car m))
+                      (else #f))))))))
 
 ;; (jolt-timer-cancel! handle) — drop a pending deadline before it fires, so the
 ;; heap lets go of its thunk now rather than at the deadline. #t when it was still
@@ -952,52 +1025,95 @@
 
 ;; (put! ch v [cb [on-caller?]]) — async put, optional completion callback. If the
 ;; put completes immediately and on-caller? (default #t), the callback runs on the
-;; calling thread; otherwise on another thread. Returns true unless already closed.
-;; That thread (and take!'s) is a daemon: it stands for core.async's dispatch pool,
-;; and a put or take nobody ever completes must not hold the process up.
+;; calling thread; otherwise on a fiber. Returns true unless already closed.
+;; A put that cannot complete at once is a waiter, the R3 protocol's one notion
+;; (alt-handler, above): registered on the channel's putters under its mutex, in
+;; the caller's call, so pending puts complete in the order they were made, and
+;; its wake is the callback, which alt-deliver! runs on a fiber with the outcome.
+;; No thread stands for core.async's dispatch pool: a pending op costs a handler,
+;; and a callback a fiber (2.2 us / 6 KB against a thread's 8 us / 87 KB, 93af2568).
+;; A put or take nobody ever completes holds nothing up. No cap: the channel has no
+;; MAX-QUEUE-SIZE on pending ops (header).
+;; The spawn behind both (and fiber-execute's, fibers-async.ss): THUNK on a fiber of
+;; its own, its throw reported. It parks nothing, so a holder of a channel's mutex
+;; may call it (alt-deliver! does, and ac-close! for a report).
+;; SITE names the fiber in a dump (fibers.ss jolt-fiber-spawn-at): the caller's own
+;; procedure when it has one, else THUNK.
+(define (async-callback-execute thunk . site)
+  (jolt-fiber-spawn-at
+   (lambda ()
+     (*txn* #f)
+     (guard (e (#t (async-report-uncaught! "fiber-execute task" e)))
+       (thunk)))
+   (if (pair? site) (car site) thunk))
+  ;; a carrier may not exist yet on the very first spawn (fiber-spawn's own
+  ;; postlude does this too) — without it the fiber sits ready and unrun.
+  (jolt-fiber-ensure-carrier!))
+;; A waiter whose wake is CALL-CB, given what the channel delivers: #t/#f for a
+;; put, the value (nil when closed) for a take.
+(define (async-callback-waiter call-cb)
+  (let ((h (alt-handler-alloc)))
+    (alt-handler-wake-set! h
+      (lambda ()
+        (let ((v (vector-ref (alt-handler-mailbox h) 1)))
+          (async-callback-execute (lambda () (call-cb v))))))
+    h))
 (define (jolt-async-put! ch v . rest)
   (let* ((cb (if (pair? rest) (car rest) jolt-nil))
          (on-caller? (if (and (pair? rest) (pair? (cdr rest))) (jolt-truthy? (cadr rest)) #t))
          (call-cb (lambda (ok) (unless (jolt-nil? cb) (jolt-invoke cb ok)))))
     ;; A put that cannot complete now parks HERE, on the caller, under the same
-    ;; mu as the attempt, so a close! after put! returns finds it queued; the
-    ;; forked thread only waits for its outcome to run the callback (jolt-5psco).
+    ;; mu as the attempt, so a close! after put! returns finds it queued (jolt-5psco);
+    ;; its wake runs the callback on a fiber instead of spawning an OS thread per put!.
     (async-check-put! v)
     (let ((r (jolt-with-mutex (async-chan-mu ch)
                (let ((x (ac-try-give!/locked ch v)))
-                 (if (eq? x 'full) (ac-park-putter! ch v) x)))))
+                 (if (eq? x 'full)
+                     (begin
+                       (async-chan-alt-putters-set! ch
+                         (append (async-chan-alt-putters ch) (list (cons (async-callback-waiter call-cb) v))))
+                       (ac-notify! ch)
+                       'parked)
+                     x)))))
       (case r
-        ((ok) (if on-caller? (call-cb #t) (fork-thread/daemon #t (lambda () (*txn* #f) (call-cb #t)))) #t)
-        ((closed) (if on-caller? (call-cb #f) (fork-thread/daemon #t (lambda () (*txn* #f) (call-cb #f)))) #f)
-        (else (fork-thread/daemon #t
-                (lambda () (*txn* #f)
-                  (ac-handler-await r #f)
-                  (call-cb (vector-ref (alt-handler-mailbox r) 1))))
-              #t)))))
+        ((ok) (if on-caller? (call-cb #t) (async-callback-execute (lambda () (call-cb #t)))) #t)
+        ((closed) (if on-caller? (call-cb #f) (async-callback-execute (lambda () (call-cb #f)))) #f)
+        (else #t)))))
 
-;; (take! ch cb [on-caller?]) — async take. Same on-caller? rule as put!.
+;; (take! ch cb [on-caller?]) — async take. Same on-caller? rule as put!, and a take
+;; that cannot complete at once is a waiter on the channel's takers, as put!'s.
 (define (jolt-async-take! ch cb . rest)
   (let* ((on-caller? (if (pair? rest) (jolt-truthy? (car rest)) #t))
-         (call-cb (lambda (v) (unless (jolt-nil? cb) (jolt-invoke cb v))))
-         (r (ac-poll! ch)))
-    (cond
-      ((eq? r ac-poll-empty) (fork-thread/daemon #t (lambda () (*txn* #f) (call-cb (jolt-async-take ch)))))
-      (on-caller? (call-cb r))
-      (else (fork-thread/daemon #t (lambda () (*txn* #f) (call-cb r)))))
+         (call-cb (lambda (v) (unless (jolt-nil? cb) (jolt-invoke cb v)))))
+    (let ((r (jolt-with-mutex (async-chan-mu ch)
+               (let ((x (ac-poll!/locked ch)))
+                 (if (eq? x ac-poll-empty)
+                     (begin
+                       (async-chan-alt-takers-set! ch
+                         (append (async-chan-alt-takers ch) (list (async-callback-waiter call-cb))))
+                       (ac-notify! ch)
+                       ac-poll-empty)
+                     x)))))
+      (unless (eq? r ac-poll-empty)
+        (if on-caller? (call-cb r) (async-callback-execute (lambda () (call-cb r))))))
     jolt-nil))
 
 ;; (go-spawn thunk) — run thunk on a thread; return a buffered(1) channel that
 ;; conveys its value once then closes (a nil result just closes). Dynamic bindings
 ;; are conveyed (Chez inherits the thread-parameter at fork; we install explicitly).
 
-;; Print an uncaught-exception report to stderr — the JVM routes a thread body's
-;; throw to the default uncaught-exception handler; silence here made a throwing
-;; worker indistinguishable from one that returned nil. Reporting failures are
-;; themselves swallowed (a worker must never die reporting).
+;; An uncaught throw of a go block, a fiber body, a fiber-execute task or a
+;; transducer's completion goes where a thread's goes (jolt-thread-uncaught!,
+;; concurrency.ss): to the default uncaught-exception handler when the program set
+;; one (Thread/setDefaultUncaughtExceptionHandler; core.async's go blocks reach it
+;; on the JVM through the pool thread they die on), with no thread to name, else
+;; to stderr -- silence here made a throwing worker indistinguishable from one
+;; that returned nil, and stderr alone told no one in a program that has a place
+;; for its errors. Reporting failures are themselves swallowed (a worker must
+;; never die reporting).
 (define (async-report-uncaught! where e)
   (guard (_ (#t #f))
-    (display (string-append "Exception in " where ":\n") (current-error-port))
-    (jolt-report-throwable e (current-error-port)))
+    (jolt-thread-uncaught! #f e (string-append "Exception in " where ":\n")))
   #f)
 
 ;; shared nil-put guard (was pasted at three put sites)
@@ -1012,10 +1128,16 @@
 ;; spawns the body on the R4 fiber carrier. Read at SPAWN time — a runtime
 ;; call, not a macroexpansion — so (binding [*go-backend* :fiber] …) covers
 ;; every go that runs inside the scope, including ones in functions it calls.
-;; The default stays :thread for the whole epic; R6 decides whether it flips.
+;; The default is :fiber on this line. Measured (L1, release): a :thread go forks an
+;; OS thread per block, 8 us and 87 KB to spawn and 13 us to a first value; a :fiber
+;; go spawns in 2.2 us and 6 KB. A park costs the same on either. On a fiber,
+;; <!!/>!!/alts!! park rather than block, so a blocking op inside a go body cannot
+;; exhaust the carrier pool; a blocking foreign call (one not routed through the IO
+;; poller) still pins its carrier for its duration. (binding [*go-backend* :thread]
+;; ...) restores an OS thread per go.
 (define jolt-go-backend-thread (keyword #f "thread"))
 (define jolt-go-backend-fiber (keyword #f "fiber"))
-(def-dynvar! "clojure.core.async" "*go-backend*" jolt-go-backend-thread)
+(def-dynvar! "clojure.core.async" "*go-backend*" jolt-go-backend-fiber)
 ;; R5: the fiber carrier-pool size (fibers.ss reads this root; jolt-nil = the
 ;; machine's processor count, a positive fixnum pins the pool — set it BEFORE
 ;; the first :fiber go, or between a jolt-fiber-pool-reset! and the next go).
@@ -1044,7 +1166,7 @@
     (if (and cell (var-cell-defined? cell))
         (let ((bv (dyn-binding-value cell)))
           (if (eq? bv dyn-no-binding) (var-cell-root cell) bv))
-        jolt-go-backend-thread)))
+        jolt-go-backend-fiber)))
 
 ;; The R4 dispatcher: go/go-loop/go-spawn go through here and honor the var.
 ;; Nothing else does — thread is always an OS thread and io-thread is always a
@@ -1052,10 +1174,15 @@
 ;; below and the workload table in the overlay's thread-call). jolt-fiber-go-spawn
 ;; is defined in fibers-async.ss, which loads after this file; the reference
 ;; resolves at call time, before any :fiber spawn can happen.
-(define (async-go-spawn thunk)
-  (if (eq? (go-backend-current) jolt-go-backend-fiber)
-      (jolt-fiber-go-spawn thunk)
-      (async-go-spawn-thread thunk)))
+;; (go-spawn thunk site): site is the "ns:line" of the go form, which its expansion
+;; passes when the reader gave the form a line (the overlay's go), for the fiber dump.
+(define async-go-spawn
+  (case-lambda
+    ((thunk) (async-go-spawn thunk thunk))
+    ((thunk site)
+     (if (eq? (go-backend-current) jolt-go-backend-fiber)
+         (jolt-fiber-go-spawn thunk site)
+         (async-go-spawn-thread thunk)))))
 
 ;; (fiber-spawn thunk) — ALWAYS a fiber, whatever *go-backend* says. This is the
 ;; other half of the thread-spawn bargain: thread-spawn asks for an OS thread by
@@ -1083,6 +1210,7 @@
     ;; a daemon, as core.async's thread and go pools' threads are on the JVM
     (fork-thread/daemon #t
      (lambda ()
+       (jolt-thread-name-set! (get-thread-id) "async-thread")   ; a thread listing says whose
        (*txn* #f)                          ; go/thread body must not inherit parent's txn
        (dyn-binding-stack snap)
        (let ((r (guard (e (#t (cons #f e))) (cons #t (jolt-invoke thunk)))))
@@ -1120,7 +1248,7 @@
 ;; channel with no entry (a plain chan, or a go channel whose entry the collector
 ;; took) reads as "nothing to report" rather than raising.
 (define go-completions (make-weak-eq-hashtable))
-(define go-completions-mu (make-mutex))
+(define-process-local go-completions-mu (make-mutex))
 (define (go-chan-register! ch)
   (jolt-with-mutex go-completions-mu
     (hashtable-set! go-completions ch (vector #f #f '()))))
@@ -1351,9 +1479,19 @@
   (jolt-list cca-thread-spawn-sym (apply jolt-list cca-fn*-sym empty-pvec body)))
 
 ;; --- a port that is not a channel ---------------------------------------------
+;; Upstream reads every port through ReadPort's take!; jolt's channels are native,
+;; so the take entry points below go straight to the channel record. A port that is
+;; not one (a reify implementing ReadPort, as Datahike's write results are) is read
+;; the way upstream reads it: impl.protocols installs, by __set-port-reader!, a fn that
+;; turns such a port into a promise-chan its take! delivers into
+;; (clojure.core.async.impl.protocols/read-port), and every take entry point asks it first. Before
+;; the overlay loads, or for a value no reader claims, the port passes as it is.
 (define jolt-async-port-reader #f)
 (define (jolt-async-port x)
   (if (or (async-chan? x) (not jolt-async-port-reader)) x (jolt-invoke jolt-async-port-reader x)))
+;; alts!'s ports with each take port that is not a channel read as the promise-chan reading it
+;; (jolt-async-port): the very vector when every take port is a channel, which is the hot path
+;; and allocates nothing. A [channel value] put spec is a vector and stays as it is.
 (define (jolt-async-ports ports)
   (let ((n (pvec-count ports)))
     (let scan ((i 0))
@@ -1369,6 +1507,22 @@
 
 ;; --- install clojure.core.async ---------------------------------------------
 (define (cca-def! name v) (def-var! "clojure.core.async" name v))
+;; (jolt.host/chan-dropped ch): how many values ch's dropping or sliding buffer has dropped, as a count
+;; that only grows (a flow's ::flow/report slides; its ping shows the count: never a silent loss)
+(def-var! "jolt.host" "chan-dropped"
+  (lambda (ch) (if (async-chan? ch) (vector-ref (async-chan-items ch) 3) 0)))
+;; (jolt.host/chan-fill ch): {:count n :capacity c :parked-puts p} — the values ch's buffer holds, its size (0
+;; for an unbuffered channel), and the puts parked waiting for room; nil for a port that is not a channel. Read
+;; under ch's lock, O(1): no wait (task jolt.async/a-channel-shows-its-fill; a flow's ping shows each in-port's)
+(def-var! "jolt.host" "chan-fill"
+  (lambda (ch)
+    (if (async-chan? ch)
+        (jolt-with-mutex (async-chan-mu ch)
+          (let ((n (ac-qlen ch)) (cap (async-chan-cap ch)) (p (length (async-chan-alt-putters ch))))
+            (jolt-hash-map (jolt-keyword "count") n
+                           (jolt-keyword "capacity") (if (fixnum? cap) cap 0)
+                           (jolt-keyword "parked-puts") p)))
+        jolt-nil)))
 (cca-def! "__set-port-reader!" (lambda (f) (set! jolt-async-port-reader f) jolt-nil))
 (cca-def! "__port" jolt-async-port)
 (cca-def! "__ports" jolt-async-ports)
@@ -1389,7 +1543,9 @@
 (cca-def! ">!" jolt-async-give)   (cca-def! ">!!" jolt-async-give!!)
 (cca-def! "timeout" jolt-async-timeout)
 (cca-def! "put!" jolt-async-put!)
-(cca-def! "take!" (lambda (ch cb . rest) (apply jolt-async-take! (jolt-async-port ch) cb rest)))
+(cca-def! "take!" (case-lambda
+                    ((ch cb) (jolt-async-take! (jolt-async-port ch) cb))
+                    ((ch cb on-caller?) (jolt-async-take! (jolt-async-port ch) cb on-caller?))))
 (cca-def! "offer!" jolt-async-offer!)
 (cca-def! "go-spawn" async-go-spawn)
 ;; thread-spawn: always a real OS thread, whatever *go-backend* says (thread

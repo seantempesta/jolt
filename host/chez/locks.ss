@@ -44,6 +44,53 @@
 ;; carrier is handed to another fiber that reads the same register while this one
 ;; is parked.
 
+;; A lock the whole process shares (a table's mutex, its condition) is the process's own, and a
+;; forked child holds only its own definitions: fork(2) copies the forking thread alone, so a mutex
+;; another thread held at the fork is held in the child by a thread that does not exist, and the
+;; child's first take of it waits forever (a Seon agent's test child, 2026-10-28: its second thread
+;; in mutex_acquire, its main idle). Re-made in the child rather than taken before the fork (POSIX's
+;; atfork prepare): taking every lock from the forking thread is a lock-order deadlock against a
+;; thread holding one and wanting another, while the child is its one thread, where making a lock
+;; anew takes nothing. jolt-after-fork-child! runs (jolt-process-locals-remake!) first. An object's monitor is reset
+;; by monitor-reset-after-fork! (java/concurrency.ss), which jolt-after-fork-child! calls next; a lock inside
+;; any other object (a promise's condition, a carrier, a ReentrantLock) is that object's, and is not covered.
+(define-syntax define-process-local
+  (syntax-rules ()
+    ((_ name expr)
+     (begin (define name expr)
+            (jolt-process-local-add! (lambda () name) (lambda () (set! name expr)))))))
+;; Register one: GET answers its current value, REMAKE! makes it afresh. Kept as a property of the
+;; symbol jolt, not in a variable, so rt.ss's re-load of this file keeps the ones registered
+;; between the two loads.
+(define (jolt-process-local-add! get remake!)
+  (putprop 'jolt 'process-locals (cons (cons get remake!) (getprop 'jolt 'process-locals '()))))
+(define (jolt-process-locals-remake!) (for-each (lambda (r) ((cdr r))) (getprop 'jolt 'process-locals '())))
+;; Their current values (a mutex, a condition, a vector of mutexes): what a test of the rule holds.
+(define (jolt-process-locals) (map (lambda (r) ((car r))) (getprop 'jolt 'process-locals '())))
+
+;; Has a second execution context ever existed in this process: a second OS thread,
+;; or any fiber? #f until the first one is made, never #f again. It is set where a
+;; context is made and nowhere else: fork-thread (lazy-bridge.ss shadows it), the
+;; fiber spawn (fibers.ss jolt-fiber-spawn-on*), and a shutdown hook's registration,
+;; which is what makes the dormant signal watcher run jolt code (java/concurrency.ss).
+;; A fiber counts as a thread does: the fibers of one carrier interleave at every
+;; park and preemption, so a lazy node one of them is forcing can be forced by
+;; another, and the context that spawned a fiber runs beside it.
+;;
+;; The lock-free paths that are only unsafe with a second mutator -- a lazy node's
+;; first force (lazy-bridge.ss, seq.ss), a ConcurrentHashMap's or a Properties'
+;; monitor (java/host-static-classes.ss), the metadata table's read
+;; (natives-meta.ss) -- skip their fences, claims and monitors while it is #f.
+;; Setting it is race-free for the reason the fork gives: it is set by the creating
+;; context before the new one can run (a fiber is enqueued after it, under its
+;; carrier's mutex), so the new context reads it set.
+;;
+;; Here, in the file every runtime loads first (scheme-adapter-runtime.ss, rt.ss,
+;; and fibers.ss's own gate), so fibers.ss can set it and values.ss, seq.ss and
+;; natives-meta.ss can read it as soon as they load.
+(define jolt-mt? #f)
+(define (jolt-mark-mt!) (set! jolt-mt? #t))
+
 ;; Slot 7: how many locks this carrier currently holds. Per thread, like the
 ;; other virtual registers, and a fresh thread starts it at fixnum 0 — which is
 ;; the correct answer for a thread that never runs fibers.
@@ -128,6 +175,44 @@
        (jolt-locks-enter!)
        setup
        (dynamic-wind before (jolt-masked-body body) (jolt-masked-cleanup lv after))))))
+
+;; (jolt-claim-wind cl held d body): BODY run with force-claimer CL's winder on
+;; the chain, for the claim the caller made masked and pushed at depth D of CL,
+;; whose slots are HELD (seq.ss force-claimed!). The same edges as jolt-wind*,
+;; entered already masked, with nothing allocated: the winder is CL's own, made
+;; once, and its after-thunk releases CL's innermost claim, which is this one
+;; whenever an unwind passes it. Its before-thunk is jolt-finally-in, so a park
+;; drops it from the chain and keeps the claim (fibers.ss
+;; jolt-park-drop-finallys!). The link that puts it on the chain is kept in a
+;; weak slot of depth D and reused while the chain under it is the same, which
+;; in a walk is every element: a link made of the same winder and the same chain
+;; is the same chain, and the weak slot pins nothing once the link is out of use.
+;; Every step is an inline register or field access but the release's CAS; the
+;; chain writes happen in this frame, which is what a chain write needs (see
+;; sa-current-winders-set!).
+(define-syntax jolt-claim-wind
+  (syntax-rules ()
+    ((_ cl held d body)
+     (let* ((old (sa-winders))
+            (wp (vector-ref held (fx+ (fx* d 3) 2)))
+            (c (and wp (car wp))))
+       (sa-winders-set!
+        (if (and (pair? c) (eq? (cdr c) old)) c (jolt-claim-link! held d (force-claimer-winder cl) old)))
+       (jolt-locks-exit!)
+       (let ((r body))
+         (jolt-locks-enter!)
+         (sa-winders-set! old)
+         (force-release-top! cl)
+         (jolt-locks-exit!)
+         r)))))
+;; A new link (winder . old) for depth D, kept weakly in HELD's slot for it.
+(define (jolt-claim-link! held d winder old)
+  (let ((i (fx+ (fx* d 3) 2)) (c (cons winder old)))
+    (let ((wp (vector-ref held i)))
+      (if wp (set-car! wp c) (vector-set! held i (weak-cons c #f))))
+    c))
+;; A claimer's winder: OUT runs on an unwind past it, nothing on a rewind.
+(define (jolt-claim-winder out) (sa-make-winder jolt-finally-in out))
 
 ;; NOTE on how a refused preemption is remembered. It is NOT remembered here.
 ;; The obvious design — a pending flag, honoured when the outermost region exits
@@ -438,7 +523,7 @@
 ;; is about to block anyway. A fiber never waits here; its state is the fiber
 ;; layer's to report (jolt-thread-state-hook, java/concurrency.ss).
 (define thread-state-boxes (make-eqv-hashtable))          ; thread id -> box
-(define thread-state-mu (make-mutex))
+(define-process-local thread-state-mu (make-mutex))
 (define thread-state-cell (make-thread-parameter #f))     ; (thread id . box)
 (define (thread-state-box)
   (let ((c (thread-state-cell)) (id (get-thread-id)))
@@ -448,7 +533,8 @@
           (jolt-with-mutex thread-state-mu (hashtable-set! thread-state-boxes id b))
           (thread-state-cell (cons id b))
           b))))
-;; The recorded state of thread ID — WAITING, TIMED_WAITING or BLOCKED — or #f.
+;; The recorded state of thread ID — WAITING, TIMED_WAITING, BLOCKED or IDLE (an idle pool worker's
+;; keep-alive, jolt-cv-idle-wait) — or #f.
 (define (thread-wait-state id)
   (let ((b (jolt-with-mutex thread-state-mu (hashtable-ref thread-state-boxes id #f))))
     (and b (unbox b))))
@@ -517,9 +603,28 @@
      (if (jolt-cv? cv)
          (begin
            (jolt-cv-threads-set! cv (fx+ (jolt-cv-threads cv) 1))
-           (call-with-thread-state 'WAITING (lambda () (cw-wait (jolt-cv-cond cv) mu)))
-           (jolt-cv-threads-set! cv (fx- (jolt-cv-threads cv) 1)))
-         (call-with-thread-state 'WAITING (lambda () (cw-wait cv mu)))))
+;; MERGE-REVIEW(deep-fixes): ours (f6850ca8..cf159447) wraps each wait in jolt-asleep-while for
+;; the all-asleep detector; upstream (slice 2) waits through cw-wait, which with interrupts
+;; disabled naps 1ms in a collect-safe call instead of touching the condition. Chosen: both, our
+;; wrappers around upstream's cw-wait. A masked waiter is counted asleep across its naps (it
+;; is waiting); whether a nap's wake can race the detector's tell is not read. Gate:
+;; threadeddeadlock, main-carrier-monitor-test, maskedacquire.
+           ;; a value wait: asleep, and told when nothing can ever wake the process
+           (call-with-thread-state 'WAITING
+             (lambda () (jolt-asleep-while cv mu (lambda () (cw-wait (jolt-cv-cond cv) mu)))))
+           (jolt-cv-threads-set! cv (fx- (jolt-cv-threads cv) 1))
+           (jolt-asleep-told-check!))
+         ;; a raw condition: the runtime's own waits, never told (their waiters are what is told),
+         ;; and asleep only on a carrier, the timer thread or a main carrier's loop
+         ;; (jolt-asleep-raw-counts), whose wakes the detector reads for itself (a queued fiber, a
+         ;; pending timer). The others (the main queue, the tap queue, exit, the loader) are woken
+         ;; by a raw signal nothing marks, so a woken one could still read asleep: they count as
+         ;; running, which can miss a deadlock, never make one up
+         (call-with-thread-state 'WAITING
+           (lambda ()
+             (if (jolt-asleep-raw-counts)
+                 (jolt-asleep-while #f mu (lambda () (cw-wait cv mu)))
+                 (cw-wait cv mu))))))
     ((cv mu abs-time)
      (when (jolt-current-fiber) (jolt-blocking-refuse 'jolt-condition-wait))
      (if (jolt-cv? cv)
@@ -530,6 +635,169 @@
              (jolt-cv-threads-set! cv (fx- (jolt-cv-threads cv) 1))
              r))
          (call-with-thread-state 'TIMED_WAITING (lambda () (cw-wait cv mu abs-time)))))))
+
+;; An idle pool worker's keep-alive wait on jolt-cv CV (concurrency.ss executor-idle-wait!): timed, but
+;; what ends it by itself is the worker's retirement, never work. It is recorded (IDLE . PENDING?), PENDING?
+;; answering whether its pool holds a task queued: a main carrier's quiescence reads it asleep while
+;; nothing is queued (jolt-thread-asleep-state?). Read at the check, not marked by the waker: a signal
+;; marks every waiter on CV awake (jolt-asleep-woken!), and the ones not woken read awake until their
+;; wait ended, 60 s for a keep-alive. A task handed over is in the queue until the worker that takes it
+;; has left this wait. No value wait: never in jolt-asleep-ids, never told.
+(define jolt-idle-notify (lambda () (void)))   ; fibers.ss: wakes a main carrier's loop
+(define (jolt-cv-idle-wait cv mu abs-time pending?)
+  (when (jolt-current-fiber) (jolt-blocking-refuse 'jolt-condition-wait))
+  (jolt-cv-threads-set! cv (fx+ (jolt-cv-threads cv) 1))
+  (let ((r (call-with-thread-state (cons 'IDLE pending?)
+             (lambda ()
+               ;; a main carrier's loop that waits while this thread may run reads the threads again
+               ;; (as a thread falling asleep wakes it, jolt-asleep-wake-detector!)
+               (jolt-idle-notify)
+               (cw-wait (jolt-cv-cond cv) mu abs-time)))))
+    (jolt-cv-threads-set! cv (fx- (jolt-cv-threads cv) 1))
+    r))
+;; A recorded wait state W that nothing but another's act ends: WAITING, BLOCKED, or an idle pool
+;; worker whose pool has no task queued.
+(define (jolt-thread-asleep-state? w)
+  (or (memq w '(WAITING BLOCKED))
+      (and (pair? w) (eq? (car w) 'IDLE) (not ((cdr w))))))
+;; W as Thread.getState and a dump name it: an idle worker's keep-alive is TIMED_WAITING on the JVM.
+(define (jolt-thread-state-name w) (if (pair? w) 'TIMED_WAITING w))
+
+;; --- all asleep: a threaded process that nothing can wake ----------------------
+;; A process run on threads (a test shard, the forks runner: not a main carrier, whose loop sees
+;; the same thing itself, fibers.ss jolt-main-carrier-deliver-deadlock!) in which every thread
+;; waits, untimed, with no fiber queued, no timer pending and no descriptor awaited, can never
+;; wake itself (Go's "all goroutines are asleep"). Each thread in an untimed jolt wait is ASLEEP
+;; here: put in jolt-asleep-ids on entry, out on leaving or when a waker wakes it, so it needs no
+;; clock and no scan. A timed wait,
+;; a foreign call or a wait recorded nowhere is awake, so a deadlock with one in it is missed,
+;; never one invented. When as many are asleep as there are jolt threads, the one that took it there
+;; wakes the detector (fibers.ss jolt-asleep-check!), which decides by ids: the boot thread and every
+;; live jolt thread asleep. It checks the rest holding no
+;; lock of its own and tells each waiter, in its own frame, the error a main carrier's waiters get.
+;;
+;; jolt-asleep-mu is the last lock in every order: taken with at most the waiter's own mu held,
+;; and nothing is taken under it.
+(define-process-local jolt-asleep-mu (make-mutex))
+(define jolt-asleep-epoch 0)                   ; moves on every enter, leave, thread start and end
+(define jolt-asleep-ids (make-eqv-hashtable))   ; thread id -> while it is asleep: (cv . mu) in a
+                                               ; value wait (to tell), #t in a raw one
+;; the thread the process started on: jolt-boot-thread-id, rt.ss's (upstream's); every use is in a body run after load
+(define jolt-asleep-on (make-weak-eq-hashtable)) ; cv -> ids asleep on it, for its waker
+(define jolt-asleep-told (make-eqv-hashtable))  ; thread id -> the error to raise in its wait
+(define jolt-asleep-uncounted (make-thread-parameter #f)) ; the detector's own wait
+(define jolt-asleep-raw-counts (make-thread-parameter #f)) ; a carrier, the timer, a main carrier's loop
+;; A wait that is counted asleep but never tells the loop it fell asleep (jolt-asleep-while's notify):
+;; a thread waiting to enter a monitor. The notify of a main carrier is jolt.io-poller's
+;; `(locking pm (pipe-write!))`, itself a monitor entry, so a thread waiting for pm's monitor made the
+;; wake that needs pm from inside its own wait (bk held), which waited for pm and made the wake
+;; again, one nested call deeper each time (10 frames and ~1 KB a pass, ~470,000 passes a second until
+;; the heap ceiling; a wakeup the innermost pass consumed was gone for the ones beneath, which waited
+;; for good): a Seon agent reading a child's two pipes with two futures did it at the child's exit,
+;; 2026-10-29, ~1.5 GB of garbage in 3.5 s. A monitor's waiter stays counted, so the next thread to
+;; sleep or end tells the loop with it asleep; only the deadlock in which this wait is the last to
+;; begin is missed, as the other waits that cannot be seen are (never one invented).
+(define jolt-asleep-silent (make-thread-parameter #f))
+(define jolt-asleep-exiting 0)                  ; threads between leaving live-threads and their end
+(define jolt-asleep-notify (lambda () (void)))  ; fibers.ss: wakes the detector
+
+;; Run WAIT (a condition-wait on CV, a jolt-cv of a value wait or #f, with MU held) counted asleep.
+(define (jolt-asleep-while cv mu wait)
+  (if (jolt-asleep-uncounted)
+      (wait)
+      (let ((id (get-thread-id)))
+        (dynamic-wind
+          (lambda ()
+            (let ((all? (jolt-with-mutex jolt-asleep-mu
+                          (set! jolt-asleep-epoch (fx+ jolt-asleep-epoch 1))
+                          ;; a tell left by a wait this thread left by an escape is not this wait's
+                          (hashtable-delete! jolt-asleep-told id)
+                          (hashtable-set! jolt-asleep-ids id (if cv (cons cv mu) #t))
+                          (when cv
+                            (hashtable-set! jolt-asleep-on cv (cons id (hashtable-ref jolt-asleep-on cv '()))))
+                          (jolt-asleep-all-hint?))))
+              (when (and all? (not (jolt-asleep-silent))) (jolt-asleep-notify))))
+          wait
+          (lambda ()
+            (jolt-with-mutex jolt-asleep-mu
+              (set! jolt-asleep-epoch (fx+ jolt-asleep-epoch 1))
+              (hashtable-delete! jolt-asleep-ids id)
+              (when cv
+                (let ((l (remv id (hashtable-ref jolt-asleep-on cv '()))))
+                  (if (null? l) (hashtable-delete! jolt-asleep-on cv) (hashtable-set! jolt-asleep-on cv l))))))))))
+
+;; As many asleep as there are jolt threads (the boot thread and lazy-bridge.ss's live ones, the
+;; detector aside), read with jolt-asleep-mu held: a hint that wakes the detector, which decides by
+;; ids (fibers.ss jolt-asleep-all-ids?). The table's size is read without its own lock, as a hint.
+(define (jolt-asleep-all-hint?)
+  (fx>=? (hashtable-size jolt-asleep-ids)
+         (fx- (fx+ 1 (hashtable-size live-threads)) (if jolt-asleep-det-id 1 0))))
+
+;; A thread is ending (lazy-bridge.ss, in its own exit): it leaves live-threads before its exit hook
+;; wakes its joiners, and until then it counts as running (the detector refuses while one is).
+(define (jolt-asleep-thread-exiting!)
+  (jolt-with-mutex jolt-asleep-mu
+    (set! jolt-asleep-exiting (fx+ jolt-asleep-exiting 1))
+    (set! jolt-asleep-epoch (fx+ jolt-asleep-epoch 1))))
+;; A thread ended (its hook has woken its joiners; holding nothing): the rest can be all asleep.
+(define (jolt-asleep-thread-ended!)
+  (let ((all? (jolt-with-mutex jolt-asleep-mu
+                (set! jolt-asleep-exiting (fx- jolt-asleep-exiting 1))
+                (set! jolt-asleep-epoch (fx+ jolt-asleep-epoch 1))
+                (jolt-asleep-all-hint?))))
+    (when all? (jolt-asleep-notify))))
+
+;; A waker of CV, with CV's mu held: each thread waiting on it is awake from now, not from when it
+;; is back from its wait (it must first take that mu again), or the detector, which takes no
+;; waiter's mu, could read a woken thread as asleep and tell a wait its value already ended (two
+;; threads handing a token through promises did). A signal wakes one of them, but which one is
+;; not known here, so each is marked awake: one not woken stays awake until its own wait ends,
+;; which can miss a deadlock, never make one up.
+;; The same for thread-wait-state, which a main carrier's loop reads (fibers.ss jolt-other-thread-may-run?): a woken thread that
+;; still read WAITING until the scheduler ran it let the loop find nothing could wake it, and die stuck or tell a wait about to be answered, under load only.
+(define (jolt-asleep-woken! cv)
+  (let ((ids (jolt-with-mutex jolt-asleep-mu
+               (let ((ids (hashtable-ref jolt-asleep-on cv '())))
+                 (for-each (lambda (id) (hashtable-delete! jolt-asleep-ids id)) ids)
+                 (set! jolt-asleep-epoch (fx+ jolt-asleep-epoch 1))
+                 ids))))
+    (for-each (lambda (id)
+                (let ((b (jolt-with-mutex thread-state-mu (hashtable-ref thread-state-boxes id #f))))
+                  (when b (set-box! b #f))))
+              ids)))
+
+;; Back from a value wait: the detector told this thread that nothing can wake it. Raised here,
+;; in the wait's own frame, with the waiter's mu held (jolt-with-mutex lets go of it as the
+;; error unwinds), as a fiber's interrupt is (fibers.ss jolt-fiber-check-interrupt!).
+(define (jolt-asleep-told-check!)
+  (let* ((id (get-thread-id))
+         (e (jolt-with-mutex jolt-asleep-mu
+              (let ((e (hashtable-ref jolt-asleep-told id #f)))
+                (when e (hashtable-delete! jolt-asleep-told id))
+                e))))
+    (when e (jolt-throw e))))
+
+;; Tell each thread in a value wait, not told yet, that nothing can wake it: E is raised in its
+;; wait (jolt-asleep-told-check!). Its condition is woken under its own mu, taken with no other
+;; lock held. Only while the asleep epoch is still E0, the one the detector's check read: the pick
+;; is made under the mu that every entry, leaving and wake moves it under, so a thread that woke or
+;; entered since is no reason to tell anyone. Answers how many were told.
+(define (jolt-asleep-tell-threads! e e0)
+  (let ((waits (jolt-with-mutex jolt-asleep-mu
+                 (if (not (eqv? e0 jolt-asleep-epoch))
+                     '()
+                 (let-values (((ids ws) (hashtable-entries jolt-asleep-ids)))
+                   (let loop ((i 0) (acc '()))
+                     (if (fx=? i (vector-length ids))
+                         acc
+                         (let ((id (vector-ref ids i)) (w (vector-ref ws i)))
+                           (if (or (not (pair? w)) (hashtable-contains? jolt-asleep-told id))
+                               (loop (fx+ i 1) acc)
+                               (begin (hashtable-set! jolt-asleep-told id e)
+                                      (loop (fx+ i 1) (cons w acc))))))))))))
+    (for-each (lambda (w) (jolt-with-mutex (cdr w) (condition-broadcast (jolt-cv-cond (car w)))))
+              waits)
+    (length waits)))
 
 ;; --- the wait beneath the fiber layer ---------------------------------------
 ;; (jolt-stop-the-world-wait cv mu timeout) -> #t signalled | #f timed out
@@ -628,7 +896,9 @@
 ;; The fiber list is drained as it is read, so a fiber that goes on to wait again
 ;; registers itself afresh and no resume is ever delivered twice.
 (define (jolt-cv-wake! cv)
-  (unless (fx=? 0 (jolt-cv-threads cv)) (condition-broadcast (jolt-cv-cond cv)))
+  (unless (fx=? 0 (jolt-cv-threads cv))
+    (jolt-asleep-woken! cv)
+    (condition-broadcast (jolt-cv-cond cv)))
   (let ((fs (jolt-cv-fibers cv)))
     (unless (null? fs)
       (jolt-cv-fibers-set! cv '())
@@ -664,7 +934,9 @@
 ;; needs for the same work from 134 threads to 7. Reference JVM Clojure dispatches
 ;; the same task in 5.2us.
 (define (jolt-cv-signal-one! cv)
-  (unless (fx=? 0 (jolt-cv-threads cv)) (condition-signal (jolt-cv-cond cv))))
+  (unless (fx=? 0 (jolt-cv-threads cv))
+    (jolt-asleep-woken! cv)
+    (condition-signal (jolt-cv-cond cv))))
 
 ;; A mono-millis deadline -> the time left until it, as the time-duration Chez's
 ;; condition-wait takes for a relative timeout. Relative and not an absolute
@@ -899,7 +1171,7 @@
 ;; and no other fiber on its carrier is disturbed. Every waiter woken re-checks,
 ;; and the check CLEARS — one interrupt, one InterruptedException, as on the JVM.
 (define jolt-interrupt-waits (make-weak-eq-hashtable))   ; interrupt box -> entry set
-(define jolt-interrupt-waits-mu (make-mutex))
+(define-process-local jolt-interrupt-waits-mu (make-mutex))
 
 ;; An ENTRY is what the interrupter wakes: a (mu . cv) pair, poked as
 ;; (jolt-with-mutex mu (jolt-cv-wake! cv)), or a procedure of no arguments that
@@ -1012,7 +1284,7 @@
 ;; concurrency.ss and fibers.ss fill it in. jolt-block-closing! is the loader's:
 ;; called after the entry is written, it breaks a cycle this wait closes.
 (define jolt-blocked-on (make-eqv-hashtable))   ; ctx -> object
-(define jolt-blocked-on-mu (make-mutex))        ; a leaf: nothing is taken under it
+(define-process-local jolt-blocked-on-mu (make-mutex)) ; a leaf: nothing is taken under it
 (define jolt-block-releaser (lambda (obj) #f))
 (define jolt-block-closing! (lambda (obj me) (void)))
 (define (jolt-block-ctx) (or (jolt-current-fiber) (get-thread-id)))

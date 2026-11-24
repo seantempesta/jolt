@@ -55,7 +55,9 @@
 
 ;; --- the fiber record -------------------------------------------------------
 ;; state: 'ready (on the run queue) | 'running | 'parked (waiting on
-;; sa-fiber-resume) | 'done | 'dead (raised; error field holds the condition).
+;; sa-fiber-resume) | 'done | 'dead (raised; error field holds the condition)
+;; | 'forked (a fiber of the process this one forked from: never run here, see
+;; jolt-fibers-forget-the-parents!).
 ;; thunk: the fiber body (immutable). k: the one-shot continuation captured at
 ;; the last park (unconsumed while 'parked). result/error: completion payload.
 ;; next: intrusive run-queue link. slice: R2's per-fiber dynamic slice (a
@@ -104,8 +106,34 @@
           ;; one (#f otherwise). A kill escapes rather than raises, so no guard
           ;; -- no try/catch -- between the safe point and here sees it.
           (mutable exit-k)
-          (mutable edge-k))
-  (nongenerative jolt-fiber-v8))
+          (mutable edge-k)
+          ;; engine ticks this fiber has run, summed over its dispatches (jolt-ticks)
+          (mutable ticks)
+          ;; its lazy-seq claims (seq.ss force-claimer), made at its first claim, or #f
+          (mutable claimer)
+          ;; #t while nobody has read this fiber's outcome, for a fiber whose
+          ;; error is reported if it is collected unread (jolt-fiber-unread-watch!);
+          ;; #f for every other fiber, and once a monitor is registered on it
+          (mutable unread)
+          ;; #t for a remote end's pump (jolt.host/fiber-pump!, set by the fiber itself): never told a
+          ;; deadlock, not counted by a quiescence check
+          (mutable pump)
+          ;; the measure open where it was spawned (a jolt.host/ticks-of node, #(parent ticks-box owner), or #f): its
+          ;; dispatches charge it and its enclosing ones (jolt-charge-lineage!), so a measure counts the fibers its body
+          ;; spawns. And the measure open in it now: that one, or one it opened (ticks-of), which what it spawns inherits
+          spawned-under
+          (mutable measure)
+          ;; where it was spawned, for the dump (jolt-fiber-dump-site): the string
+          ;; "ns:line" a go form's expansion passes, one constant every spawn from
+          ;; that form shares, else the procedure the spawner handed over (its body:
+          ;; a fn literal's code name says the fn it was written in). Set at the spawn.
+          site
+          ;; the bytes its dispatches allocated and the CPU time they took, summed as ticks are
+          ;; (jolt-fiber-drain!): CPU time counts what ticks cannot, C (foreign calls, the
+          ;; collector's copying, dlsym), so a dispatch far over its ticks was time in C
+          (mutable bytes)
+          (mutable cpu-ns))
+  (nongenerative jolt-fiber-v14))
 
 ;; --- the per-fiber dynamic slice ---------------------------------------------
 ;; R2 (jolt-nvpr.3). jolt's `binding` macro pushes by calling the
@@ -344,8 +372,27 @@
           ;; default pool. live: how many fibers spawned onto it have not
           ;; finished, counted under mu for a pool carrier only, so a shut-down
           ;; pool's carrier knows when it may stop (see jolt-fiber-pool-make).
-          pool (mutable live))
-  (nongenerative jolt-carrier-v7))
+          pool (mutable live)
+          ;; (chez-thread-id . os-thread-id) of the thread running this carrier's
+          ;; loop, set when the loop starts, #f before: what the fiber dump's header
+          ;; prints, so a native sample's thread is matched to a carrier
+          (mutable os-thread))
+  (nongenerative jolt-carrier-v8))
+
+;; (jolt-thread-ids) -> (chez-thread-id . os-thread-id): the calling thread's id as Chez
+;; numbers it (get-thread-id, the dump's "on thread") and as the OS does, which a native
+;; sample prints (macOS pthread_threadid_np, `sample`'s Thread_N; Linux gettid, perf's and
+;; /proc's tid), or #f for the second where the platform has neither. The foreign
+;; procedure is made once, here, at load: a carrier asks once, as its loop starts.
+(define jolt-os-thread-id
+  (cond ((foreign-entry? "pthread_threadid_np")
+         (let ((tid (foreign-procedure "pthread_threadid_np" (uptr u8*) int)))
+           (lambda () (let ((b (make-bytevector 8 0)))
+                        (and (fx=? 0 (tid 0 b)) (bytevector-u64-native-ref b 0))))))
+        ((foreign-entry? "gettid")
+         (let ((tid (foreign-procedure "gettid" () int))) (lambda () (tid))))
+        (else (lambda () #f))))
+(define (jolt-thread-ids) (cons (get-thread-id) (jolt-os-thread-id)))
 
 ;; (jolt-fiber-bump-sm-parks! f) / (jolt-fiber-bump-chan-parks! f) — called by the
 ;; parking fiber, on its own carrier's field, so no two threads touch one field.
@@ -386,8 +433,8 @@
 ;; parkable IO + offload), with `thread` as the documented escape.
 (define jolt-fiber-carriers #f)           ; vector of jolt-carrier, or #f
 (define jolt-fiber-rr 0)                  ; round-robin cursor (under rr-mu)
-(define jolt-fiber-rr-mu (make-mutex))
-(define jolt-fiber-pool-mu (make-mutex))  ; guards pool start/reset
+(define-process-local jolt-fiber-rr-mu (make-mutex))
+(define-process-local jolt-fiber-pool-mu (make-mutex))  ; guards pool start/reset
 (define jolt-fiber-pool-started? #f)
 
 ;; The pool size. N defaults to the machine's processor count (jolt's
@@ -443,7 +490,7 @@
         (do ((i 0 (fx+ i 1))) ((fx=? i n))
           (vector-set! v i
             (make-jolt-carrier (make-mutex) (make-condition) #f #f #f
-                               (make-jolt-dslice #f #f #f) #f #f 0 0 0 0 #f 0)))
+                               (make-jolt-dslice #f #f #f) #f #f 0 0 0 0 #f 0 #f)))
         (set! jolt-fiber-carriers v)))
     (jolt-unlock! jolt-fiber-rr-mu)))
 
@@ -494,16 +541,39 @@
 (define (jolt-fiber-enqueue!/locked c f)
   (if (jolt-carrier-tail c)
       (begin (jolt-fiber-next-set! (jolt-carrier-tail c) f)
-             (jolt-carrier-tail-set! c f))
+             (jolt-carrier-tail-set! c f)
+             #f)
       (begin (condition-signal (jolt-carrier-cv c))
              (jolt-carrier-head-set! c f)
-             (jolt-carrier-tail-set! c f))))
+             (jolt-carrier-tail-set! c f)
+             #t)))
+
+;; After an enqueue that made the queue non-empty (its answer, woke?), with the carrier's mu
+;; released: a main carrier waiting for readiness waits in the io poller's kevent, not on its
+;; condition, so a fiber another thread queued (a future's put, ring-chez's acceptor handing on a
+;; connection) ends that wait through the poller's wake pipe, or it never runs. Outside the mu:
+;; the wake takes the poller's lock, which the park path holds while it takes the mu.
+(define (jolt-main-wake-after! woke?)
+  (when (and woke? jolt-main-io-wake jolt-main-thread (not (eqv? (get-thread-id) jolt-main-thread)))
+    (jolt-main-io-wake)))
+
+;; A deadline another thread set ahead of every other (jolt-timer-at!): the main loop waits up to
+;; the next deadline it read before this one existed, in the poller's wait or on carrier 0's
+;; condition, so both are woken and it reads again (it re-reads under the mu, jolt-timer-before?,
+;; so a signal before its wait is not lost). Called with no lock held, after timeout-mu is released.
+(define (jolt-main-wake-for-timer!)
+  (when (and jolt-main-thread (not (eqv? (get-thread-id) jolt-main-thread)))
+    (let ((c (vector-ref jolt-fiber-carriers 0)))
+      (jolt-lock! (jolt-carrier-mu c))
+      (condition-signal (jolt-carrier-cv c))
+      (jolt-unlock! (jolt-carrier-mu c)))
+    (when jolt-main-io-wake (jolt-main-io-wake))))
 
 (define (jolt-fiber-enqueue! c f)
-  (begin
-    (jolt-lock! (jolt-carrier-mu c))
-    (jolt-fiber-enqueue!/locked c f)
-    (jolt-unlock! (jolt-carrier-mu c))))
+  (jolt-lock! (jolt-carrier-mu c))
+  (let ((woke? (jolt-fiber-enqueue!/locked c f)))
+    (jolt-unlock! (jolt-carrier-mu c))
+    (jolt-main-wake-after! woke?)))
 
 (define (jolt-fiber-dequeue! c)
   (begin
@@ -537,6 +607,17 @@
 (define jolt-slice-txn-param
   (guard (e (#t (make-thread-parameter #f)))
     *txn*))
+;; The thread's record of the throw it is handling (rt.ss jolt-throw-cont and
+;; jolt-throw-sitep, which a catch that completes clears, jolt-catch-complete!;
+;; jolt-fault-captured, a host fault's). A fiber that dies of a throw dies in
+;; resume*'s guard, which is no catch, so its carrier kept that throw's
+;; continuation -- the dead fiber's stack, and the fiber in it -- until the next
+;; throw on that carrier: the fiber was never collected. Its death is where that
+;; throw was handled, so jolt-fiber-dead! clears them. Captured the same guarded
+;; way (unbound, so empty, on the standalone load).
+(define jolt-fiber-throw-slots
+  (guard (e (#t '()))
+    (list jolt-throw-cont jolt-throw-sitep jolt-fault-captured)))
 
 ;; The scheduler's own slice — the caller's dynamic state at drain entry —
 ;; kept per carrier in one mutable record so the per-run capture allocates
@@ -685,10 +766,11 @@
 (define (sa-fiber-resume f)
   (let ((c (jolt-fiber-carrier f)))
     (jolt-lock! (jolt-carrier-mu c))
-    (when (eq? (jolt-fiber-state f) 'parked)
-      (jolt-fiber-state-set! f 'ready)
-      (jolt-fiber-enqueue!/locked c f))
-    (jolt-unlock! (jolt-carrier-mu c))))
+    (let ((woke? (and (eq? (jolt-fiber-state f) 'parked)
+                      (begin (jolt-fiber-state-set! f 'ready)
+                             (jolt-fiber-enqueue!/locked c f)))))
+      (jolt-unlock! (jolt-carrier-mu c))
+      (jolt-main-wake-after! woke?))))
 
 ;; (sa-fiber-spawn thunk) -> fiber. Create a fiber running THUNK, place it
 ;; round-robin on a carrier, and make it runnable; return the record.
@@ -698,7 +780,10 @@
 ;; (dyn-binding-stack) for a thread today; *txn* is always #f so a child
 ;; spawned inside a dosync cannot join the parent's transaction (ref-sets into
 ;; the parent's log would be committed by the parent, not the child).
-(define (sa-fiber-spawn thunk) (jolt-fiber-spawn* thunk #f #f))
+(define (sa-fiber-spawn thunk) (jolt-fiber-spawn* thunk #f #f thunk))
+;; The same, with where it was spawned (the fiber's site field) given: a spawn that
+;; wraps the caller's body names the body, or the site its go form passed.
+(define (jolt-fiber-spawn-at thunk site) (jolt-fiber-spawn* thunk #f #f site))
 
 ;; F's interrupt box, made the first time it is needed. Only F's own code or a
 ;; spawn that binds a Thread object before F runs reaches here, so no two threads
@@ -717,23 +802,347 @@
 ;; BEFORE it can run: a virtual thread started from a Thread object (java/
 ;; concurrency.ss) binds that object to the fiber there, so the fiber's own
 ;; Thread/currentThread can never see it unbound.
-(define (jolt-fiber-spawn* thunk ibox before-run)
-  (jolt-fiber-spawn-on* (jolt-fiber-pick!) thunk ibox before-run))
+(define (jolt-fiber-spawn* thunk ibox before-run site)
+  (jolt-fiber-spawn-on* (jolt-fiber-pick!) thunk ibox before-run site))
 
 ;; The same, onto carrier c: the default pool's pick or a pool's.
-(define (jolt-fiber-spawn-on* c thunk ibox before-run)
-  (let ((f (make-jolt-fiber
+;; A fiber is a second execution context beside the one spawning it, so the spawn
+;; turns the single-threaded fast paths off for good (locks.ss jolt-mt?), before
+;; the fiber can run.
+(define (jolt-fiber-spawn-on* c thunk ibox before-run site)
+  (jolt-mark-mt!)
+  (let* ((under (jolt-current-measure))
+         (f (make-jolt-fiber
             'ready thunk #f #f #f #f
             (make-jolt-dslice (jolt-slice-stack-param)
                               (jolt-slice-ns-param)
                               #f)
-            c #f '() 0 #f #f 0 #f ibox #f #f #f #f)))
+            c #f '() 0 #f #f 0 #f ibox #f #f #f #f 0 #f #f #f under under site 0 0)))
+    (jolt-fiber-register! f)
     (when ibox (jolt-fiber-own-ibox! f ibox))
     (when before-run (before-run f))
     ;; listed before it can run, so it can't finish (and be unlisted) first
     (jolt-fiber-live-add! f)
     (jolt-fiber-enqueue! c f)
     f))
+
+;; --- every live fiber, and the dump of them ----------------------------------
+;; A hang is a fiber parked on something that never comes, and a native sample of the
+;; process shows only the carrier idle in kevent. So every fiber is held, weakly (a
+;; finished one is collected as before), from its spawn, and (jolt-fiber-dump port) writes
+;; each: its state, carrier, what it is parked on, its engine ticks, where it was spawned,
+;; and for a parked fiber the frames of the continuation it will resume (Chez's inspector:
+;; each frame's procedure name and source), innermost first. It reads and prints; it
+;; changes nothing but the requests for running fibers' frames (jolt-fiber-frames-wanted).
+;; SIGINFO runs it (fibers-async.ss), on the thread whose event check takes the signal: a
+;; main carrier idle in its poller's kevent wakes for it. A forked child lists the fibers it
+;; inherited as they were at the fork: those of the forking thread's carrier can resume in
+;; it, those of the carriers fork(2) did not copy never will (their carrier is not this
+;; one). It cannot reach a thread that is in a foreign call, a condition wait (a promise's
+;; deref) or a lock, which run no event check: a parked fiber's frames are reachable from
+;; any thread, a running fiber's only from its own carrier, at its next safe point.
+;; A weak list, not a weak table, pushed without a lock: a spawn CASes one weak pair onto
+;; the box (a weak eq-hashtable's insert under a mutex cost 0.45 us a spawn, 20%). The pairs
+;; whose fiber was collected are dropped when the pushes reach twice the live count at the
+;; last drop, so the list stays within twice the live fibers; the drop is a CAS of the
+;; pruned list over the one it read, retried if a push landed between, so no push is lost.
+(define jolt-fiber-registry (box '()))
+(define jolt-fiber-registry-pushes 0)    ; approximate (unlocked): only times the next drop
+(define jolt-fiber-registry-limit 1024)
+;; the fibers of weak list l still held, each car read once (a collection between two reads
+;; of one weak car could leave the broken-weak-pointer object in the result)
+(define (jolt-fiber-held l)
+  (let loop ((l l) (acc '()))
+    (if (null? l)
+        (reverse acc)
+        (let ((f (car l))) (loop (cdr l) (if (bwp-object? f) acc (cons f acc)))))))
+(define (jolt-fiber-registry-live) (jolt-fiber-held (unbox jolt-fiber-registry)))
+(define (jolt-fiber-register! f)
+  (let retry ()
+    (let ((old (unbox jolt-fiber-registry)))
+      (unless (box-cas! jolt-fiber-registry old (weak-cons f old)) (retry))))
+  (set! jolt-fiber-registry-pushes (fx+ jolt-fiber-registry-pushes 1))
+  (when (fx>=? jolt-fiber-registry-pushes jolt-fiber-registry-limit)
+    (set! jolt-fiber-registry-pushes 0)
+    (let retry ()
+      (let* ((old (unbox jolt-fiber-registry))
+             (live (jolt-fiber-held old)))
+        (if (box-cas! jolt-fiber-registry old (fold-right weak-cons '() live))
+            (set! jolt-fiber-registry-limit (fxmax 1024 (fx* 2 (length live))))
+            (retry))))))
+
+;; In a forked child, the fibers it inherited are the parent's: fork(2) copied their records
+;; and the channels, locks and handlers that hold them, but none of them is this process's
+;; work. Each but the forking one is marked 'forked, which no resume acts on (sa-fiber-resume
+;; and the interrupt wake take only a 'parked fiber), so a put to a channel a parent fiber
+;; waits on completes into that waiter's handler, which is the parent's, and the value goes
+;; no further: nothing runs the waiter here. Without it the child ran the parent's code on its copy of the parent's state: the
+;; parent's go loops, root's procs in every fork of a Seon root. Every fiber that could be
+;; resumed is held by what would resume it, so the weak registry lists it. Called by
+;; jolt-after-fork-child!, while the child is its one thread.
+;; The registry then lists only the child's own fibers: a 'forked one is no work of this process,
+;; so its quiescence, its deadlock check and its dump never count it (a child whose own work waited
+;; was never quiescent while it held its parent's go loops: fiber-quiescent-test's fork case).
+;; What a parked fiber waits on, retired in a forked child (async.ss sets it: a channel's alt-handler is made
+;; inactive). The fiber is the parent's and never runs here, but its take or put stood on the channel, so a put
+;; in the child was taken by it and lost (gate forkparkedfiber, 2026-11-14). #f until async.ss loads.
+(define jolt-fiber-retire-wait! #f)
+(define (jolt-fibers-forget-the-parents!)
+  (let ((self (jolt-current-fiber)))
+    (for-each (lambda (f)
+                (unless (or (eq? f self) (memq (jolt-fiber-state f) '(done dead)))
+                  (let ((h (jolt-fiber-parked-on f)))
+                    (when (and h jolt-fiber-retire-wait!) (jolt-fiber-retire-wait! h)))
+                  (jolt-fiber-state-set! f 'forked)
+                  (jolt-fiber-next-set! f #f)))
+              (jolt-fiber-registry-live))
+    (set-box! jolt-fiber-registry
+              (fold-right weak-cons '()
+                          (filter (lambda (f) (not (eq? 'forked (jolt-fiber-state f)))) (jolt-fiber-registry-live))))))
+
+;; up to limit frames of continuation k as (name source-datum-or-#f vars), innermost first,
+;; and how many were left: the last element is that count, 0 when none. A compiled Clojure
+;; fn's code is unnamed, so vars names a frame by what it holds: each var cell among its
+;; variables (the vars it calls) and each fn a var was defined as (proc-name-of, rt.ss)
+(define (jolt-frame-vars o)
+  (let loop ((i 0) (acc '()))
+    (if (fx>=? i (o 'length))
+        (reverse acc)
+        (let* ((r (o 'ref i))
+               (v (and (eq? 'variable (r 'type)) ((r 'ref) 'value)))
+               (name (cond ((and v (var-cell? v)) (format "~a/~a" (var-cell-ns v) (var-cell-name v)))
+                           ((and v (procedure? v) (proc-name-of v)) => (lambda (p) (format "~a/~a" (car p) (cdr p))))
+                           (else #f))))
+          (loop (fx+ i 1) (if (and name (not (member name acc))) (cons name acc) acc))))))
+(define (jolt-continuation-frames k limit)
+  (let loop ((o (inspect/object k)) (i 0) (acc '()))
+    (cond ((not (eq? (o 'type) 'continuation)) (reverse (cons 0 acc)))
+          ((fx>=? i limit)
+           (let count ((o o) (n 0))
+             (if (eq? (o 'type) 'continuation) (count (o 'link) (fx+ n 1)) (reverse (cons n acc)))))
+          (else
+           (let* ((code (o 'code)) (src (o 'source)))
+             (loop (o 'link) (fx+ i 1)
+                   (cons (list (and code (code 'name)) (and src (src 'value)) (jolt-frame-vars o)) acc)))))))
+
+(define (jolt-fiber-describe-wait x)
+  (cond ((not x) "nothing")
+        ((symbol? x) (symbol->string x))
+        ((record? x) (symbol->string (record-type-name (record-rtd x))))
+        ((procedure? x) (let ((code ((inspect/object x) 'code)))
+                          (format "the procedure ~a" (or (and code (code 'name)) "?"))))
+        (else "a value")))
+
+;; Where fiber f was spawned (its site field): "spawned at ns:line" for a go form, else by
+;; the procedure its spawner handed over: a fn literal's code name, jfn$<ns>/<def>$<n>
+;; (backend_scheme fnsrc-name), says the def it was written in, which is the fn that
+;; spawned it; a defined fn is named by its var (rt.ss proc-name-of).
+(define (jolt-fiber-site-text f)
+  (let ((s (jolt-fiber-site f)))
+    (cond
+      ((string? s) (string-append "spawned at " s))
+      ((procedure? s)
+       (let* ((p (proc-name-of s))
+              (code ((inspect/object s) 'code))
+              (nm (and code (code 'name))))
+         (cond
+           (p (format "spawned running ~a/~a" (car p) (cdr p)))
+           ((and (string? nm) (fx>? (string-length nm) 4) (string=? "jfn$" (substring nm 0 4)))
+            (let* ((body (substring nm 4 (string-length nm)))
+                   (slash (let loop ((i 0)) (cond ((fx=? i (string-length body)) #f)
+                                                  ((char=? #\/ (string-ref body i)) i)
+                                                  (else (loop (fx+ i 1))))))
+                   (dollar (and slash (let loop ((i (fx+ slash 1)))
+                                        (cond ((fx=? i (string-length body)) #f)
+                                              ((char=? #\$ (string-ref body i)) i)
+                                              (else (loop (fx+ i 1))))))))
+              (cond ((not (and slash dollar)) (string-append "spawned by " body))
+                    ((fx=? dollar (fx+ slash 1))
+                     (format "spawned by a fn at the top level of ~a" (substring body 0 slash)))
+                    (else (format "spawned by ~a" (substring body 0 dollar))))))
+           (nm (format "spawned running ~a" nm))
+           (else "spawned by a procedure with no name"))))
+      ((record? s) (format "spawned running a ~a" (record-type-name (record-rtd s))))
+      (else "spawned at a place not known"))))
+
+;; The frames of continuation k, innermost first: each frame's procedure, the vars it
+;; names, and its source form where the code carries one.
+(define (jolt-fiber-print-frames port k)
+  (let loop ((fr (jolt-continuation-frames k 40)) (i 0))
+    (cond ((null? (cdr fr))
+           (unless (fx=? 0 (car fr)) (fprintf port "  ... ~a more frames~%" (car fr))))
+          (else
+           (let* ((v (cadar fr))
+                  (t (and v (with-output-to-string (lambda () (write v)))))
+                  (vars (caddar fr)))
+             ;; a frame's source form, or its length where it is longer than a line
+             (fprintf port "  ~a ~a~a~a~%" i (or (caar fr) "?")
+                      (if (null? vars) "" (format " [~{~a~^ ~}]" vars))
+                      (cond ((not t) "")
+                            ((fx>? (string-length t) 160) (format " (a form of ~a chars)" (string-length t)))
+                            (else (string-append " " t)))))
+           (loop (cdr fr) (fx+ i 1))))))
+
+;; A running fiber's frames are on its carrier's stack, which Chez lets only that thread
+;; read (inspect/object reads a continuation; another thread's live stack is none). So a
+;; dump that asks for them (SIGINFO's) leaves each running fiber here, held weakly, with
+;; its number in the dump and the port, and the fiber prints its own at its next safe
+;; point: the preemption handler, while it holds no lock (jolt-fiber-preempt-handler), at
+;; most a quantum on. Nothing waits for it. A dump replaces the last one's requests, and
+;; makes them once it has written itself; each answer is made as text and written whole
+;; under jolt-fiber-frames-mu, so two never interleave on the port.
+(define jolt-fiber-frames-wanted (box '()))
+(define-process-local jolt-fiber-frames-mu (make-mutex))
+(define (jolt-fiber-frames-answer! f)
+  (let retry ()
+    (let* ((old (unbox jolt-fiber-frames-wanted))
+           (e (find (lambda (e) (eq? (car e) f)) old)))
+      (when e
+        (if (box-cas! jolt-fiber-frames-wanted old (remq e old))
+            (let ((port (cddr e))
+                  (text (call/cc
+                          (lambda (k)
+                            (call-with-string-output-port
+                              (lambda (p)
+                                (fprintf p "fiber ~a (running at the dump), ~a, at its next safe point:~%"
+                                         (cadr e) (jolt-fiber-site-text f))
+                                (jolt-fiber-print-frames p k)))))))
+              (jolt-with-mutex jolt-fiber-frames-mu
+                (put-string port text)
+                (flush-output-port port)))
+            (retry))))))
+
+;; (jolt-fiber-dump port [follow?]): the header (each carrier's thread, Chez's and the OS's,
+;; and the fiber it runs), then every live fiber, the running ones first and then by ticks,
+;; most first, so a fiber that spins is at the top; each with where it was spawned. follow?
+;; (SIGINFO's dump, whose port lives as long as the process) asks each running fiber for its
+;; frames at its next safe point (jolt-fiber-frames-wanted).
+;; A fiber that holds quiescence off: one that may still run. A pump is no work of the program's; a
+;; parked one waits; a done or dead one never runs again, though the weak registry keeps it until a
+;; collection (it held quiescence off until one, so whether a program was ever quiescent hung on
+;; when the collector ran: a forked test child under load).
+(define (jolt-fiber-holds-quiescence? f)
+  (not (or (jolt-fiber-pump? f) (memq (jolt-fiber-state f) '(parked done dead)))))
+;; The conditions that hold a main carrier's quiescence off (jolt-main-carrier-run!): each fiber
+;; that is neither a pump nor parked (the dump's own fiber left out), a timer pending, another
+;; Jolt thread that may run, a fiber that is no pump waiting on the poller. NUMBERED is the
+;; dump's (fiber . n) list.
+(define (jolt-quiescence-held-by numbered)
+  (let* ((self (jolt-current-fiber))
+         (me (get-thread-id))
+         (fibers (filter (lambda (e) (let ((f (car e)))
+                                       (and (not (eq? f self)) (jolt-fiber-holds-quiescence? f))))
+                         numbered))
+         (timers (guard (_ (#t 0)) (fx- timeout-heap-n timeout-heap-dead)))
+         (threads (guard (_ (#t '()))
+                    (filter (lambda (id) (and (not (eqv? id me)) (not (eqv? id jolt-timer-thread-id))
+                                              (not (jolt-thread-asleep-state? (thread-wait-state id)))))
+                            (live-thread-ids))))
+         (io (and jolt-io-work-awaited (guard (_ (#t #f)) (jolt-io-work-awaited)))))
+    (append
+      (map (lambda (e) (format "fiber ~a ~a" (cdr e) (jolt-fiber-state (car e)))) fibers)
+      (if (fx>? timers 0) (list (format "~a timer~:p pending" timers)) '())
+      (map (lambda (id) (format "thread ~a ~a" id (jolt-thread-state-name (thread-wait-state id)))) threads)
+      (if io (list "a fiber that is no pump waits on the poller") '()))))
+(define jolt-fiber-dump
+  (case-lambda
+    ((port) (jolt-fiber-dump port #f))
+    ((port follow?)
+     (let* ((fs (jolt-fiber-registry-live))
+            (cs (or jolt-fiber-carriers '#()))
+            (carrier-index (lambda (c) (let loop ((i 0))
+                                         (cond ((fx=? i (vector-length cs)) #f)
+                                               ((eq? c (vector-ref cs i)) i)
+                                               (else (loop (fx+ i 1)))))))
+            (running? (lambda (f) (eq? 'running (jolt-fiber-state f))))
+            (live (list-sort
+                    (lambda (a b) (or (and (running? a) (not (running? b)))
+                                      (and (eq? (running? a) (running? b))
+                                           (> (jolt-fiber-ticks a) (jolt-fiber-ticks b)))))
+                    (filter (lambda (f) (not (memq (jolt-fiber-state f) '(done dead)))) fs)))
+            (numbered (map cons live (iota (length live))))
+            ;; the default pool's carriers, in order, then each pool carrier a fiber names
+            (carriers (let loop ((l live) (acc (reverse (vector->list cs))))
+                        (cond ((null? l) (reverse acc))
+                              ((memq (jolt-fiber-carrier (car l)) acc) (loop (cdr l) acc))
+                              (else (loop (cdr l) (cons (jolt-fiber-carrier (car l)) acc))))))
+            (pool-n 0))
+       (fprintf port "jolt fiber dump: ~a live fibers of ~a held, on thread ~a~%"
+                (length live) (length fs) (get-thread-id))
+       (for-each
+         (lambda (c)
+           (let ((ids (jolt-carrier-os-thread c))
+                 (on (filter (lambda (e) (and (running? (car e)) (eq? c (jolt-fiber-carrier (car e)))))
+                             numbered)))
+             (fprintf port "carrier ~a: ~a, ~a~%"
+                      (or (carrier-index c)
+                          (begin (set! pool-n (fx+ pool-n 1)) (format "~a of a pool" (fx- pool-n 1))))
+                      (if ids
+                          (format "thread ~a, os thread ~a" (car ids) (or (cdr ids) "not known"))
+                          "no thread started")
+                      (if (null? on)
+                          "running no fiber"
+                          (format "running fiber ~{~a~^, ~}" (map cdr on))))))
+         carriers)
+       ;; what holds a main carrier's quiescence off now (jolt-quiescent? and the loop's own
+       ;; conditions), read without the locks: the dump runs in a signal's handler, inside
+       ;; whatever the thread held. "nothing" when every condition holds.
+       (fprintf port "quiescence: ~a; handler ~a, told this spell ~a, ~a notice~:p, last answer ~a~a~%"
+                (let ((held (jolt-quiescence-held-by numbered)))
+                  (if (null? held) "nothing holds it" (format "held by ~{~a~^; ~}" held)))
+                (if jolt-quiescent-handler "set" "none") (if jolt-quiescent-told "yes" "no")
+                jolt-quiescent-notices
+                (guard (_ (#t "?")) (jolt-pr-str (if (jolt-nil? jolt-quiescent-last-answer) jolt-nil (or jolt-quiescent-last-answer jolt-nil))))
+                (if jolt-quiescent-last-error
+                    (format ", last throw ~a" (guard (_ (#t "?")) (if (condition? jolt-quiescent-last-error)
+                                                                     (call-with-string-output-port (lambda (s) (display-condition jolt-quiescent-last-error s)))
+                                                                     (jolt-pr-str (jolt-unwrap-throw jolt-quiescent-last-error)))))
+                    ""))
+       ;; the names a foreign-procedure was resolved for most often: one whose count grows with its calls is
+       ;; resolved per call (a dlsym walk over every loaded object each time)
+       ;; past the table's 256 names the rest are counted in one slot, "(other names)": printed apart, so the
+       ;; evidence never reads smaller than it is (flow)
+       (when jolt-foreign-lookups-proc
+         (let* ((all (jolt-foreign-lookups-proc))
+                (past (assoc "(other names)" all))
+                (top (jolt-first-n (list-sort (lambda (a b) (> (cdr a) (cdr b)))
+                                              (filter (lambda (e) (not (equal? (car e) "(other names)"))) all))
+                                   5)))
+           (unless (null? top)
+             (fprintf port "foreign lookups (most first): ~{~a ~a~^, ~}~%"
+                      (apply append (map (lambda (e) (list (car e) (cdr e))) top))))
+           (when past (fprintf port "  (~a lookups past the table, unnamed)~%" (cdr past)))))
+       (for-each
+         (lambda (e)
+           (let ((f (car e)) (n (cdr e)))
+             (fprintf port "fiber ~a: ~a, carrier ~a, parked on ~a, wait state ~a, ~a ticks, ~a bytes, ~a cpu ns, ~a~%"
+                      n (jolt-fiber-state f) (or (carrier-index (jolt-fiber-carrier f)) "of a pool")
+                      (jolt-fiber-describe-wait (jolt-fiber-parked-on f))
+                      (or (jolt-fiber-wstate f) "none") (jolt-fiber-ticks f) (jolt-fiber-bytes f) (jolt-fiber-cpu-ns f)
+                      (jolt-fiber-site-text f))
+             ;; the labelled measures open in it, innermost first: a step's scope and its ticks since it began
+             ;; (as of the fiber's last dispatch for a running one)
+             (let loop ((m (jolt-fiber-measure f)))
+               (when (and (vector? m) (fx>=? (vector-length m) 5) (eq? (vector-ref m 2) f))
+                 (when (vector-ref m 4)
+                   (fprintf port "  in ~a, ~a ticks since it began~%"
+                            (guard (_ (#t "?")) (jolt-pr-str (vector-ref m 4)))
+                            (max 0 (- (jolt-fiber-ticks f) (or (vector-ref m 3) 0)))))
+                 (loop (vector-ref m 0))))
+             (cond
+               ;; a running fiber's k is the one it last parked with, stale: only a parked one's is shown
+               ((and (eq? 'parked (jolt-fiber-state f)) (jolt-fiber-k f))
+                => (lambda (k) (jolt-fiber-print-frames port k)))
+               ((and follow? (running? f))
+                (fprintf port "  running: its frames follow, as fiber ~a, at its next safe point~%" n))
+               ((jolt-fiber-sm f) => (lambda (sm) (fprintf port "  a CPS step: ~a~%" (jolt-fiber-describe-wait sm))))
+               (else (fprintf port "  no saved continuation (~a)~%" (jolt-fiber-state f))))))
+         numbered)
+       (flush-output-port port)
+       (when follow?
+         (set-box! jolt-fiber-frames-wanted
+                   (map (lambda (e) (weak-cons (car e) (cons (cdr e) port)))
+                        (filter (lambda (e) (running? (car e))) numbered))))))))
 
 ;; --- preemption (swish's quantum, erlang.ss:872 and @yield) ------------------
 ;; Without this a fiber only ever leaves its carrier at a channel op, so a
@@ -953,6 +1362,8 @@
       ;; again for another client (a sample, a run-interruptible poll), and a
       ;; fire between the enqueue and the switch would queue this fiber twice.
       (else
+       ;; a dump asked for the frames of the fibers running at it (jolt-fiber-frames-wanted)
+       (unless (null? (unbox jolt-fiber-frames-wanted)) (jolt-fiber-frames-answer! f))
        (disable-interrupts)
        (jolt-fiber-bump-preempts! f)
        (jolt-fiber-state-set! f 'ready)
@@ -963,6 +1374,111 @@
        ;; Resumed. A compute-bound fiber that was interrupted meets it here, on
        ;; its next quantum, the only safe point it ever reaches.
        (jolt-fiber-check-interrupt! f)))))
+
+;; --- the tick count: the work a thread, or a fiber, has done --------------------
+;;
+;; jolt-set-timer! is the one way jolt arms the engine timer (fibers' quantum,
+;; jolt.host/run-interruptible's poll and budget): it asks set-timer what was left
+;; and adds what was used of the last arm to this thread's count, so the count is
+;; the timer's own, kept at the one place the timer is set. (jolt-thread-ticks)
+;; reads it now, the running arm's part included. A fiber's own count
+;; (jolt-fiber-ticks) is what its dispatches used: the drain loop adds each one's
+;; difference (jolt-fiber-drain!). (jolt-ticks) is the running fiber's, else the
+;; thread's: what a budget, or a measure of a body's cost, reads. Chez feeds the
+;; timer in chunks of at most 1000 ticks, pre-counted; a signal or a collection
+;; request that cuts a chunk short counts it whole, under 1000 ticks each time.
+;; Owner-tagged like interrupt-poll-stack: a child thread inherits the parameter's
+;; value, and the cell is made afresh for a thread that does not own it.
+(define jolt-ticks-state (make-thread-parameter #f))
+(define (jolt-ticks-cell)
+  ;; #(owner consumed armed dispatch-mark measures measure): measures, the ticks-of extents open
+  ;; off a fiber (each armed the timer to count, and a borrow's exit must leave it so); measure,
+  ;; the innermost ticks-of node open off a fiber on this thread (jolt-current-measure), or #f
+  (let ((s (jolt-ticks-state)) (id (get-thread-id)))
+    (if (and s (eqv? (vector-ref s 0) id))
+        s
+        (let ((s (vector id 0 0 0 0 #f))) (jolt-ticks-state s) s))))
+
+;; A measure's node: #(parent ticks-box owner). The measure open in this context: the running fiber's, else this thread's.
+;; A fiber's own ticks now: its dispatches' sum and, when it is the running one, the running dispatch's
+;; (jolt-ticks less the lineage of its open measure). Interrupts held across the two reads, as jolt-ticks.
+(define (jolt-fiber-own-ticks f)
+  (disable-interrupts)
+  (let ((n (if (eq? f (jolt-current-fiber))
+               (+ (jolt-fiber-ticks f) (- (jolt-thread-ticks*) (vector-ref (jolt-ticks-cell) 3)))
+               (jolt-fiber-ticks f))))
+    (enable-interrupts)
+    n))
+(define (jolt-current-measure)
+  (let ((f (jolt-current-fiber)))
+    (if f (jolt-fiber-measure f) (vector-ref (jolt-ticks-cell) 5))))
+(define (jolt-set-current-measure! n)
+  (let ((f (jolt-current-fiber)))
+    (if f (jolt-fiber-measure-set! f n) (vector-set! (jolt-ticks-cell) 5 n))))
+;; d ticks a fiber spawned under node n ran: n's and every enclosing measure's, by a compare-and-set (a measure's
+;; fibers run on any carrier). O(the nesting depth).
+(define (jolt-charge-lineage! n d)
+  (let loop ((n n))
+    (when n
+      (let ((b (vector-ref n 1)))
+        (let retry () (let ((o (unbox b))) (unless (box-cas! b o (+ o d)) (retry)))))
+      (loop (vector-ref n 0)))))
+;; the lineage ticks this context adds to its own count: its own open measure's (a node it opened, never one it was
+;; spawned under, whose ticks hold its own dispatches)
+(define (jolt-own-lineage-ticks)
+  (let ((n (jolt-current-measure)))
+    (if (and n (eq? (vector-ref n 2) (or (jolt-current-fiber) (get-thread-id)))) (unbox (vector-ref n 1)) 0)))
+(define (jolt-set-timer! n)
+  (let* ((s (jolt-ticks-cell)) (left (set-timer n)))
+    (vector-set! s 1 (+ (vector-ref s 1) (fxmax 0 (fx- (vector-ref s 2) left))))
+    (vector-set! s 2 n)
+    left))
+;; The slow watch's arm (ticks.ss jolt-tick-watch!, jolt-tick-fire): the one arm that is not
+;; counted. The watch stands for no work: it keeps a timer event coming on a thread with nothing
+;; registered, so the thread can join sampling. Counted, an idle thread's count would move
+;; (jolt.host/ticks-of's "nothing armed" would never hold, and a measure a throw left open could
+;; not be told from the watch). It closes whatever counted arm it replaces and leaves the cell
+;; reading "nothing armed", so the count stands still under it.
+(define (jolt-watch-timer! n)
+  (let* ((s (jolt-ticks-cell)) (left (set-timer n)))
+    (vector-set! s 1 (+ (vector-ref s 1) (fxmax 0 (fx- (vector-ref s 2) left))))
+    (vector-set! s 2 0)
+    left))
+;; #t while the timer's running arm is a counted one (jolt-set-timer!'s), #f under the watch or
+;; with nothing armed.
+(define (jolt-timer-counted?) (not (fx=? 0 (vector-ref (jolt-ticks-cell) 2))))
+(define (jolt-thread-ticks)
+  ;; read whole: the handler (which arms, so moves consumed and armed) never runs mid-read.
+  ;; A plain pair, not with-interrupts-disabled (a dynamic-wind: a winder and a cons per
+  ;; read); the read cannot throw.
+  (disable-interrupts)
+  (let ((n (jolt-thread-ticks*))) (enable-interrupts) n))
+(define (jolt-thread-ticks*)
+  (let ((s (jolt-ticks-cell)))
+    ;; nothing armed: the count is whole (the disarm counted the last arm), no timer read
+    (if (fx=? 0 (vector-ref s 2))
+        (vector-ref s 1)
+        (+ (vector-ref s 1) (fxmax 0 (fx- (vector-ref s 2) (jolt-timer-left)))))))
+;; What set-timer would answer, read without stopping or re-arming the timer (Chez's own
+;; parts: s/event.ss set-timer, s/prims.ss $get-timer): the ticks not yet fed to the trap,
+;; plus the trap's own fuel unless interrupts are disabled (then the trap is parked, and
+;; set-timer answers the unfed ticks alone). #f: the arm has fired.
+(define (jolt-timer-left)
+  (let ((t (#%$tc-field 'timer-ticks (#%$tc))))
+    (cond ((not t) 0)
+          ((fx> (#%$tc-field 'disable-count (#%$tc)) 0) t)
+          (else (fx+ t (#%$get-timer))))))
+(define (jolt-ticks)
+  ;; one read: never preempted between the fiber's count and the thread's (a plain pair,
+  ;; as jolt-thread-ticks)
+  (disable-interrupts)
+  (let* ((f (jolt-current-fiber))
+         (n (+ (if f
+                   (+ (jolt-fiber-ticks f) (- (jolt-thread-ticks*) (vector-ref (jolt-ticks-cell) 3)))
+                   (jolt-thread-ticks*))
+               (jolt-own-lineage-ticks))))
+    (enable-interrupts)
+    n))
 
 ;; Arm around a dispatch, disarm on the way back to the drain loop, so the
 ;; scheduler itself is never preempted. The timer belongs to the tick scheduler
@@ -1054,12 +1570,13 @@
 (define (jolt-fiber-iwait-wake! f)
   (let* ((c (jolt-fiber-carrier f)) (mu (jolt-carrier-mu c)))
     (jolt-lock! mu)
-    (when (and (eq? (jolt-fiber-state f) 'parked)
-               (jolt-fiber-iwait f)
-               (eq? (jolt-fiber-parked-on f) (jolt-fiber-iwait f)))
-      (jolt-fiber-state-set! f 'ready)
-      (jolt-fiber-enqueue!/locked c f))
-    (jolt-unlock! mu)))
+    (let ((woke? (and (eq? (jolt-fiber-state f) 'parked)
+                      (jolt-fiber-iwait f)
+                      (eq? (jolt-fiber-parked-on f) (jolt-fiber-iwait f))
+                      (begin (jolt-fiber-state-set! f 'ready)
+                             (jolt-fiber-enqueue!/locked c f)))))
+      (jolt-unlock! mu)
+      (jolt-main-wake-after! woke?))))
 
 (set! jolt-interrupt-owner-wake jolt-fiber-iwait-wake!)
 
@@ -1252,7 +1769,7 @@
 ;; dying fiber's own carrier, so it is a shared side table and takes the same
 ;; treatment as the others (jolt-3907): one mutex, held only to swap the list,
 ;; never while a monitor runs.
-(define jolt-fiber-monitor-mu (make-mutex))
+(define-process-local jolt-fiber-monitor-mu (make-mutex))
 
 ;; --- the live fibers (jolt#1606) ---------------------------------------------
 ;; Every fiber that has been spawned and not finished, whoever spawned it:
@@ -1422,6 +1939,52 @@
           (guard (e (#t #f)) ((car ms) out))
           (loop (cdr ms)))))))
 
+;; --- an error nobody read ----------------------------------------------------
+;; A fiber spawned to be joined (jolt.fibers/spawn) keeps its error for join or
+;; monitor! to read, and a fiber nobody joins or monitors would lose it without a
+;; word. Reporting at its end would be wrong: a join may come later and rethrow
+;; it. So the rule is a rejected promise's (Node's unhandledRejection, asyncio's
+;; "Task exception was never retrieved"): an error nobody read is reported once,
+;; when the fiber is collected, since nobody can read it after that.
+;;
+;; jolt-fiber-unread-watch! marks a fiber unread and registers it with a guardian;
+;; a monitor's registration (fibers-async.ss fiber-monitor!, which join goes
+;; through) clears the mark. After each collection, jolt-fiber-unread-drain! takes
+;; every collected fiber from the guardian and hands REPORT the error of each that
+;; still has the mark and ended with one. Only the fibers marked are reported, so
+;; a go body, a virtual thread or a fiber-execute task, whose throw already reaches
+;; the handler (async.ss async-report-uncaught!), never is.
+;;
+;; Registering takes no lock: Chez puts a guardian entry on the registering
+;; thread's own list (cpprim.ss $install-guardian, the thread context's
+;; guardian-entries), with no event check inside it. Taking one from the guardian
+;; is a plain pop of the guardian's queue, so the drain pops under a mutex, and
+;; reports after releasing it.
+(define jolt-fiber-unread-guardian (make-guardian))
+(define-process-local jolt-fiber-unread-mu (make-mutex))
+(define (jolt-fiber-unread-watch! f)
+  (jolt-fiber-unread-set! f #t)
+  (jolt-fiber-unread-guardian f))
+;; (jolt-fiber-unread-drain! report) -> void. Run after a collection, at a safe
+;; point of the thread that took part (rt.ss jolt-after-collection!). REPORT runs
+;; user code (an uncaught-exception handler), so the drain waits while the thread
+;; holds any of the runtime's locks (the stack check's rule): the fibers stay in
+;; the guardian, and the next collection on a thread holding none takes them. Each
+;; fiber leaves the guardian once, so it is reported at most once, and a report
+;; that collects again only drains what is left.
+(define (jolt-fiber-unread-drain! report)
+  (when (fx=? 0 (jolt-locks-held))
+    (let loop ((fs (jolt-with-mutex jolt-fiber-unread-mu
+                     (let pop ((acc '()))
+                       (let ((f (jolt-fiber-unread-guardian)))
+                         (if f (pop (cons f acc)) acc))))))
+      (unless (null? fs)
+        (let ((f (car fs)))
+          (when (and (jolt-fiber-unread f) (jolt-fiber-error f))
+            (jolt-fiber-unread-set! f #f)
+            (report (jolt-fiber-error f))))
+        (loop (cdr fs))))))
+
 ;; --- the scheduler ----------------------------------------------------------
 ;; Resume (or first-run) fiber f on ITS carrier's thread, returning to the
 ;; loop when f parks, finishes, or dies.
@@ -1469,6 +2032,10 @@
     (jolt-adjust-interrupts! (jolt-current-disable-count) base)
     ;; Back on the scheduler: whatever escape brought us here is over.
     (jolt-park-unwinding-set! #f)
+    ;; The continuation is spent, and its frames hold F: kept in the carrier until
+    ;; its next dispatch, it kept the last fiber each carrier ran from being
+    ;; collected. Nothing reads it before the next dispatch sets it again.
+    (jolt-carrier-sched-k-set! c #f)
     ;; The fiber parked, finished, or died: its setter-written dynamic state
     ;; (binding frames, current ns) is still live on the carrier — a continuation
     ;; escape does not undo a setter write (R0(a)). fiber -> scheduler: revert to
@@ -1614,6 +2181,8 @@
 
 (define (jolt-fiber-dead! f e)
   (jolt-fiber-finish! f 'dead e)
+  ;; the throw is handled here: the carrier forgets it (jolt-fiber-throw-slots)
+  (for-each (lambda (p) (when (p) (p #f))) jolt-fiber-throw-slots)
   (set-virtual-register! jolt-vreg-current-fiber 0)
   (jolt-fiber-k-set! f #f)
   (jolt-fiber-sm-set! f #f)
@@ -1626,6 +2195,29 @@
 ;; parks (jolt-fiber-park!) stops the drain until resumed. The scheduler's
 ;; slice is captured at entry — the caller's dynamic state, which every park
 ;; restores onto the carrier.
+;; The calling thread's own allocation (Chez jolt/thread-bytes: S_thread_bytes_allocated), never
+;; another thread's or the collector's copying; on a Chez without the counter the process-wide count.
+;; A budget's byte limit reads it too (concurrency.ss).
+(define jolt-thread-bytes
+  (if (foreign-entry? "(cs)thread_bytes_allocated")
+      (foreign-procedure "(cs)thread_bytes_allocated" () uptr)
+      (lambda () (bytes-allocated))))
+;; the first n of l, or all of l when it has fewer
+(define (jolt-first-n l n) (if (or (null? l) (fx=? n 0)) '() (cons (car l) (jolt-first-n (cdr l) (fx- n 1)))))
+;; Our Chez's count of each foreign-procedure evaluation's lookup by name (c/foreign.c S_foreign_lookups):
+;; ((name . count) ...), or #f on a Chez without it. jolt.host/foreign-lookups and the dump read it.
+(define jolt-foreign-lookups-proc
+  (and (foreign-entry? "(cs)foreign_lookups") (foreign-procedure "(cs)foreign_lookups" () scheme-object)))
+;; One lookup made here counted into that table: Jolt's own dlsym walk over its declared natives
+;; (ffi.ss jolt-ffi-dlsym-native), where a cfn resolves; #f on a Chez without it.
+(define jolt-count-foreign-lookup
+  (and (foreign-entry? "(cs)count_foreign_lookup") (foreign-procedure "(cs)count_foreign_lookup" (string) void)))
+;; The calling thread's CPU time in nanoseconds (macOS clock_gettime_nsec_np, CLOCK_THREAD_CPUTIME_ID
+;; 16), made once at load; 0 where it does not resolve (Linux: clock_gettime's struct form, later).
+(define jolt-thread-cpu-ns
+  (cond ((foreign-entry? "clock_gettime_nsec_np")
+         (let ((f (foreign-procedure "clock_gettime_nsec_np" (int) unsigned-64))) (lambda () (f 16))))
+        (else (lambda () 0))))
 (define (jolt-fiber-drain! c)
   (jolt-fiber-install-preempt-handler!)
   (jolt-carrier-base-cchain (jolt-foreign-call-chain))
@@ -1638,7 +2230,15 @@
   (let loop ()
     (let ((f (jolt-fiber-dequeue! c)))
       (when f
-        (jolt-fiber-run f)
+        ;; the dispatch's ticks are this fiber's (jolt-ticks), and so are its bytes and CPU time
+        (let ((mark (jolt-thread-ticks)) (b0 (jolt-thread-bytes)) (c0 (jolt-thread-cpu-ns)))
+          (vector-set! (jolt-ticks-cell) 3 mark)
+          (jolt-fiber-run f)
+          (let ((d (- (jolt-thread-ticks) mark)))
+            (jolt-fiber-ticks-set! f (+ (jolt-fiber-ticks f) d))
+            (jolt-fiber-bytes-set! f (+ (jolt-fiber-bytes f) (- (jolt-thread-bytes) b0)))
+            (jolt-fiber-cpu-ns-set! f (+ (jolt-fiber-cpu-ns f) (- (jolt-thread-cpu-ns) c0)))
+            (let ((n (jolt-fiber-spawned-under f))) (when n (jolt-charge-lineage! n d)))))
         (loop)))))
 
 ;; (sa-fiber-run-all) -> void. Drain carrier 0's run queue on the calling
@@ -1649,6 +2249,374 @@
 (define (sa-fiber-run-all)
   (jolt-fiber-ensure-carriers!)
   (jolt-fiber-drain! (vector-ref jolt-fiber-carriers 0)))
+
+;; --- the main carrier: a program and its fibers on its one thread -------------
+;; (jolt-main-carrier-run! thunk) runs thunk as a fiber on carrier 0 and drives carrier 0
+;; from the calling thread, here, until it finishes: no carrier, timer or poller thread is
+;; started while it runs, and at its return the process starts them (jolt-main-carrier-leave!). Every wait the program makes is then a fiber's park, and this one loop is
+;; the scheduler beneath every fiber of the process, at one base, as an event loop is
+;; (ClojureScript's core.async on its one thread). Due timers run here (async.ss,
+;; jolt-timers-run-due!), and when nothing can run the loop waits for readiness on this
+;; thread (jolt-main-io-wait, jolt.io-poller's) or sleeps until the next deadline. The
+;; process stays one OS thread, so it forks safely with its fibers mid-flight: no other
+;; thread exists to hold a lock at the fork. A loop with nothing queued, no timer and no
+;; descriptor awaited while the program has not finished can never move again: it raises
+;; instead of hanging. A program that waits for signals (jolt.io-poller/wake-on-signals!)
+;; always has a wake source, so it never raises that: it waits. Answers the program's value,
+;; or rethrows what it threw.
+(define jolt-main-io-wait #f)    ; (timeout-ms | #f) -> #t waited, #f nothing awaited; jolt.io-poller's
+(define jolt-main-io-wake #f)    ; () -> ends that wait now (its wake pipe); jolt.io-poller's
+(define jolt-main-io-leave #f)   ; () -> its own thread waits from now on; jolt.io-poller's
+(define jolt-io-after-fork #f)   ; jolt.io-poller's reset of its table in a forked child (any mode)
+
+(define (jolt-main-carrier-run! thunk)
+  (if (and jolt-main-thread (eqv? (get-thread-id) jolt-main-thread) (jolt-current-fiber))
+      ;; already a fiber of this process's main carrier (a child forked from inside one, as an
+      ;; agent of Seon's fork server is): thunk runs here, beneath the loop already driving it
+      (thunk)
+      (jolt-main-carrier-run/loop! thunk)))
+
+;; Another thread than this one that may still run: not parked in an untimed jolt wait (WAITING
+;; or BLOCKED, locks.ss thread-wait-state), nor an idle pool worker waiting out its keep-alive with nothing queued (locks.ss jolt-thread-asleep-state?:
+;; it runs only if something else enqueues, and its timeout ends in its retirement). A timed one (TIMED_WAITING: a sleep, a deref with a
+;; timeout) wakes by itself; one in a foreign call or a raw wait reads as running too. None is
+;; ever taken for asleep, so a deadlock it is part of is missed, never one invented. The timer
+;; thread is not one: the loop reads its heap itself (next), so its wait is no work of its own.
+(define (jolt-other-thread-may-run?)
+  (let ((me (get-thread-id)))
+    (exists (lambda (id) (and (not (eqv? id me)) (not (eqv? id jolt-timer-thread-id))
+                              (not (jolt-thread-asleep-state? (thread-wait-state id)))))
+            (live-thread-ids))))
+
+;; Nothing can ever wake the program (no fiber queued, no timer, no descriptor awaited, every other
+;; thread parked or gone, all read together under carrier C's mu): each parked fiber not yet told
+;; is told once, by a typed error it throws from its own wait (a deref, a <!!), which unwinds to
+;; its caller as any throw does (Go's "all goroutines are asleep"). The error names every wait
+;; (jolt-fiber-dump). Each tell queues its fiber on C, and is made only while the last fiber
+;; queued there is one this telling woke (C's mu: a fiber another thread queued stops it). Answers
+;; how many were woken: none (each already told, or masked) leaves the caller nothing to wait for.
+(define (jolt-main-carrier-deliver-deadlock! c)
+  (let ((e (jolt-deadlock-error)))
+    (jolt-deadlock-tell-fibers! e
+      (lambda ()
+        (jolt-with-mutex (jolt-carrier-mu c)
+          (let ((t (jolt-carrier-tail c)))
+            (or (not t) (eq? e (jolt-fiber-interrupt t)))))))))
+
+;; The error each waiter is told: every wait named (jolt-fiber-dump: each fiber and the frames it
+;; will resume; each thread in a value wait by id).
+(define (jolt-deadlock-error)
+  (let ((parked (with-output-to-string
+                  (lambda ()
+                    (jolt-fiber-dump (current-output-port))
+                    (let ((ids (jolt-with-mutex jolt-asleep-mu
+                                 (let-values (((ks vs) (hashtable-entries jolt-asleep-ids)))
+                                   (filter (lambda (id) id)
+                                           (map (lambda (k v) (and (pair? v) k)) (vector->list ks) (vector->list vs)))))))
+                      (unless (null? ids)
+                        (printf "threads in a value wait: ~a~%" ids)))))))
+    (jolt-ex-info "deadlock: every fiber and thread of this process waits, and nothing can wake one (no fiber queued, no timer, no descriptor awaited)"
+                  (jolt-hash-map (keyword "jolt" "deadlock") #t (keyword #f "parked") parked))))
+
+;; What a main carrier's loop raises when nothing can wake its program and no waiter was left to
+;; tell: every wait named, as the deadlock error does, so the program's own wait is in it.
+(define (jolt-main-carrier-stuck-error)
+  (jolt-ex-info "jolt-main-carrier: stuck: the program waits, and nothing is queued, no timer is set and no descriptor is awaited, so nothing can ever wake it"
+                (jolt-hash-map (keyword "jolt" "stuck") #t
+                               (keyword #f "parked") (with-output-to-string
+                                                       (lambda () (jolt-fiber-dump (current-output-port)))))))
+
+;; A remote end's pump (jolt.async.remote: the fibers moving values between a socket and its channels)
+;; marks itself (a field of its own record: one writer, the fiber): it is no work of the program's, so a deadlock is never told to it (its link would die and
+;; carry no report out), and a quiescence check counts every fiber but the pumps.
+(define (jolt-fiber-pump? f) (jolt-fiber-pump f))
+(define (jolt-fiber-mark-pump!) (let ((f (jolt-current-fiber))) (when f (jolt-fiber-pump-set! f #t))))
+
+;; Quiescence, as an event: (jolt.host/on-quiescent! f) registers the one handler (nil removes it), called
+;; with the dump (every fiber and the frames it will resume) the moment a main carrier's program goes
+;; quiescent: no fiber queued, no timer pending, no other thread that may run, and every fiber but a pump
+;; parked; once each time, until a fiber runs again (a pump's run counts, so a handler may hear one state twice:
+;; it ends what it ends once). An idle process that waits for a peer is quiescent
+;; too, so what quiescence means is the handler's: a test runner with a test in flight ends it as a deadlock.
+(define jolt-quiescent-handler #f)
+(define jolt-quiescent-told #f)
+;; what the dump says of the handler: how many notices it heard, its last answer, its last throw (kept, said
+;; on stderr once, never ended the program: a handler's error is its own, the loop goes on)
+(define jolt-quiescent-notices 0)
+(define jolt-quiescent-last-answer #f)
+(define jolt-quiescent-last-error #f)
+(define (jolt-on-quiescent! f) (set! jolt-quiescent-handler f) (set! jolt-quiescent-told #f))
+(define jolt-io-work-awaited #f)   ; () -> true while a fiber that is no pump waits on the poller; jolt.io-poller's
+(define (jolt-quiescent?)
+  (and (not (exists jolt-fiber-holds-quiescence? (jolt-fiber-registry-live)))
+       ;; a fiber parked on a descriptor the poller watches (a subprocess's exit, a pipe, a
+       ;; socket) is waiting on work the poller will deliver, as the deadlock checks count it:
+       ;; not quiescent. A pump's wait on its socket is a peer's to end, so it does not count.
+       (not (and jolt-io-work-awaited (jolt-io-work-awaited)))))
+;; The handler hears quiescence once a spell, when one is set and the program is quiescent; its answer
+;; and its throw are kept for the dump (a throw is said on stderr, never ends the loop). The caller has
+;; read that nothing else can run: no timer due, no other thread that may run.
+(define (jolt-quiescent-tell!)
+  (when (and jolt-quiescent-handler (not jolt-quiescent-told) (jolt-quiescent?))
+    (set! jolt-quiescent-told #t)
+    (set! jolt-quiescent-notices (fx+ jolt-quiescent-notices 1))
+    (guard (e (#t (set! jolt-quiescent-last-error e)
+                  (guard (_ (#t #f))
+                    (let ((p (current-error-port)))
+                      (fprintf p "jolt: the quiescence handler threw: ~a~%"
+                               (if (condition? e) (call-with-string-output-port (lambda (s) (display-condition e s))) e))
+                      (flush-output-port p)))))
+      (set! jolt-quiescent-last-answer (jolt-invoke jolt-quiescent-handler (jolt-quiescent-dump))))))
+(define (jolt-quiescent-dump)
+  (with-output-to-string (lambda () (jolt-fiber-dump (current-output-port)))))
+
+;; Tell each parked fiber not told yet; answers how many it woke. STILL? (the detector's: the
+;; asleep epoch has not moved since its check) is asked before each tell, so a wake in between
+;; tells no more.
+(define jolt-deadlock-tell-fibers!
+  (case-lambda
+    ((e) (jolt-deadlock-tell-fibers! e (lambda () #t)))
+    ((e still?)
+  (fold-left (lambda (n f)
+               (if (still?)
+                   (begin (jolt-fiber-deliver-interrupt! f e)
+                          (if (eq? 'parked (jolt-fiber-state f)) n (fx+ n 1)))
+                   n))
+             0
+             (filter (lambda (f) (and (eq? 'parked (jolt-fiber-state f)) (not (jolt-fiber-interrupt f))
+                                      (not (jolt-fiber-pump? f))))
+                     (jolt-fiber-registry-live))))))
+
+;; --- all asleep, on threads (locks.ss counts) -----------------------------------
+;; The detector: one daemon thread, started the first time every counted thread is asleep, waiting
+;; on a condition of its own, uncounted. Woken, it reads the asleep epoch, then checks, each under
+;; its own lock and holding none of its own, that no carrier has a fiber queued, no timer is
+;; pending and the poller awaits no descriptor; the epoch unchanged after says nothing woke in
+;; between, and it tells every waiter. A main carrier's loop decides this itself (above), so the
+;; detector runs only on threads. Telling nothing new (every waiter told already, or masked) says
+;; so once on stderr: the process is left as it was, never spun.
+(define jolt-io-awaited #f)        ; () -> true while a descriptor is awaited; jolt.io-poller's
+(define-process-local jolt-asleep-det-mu (make-mutex))
+(define-process-local jolt-asleep-det-cv (make-condition))
+(define jolt-asleep-det-pending #f)
+(define jolt-asleep-det-started (box #f))
+(define jolt-asleep-said #f)
+
+(define (jolt-asleep-wake-detector!)
+  (if jolt-main-thread
+      ;; a main carrier decides itself (jolt-main-carrier-run/loop!): its loop, waiting while another
+      ;; thread may run, reads every thread again when the last one falls asleep. Without this a thread
+      ;; that left a timed wait for an untimed one (a future that sleeps, then derefs a promise no
+      ;; one delivers) neither queued a fiber nor ended, so the loop never looked again
+      (jolt-main-wake-for-timer!)
+    (begin
+    (jolt-with-mutex jolt-asleep-det-mu
+      (set! jolt-asleep-det-pending #t)
+      (condition-signal jolt-asleep-det-cv))
+    (jolt-asleep-detector-start!))))
+
+;; The detector's one start, at most once a process: from its first wake, or when a main carrier's
+;; program returns and the process starts its threads (jolt-main-carrier-leave!), so a process that
+;; ran a main carrier has it from then on, as it has its carriers, not from whenever all its threads
+;; first happened to wait. Answers once the thread has named itself, so a count of the process's
+;; threads by name made after the start sees it; what the thread does before that (naming itself,
+;; setting a thread parameter) cannot raise, so the wait always ends.
+(define (jolt-asleep-detector-start!)
+  ;; the strong claim: box-cas! refuses spuriously on Apple silicon, and a refused claim here
+  ;; started no detector at all (Seon's root, 2026-10-28: 2 runs in 3)
+  (when (sa-box-cas! jolt-asleep-det-started #f #t)
+    (fork-thread/daemon #t
+      (lambda ()
+        (jolt-thread-name-set! (get-thread-id) "jolt-asleep")
+        (jolt-asleep-uncounted #t)
+        (jolt-with-mutex jolt-asleep-det-mu
+          (set! jolt-asleep-det-id (get-thread-id))
+          (condition-broadcast jolt-asleep-det-cv))
+        (let loop ()
+          (jolt-with-mutex jolt-asleep-det-mu
+            (let wait ()
+              (unless jolt-asleep-det-pending
+                (jolt-condition-wait jolt-asleep-det-cv jolt-asleep-det-mu)
+                (wait)))
+            (set! jolt-asleep-det-pending #f))
+          (jolt-asleep-check!)
+          (loop))))
+    ;; uncounted, as the detector's own wait: a start that waited counted asleep could wake the
+    ;; detector it is starting
+    (parameterize ((jolt-asleep-uncounted #t))
+      (jolt-with-mutex jolt-asleep-det-mu
+        (let wait ()
+          (unless jolt-asleep-det-id
+            (jolt-condition-wait jolt-asleep-det-cv jolt-asleep-det-mu)
+            (wait)))))))
+
+(define (jolt-asleep-no-fiber-queued?)
+  (let ((cs jolt-fiber-carriers))
+    (or (not cs)
+        (let loop ((i 0))
+          (or (fx=? i (vector-length cs))
+              (let ((c (vector-ref cs i)))
+                (and (not (jolt-with-mutex (jolt-carrier-mu c) (jolt-carrier-head c)))
+                     (loop (fx+ i 1)))))))))
+
+(define jolt-asleep-det-id #f)
+;; every jolt thread asleep: the boot thread and each live one, the detector aside
+(define (jolt-asleep-all-ids?)
+  (let ((ids (cons jolt-boot-thread-id (live-thread-ids))))
+    (jolt-with-mutex jolt-asleep-mu
+      (and (fx=? 0 jolt-asleep-exiting)
+           (for-all (lambda (id) (or (eqv? id jolt-asleep-det-id) (hashtable-contains? jolt-asleep-ids id))) ids)))))
+
+(define (jolt-asleep-check!)
+  (let ((e0 (jolt-with-mutex jolt-asleep-mu jolt-asleep-epoch)))
+    (when (and (jolt-asleep-all-ids?)
+               (jolt-asleep-no-fiber-queued?)
+               (fx=? 0 (jolt-with-mutex timeout-mu (timeout-pending-count)))
+               (not (and jolt-io-awaited (jolt-io-awaited)))
+               ;; ^C interrupts the evaluation while a token is installed
+               ;; (concurrency.ss jolt-interrupt-on-sigint!): a wake source, as an
+               ;; awaited descriptor is, so a REPL's wait on a promise is no deadlock
+               (not (jolt-with-mutex jolt-sigint-mu (unbox jolt-sigint-target)))
+               (eqv? e0 (jolt-with-mutex jolt-asleep-mu jolt-asleep-epoch)))
+      (let* ((e (jolt-deadlock-error))
+             (still? (lambda () (eqv? e0 (jolt-with-mutex jolt-asleep-mu jolt-asleep-epoch))))
+             (n (+ (jolt-deadlock-tell-fibers! e still?) (jolt-asleep-tell-threads! e e0))))
+        (when (and (fx=? n 0) (not jolt-asleep-said))
+          (set! jolt-asleep-said #t)
+          (let ((p (current-error-port)))
+            (display "jolt: every thread and fiber waits and nothing can wake one, and each waiter was told already or is masked:\n" p)
+            (jolt-fiber-dump p)
+            (flush-output-port p)))))))
+
+(set! jolt-asleep-notify jolt-asleep-wake-detector!)
+;; an idle pool worker's keep-alive (locks.ss jolt-cv-idle-wait) is asleep to a main carrier only
+(set! jolt-idle-notify (lambda () (when jolt-main-thread (jolt-main-wake-for-timer!))))
+
+;; Chez's parallel-collector pool fixer (chez-patches/0008-fixed-sweeper-pool), looked up once,
+;; at load: a Chez entry, there before any library is loaded. #f on a stock Chez.
+(define jolt-collect-sweepers
+  (and (foreign-entry? "(cs)collect_sweepers") (foreign-procedure "(cs)collect_sweepers" (iptr) iptr)))
+(define (jolt-main-carrier-run/loop! thunk)
+  (when jolt-fiber-pool-started?
+    (error 'jolt-main-carrier-run! "fibers already run on carrier threads: call it before the first fiber"))
+  (set! jolt-main-carrier-pool-n (jolt-fiber-carrier-count))
+  (jolt-fiber-carrier-count-set! 1)
+  (set! jolt-fiber-pool-started? #t)
+  (jolt-fiber-ensure-carriers!)
+  (set! jolt-main-thread (get-thread-id))
+  ;; its idle wait on carrier 0 is asleep while it is the loop (locks.ss; reset when it leaves)
+  (jolt-asleep-raw-counts #t)
+  (set! jolt-thread-end-wake jolt-main-wake-for-timer!)
+  ;; physics: a process that forks must never start Chez's parallel-collector sweepers (a
+  ;; child of one hangs or faults in its collections). Where this Chez can fix the pool
+  ;; (chez-patches/0008-fixed-sweeper-pool), it is fixed at none; a stock Chez can still
+  ;; start them beside the runtime's own watcher thread (measured: 1-2 faulting runs in 10 of
+  ;; test/chez/main-carrier-test.clj on stock Chez 10, none in 20 with the pool fixed).
+  (when jolt-collect-sweepers (jolt-collect-sweepers 0))
+  (jolt-carrier-os-thread-set! (vector-ref jolt-fiber-carriers 0) (jolt-thread-ids))
+  (let* ((c (vector-ref jolt-fiber-carriers 0))
+         (box (vector #f #f #f))    ; done? value error
+         (f (jolt-fiber-spawn-at
+              (lambda ()
+                (guard (e (#t (vector-set! box 2 e) (vector-set! box 0 #t)))
+                  (vector-set! box 1 (thunk))
+                  (vector-set! box 0 #t)))
+              thunk)))
+    (let loop ()
+      ;; anything that runs ends a quiescent episode: the next quiescence is told again
+      (when (jolt-carrier-head c) (set! jolt-quiescent-told #f))
+      (jolt-fiber-drain! c)
+      (let* ((fired (jolt-timers-run-due!)) (next (cdr fired)))
+        (cond
+          ((vector-ref box 0)
+           (jolt-main-carrier-leave! c)
+           (if (vector-ref box 2) (raise (vector-ref box 2)) (vector-ref box 1)))
+          ((or (car fired) (jolt-carrier-head c)) (set! jolt-quiescent-told #f) (loop))
+          (else
+           (let ((ms (and next (max 0 (mono-ms-until next)))))
+             ;; quiescent: the handler hears it once (it may queue a fiber: the loop runs it next)
+             (when (and (not next) (not (jolt-other-thread-may-run?)))
+               (jolt-quiescent-tell!))
+             (cond
+               ((jolt-carrier-head c) (void))
+               ;; a wait woken by a signal (jolt.io-poller/wake-on-signals!) runs its handler
+               ;; now: Chez runs a signal's handler at its next event check, and the loop would
+               ;; otherwise go back into kevent before one came
+               ((and jolt-main-io-wait (jolt-main-io-wait ms)) (#%$event))
+               ;; up to the next timer, on the carrier's condition: a fiber another thread queues
+               ;; signals it (jolt-fiber-enqueue!/locked), so it runs then, not at the timer
+               (ms (let* ((secs (exact (floor (/ ms 1000))))
+                          (until (make-time 'time-duration (min 999999999 (exact (round (* 1000000 (- ms (* 1000 secs)))))) secs)))
+                     ;; held with jolt-with-mutex: a throw in the region (the deadline read, the
+                     ;; wait) releases the mu and its count, so it surfaces as itself and not as a
+                     ;; later wait's "mutex is recursively locked" (test/chez/main-carrier-throw-test.clj)
+                     (jolt-with-mutex (jolt-carrier-mu c)
+                       ;; nor when another thread set a deadline earlier than next since it was read
+                       ;; (jolt-timer-at!, which signals this condition after it): read again under the mu
+                       (unless (or (jolt-carrier-head c) (jolt-timer-before? next))
+                         (jolt-condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c) until)))))
+               ;; "nothing can run" was read above at different moments (the queue, then the
+               ;; poller, then each thread), and a thread can queue a fiber and end between two of
+               ;; them: so the queue, the deadlines and every thread are read again together, under
+               ;; the mu each of their wakers takes (an enqueue, jolt-timer-at!'s wake, a thread's
+               ;; end, jolt-thread-end-wake). A fiber queued or a deadline set runs on the next
+               ;; pass; another thread that may still run (a future that delivers what a fiber
+               ;; waits on) queues the fiber or ends, and either signals this condition
+               ((jolt-with-mutex (jolt-carrier-mu c)
+                  (cond ((or (jolt-carrier-head c) (jolt-timer-before? next)) #t)
+                        ((jolt-other-thread-may-run?)
+                         (jolt-condition-wait (jolt-carrier-cv c) (jolt-carrier-mu c))
+                         #t)
+                        (else #f)))
+                (void))
+               ;; tell first, then deadlock: nothing can wake it, so the program is quiescent, and a
+               ;; handler not told yet hears that before any waiter is told the deadlock. The check
+               ;; above read the threads earlier; one that ended since (a pool thread finishing) left
+               ;; it unasked there, and the deadlock came with the handler never told. What the
+               ;; handler queues runs on the next pass, as at the top
+               ((begin (jolt-quiescent-tell!)
+                       (jolt-with-mutex (jolt-carrier-mu c) (jolt-carrier-head c)))
+                (void))
+               ;; nothing can wake it: each waiter is told and throws in its caller
+               ((fx>? (jolt-main-carrier-deliver-deadlock! c) 0) (void))
+               ;; none told because another thread queued a fiber meanwhile: it runs
+               ((jolt-with-mutex (jolt-carrier-mu c) (jolt-carrier-head c)) (void))
+               (else (raise (jolt-main-carrier-stuck-error))))
+             (loop))))))))
+
+;; The program returned: from here the process is an ordinary one, so its fibers, timers and
+;; I/O get the threads the loop stood for. What the program left behind runs on them: a fiber
+;; it left parked on a channel is queued onto carrier 0 when the channel is put to, a deadline
+;; it left pending is the timer thread's, a descriptor it left awaited is the poller thread's.
+;; The pool grows to its configured size around carrier 0 (one carrier was the main carrier's
+;; count), and every carrier gets its thread. A process can so load on its one thread, fork a
+;; child that shares what it loaded, then start its threads (test/chez/main-carrier-returns-test.clj).
+;; Called on the one thread, at the return, so nothing else runs while it rebuilds.
+(define jolt-main-carrier-pool-n 1)   ; the pool's count before the main carrier set it to one
+(define (jolt-main-carrier-leave! c0)
+  (set! jolt-main-thread #f)
+  (jolt-asleep-raw-counts #f)
+  (jolt-fiber-carrier-count-set! #f)
+  (jolt-fiber-preempt-refresh!)
+  (let* ((n jolt-main-carrier-pool-n) (v (make-vector n)))
+    (vector-set! v 0 c0)
+    (do ((i 1 (fx+ i 1))) ((fx=? i n))
+      (vector-set! v i (make-jolt-carrier (make-mutex) (make-condition) #f #f #f
+                                          (make-jolt-dslice #f #f #f) #f #f 0 0 0 0 #f 0 #f)))
+    (set! jolt-fiber-carriers v)
+    (do ((i 0 (fx+ i 1))) ((fx=? i n))
+      (let ((c (vector-ref v i)) (name (string-append "jolt-carrier-" (number->string i))))
+        (jolt-carrier-thread-set! c
+          (fork-thread/daemon #t (lambda ()
+                                   (rdr-default-modes!)
+                                   (jolt-thread-name-set! (get-thread-id) name)
+                                   (jolt-fiber-carrier-loop c)))))))
+  (jolt-timer-thread-ensure!)
+  (jolt-asleep-detector-start!)
+  (when jolt-main-io-leave (jolt-main-io-leave))
+  (set! jolt-main-io-wait #f)
+  (set! jolt-main-io-wake #f)
+  (set! jolt-main-io-leave #f))
 
 ;; --- the carrier loop and the pool lifecycle (R4 carrier, generalized R5) ----
 ;; R3 found that sa-fiber-run-all is a ONE-SHOT drain, not a scheduler: a
@@ -1668,6 +2636,9 @@
 ;; checked under the mutex AFTER a drain, so a stopped carrier finishes its
 ;; queue first.
 (define (jolt-fiber-carrier-loop c)
+  (jolt-carrier-os-thread-set! c (jolt-thread-ids))
+  ;; its idle wait is asleep (locks.ss): a fiber queued is what wakes it, which the detector reads
+  (jolt-asleep-raw-counts #t)
   (let loop ()
     (jolt-fiber-drain! c)
     (jolt-lock! (jolt-carrier-mu c))
@@ -1693,7 +2664,11 @@
         (let ((c (vector-ref v i)))
           (jolt-carrier-thread-set! c
             ;; daemon, as the JVM's go dispatch threads are
-            (fork-thread/daemon #t (lambda () (rdr-default-modes!) (jolt-fiber-carrier-loop c))))))))
+            (fork-thread/daemon #t (lambda ()
+                                     (rdr-default-modes!)
+                                     ;; a name, so a thread listing says whose it is
+                                     (jolt-thread-name-set! (get-thread-id) (string-append "jolt-carrier-" (number->string i)))
+                                     (jolt-fiber-carrier-loop c))))))))
   (jolt-unlock! jolt-fiber-pool-mu))
 
 ;; (jolt-fiber-pool-reset!) -> void. Stop every carrier thread (each finishes
@@ -1754,6 +2729,7 @@
 ;; A pool carrier's loop: the default carrier loop, except a stop only ends it
 ;; once nothing placed on it is left to run.
 (define (jolt-fiber-pool-carrier-loop c)
+  (jolt-carrier-os-thread-set! c (jolt-thread-ids))
   (let loop ()
     (jolt-fiber-drain! c)
     (jolt-lock! (jolt-carrier-mu c))
@@ -1775,12 +2751,16 @@
     (do ((i 0 (fx+ i 1))) ((fx=? i n))
       (vector-set! v i
         (make-jolt-carrier (make-mutex) (make-condition) #f #f #f
-                           (make-jolt-dslice #f #f #f) #f #f 0 0 0 0 p 0)))
+                           (make-jolt-dslice #f #f #f) #f #f 0 0 0 0 p 0 #f)))
     (jolt-pool-carriers-set! p v)
     (do ((i 0 (fx+ i 1))) ((fx=? i n))
       (let ((c (vector-ref v i)))
         (jolt-carrier-thread-set! c
-          (fork-thread/daemon #t (lambda () (rdr-default-modes!) (jolt-fiber-pool-carrier-loop c))))))
+          (fork-thread/daemon #t (lambda ()
+                                   (rdr-default-modes!)
+                                   (jolt-thread-name-set! (get-thread-id)
+                                     (string-append "jolt-carrier-" (format "~a" name) "-" (number->string i)))
+                                   (jolt-fiber-pool-carrier-loop c))))))
     p))
 
 (define (jolt-fiber-pool-size p) (vector-length (jolt-pool-carriers p)))
@@ -1812,12 +2792,14 @@
   (when (jolt-carrier-stop? c) (condition-signal (jolt-carrier-cv c)))
   (jolt-unlock! (jolt-carrier-mu c)))
 
-;; (jolt-fiber-pool-spawn p thunk) -> fiber, or #f if p is shut down.
-(define (jolt-fiber-pool-spawn p thunk)
+;; (jolt-fiber-pool-spawn p thunk site) -> fiber, or #f if p is shut down; site is
+;; where it was spawned (the fiber record's site field).
+(define (jolt-fiber-pool-spawn p thunk site)
   (let ((c (jolt-fiber-pool-reserve! p)))
     (and c
          (jolt-fiber-spawn-on* c thunk #f
-           (lambda (f) (jolt-fiber-monitor! f (lambda (err) (jolt-fiber-pool-release! c))))))))
+           (lambda (f) (jolt-fiber-monitor! f (lambda (err) (jolt-fiber-pool-release! c))))
+           site))))
 
 ;; (jolt-fiber-pool-shutdown! p) -> void. No new spawns; each carrier ends once
 ;; the fibers already on it have finished. Does not wait for them.

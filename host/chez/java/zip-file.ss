@@ -197,15 +197,17 @@
   (define name (and (pair? rest) (car rest)))
   ;; a file that is not there is the JDK's NoSuchFileException (its
   ;; Files.readAttributes, before the open); one that is there but cannot be
-  ;; opened is the RandomAccessFile's FileNotFoundException, "(Permission
-  ;; denied)" as the JDK spells the EACCES it got
+  ;; opened is the RandomAccessFile's FileNotFoundException, its reason the
+  ;; open's own strerror (io.ss io-open-reason): "Too many open files" is the
+  ;; process's, not the file's, and was reported as "Permission denied"
   (let ((in (guard (e (#t (if (file-exists? path)
                               (zip-throw "java.io.FileNotFoundException"
-                                         (string-append (or name path) " (Permission denied)"))
+                                         (string-append (or name path) " ("
+                                                        (or (io-open-reason (list e)) "Permission denied") ")"))
                               (zip-throw "java.nio.file.NoSuchFileException" (or name path)))))
               (open-file-input-port path))))
     (dynamic-wind
-      (lambda () #f)
+      jolt-finally-in
       (lambda ()
         (let ((size (port-length in)))
           (when (= size 0) (zip-zerror "zip file is empty"))
@@ -361,8 +363,14 @@
 ;; same path is a new zipdir (zipdir-for), and an old descriptor would read the
 ;; old file.
 ;;
-;; The scope closes its readers on ANY exit, a fiber park included; a resumed
-;; load that reads again just opens a new one.
+;; The scope closes its readers when it ends, never at a fiber's park: a park
+;; unwinds the fiber's winders on its way to the scheduler, and a read the fiber
+;; resumes may hold a reader the scope opened (a stream mid-entry, a whole-entry
+;; read preempted between its reads). Its winder's before-thunk is the shared
+;; jolt-finally-in, so the park drops it (fibers.ss jolt-finally-winder?), as it
+;; drops a `finally`'s. Unfixed, a fiber parked mid-read had its port closed
+;; under it, and the read it resumed raised on the closed port (a Seon fork
+;; server reading its deps' jars at boot, a preemptible fiber, died of it).
 ;;
 ;; The parameter holds (thread-id . readers) and a scope answers only on the
 ;; thread that opened it. A forked thread starts with its creator's parameter
@@ -378,7 +386,7 @@
       (thunk)
       (let ((readers (make-eq-hashtable)))
         (dynamic-wind
-          (lambda () #f)
+          jolt-finally-in
           (lambda () (parameterize ((zipdir-read-scope (cons (get-thread-id) readers))) (thunk)))
           (lambda ()
             (let-values (((ds rs) (hashtable-entries readers)))
@@ -395,14 +403,15 @@
   (let ((bv (zipdir-read-at read-at! (zipdir-data-offset read-at! ent) (zdirent-csize ent))))
     (or bv (zip-zerror "ZipFile invalid LOC header (bad signature)"))))
 ;; The compressed bytes of ENT: through the scope's reader when one is open,
-;; else from a reader opened for the call.
+;; else from a reader opened for the call and closed when it ends (never at a
+;; park: jolt-finally-in, as the scope's).
 (define (zipdir-raw-bytes d ent)
   (let ((readers (zipdir-scope-readers)))
     (if readers
         (zipdir-raw-bytes-via (car (zipdir-scoped-reader readers d)) ent)
         (let-values (((read-at! close!) (zipdir-file-reader (zipdir-path d))))
           (dynamic-wind
-            (lambda () #f)
+            jolt-finally-in
             (lambda () (zipdir-raw-bytes-via read-at! ent))
             close!)))))
 
@@ -417,7 +426,7 @@
   (let-values (((zs code msg) (zstream-open 'inflate -15 0 0)))
     (unless zs (zip-throw "java.lang.InternalError" (or msg "inflateInit2 failed")))
     (dynamic-wind
-      (lambda () #f)
+      jolt-finally-in
       (lambda ()
         (let ((len (bytevector-length bv)))
           (define (grown out need)
@@ -527,20 +536,23 @@
 
 ;; --- the index the loader shares ---------------------------------------------
 ;; One zipdir per archive path, keyed by the file's modification time: a jar
-;; re-fetched at the same path is read again. A path that is not a readable
-;; archive answers #f, and is not remembered, so it is asked again — the
-;; archive may be finished by then. The table is read under its lock; a build
-;; runs outside it, so two threads may read one archive at once and the second
-;; store wins, which is harmless: the two are equal.
+;; re-fetched at the same path is read again. A path that holds no file, or a
+;; file that is not a whole archive (zipdir-read's ZipException), answers #f,
+;; and is not remembered, so it is asked again — the archive may be finished by
+;; then. Any other failure (the open's, a read's: the process out of
+;; descriptors, an I/O error) is no answer about the file, so it raises to the
+;; caller with its own cause. The table is read under its lock; a build runs
+;; outside it, so two threads may read one archive at once and the second store
+;; wins, which is harmless: the two are equal.
 (define zipdir-cache (make-hashtable string-hash string=?))
-(define zipdir-cache-mu (make-mutex))
+(define-process-local zipdir-cache-mu (make-mutex))
 (define (zipdir-for path)
-  (let ((stamp (guard (e (#t #f)) (sa-file-mtime-ms path))))
-    (and stamp
+  (and (file-exists? path) (not (file-directory? path))
+       (let ((stamp (sa-file-mtime-ms path)))
          (let ((hit (jolt-with-mutex zipdir-cache-mu (hashtable-ref zipdir-cache path #f))))
            (if (and hit (eqv? (car hit) stamp))
                (cdr hit)
-               (let ((d (guard (e (#t #f)) (zipdir-read path #f))))
+               (let ((d (guard (e ((zip-thrown? e "ZipException") #f)) (zipdir-read path #f))))
                  (when d
                    (jolt-with-mutex zipdir-cache-mu
                      (hashtable-set! zipdir-cache path (cons stamp d))))
