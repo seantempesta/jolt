@@ -50,6 +50,8 @@
 (ns jolt.io-poller
   (:require [jolt.ffi :as ffi]
             [jolt.socket.native :as native]
+            [clojure.core.async :as a]
+            [jolt.fibers]
             [clojure.string :as str]))
 
 (ffi/load-library)
@@ -89,7 +91,11 @@
 ;; -- syscalls -----------------------------------------------------------------
 (ffi/defcfn c-fcntl "fcntl" [:int :int :varargs :int] :int)
 (ffi/defcfn c-close "close" [:int] :int)
+;; merge: c-pipe and c-read kept for ours (the kqueue/epoll wake pipe, the signalfd read), which
+;; upstream e20e2174 dropped with its control pipe
+(ffi/defcfn c-pipe "pipe" [:pointer] :int)
 (ffi/defcfn c-write "write" [:int :pointer :size_t] :ssize_t)
+(ffi/defcfn c-read "read" [:int :pointer :size_t] :ssize_t)
 (ffi/defcfn c-getsockopt "getsockopt" [:int :int :int :pointer :pointer] :int)
 ;; macOS: kqueue/kevent. kevent's timeout is a NULL-able pointer; NULL (via
 ;; ffi/null means wait forever. :blocking => __collect_safe.
@@ -104,6 +110,16 @@
 (ffi/defcfn c-epoll-ctl "epoll_ctl" [:int :int :int :pointer] :int)
 (ffi/defcfn c-epoll-wait "epoll_wait" [:int :pointer :int :int] :int :blocking)
 (ffi/defcfn c-eventfd "eventfd" [:uint :int] :int)
+;; Linux: a process's exit as a readable descriptor (exit-chan); syscall because older glibc has
+;; no pidfd_open wrapper
+(ffi/defcfn c-syscall "syscall" [:long :varargs :long :long] :long)
+;; Linux: a signal as a readable descriptor (wake-on-signals!). The signals must be blocked in
+;; the thread that would take them, so they stay pending for the descriptor to read.
+(ffi/defcfn c-signalfd "signalfd" [:int :pointer :int] :int)
+(ffi/defcfn c-sigemptyset "sigemptyset" [:pointer] :int)
+(ffi/defcfn c-sigaddset "sigaddset" [:pointer :int] :int)
+(ffi/defcfn c-pthread-sigmask "pthread_sigmask" [:int :pointer :pointer] :int)
+(ffi/defcfn c-raise "raise" [:int] :int)
 
 ;; -- fd helpers (the socket layer's syscall surface) ---------------------------
 (defn errno [] (ffi/errno))
@@ -141,9 +157,22 @@
 (def ^:private EV-ONESHOT 0x10)
 (def ^:private EV-CLEAR 0x20)
 (def ^:private EVFILT-USER -10)
+(def ^:private EVFILT-SIGNAL -6)
+;; <sys/signal.h> on macOS: the status request (^T), which runs the fiber dump
+(def ^:private SIGINFO 29)
 (def ^:private NOTE-TRIGGER 0x01000000)
 (def ^:private EFD-NONBLOCK 0x800)
 (def ^:private EFD-CLOEXEC 0x80000)
+(def ^:private SYS-PIDFD-OPEN 434)  ; the same number on x86_64 and arm64
+(def ^:private EVFILT-PROC -5)
+;; (EV-ONESHOT: defined above, upstream e20e2174 and ours both declared it)
+(def ^:private NOTE-EXIT 0x80000000)
+(def ^:private ESRCH 3)
+(def ^:private SFD-NONBLOCK 0x800)
+(def ^:private SFD-CLOEXEC 0x80000)
+(def ^:private SIG-BLOCK 0)         ; <signal.h> on Linux
+(def ^:private SIG-UNBLOCK 1)
+(def ^:private SIGINFO-SIZE 128)    ; struct signalfd_siginfo; ssi_signo is its first u32
 (def ^:private KEVENT-SIZE 32)      ; struct kevent: uptr ident @0, i16 filter @8, u16 flags @10, u32 fflags @12, iptr data @16, ptr udata @24
 (def ^:private EPOLLIN 0x1)
 (def ^:private EPOLLOUT 0x4)
@@ -276,7 +305,7 @@
     (when w
       (let [b (ffi/alloc 1)]
         (try (ffi/write b :uint8 1)
-             (native/c-send w b 1 0)
+             (if poll-backend? (native/c-send w b 1 0) (c-write w b 1))
              (finally (ffi/free b)))))))
 
 (defn- open-wake-pair! []
@@ -290,19 +319,61 @@
 (defn- drain-pipe! []
   (let [r (pipe-read!) b (ffi/alloc 64)]
     (try
-      (loop []
-        (let [[n e] (native/c-recv r b 64 0)]
-          (cond
-            (pos? n) (recur)
-            (and (neg? n) (or (native/eagain? e) (native/eintr? e))) nil
-            ;; end of stream or a hard error: the pair is dead (reset by
-            ;; something outside), and its read end would report ready on
-            ;; every round from now on — a spinning poller. Replace it.
-            :else (let [[_ w] (:pipe @state)]
-                    (open-wake-pair!)
-                    (native/c-close r)
-                    (native/c-close w)))))
+      (if poll-backend?
+        (loop []
+          (let [[n e] (native/c-recv r b 64 0)]
+            (cond
+              (pos? n) (recur)
+              (and (neg? n) (or (native/eagain? e) (native/eintr? e))) nil
+              ;; end of stream or a hard error: the pair is dead (reset by
+              ;; something outside), and its read end would report ready on
+              ;; every round from now on — a spinning poller. Replace it.
+              :else (let [[_ w] (:pipe @state)]
+                      (open-wake-pair!)
+                      (native/c-close r)
+                      (native/c-close w)))))
+        ;; merge: kqueue/epoll keep ours' wake pipe (a main carrier's wake from another
+        ;; thread, wake-if-none-awaited!), a plain non-blocking pipe
+        (loop [] (when-not (neg? (c-read r b 64)) (recur))))
       (finally (ffi/free b)))))
+
+;; MERGE-REVIEW(deep-fixes): upstream e20e2174 (direct one-shot registration) removed
+;; poller-round, requeue-adds! and the delete bookkeeping; ours (main carrier, wake-on-signals!,
+;; exit-chan, the all-asleep count) had extended poller-round with a timeout, the signalfd and
+;; EVFILT_SIGNAL. Chosen: upstream's registration; ours re-fitted as wait-round/event-list below
+;; (one wait, optional timeout, signal events filtered), used by the poller thread and by a main
+;; carrier's main-io-wait. Gate: fibers, fiberspoll (poller-direct, poller-registration),
+;; main-carrier-wake-test, main-carrier-sh-test, exit-watch-eagain, fork-child-test, threadeddeadlock.
+;; Linux: signals for a main carrier's loop (wake-on-signals!). A signalfd reports only signals
+;; that are pending, so they are blocked in the thread that asked (and in every thread it makes
+;; later); when the descriptor is readable the loop takes each one, unblocks it for an instant
+;; and raises it in this thread, which runs the handler that was registered for it (Chez's, at its
+;; next event check) just as a signal delivered on macOS runs it beside EVFILT_SIGNAL's wake.
+(defn- sigset
+  "A sigset_t holding sigs, for the caller to free."
+  [sigs]
+  (let [set (ffi/alloc 128)]
+    (c-sigemptyset set)
+    (doseq [sig sigs] (c-sigaddset set sig))
+    set))
+
+(defn- sigmask! [how sigs]
+  (let [set (sigset sigs)]
+    (try (c-pthread-sigmask how set ffi/null)
+         (finally (ffi/free set)))))
+
+(defn- redeliver-signals!
+  "Take the signals pending on signalfd fd and deliver each in this thread."
+  [fd]
+  (let [buf (ffi/alloc (* 8 SIGINFO-SIZE))]
+    (try
+      (let [n (c-read fd buf (* 8 SIGINFO-SIZE))]
+        (when (pos? n)
+          (doseq [sig (distinct (for [i (range (quot n SIGINFO-SIZE))] (ffi/read buf :uint (* i SIGINFO-SIZE))))]
+            (sigmask! SIG-UNBLOCK [sig])
+            (c-raise sig)
+            (sigmask! SIG-BLOCK [sig]))))
+      (finally (ffi/free buf)))))
 
 ;; The directions of fd with a fiber parked on them. Under pm.
 (defn- parked-filts [fd]
@@ -404,28 +475,62 @@
       (Thread/sleep 10))
     (recur)))
 
+(declare awaited?)
+;; The [fd filt] pairs of a round's n events. Ours on top of upstream's: the signalfd's event
+;; (wake-on-signals!, Linux) delivers its signals here and is no readiness; an EVFILT_SIGNAL
+;; event (wake-on-signals!, SIGINFO; macOS) is only the wake, its ident a signal number.
 (defn- event-list [evbuf n]
-  (loop [i 0 acc []]
-    (if (< i n)
-      (let [fd (ev-fd evbuf i)]
-        (recur (inc i) (into acc (map (fn [f] [fd f]) (ev-filts evbuf i)))))
-      acc)))
+  (let [sigfd (:sigfd @state)]
+    (loop [i 0 acc []]
+      (if (< i n)
+        (cond
+          (and sigfd (= sigfd (ev-fd evbuf i)))
+          (do (redeliver-signals! sigfd) (recur (inc i) acc))
+          (and macos? (= (bit-and (ffi/read evbuf :uint (+ (* i KEVENT-SIZE) 8)) 0xffff)
+                         (bit-and EVFILT-SIGNAL 0xffff)))
+          (recur (inc i) acc)
+          :else
+          (let [fd (ev-fd evbuf i)]
+            (recur (inc i) (into acc (map (fn [f] [fd f]) (ev-filts evbuf i))))))
+        acc))))
 
-;; One thread blocks in the ONE collect-safe wait, and wakes whoever fired. 256 is
-;; the most events one round reports, so it bounds itself. A failed wait (a signal,
-;; most likely) reports nothing and goes round again; registrations are the kernel's
-;; by then, so nothing is lost with it.
+(declare timespec ceil-long)
+;; One collect-safe wait on kq into evbuf (256 events), at most timeout-ms (nil: until an
+;; event): the events' [fd filt] pairs, or nil when the wait failed (a signal, most likely).
+;; Registrations are the kernel's by then, so nothing is lost with a failed wait.
+(defn- wait-round [kq evbuf timeout-ms]
+  (swap! waits inc)
+  (let [ts (when (and macos? timeout-ms) (timespec timeout-ms))
+        n (try (if macos?
+                 (c-kevent kq ffi/null 0 evbuf 256 (or ts ffi/null))
+                 (c-epoll-wait kq evbuf 256 (if timeout-ms (min (ceil-long timeout-ms) 2147483647) -1)))
+               (finally (when ts (ffi/free ts))))]
+    (when-not (neg? n) (event-list evbuf n))))
+
+;; One thread blocks in the ONE collect-safe wait, and wakes whoever fired. A round with
+;; nothing awaited only waits for the wake pipe: asleep (jolt.host/asleep-while), so a process
+;; whose every thread waits can be told so; the first wait registered after it writes the pipe
+;; (commit-wait!), which wakes this round and moves the asleep count.
 (defn- poller-loop [kq]
   (let [evbuf (ffi/alloc (* 256 (if macos? KEVENT-SIZE EPOLL-EVENT-SIZE)))]
     (loop []
-      (swap! waits inc)
-      (let [n (if macos?
-                (c-kevent kq ffi/null 0 evbuf 256 ffi/null)
-                (c-epoll-wait kq evbuf 256 -1))]
-        (when (pos? n)
-          (doseq [f (process-events! (event-list evbuf n))]
+      (let [evs (if (locking pm (or (awaited? @state) (do (swap! state assoc :asleep-round? true) false)))
+                  (wait-round kq evbuf nil)
+                  (try (jolt.host/asleep-while #(wait-round kq evbuf nil))
+                       (finally (locking pm (swap! state assoc :asleep-round? false)))))]
+        (when (seq evs)
+          (doseq [f (process-events! evs)]
             (jolt.host/fiber-resume f))))
       (recur))))
+
+;; The last wait leaving, a parked fiber or a :pending registration, wakes the poller's round: one already in its wait would stay there, a
+;; running thread to the all-asleep detector (fibers.ss jolt-asleep-check!), and a process with
+;; nothing left to wake it would wait for good instead of being told (5 runs in 20 of
+;; threadeddeadlock). The next round finds nothing awaited and counts asleep. Under pm, after
+;; the state moved, so that round reads what left. kqueue and epoll only need this; WSAPoll's
+;; set is woken by its own callers.
+(defn- wake-if-none-awaited! []
+  (when-not (awaited? @state) (pipe-write!)))
 
 ;; Wake one thread waiter (wait-thread). Under pm: a waiter unregisters under pm
 ;; before it closes its kqueue/eventfd, so the number named here is still its.
@@ -462,6 +567,7 @@
                                            (update :fds dissoc fd))))
                   (doseq [h (get-in @state [:threads fd])] (thread-wake! h))
                   (when (and poll-backend? e) (pipe-write!))
+                  (wake-if-none-awaited!)
                   (into (vec (:waiters (:read e))) (:waiters (:write e)))))]
     (doseq [f woken] (jolt.host/fiber-resume f))))
 
@@ -484,6 +590,7 @@
                                            (update :cancelled disj fd)
                                            (update :pending dissoc fd)
                                            (update :fds dissoc fd))))
+                  (wake-if-none-awaited!)
                   (into (vec (:waiters (:read e))) (:waiters (:write e)))))]
     (doseq [f woken] (jolt.host/fiber-resume f))))
 
@@ -514,19 +621,130 @@
     (.setDaemon true)
     (.start)))
 
+;; -- the main carrier's rounds -------------------------------------------------
+;; In a program whose fibers run on its one thread (jolt.host/main-carrier-run!), no poller
+;; thread exists: that thread's loop (fibers.ss, jolt-main-carrier-run!) calls main-io-wait
+;; when nothing else can run. It runs one round here, waiting at most timeout-ms (nil: until
+;; a descriptor is ready), and resumes the woken fibers; it answers false at once when no
+;; fiber waits on any descriptor, so the loop knows nothing here can end its wait.
+
+(defn- awaited? [st]
+  (or (seq (:pending st)) (seq (:signals st))
+      (some (fn [[_ fm]] (some (fn [[_ e]] (seq (:waiters e))) fm)) (:fds st))))
+
+(defn- main-io-wait [timeout-ms]
+  (if-not (awaited? @state)
+    false
+    (let [evbuf (ffi/alloc (* 256 (if macos? KEVENT-SIZE EPOLL-EVENT-SIZE)))]
+      ;; nil: the wait itself failed, most often EINTR (a signal this loop also waits for); the
+      ;; registrations are the kernel's, and the loop's next round waits again
+      (try (when-let [evs (seq (wait-round (:kq @state) evbuf timeout-ms))]
+             (doseq [f (process-events! evs)] (jolt.host/fiber-resume f)))
+           (finally (ffi/free evbuf)))
+      true)))
+
+(declare ensure-started!)
+(defn wake-on-signals!
+  "A main carrier's loop also wakes when any of signals sigs arrives, so a program whose only
+  wake source is a signal (an interrupt from its parent) waits for it instead of being stuck.
+  macOS: kqueue's EVFILT_SIGNAL, which records a delivery its handler also takes. Linux: a
+  signalfd in the epoll set, with the signals blocked in the calling thread (and so in the
+  threads it makes afterwards; a thread that already exists keeps them unblocked, and a
+  delivery there runs the handler without waking the loop): when it is readable the loop
+  raises each signal in its own thread, so the handler runs there. Answers true, or false
+  when the kernel refuses (no signalfd, a signal that cannot be blocked)."
+  [sigs]
+  (cond
+    poll-backend? false
+    macos?
+    (locking pm
+      (ensure-started!)
+      (let [ch (ffi/alloc (* (count sigs) KEVENT-SIZE))]
+        (try
+          (doseq [[i sig] (map-indexed vector sigs)] (kevent-put! ch i sig EVFILT-SIGNAL EV-ADD))
+          (c-kevent (:kq @state) ch (count sigs) ffi/null 0 ffi/null)
+          (finally (ffi/free ch))))
+      (swap! state update :signals (fnil into #{}) sigs)
+      true)
+    :else
+    (locking pm
+      (ensure-started!)
+      (let [all (into (or (:signals @state) #{}) sigs)
+            set (sigset all)]
+        (try
+          (sigmask! SIG-BLOCK sigs)
+          (let [old (:sigfd @state)
+                fd (c-signalfd (or old -1) set (bit-or SFD-NONBLOCK SFD-CLOEXEC))]
+            (cond
+              (neg? fd) (do (sigmask! SIG-UNBLOCK sigs) false)
+              :else (do (when-not old (ep-ctl! (:kq @state) EPOLL-ADD fd :read))
+                        (swap! state assoc :sigfd fd :signals all)
+                        true)))
+          (finally (ffi/free set)))))))
+
+(defn- after-fork!
+  "In a forked child: the kqueue is not inherited, so the table starts afresh (the next wait
+  makes a new one); the parent's pipe descriptors are closed, and so is the signalfd, whose
+  signals the child takes by their handlers again until it asks (wake-on-signals!) once more."
+  []
+  (doseq [fd (:pipe @state)] (c-close fd))
+  (when-let [fd (:sigfd @state)]
+    (c-close fd)
+    (sigmask! SIG-UNBLOCK (:signals @state)))
+  (reset! state {:fds {} :pending {} :pipe nil :kq nil :started? false :cancelled #{} :threads {}}))
+
+;; all asleep on threads: the detector asks whether a descriptor is awaited (fibers.ss jolt-asleep-check!)
+(jolt.host/io-awaited-set! #(awaited? @state))
+;; quiescence: a fiber parked on a descriptor here is the program's work unless it is a remote end's
+;; pump (its socket is a peer's to end); a signal awaited is a peer's act too, so it does not count
+(defn- work-awaited? [st]
+  (some (fn [[_ fm]] (some (fn [[_ e]] (some #(not (jolt.host/fiber-pump? %)) (:waiters e))) fm)) (:fds st)))
+(jolt.host/io-work-awaited-set! #(boolean (work-awaited? @state)))
+
+;; every forked child resets the table (jolt-after-fork-child!): its kqueue and poller thread are the parent's
+(jolt.host/io-after-fork-set! after-fork!)
+
+(defn- start-poller-thread!
+  "The poller's thread over kqueue (or epoll) kq: a daemon thread, not a future, as the poller
+  runs for the life of the process, and a non-daemon thread would keep it from ending."
+  [kq]
+  (doto (Thread. (fn [] (poller-loop kq)) "jolt-io-poller")
+    (.setDaemon true)
+    (.start)))
+
 (defn- ensure-started! []
   ;; under pm. One poller thread per process, started on the first fiber wait.
   (cond
     (:started? @state) nil
     poll-backend? (ensure-started-wsapoll!)
     :else
-    (let [kq (if macos? (c-kqueue) (c-epoll-create1 0))]
-      (swap! state assoc :kq kq :started? true)
-      ;; a daemon thread, not a future: the poller runs for the life of
-      ;; the process, and a non-daemon thread would keep it from ending
-      (doto (Thread. (fn [] (poller-loop kq)) "jolt-io-poller")
-        (.setDaemon true)
-        (.start)))))
+    (let [pfds (ffi/alloc 8)]
+      (try
+        (when (neg? (c-pipe pfds))
+          (throw (Exception. "jolt.io-poller: pipe() failed")))
+        (let [r (ffi/read pfds :int 0) w (ffi/read pfds :int 4)]
+          (nonblock! r) (nonblock! w)
+          (let [kq (if macos? (c-kqueue) (c-epoll-create1 0))]
+            (swap! state assoc :pipe [r w] :kq kq :started? true)
+            (if macos?
+              (let [ch (ffi/alloc (* 2 KEVENT-SIZE))]
+                (try
+                  (kevent-put! ch 0 r EVFILT-READ EV-ADD)
+                  ;; SIGINFO wakes a round, so a main carrier idle here runs the fiber dump's
+                  ;; handler (jolt.host/fiber-dump, fibers-async.ss); not one of :signals, so it
+                  ;; is no wake source a stuck loop could count on (awaited?)
+                  (kevent-put! ch 1 SIGINFO EVFILT-SIGNAL EV-ADD)
+                  (c-kevent kq ch 2 ffi/null 0 ffi/null)
+                  (finally (ffi/free ch))))
+              (ep-ctl! kq EPOLL-ADD r :read))
+            (if (jolt.host/main-carrier?)
+              ;; a main-carrier process: no poller thread; its loop runs the rounds (main-io-wait),
+              ;; and a fiber another thread queues ends the round through the wake pipe
+              (jolt.host/main-io-wait-set! main-io-wait (fn [] (locking pm (pipe-write!)))
+                                           ;; the program returned: this kqueue's waits are the poller thread's
+                                           (fn [] (start-poller-thread! kq)))
+              (start-poller-thread! kq))))
+        (finally (ffi/free pfds))))))
 
 ;; -- the wait API --------------------------------------------------------------
 ;; (wait-ready fd :read|:write) -> void. Fiber-aware: parks the current fiber on
@@ -548,6 +766,13 @@
 ;; A positive time left, rounded up to a whole unit, for a syscall that takes one:
 ;; rounded down, the last wait ends short of the deadline and goes round again.
 (defn- ceil-long [x] (let [q (long (quot x 1))] (if (> x q) (inc q) q)))
+(defn- timespec
+  "A struct timespec of ms (exact or fractional) from now, for kevent's timeout: the caller frees it."
+  [ms]
+  (let [ts (ffi/alloc 16) ns (ceil-long (* (max 0 ms) 1000000))]
+    (ffi/write ts :int64 (quot ns 1000000000) 0)
+    (ffi/write ts :int64 (rem ns 1000000000) 8)
+    ts))
 
 ;; (wait-ready fd filt deadline-ms) is the same wait bounded by a deadline on
 ;; clock-ms, answering :timeout when the deadline passed first and nil otherwise
@@ -592,7 +817,16 @@
           (jolt.host/fiber-park-commit!)
           true)
         (if (register! fd filt)
-          (do (jolt.host/fiber-park-commit!) true)
+          (do
+            ;; MERGE-REVIEW(deep-fixes): ours counts the poller thread's round asleep while nothing
+            ;; is awaited (poller-loop); upstream's direct registration no longer writes the pipe, so
+            ;; a wait registered while that round is asleep (:asleep-round?, set by poller-loop)
+            ;; writes it here, waking the round to be counted awake: one write per idle->awaited
+            ;; edge, never per park. Gate: threadeddeadlock, poller-direct.
+            (when (:asleep-round? @state)
+              (swap! state assoc :asleep-round? false)
+              (pipe-write!))
+            (jolt.host/fiber-park-commit!) true)
           (do (swap! state assoc-in [:fds fd filt :waiters] ws) false))))))
 
 (defn wait-fiber [fd filt]
@@ -629,6 +863,7 @@
                             (swap! w assoc :expired? true)
                             (when (unpark-waiter! fd filt f)
                               (swap! w assoc :timed-out? true)
+                              (wake-if-none-awaited!)
                               true)))
                     (jolt.host/fiber-resume f))))
         park? (locking pm (if (:expired? @w) :expired (commit-wait! fd filt)))]
@@ -756,3 +991,82 @@
      (<= (remaining-ms deadline) 0) :timeout
      (jolt.host/fiber?) (wait-fiber-until fd filt deadline)
      :else (wait-thread fd filt deadline))))
+
+
+;; -- a process's exit, and readiness, as values on channels --------------------------
+;; The same wait a fiber makes with wait-ready, for a caller that waits on several things with
+;; alts!: a child's exit beside its pipe's input. The platform's difference is in exit-watch.
+
+(def ^:private EXIT-WATCH-ATTEMPTS
+  "How many times exit-watch asks the kernel for one watch when it answers EAGAIN (a refusal
+  that is transient: a just-forked child under load). The last refusal throws with its errno."
+  16)
+
+(defn- ask-while-eagain
+  "Calls (attempt) until it answers a non-negative value, which is returned, or a negative -errno
+  other than EAGAIN, which is returned; EAGAIN is asked again, at most EXIT-WATCH-ATTEMPTS times
+  in all, the last answer returned. Between attempts the thread yields the CPU (sched_yield, so
+  the child's setup can run), with no sleep and no clock."
+  [attempt]
+  (loop [n 1]
+    (let [r (attempt)]
+      (if (and (neg? r) (= (- r) EAGAIN) (< n EXIT-WATCH-ATTEMPTS))
+        (do (Thread/yield) (recur (inc n)))
+        r))))
+
+(defn- exit-watch
+  "A descriptor that is readable once process pid has exited (macOS: a kqueue holding
+  EVFILT_PROC/NOTE_EXIT; Linux: a pidfd), or :gone when pid has exited and is not waiting to be
+  reaped or never was. EAGAIN is asked again (ask-while-eagain); throws when the kernel refuses
+  for another reason, or EAGAIN persists, with the errno."
+  [pid]
+  (if macos?
+    (let [kq (c-kqueue)]
+      (when (neg? kq)
+        (throw (ex-info "jolt.io-poller/exit-chan: kqueue refused" {:pid pid :errno (errno)})))
+      (let [ch (ffi/alloc KEVENT-SIZE)]
+        (try
+          (kevent-put! ch 0 pid EVFILT-PROC (bit-or EV-ADD EV-ONESHOT) NOTE-EXIT)
+          (let [r (ask-while-eagain
+                    #(let [rc (c-kevent kq ch 1 ffi/null 0 ffi/null)] (if (neg? rc) (- (errno)) rc)))]
+            (if (neg? r)
+              (do (c-close kq)
+                  (if (= (- r) ESRCH)
+                    :gone
+                    (throw (ex-info "jolt.io-poller/exit-chan: kevent refused the watch" {:pid pid :errno (- r)}))))
+              kq))
+          (finally (ffi/free ch)))))
+    (let [fd (ask-while-eagain
+               #(let [rc (c-syscall SYS-PIDFD-OPEN pid 0)] (if (neg? rc) (- (errno)) rc)))]
+      (if (neg? fd)
+        (if (= (- fd) ESRCH)
+          :gone
+          (throw (ex-info "jolt.io-poller/exit-chan: pidfd_open refused the watch" {:pid pid :errno (- fd)})))
+        fd))))
+
+(defn ready-chan
+  "A channel that gets fd once fd is ready for filt (:read or :write), then closes: wait-ready
+  as a value, for alts!. The wait is a fiber's, parked on the poller. A channel nobody takes
+  leaves its fiber parked until fd is ready or its owner calls forget!/cancel! on it."
+  [fd filt]
+  (let [ch (a/chan 1)]
+    (jolt.fibers/spawn (fn [] (wait-ready fd filt) (a/>!! ch fd) (a/close! ch)))
+    ch))
+
+(defn- put-exit! [ch pid close?]
+  (a/>!! ch pid)
+  (when close? (a/close! ch)))
+
+(defn exit-chan
+  "A channel that gets pid once process pid has exited, then closes; with ch given, pid is put on
+  ch instead and ch stays open (one channel for the exits of many children). pid is not reaped:
+  the caller waitpids exactly that pid. A pid that is gone already is answered at once. macOS's
+  kqueue NOTE_EXIT and Linux's pidfd are one wait on the poller, beside any other readiness."
+  ([pid] (exit-chan pid (a/chan 1) true))
+  ([pid ch] (exit-chan pid ch false))
+  ([pid ch close?]
+   (let [w (exit-watch pid)]
+     (if (= w :gone)
+       (put-exit! ch pid close?)
+       (jolt.fibers/spawn (fn [] (wait-ready w :read) (forget! w) (c-close w) (put-exit! ch pid close?))))
+     ch)))
