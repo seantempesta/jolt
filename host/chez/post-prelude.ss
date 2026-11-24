@@ -479,3 +479,11 @@
                   (cons "protocol-dispatch1" protocol-dispatch1)
                   (cons "protocol-dispatch2" protocol-dispatch2)
                 (cons "protocol-dispatch3" protocol-dispatch3)))
+
+;; *compiler-options*' root from JOLT_COMPILER_OPTIONS (EDN map), read once at start.
+(let ((e (getenv "JOLT_COMPILER_OPTIONS")))
+  (when (and e (not (string=? e "")))
+    (let ((v (jolt-read-string e)))
+      (unless (jolt-map? v)
+        (error 'jolt "JOLT_COMPILER_OPTIONS must be an EDN map" e))
+      (var-root-set! (jolt-var "clojure.core" "*compiler-options*") v))))

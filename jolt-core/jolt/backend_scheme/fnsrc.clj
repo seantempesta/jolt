@@ -44,7 +44,7 @@
 ;;
 ;; So core's literals register too. The seed prelude grows by their source forms;
 ;; that is the price, and it is paid once at mint rather than by every program.
-(defn fnsrc-system-ns? [ns] (nil? ns))
+(defn fnsrc-system-ns? [ns] (or (nil? ns) (false? (get *compiler-options* :image-fn-forms))))
 ;; The globally unique letrec name for the next anon literal:
 ;; jfn$<ns>/<def>$<counter> (counter per top-level def); literals outside any
 ;; def use jfn$<ns>/$<counter>, with the counter per NAMESPACE for the life of

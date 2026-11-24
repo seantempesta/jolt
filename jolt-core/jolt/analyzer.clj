@@ -46,7 +46,7 @@
             [jolt.analyzer.diagnostics :refer [*positioned-form-box* *expansion-box*
                                                *macro-run-box* analysis-error
                                                resolve-error as-analysis-diagnostic
-                                               current-form-position]]
+                                               current-form-position suggestions-for]]
             [jolt.analyzer.hints :refer [jvm-boolean-prim? jvm-non-boolean-class hint-of
                                          init-proves-hint add-hint tag->nkind ahint-of
                                          with-ret-nhint fi-tag-class fi-adapt-form
@@ -87,6 +87,11 @@
 ;; rname), so it has to be unique across every thread compiling, not just within one
 ;; compilation. Read and bump in one swap! — reading the atom and then incrementing
 ;; it is two steps, and two threads that interleaved between them got the same name.
+;; The unit tap: a fn of [form node], or nil. The runtime compile spine
+;; (host/chez/compile-eval.ss) invokes it with each top-level unit after
+;; analysis and binds it to nil while the unit runs.
+(def ^:dynamic *unit-tap* nil)
+
 (def ^:private gensym-counter (atom 0))
 (defn- gen-name [prefix]
   (str "_r$" prefix (dec (swap! gensym-counter inc))))

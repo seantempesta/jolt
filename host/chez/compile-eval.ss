@@ -503,11 +503,22 @@
 ;; `ns` is the compile namespace unqualified symbols resolve against. No require
 ;; pre-scan here (ce-scan-requires! is for the walks that never run the form):
 ;; the aliases in force are the ones earlier forms registered by RUNNING.
+;; --- the unit tap (jolt.analyzer/*unit-tap*) ---------------------------------
+(define jolt-unit-tap-cell (jolt-var "jolt.analyzer" "*unit-tap*"))
+(define (jolt-unit-tap)
+  (let ((t (var-deref "jolt.analyzer" "*unit-tap*")))
+    (and (not (jolt-nil? t)) (procedure? t) t)))
+(define (jolt-run-unit thunk)
+  (if (jolt-unit-tap)
+      (dyn-with-frame (list (cons jolt-unit-tap-cell jolt-nil)) thunk)
+      (thunk)))
+
 (define (jolt-analyze-emit-form form ns)
   (let* ((ctx (make-analyze-ctx ns))
          ;; the form runs as soon as it compiles (hc-late-bound-namespace?)
          (node (parameterize ((hc-compiling-to-run #t)) (jolt-ce-analyze ctx form))))
     (jolt-lint-node! node)
+    (let ((tap (jolt-unit-tap))) (when tap (tap form node)))
     (cond
       ((hc-compiler-direct-linking?) (jolt-direct-link-emit node ctx))
       ;; guarded inlining stashes and splices on the back end's unit, the one
@@ -794,9 +805,11 @@
        ;; twice). An eval a macro does while this form is ANALYZED stays
        ;; captured: SCM does not repeat it.
        (let ((run (lambda ()
-                    (if (jolt-ce-trace-frames?)
-                        (jolt-eval-with-source scm form (or outer form) ns)
-                        (eval (read (open-input-string scm)) (interaction-environment))))))
+                    (jolt-run-unit
+                      (lambda ()
+                        (if (jolt-ce-trace-frames?)
+                            (jolt-eval-with-source scm form (or outer form) ns)
+                            (eval (read (open-input-string scm)) (interaction-environment))))))))
          (if cap
              (parameterize ((jolt-aot-capture #f)) (run))
              (run)))))))

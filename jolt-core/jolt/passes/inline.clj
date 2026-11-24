@@ -643,6 +643,15 @@
         test {:op :inline-guard :fn fl :ns (get f :ns) :name (get f :name) :token (get stash :token)}]
     {:op :let :bindings binds :body {:op :if :test test :then body :else call}}))
 
+(defn- no-inline-ns?
+  "True when nsn matches or lies under a namespace prefix listed in
+  *compiler-options* :no-inline-ns-prefixes (symbols or strings, e.g. [seon my])."
+  [nsn]
+  (let [ps (get *compiler-options* :no-inline-ns-prefixes) s (str nsn)]
+    (boolean (and ps nsn (some (fn [p] (let [r (str p) d (str r ".")]
+                                         (or (= s r) (and (<= (count d) (count s)) (= d (subs s 0 (count d)))))))
+                               ps)))))
+
 (defn- try-inline
   "node is an :invoke whose children are already inlined. If its :fn is a var
   with a stashed, in-budget, arity-matching inline body, return the spliced
@@ -651,6 +660,7 @@
   [node ctx]
   (let [f (get node :fn)
         stash (when (and (= :var (get f :op)) (not (get node :no-inline))
+                         (not (no-inline-ns? (get f :ns)))
                          ;; a protocol method's var holds defprotocol's generic
                          ;; dispatcher, a plain one-arity fn; the back end calls
                          ;; it through the receiver's dispatch vector, which its

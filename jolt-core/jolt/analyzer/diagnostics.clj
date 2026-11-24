@@ -203,7 +203,7 @@
 
 ;; Up to 3 candidate names closest to nm within the threshold, nearest first,
 ;; ties broken alphabetically for a stable message.
-(defn- suggestions-for [nm candidates]
+(defn suggestions-for [nm candidates]
   (let [thr (suggest-threshold (count nm))
         scored (filter (fn [p] (<= (second p) thr))
                        (map (fn [c] [c (edit-distance nm c)])
