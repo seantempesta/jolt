@@ -359,8 +359,22 @@
                            (bld-exe-dir chez)
                            (let ((w (bld-which-any '("chez" "scheme" "petite"))))
                              (or (and w (path-parent w)) "."))))
-               (cand (string-append bindir "/../lib/csv" bld-version "/" bld-machine)))
-          cand))))
+               (libdir (string-append bindir "/../lib"))
+               (prefix (string-append "csv" bld-version))
+               (cand (string-append libdir "/" prefix "/" bld-machine)))
+          (if (file-exists? (string-append cand "/scheme.h"))
+              cand
+              ;; Chez pre-release builds install into lib/csv<ver>-pre-release.<n>/<machine>
+              (or (and (file-directory? libdir)
+                       (let loop ((xs (directory-list libdir)))
+                         (and (pair? xs)
+                              (let ((d (car xs)))
+                                (if (and (>= (string-length d) (string-length prefix))
+                                         (string=? (substring d 0 (string-length prefix)) prefix)
+                                         (file-exists? (string-append libdir "/" d "/" bld-machine "/scheme.h")))
+                                    (string-append libdir "/" d "/" bld-machine)
+                                    (loop (cdr xs)))))))
+                  cand))))))
 ;; The csv dir supplying the boots + kernel + scheme.h that get baked into the
 ;; OUTPUT binary: the target pack when cross-compiling, else the host csv. (For a
 ;; cross build the host chez still runs the compile, finding its own boots via its
