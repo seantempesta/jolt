@@ -5,18 +5,43 @@
 ;; (jolt-str-render-one for %s / str of a uuid).
 
 ;; --- UUID --------------------------------------------------------------------
-;; A uuid is a record wrapping its canonical 36-char lowercase string. str -> the
-;; bare string; pr-str -> #uuid "…"; not map?/coll?.
-(define-record-type juuid (fields s) (nongenerative chez-juuid-v1))
+;; A UUID is its two 64-bit halves (unsigned): =, compare and hashCode read them.
+;; str -> the canonical 36-char lowercase text; pr-str -> #uuid "…"; not map?/coll?.
+;; A uuid made from text keeps that text; one made from its halves or its 16 bytes
+;; (UUID. msb lsb, a stored uuid read back) holds none, and str writes it from the
+;; halves when asked, as the JVM's toString does: a uuid used as a key or compared
+;; never pays for 36 four-byte chars it does not show.
+(define-record-type juuid
+  (fields text msb lsb)
+  (protocol (lambda (new)
+              (case-lambda
+                ((s) (new s (uuid-half-u s 0) (uuid-half-u s 16)))
+                ((msb lsb) (new #f msb lsb)))))
+  (nongenerative chez-juuid-v3))
 (define (jolt-uuid-pred? x) (juuid? x))
+;; The canonical text: the one it was made from, else written from the halves.
+(define (juuid-s u) (or (juuid-text u) (uuid-halves->text (juuid-msb u) (juuid-lsb u))))
+(define (jolt-uuid=? a b) (and (= (juuid-msb a) (juuid-msb b)) (= (juuid-lsb a) (juuid-lsb b))))
+(define (uuid-halves->text msb lsb)
+  ;; the halves' 16 bytes, written by the u64 store: a bignum shift or mask allocates
+  ;; (~400 B each), a byte read does not
+  (let ((s (make-string 36 #\-)) (b (make-bytevector 16)))
+    (bytevector-u64-set! b 0 msb (endianness big))
+    (bytevector-u64-set! b 8 lsb (endianness big))
+    (let loop ((i 0))
+      (if (fx=? i 16)
+          s
+          (let ((x (bytevector-u8-ref b i)) (j (fx* i 2)))
+            (string-set! s (uuid-hex-pos j) (string-ref hexd (fxsrl x 4)))
+            (string-set! s (uuid-hex-pos (fx+ j 1)) (string-ref hexd (fxand x 15)))
+            (loop (fx+ i 1)))))))
 
 (define hexd "0123456789abcdef")
 ;; Position of hex digit j within the 8-4-4-4-12 layout: one extra character for
 ;; each hyphen already passed (they sit after hex digits 8, 12, 16 and 20).
+;; Two-argument fx+ only: the five-argument form went through a rest list.
 (define (uuid-hex-pos j)
-  (fx+ j
-       (if (fx>=? j 8) 1 0) (if (fx>=? j 12) 1 0)
-       (if (fx>=? j 16) 1 0) (if (fx>=? j 20) 1 0)))
+  (cond ((fx<? j 8) j) ((fx<? j 12) (fx+ j 1)) ((fx<? j 16) (fx+ j 2)) ((fx<? j 20) (fx+ j 3)) (else (fx+ j 4))))
 ;; v4 from 16 bytes of OS entropy (jolt-random-bytes), NOT from the seeded PRNG:
 ;; v4 UUIDs get used as session ids and reset tokens, where a guessable value is a
 ;; forgeable one. RFC 4122 then overwrites 6 of the 128 bits — version 4 in the
@@ -77,13 +102,25 @@
         (else (fx- (char->integer c) 55))))
 ;; unsigned value of the 16 hex digits starting at digit index `start` (0 = msb,
 ;; 16 = lsb), mapped through the 8-4-4-4-12 layout by uuid-hex-pos.
+;; Two 32-bit words in fixnums, joined once: a bignum per digit was most of a parse.
 (define (uuid-half-u s start)
-  (let loop ((j start) (acc 0))
-    (if (fx=? j (fx+ start 16))
-        acc
-        (loop (fx+ j 1) (+ (* acc 16) (uuid-hexv (string-ref s (uuid-hex-pos j))))))))
-(define (uuid-msb-u u) (uuid-half-u (juuid-s u) 0))
-(define (uuid-lsb-u u) (uuid-half-u (juuid-s u) 16))
+  (define (word from)
+    (let loop ((j from) (acc 0))
+      (if (fx=? j (fx+ from 8))
+          acc
+          (loop (fx+ j 1) (fxior (fxsll acc 4) (uuid-hexv (string-ref s (uuid-hex-pos j))))))))
+  ;; joined by the u32 stores and one u64 read: a bignum shift or add allocates
+  (let ((b (make-bytevector 8)))
+    (bytevector-u32-set! b 0 (word start) (endianness big))
+    (bytevector-u32-set! b 4 (word (fx+ start 8)) (endianness big))
+    (bytevector-u64-ref b 0 (endianness big))))
+(define (uuid-msb-u u) (juuid-msb u))
+(define (uuid-lsb-u u) (juuid-lsb u))
+;; two distinct uuids: jolt=2 and jolt-hash answer uuids ahead of the arm walk, so
+;; the eq and hash registries refuse an arm claiming one (values.ss probes)
+(define juuid-fast-type-probes
+  (cons (make-juuid "00000000-0000-4000-8000-000000000001")
+        (make-juuid "00000000-0000-4000-8000-000000000002")))
 (define (uuid-u64->s64 n) (if (>= n #x8000000000000000) (- n #x10000000000000000) n))
 (define (uuid-cmp a b)
   (let ((ma (uuid-u64->s64 (uuid-msb-u a))) (mb (uuid-u64->s64 (uuid-msb-u b))))
@@ -98,17 +135,12 @@
 (register-str-render! juuid? juuid-s)
 (define (juuid-pr u) (string-append "#uuid \"" (juuid-s u) "\""))
 (register-pr-arm! juuid? juuid-pr)
-;; two uuids are = iff same string.
-(register-eq-arm! (lambda (a b) (or (juuid? a) (juuid? b)))
-                  (lambda (a b) (and (juuid? a) (juuid? b) (string=? (juuid-s a) (juuid-s b)))))
-;; and hash as UUID.hashCode, which is what Util.hasheq answers for one: the
-;; equal-hash fallback gave every uuid the same hash (#1313).
+;; Two uuids compare and hash ahead of the arm walk (values.ss jolt=2 / jolt-hash).
 (define (uuid-hashcode u)
   (let* ((hilo (bitwise-xor (uuid-msb-u u) (uuid-lsb-u u)))
          (x (bitwise-xor (bitwise-arithmetic-shift-right hilo 32)
                          (bitwise-and hilo #xFFFFFFFF))))
     (if (>= x #x80000000) (- x #x100000000) x)))
-(register-hash-arm! juuid? uuid-hashcode)
 
 ;; --- bigint / biginteger -----------------------------------------------------
 ;; JVM bigint/biginteger coerce: string → parsed integer, double/float →

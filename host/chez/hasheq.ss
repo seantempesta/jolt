@@ -826,6 +826,7 @@
     ;; read — this is key-hash's path, so a record map key costs a field read.
     ;; A jrec probe in hash-fast-probes keeps any arm from claiming one.
     ((jrec? x) (jrec-hasheq-fast x))
+    ((juuid? x) (uuid-hashcode x))
     ;; Ahead of the arm walk, like keywords/symbols/collections: a procedure is
     ;; in hash-fast-probes, so no arm may claim one (values.ss guard).
     ((procedure? x) (procedure-hasheq x))

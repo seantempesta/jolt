@@ -4105,14 +4105,16 @@
 ;; (UUID. msb lsb): build from the most/least-significant 64-bit halves (the JVM's
 ;; 2-long ctor), the form test.check's uuid generator uses. (UUID. s) parses a
 ;; string. The 128 bits format as the canonical 8-4-4-4-12 lowercase hex string.
-(define (uuid-long->hex16 n)
-  (let* ((u (bitwise-and (jnum->exact n) #xFFFFFFFFFFFFFFFF))
-         (s (string-downcase (number->string u 16))))   ; JVM UUIDs are lowercase
-    (string-append (make-string (- 16 (string-length s)) #\0) s)))
+;; The halves are kept as they are, unsigned; the text is written when str asks
+;; (natives-misc.ss juuid-s).
 (define (uuid-from-halves msb lsb)
-  (let ((h (uuid-long->hex16 msb)) (l (uuid-long->hex16 lsb)))
-    (make-juuid (string-append (substring h 0 8) "-" (substring h 8 12) "-" (substring h 12 16)
-                               "-" (substring l 0 4) "-" (substring l 4 16)))))
+  (define (u64 n)
+    (let ((n (jnum->exact n)) (b (make-bytevector 8)))
+      (if (< n 0)
+          (bytevector-s64-set! b 0 n (endianness big))
+          (bytevector-u64-set! b 0 (bitwise-and n #xFFFFFFFFFFFFFFFF) (endianness big)))
+      (bytevector-u64-ref b 0 (endianness big))))
+  (make-juuid (u64 msb) (u64 lsb)))
 (define (uuid-ctor . args)
   (if (= (length args) 2)
       (uuid-from-halves (car args) (cadr args))

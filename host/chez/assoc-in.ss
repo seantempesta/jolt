@@ -25,7 +25,7 @@
 
 (define (assoc-in-key=? a b)
   (cond ((eq? a b) #t)
-        ((juuid? a) (and (juuid? b) (string=? (juuid-s a) (juuid-s b))))
+        ((juuid? a) (and (juuid? b) (jolt-uuid=? a b)))
         ((juuid? b) #f)
         (else (jolt=2 a b))))
 

@@ -332,6 +332,27 @@
                   kw))))))
 (define (keyword? x) (keyword-t? x))
 
+;; Decode an interned keyword directly from UTF-8 slices in a bytevector (used
+;; by konserve jfasl): pure ASCII writes into the intern key in one pass with no
+;; intermediate strings on a hit, falling back to utf8->string for non-ASCII.
+(define (keyword-from-utf8 bv ns-at ns-len name-at name-len)
+  (define (fill! s to at n)
+    (let loop ((i 0))
+      (or (fx=? i n)
+          (let ((b (bytevector-u8-ref bv (fx+ at i))))
+            (and (fx<? b 128)
+                 (begin (string-set! s (fx+ to i) (integer->char b)) (loop (fx+ i 1))))))))
+  (define (text at n) (let ((b (make-bytevector n))) (bytevector-copy! bv at b 0 n) (utf8->string b)))
+  (define (general) (keyword (and ns-at (text ns-at ns-len)) (text name-at name-len)))
+  (if (not ns-at)
+      (let ((s (make-string name-len)))
+        (if (fill! s 0 name-at name-len) (keyword #f s) (general)))
+      (let ((k (make-string (fx+ ns-len 1 name-len) #\x0)))
+        (if (and (fill! k 0 ns-at ns-len) (fill! k (fx+ ns-len 1) name-at name-len))
+            (or (hashtable-ref keyword-table k #f)
+                (keyword (substring k 0 ns-len) (substring k (fx+ ns-len 1) (string-length k))))
+            (general)))))
+
 ;; --- symbols: ns + name + meta; NOT interned (meta varies), = by ns/name ------
 ;; The ns/name STRINGS are pooled (like JVM Symbol.intern, which .intern()s them):
 ;; two separately-read `?a` symbols share one name-string object, so code that
@@ -560,7 +581,9 @@
    ;; two jrecs (jolt=2's jrec-pair=? clause). records.ss builds the probe after
    ;; the earliest arms register; those are checked by the dispatch-caches unit
    ;; row after boot instead (probe-if-available).
-   (probe-if-available (lambda () (cons jrec-fast-type-probe jrec-fast-type-probe)))))
+   (probe-if-available (lambda () (cons jrec-fast-type-probe jrec-fast-type-probe)))
+   ;; two UUIDs (jolt=2's clause after the jrec one, natives-misc.ss)
+   (probe-if-available (lambda () juuid-fast-type-probes))))
 (define (eq-arm-reject-fast-type! who pred)
   (reject-fast-type-claim! who
                            (lambda (probe) (pred (car probe) (cdr probe)))
@@ -679,6 +702,8 @@
         ;; ahead of the walk it sat at the end of (records-coll.ss jrec-equiv=?,
         ;; loads later — runtime forward ref). The pair is in eq-fast-probes.
         ((and (jrec? a) (jrec? b)) (jrec-equiv=? a b))
+        ;; Two UUIDs compare by their 64-bit halves ahead of the arm walk
+        ((and (juuid? a) (juuid? b)) (jolt-uuid=? a b))
         ;; one of jolt's own vector, map or set types against a base scalar, in
         ;; either order: Util.equiv asks the collection's equiv, which is false
         ;; against a non-collection, so nothing else is asked. (= v "s") used
@@ -764,7 +789,8 @@
    ;; a jrec answers via its hasheq slot ahead of the walk. records.ss loads
    ;; after several arm registrants, and a probe that cannot be built is one
    ;; those registrations are not checked against (probe-if-available).
-   (probe-if-available (lambda () jrec-fast-type-probe))))
+   (probe-if-available (lambda () jrec-fast-type-probe))
+   (probe-if-available (lambda () (car juuid-fast-type-probes)))))
 (define (hash-arm-reject-fast-type! who pred)
   (reject-fast-type-claim! who pred (hash-fast-probes) "the jolt-hash fast path"))
 (define jolt-hash-arms '())
@@ -818,6 +844,7 @@
         ;; jrec: hasheq slot read, slow-path dispatch on 0 (records-coll.ss,
         ;; loads later — runtime forward ref like the collection clauses).
         ((jrec? x) (jrec-hasheq-fast x))
+        ((juuid? x) (uuid-hashcode x))
         (else (let loop ((as jolt-hash-arms))
                 (cond ((null? as) (jolt-hash-base x))
                       (((caar as) x) ((cdar as) x))
